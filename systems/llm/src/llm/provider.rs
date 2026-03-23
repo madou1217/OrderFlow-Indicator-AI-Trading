@@ -1588,7 +1588,7 @@ fn qwen_output_contract(
     } else if pending_order_mode {
         "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- Top-level keys must appear in this order: `pending_context`, `params`, and `reason`. `analysis` and `self_check` may be present as extra objects.\n- `reason` must be a non-empty top-level string. Do not place `reason` inside `analysis`.\n- `pending_context` must include `preferred_direction`, `entry_state`, `entry_sweep_risk_15m`, `thesis_freshness`, `tp_state`, and `key_condition`.\n- `params` must contain exactly: `entry`, `tp`, `sl`, `leverage` — each a number or null.\n- Set all params to null if there is no valid setup.\n".to_string()
     } else if management_mode {
-        "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- Top-level keys must be `decision`, `reason`, `management_context`, and `params`. `analysis` may be present as an extra object.\n- `reason` must be a non-empty top-level string.\n- `management_context` must include `direction_state`, `near_term_risk_15m`, `sl_survival_risk`, `tp_state`, and `key_condition`.\n- Allowed decisions: HOLD, REDUCE, CLOSE, ADJUST, ADD.\n- `params` must always be present.\n- For HOLD: keep `params` present; action fields may be null.\n- For CLOSE: set `params.close_price` to a number or null.\n- For REDUCE or ADD: set `params.qty_ratio` to a number 0-1.\n- For ADJUST: set `params.adjust_fields` (array: [\"tp\"], [\"sl\"], or [\"tp\",\"sl\"]), and corresponding values: `new_tp`/`new_sl`.\n".to_string()
+        "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- Top-level keys must appear in this order: `management_context`, `decision`, `params`, and `reason`. `analysis` may be present as an extra object.\n- `reason` must be a non-empty top-level string.\n- `management_context` must include `direction_state`, `near_term_risk_15m`, `sl_survival_risk`, `tp_state`, and `key_condition`.\n- Allowed decisions: HOLD, REDUCE, CLOSE, ADJUST, ADD.\n- `params` must always be present.\n- For HOLD: keep `params` present; action fields may be null.\n- For CLOSE: set `params.close_price` to a number or null.\n- For REDUCE or ADD: set `params.qty_ratio` to a number 0-1.\n- For ADJUST: set `params.adjust_fields` (array: [\"tp\"], [\"sl\"], or [\"tp\",\"sl\"]), and corresponding values: `new_tp`/`new_sl`.\n".to_string()
     } else {
         "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- Keep `reason` as a top-level string. Do not place `reason` inside `analysis`.\n- Top-level keys must appear in this order: `trade_quality`, `decision`, `params`, and `reason`. `analysis` and `self_check` may be present as extra objects.\n- `trade_quality` must include `thesis_clarity`, `execution_quality`, `path_to_target_quality`, `stopout_risk_before_resolution`, and `reward_to_risk_sufficiency`.\n- Allowed entry decisions: LONG, SHORT, NO_TRADE. Never use HOLD in entry mode.\n- For LONG or SHORT, params must include `entry`, `tp`, `sl`, `leverage`, and `horizon`.\n- For NO_TRADE, set `params.entry`, `params.tp`, `params.sl`, `params.leverage`, and `params.horizon` to null.\n".to_string()
     }
@@ -2163,20 +2163,20 @@ fn qwen_management_response_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": true,
-        "required": ["decision", "reason", "management_context", "params"],
+        "required": ["management_context", "decision", "params", "reason"],
         "properties": {
+            "management_context": management_context_schema_openai(),
             "decision": {
                 "type": "string",
                 "enum": ["HOLD", "REDUCE", "CLOSE", "ADJUST", "ADD"]
             },
-            "reason": {
-                "type": "string",
-                "minLength": 1
-            },
-            "management_context": management_context_schema_openai(),
             "params": {
                 "type": "object",
                 "additionalProperties": true
+            },
+            "reason": {
+                "type": "string",
+                "minLength": 1
             },
             "analysis": {
                 "type": ["object", "null"],
@@ -2191,18 +2191,18 @@ fn custom_llm_management_response_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["decision", "reason", "management_context", "params"],
+        "required": ["management_context", "decision", "params", "reason"],
         "properties": {
+            "management_context": management_context_schema_openai(),
             "decision": {
                 "type": "string",
                 "enum": ["HOLD", "REDUCE", "CLOSE", "ADJUST", "ADD"]
             },
+            "params": management_params_schema_base_openai(),
             "reason": {
                 "type": "string",
                 "minLength": 1
-            },
-            "management_context": management_context_schema_openai(),
-            "params": management_params_schema_base_openai()
+            }
         }
     })
 }
@@ -3011,10 +3011,10 @@ fn ml_grok_management_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["decision", "management_context", "params", "reason"],
+        "required": ["management_context", "decision", "params", "reason"],
         "properties": {
-            "decision": { "type": "string", "enum": ["HOLD", "REDUCE", "CLOSE", "ADJUST", "ADD"] },
             "management_context": management_context_schema_openai(),
+            "decision": { "type": "string", "enum": ["HOLD", "REDUCE", "CLOSE", "ADJUST", "ADD"] },
             "params": management_params_schema_base_openai(),
             "reason": { "type": "string" }
         },
@@ -3070,8 +3070,8 @@ fn ml_gemini_management_schema() -> Value {
     json!({
         "type": "OBJECT",
         "properties": {
-            "decision": { "type": "STRING", "enum": ["HOLD", "REDUCE", "CLOSE", "ADJUST", "ADD"] },
             "management_context": management_context_schema_gemini(),
+            "decision": { "type": "STRING", "enum": ["HOLD", "REDUCE", "CLOSE", "ADJUST", "ADD"] },
             "params": {
                 "type": "OBJECT",
                 "properties": {
@@ -3085,7 +3085,7 @@ fn ml_gemini_management_schema() -> Value {
             },
             "reason": { "type": "STRING" }
         },
-        "required": ["decision", "management_context", "params", "reason"]
+        "required": ["management_context", "decision", "params", "reason"]
     })
 }
 
@@ -3122,12 +3122,12 @@ fn ml_qwen_management_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": true,
-        "required": ["decision", "reason", "management_context", "params"],
+        "required": ["management_context", "decision", "params", "reason"],
         "properties": {
-            "decision": { "type": "string", "enum": ["HOLD", "REDUCE", "CLOSE", "ADJUST", "ADD"] },
-            "reason": { "type": "string", "minLength": 1 },
             "management_context": management_context_schema_openai(),
+            "decision": { "type": "string", "enum": ["HOLD", "REDUCE", "CLOSE", "ADJUST", "ADD"] },
             "params": { "type": "object", "additionalProperties": true },
+            "reason": { "type": "string", "minLength": 1 },
             "analysis": { "type": ["object", "null"], "additionalProperties": true }
         },
         "allOf": management_action_constraints_openai()
@@ -3177,12 +3177,12 @@ fn ml_custom_llm_management_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["decision", "reason", "management_context", "params"],
+        "required": ["management_context", "decision", "params", "reason"],
         "properties": {
-            "decision": { "type": "string", "enum": ["HOLD", "REDUCE", "CLOSE", "ADJUST", "ADD"] },
-            "reason": { "type": "string", "minLength": 1 },
             "management_context": management_context_schema_openai(),
-            "params": management_params_schema_base_openai()
+            "decision": { "type": "string", "enum": ["HOLD", "REDUCE", "CLOSE", "ADJUST", "ADD"] },
+            "params": management_params_schema_base_openai(),
+            "reason": { "type": "string", "minLength": 1 }
         }
     })
 }
@@ -3267,11 +3267,11 @@ fn gemini_management_response_schema() -> Value {
     json!({
         "type": "OBJECT",
         "properties": {
+            "management_context": management_context_schema_gemini(),
             "decision": {
                 "type": "STRING",
                 "enum": ["HOLD", "REDUCE", "CLOSE", "ADJUST", "ADD"]
             },
-            "management_context": management_context_schema_gemini(),
             "params": {
                 "type": "OBJECT",
                 "properties": {
@@ -3285,7 +3285,7 @@ fn gemini_management_response_schema() -> Value {
             },
             "reason": { "type": "STRING" }
         },
-        "required": ["decision", "management_context", "params", "reason"]
+        "required": ["management_context", "decision", "params", "reason"]
     })
 }
 
@@ -4618,9 +4618,13 @@ mod tests {
         assert!(schema
             .get("required")
             .and_then(Value::as_array)
-            .map(|required| required
-                .iter()
-                .any(|v| v.as_str() == Some("management_context")))
+            .map(|required| {
+                required
+                    .iter()
+                    .map(|v| v.as_str().unwrap_or_default())
+                    .collect::<Vec<_>>()
+                    == vec!["management_context", "decision", "params", "reason"]
+            })
             .unwrap_or(false));
     }
 
@@ -4779,6 +4783,7 @@ mod tests {
             "medium_large_opportunity",
         );
         assert!(contract.contains("management_context"));
+        assert!(contract.contains("`management_context`, `decision`, `params`, and `reason`"));
         assert!(contract.contains("direction_state"));
         assert!(contract.contains("near_term_risk_15m"));
         assert!(contract.contains("sl_survival_risk"));
