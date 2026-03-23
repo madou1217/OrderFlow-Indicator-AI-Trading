@@ -2078,8 +2078,9 @@ fn qwen_entry_response_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": true,
-        "required": ["decision", "reason", "trade_quality", "params"],
+        "required": ["trade_quality", "decision", "reason", "params"],
         "properties": {
+            "trade_quality": trade_quality_schema_openai(),
             "decision": {
                 "type": "string",
                 "enum": ["LONG", "SHORT", "NO_TRADE"]
@@ -2088,7 +2089,6 @@ fn qwen_entry_response_schema() -> Value {
                 "type": "string",
                 "minLength": 1
             },
-            "trade_quality": trade_quality_schema_openai(),
             "params": {
                 "type": "object",
                 "additionalProperties": true
@@ -2123,8 +2123,9 @@ fn custom_llm_entry_response_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["decision", "reason", "trade_quality", "params"],
+        "required": ["trade_quality", "decision", "reason", "params"],
         "properties": {
+            "trade_quality": trade_quality_schema_openai(),
             "decision": {
                 "type": "string",
                 "enum": ["LONG", "SHORT", "NO_TRADE"]
@@ -2133,7 +2134,6 @@ fn custom_llm_entry_response_schema() -> Value {
                 "type": "string",
                 "minLength": 1
             },
-            "trade_quality": trade_quality_schema_openai(),
             "params": {
                 "type": "object",
                 "additionalProperties": false,
@@ -2665,7 +2665,7 @@ fn grok_entry_response_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["analysis", "decision", "trade_quality", "params", "reason"],
+        "required": ["analysis", "trade_quality", "decision", "params", "reason"],
         "properties": {
             "analysis": {
                 "type": "object",
@@ -2676,11 +2676,11 @@ fn grok_entry_response_schema() -> Value {
                     "trade_logic": { "type": "string" }
                 }
             },
+            "trade_quality": trade_quality_schema_openai(),
             "decision": {
                 "type": "string",
                 "enum": ["LONG", "SHORT", "NO_TRADE"]
             },
-            "trade_quality": trade_quality_schema_openai(),
             "params": {
                 "type": "object",
                 "additionalProperties": false,
@@ -3232,11 +3232,11 @@ fn gemini_entry_response_schema() -> Value {
                 },
                 "required": ["market_thesis", "trade_logic"]
             },
+            "trade_quality": trade_quality_schema_gemini(),
             "decision": {
                 "type": "STRING",
                 "enum": ["LONG", "SHORT", "NO_TRADE"]
             },
-            "trade_quality": trade_quality_schema_gemini(),
             "params": {
                 "type": "OBJECT",
                 "properties": {
@@ -3250,7 +3250,7 @@ fn gemini_entry_response_schema() -> Value {
             },
             "reason": { "type": "STRING" }
         },
-        "required": ["analysis", "decision", "trade_quality", "params", "reason"]
+        "required": ["analysis", "trade_quality", "decision", "params", "reason"]
     })
 }
 

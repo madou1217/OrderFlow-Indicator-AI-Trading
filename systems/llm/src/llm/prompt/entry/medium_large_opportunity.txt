@@ -10,7 +10,8 @@ If the current data does not support a realistically profitable trade, return NO
 Your task has two parts:
 
 1. Direction
-What is the dominant 4h to 1d opportunity, and does the current data support turning it into a profitable trade now?
+Does the current data support a realistically profitable 4h to 1d trade now?
+If yes, which higher-timeframe thesis provides it?
 Read all timeframes as one picture - they are not separate questions:
 - 1d frames the regime and outer path
 - 4h defines the core tradable thesis within that regime
