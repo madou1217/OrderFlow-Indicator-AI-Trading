@@ -1590,7 +1590,7 @@ fn qwen_output_contract(
     } else if management_mode {
         "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- Top-level keys must be `decision`, `reason`, `management_context`, and `params`. `analysis` may be present as an extra object.\n- `reason` must be a non-empty top-level string.\n- `management_context` must include `direction_state`, `near_term_risk_15m`, `sl_survival_risk`, `tp_state`, and `key_condition`.\n- Allowed decisions: HOLD, REDUCE, CLOSE, ADJUST, ADD.\n- `params` must always be present.\n- For HOLD: keep `params` present; action fields may be null.\n- For CLOSE: set `params.close_price` to a number or null.\n- For REDUCE or ADD: set `params.qty_ratio` to a number 0-1.\n- For ADJUST: set `params.adjust_fields` (array: [\"tp\"], [\"sl\"], or [\"tp\",\"sl\"]), and corresponding values: `new_tp`/`new_sl`.\n".to_string()
     } else {
-        "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- Keep `reason` as a top-level string. Do not place `reason` inside `analysis`.\n- Top-level keys must be `decision`, `reason`, `trade_quality`, and `params`. `analysis` and `self_check` may be present as extra objects.\n- `trade_quality` must include `thesis_clarity`, `execution_quality`, `path_to_target_quality`, `stopout_risk_before_resolution`, and `reward_to_risk_sufficiency`.\n- Allowed entry decisions: LONG, SHORT, NO_TRADE. Never use HOLD in entry mode.\n- For LONG or SHORT, params must include `entry`, `tp`, `sl`, `leverage`, and `horizon`.\n- For NO_TRADE, set `params.entry`, `params.tp`, `params.sl`, `params.leverage`, and `params.horizon` to null.\n".to_string()
+        "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- Keep `reason` as a top-level string. Do not place `reason` inside `analysis`.\n- Top-level keys must appear in this order: `trade_quality`, `decision`, `params`, and `reason`. `analysis` and `self_check` may be present as extra objects.\n- `trade_quality` must include `thesis_clarity`, `execution_quality`, `path_to_target_quality`, `stopout_risk_before_resolution`, and `reward_to_risk_sufficiency`.\n- Allowed entry decisions: LONG, SHORT, NO_TRADE. Never use HOLD in entry mode.\n- For LONG or SHORT, params must include `entry`, `tp`, `sl`, `leverage`, and `horizon`.\n- For NO_TRADE, set `params.entry`, `params.tp`, `params.sl`, `params.leverage`, and `params.horizon` to null.\n".to_string()
     }
 }
 
@@ -2087,20 +2087,20 @@ fn qwen_entry_response_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": true,
-        "required": ["trade_quality", "decision", "reason", "params"],
+        "required": ["trade_quality", "decision", "params", "reason"],
         "properties": {
             "trade_quality": trade_quality_schema_openai(),
             "decision": {
                 "type": "string",
                 "enum": ["LONG", "SHORT", "NO_TRADE"]
             },
-            "reason": {
-                "type": "string",
-                "minLength": 1
-            },
             "params": {
                 "type": "object",
                 "additionalProperties": true
+            },
+            "reason": {
+                "type": "string",
+                "minLength": 1
             },
             "analysis": {
                 "type": ["object", "null"],
@@ -2132,16 +2132,12 @@ fn custom_llm_entry_response_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["trade_quality", "decision", "reason", "params"],
+        "required": ["trade_quality", "decision", "params", "reason"],
         "properties": {
             "trade_quality": trade_quality_schema_openai(),
             "decision": {
                 "type": "string",
                 "enum": ["LONG", "SHORT", "NO_TRADE"]
-            },
-            "reason": {
-                "type": "string",
-                "minLength": 1
             },
             "params": {
                 "type": "object",
@@ -2154,6 +2150,10 @@ fn custom_llm_entry_response_schema() -> Value {
                     "leverage": {"type": ["number", "null"]},
                     "horizon": {"type": ["string", "null"]}
                 }
+            },
+            "reason": {
+                "type": "string",
+                "minLength": 1
             }
         }
     })
@@ -2977,19 +2977,10 @@ fn ml_grok_entry_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["analysis", "decision", "trade_quality", "params", "reason"],
+        "required": ["trade_quality", "decision", "params", "reason", "analysis"],
         "properties": {
-            "analysis": {
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["market_thesis", "trade_logic"],
-                "properties": {
-                    "market_thesis": { "type": "string" },
-                    "trade_logic": { "type": "string" }
-                }
-            },
-            "decision": { "type": "string", "enum": ["LONG", "SHORT", "NO_TRADE"] },
             "trade_quality": trade_quality_schema_openai(),
+            "decision": { "type": "string", "enum": ["LONG", "SHORT", "NO_TRADE"] },
             "params": {
                 "type": "object",
                 "additionalProperties": false,
@@ -3002,7 +2993,16 @@ fn ml_grok_entry_schema() -> Value {
                     "horizon": { "type": ["string", "null"] }
                 }
             },
-            "reason": { "type": "string" }
+            "reason": { "type": "string" },
+            "analysis": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["market_thesis", "trade_logic"],
+                "properties": {
+                    "market_thesis": { "type": "string" },
+                    "trade_logic": { "type": "string" }
+                }
+            }
         }
     })
 }
@@ -3039,16 +3039,8 @@ fn ml_gemini_entry_schema() -> Value {
     json!({
         "type": "OBJECT",
         "properties": {
-            "analysis": {
-                "type": "OBJECT",
-                "properties": {
-                    "market_thesis": { "type": "STRING" },
-                    "trade_logic": { "type": "STRING" }
-                },
-                "required": ["market_thesis", "trade_logic"]
-            },
-            "decision": { "type": "STRING", "enum": ["LONG", "SHORT", "NO_TRADE"] },
             "trade_quality": trade_quality_schema_gemini(),
+            "decision": { "type": "STRING", "enum": ["LONG", "SHORT", "NO_TRADE"] },
             "params": {
                 "type": "OBJECT",
                 "properties": {
@@ -3060,9 +3052,17 @@ fn ml_gemini_entry_schema() -> Value {
                 },
                 "required": ["entry", "tp", "sl", "leverage", "horizon"]
             },
-            "reason": { "type": "STRING" }
+            "reason": { "type": "STRING" },
+            "analysis": {
+                "type": "OBJECT",
+                "properties": {
+                    "market_thesis": { "type": "STRING" },
+                    "trade_logic": { "type": "STRING" }
+                },
+                "required": ["market_thesis", "trade_logic"]
+            }
         },
-        "required": ["analysis", "decision", "trade_quality", "params", "reason"]
+        "required": ["trade_quality", "decision", "params", "reason", "analysis"]
     })
 }
 
@@ -3107,12 +3107,12 @@ fn ml_qwen_entry_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": true,
-        "required": ["decision", "reason", "trade_quality", "params"],
+        "required": ["trade_quality", "decision", "params", "reason"],
         "properties": {
-            "decision": { "type": "string", "enum": ["LONG", "SHORT", "NO_TRADE"] },
-            "reason": { "type": "string", "minLength": 1 },
             "trade_quality": trade_quality_schema_openai(),
+            "decision": { "type": "string", "enum": ["LONG", "SHORT", "NO_TRADE"] },
             "params": { "type": "object", "additionalProperties": true },
+            "reason": { "type": "string", "minLength": 1 },
             "analysis": { "type": ["object", "null"], "additionalProperties": true }
         }
     })
@@ -3152,11 +3152,10 @@ fn ml_custom_llm_entry_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["decision", "reason", "trade_quality", "params"],
+        "required": ["trade_quality", "decision", "params", "reason"],
         "properties": {
-            "decision": { "type": "string", "enum": ["LONG", "SHORT", "NO_TRADE"] },
-            "reason": { "type": "string", "minLength": 1 },
             "trade_quality": trade_quality_schema_openai(),
+            "decision": { "type": "string", "enum": ["LONG", "SHORT", "NO_TRADE"] },
             "params": {
                 "type": "object",
                 "additionalProperties": false,
@@ -3168,7 +3167,8 @@ fn ml_custom_llm_entry_schema() -> Value {
                     "leverage": { "type": ["number", "null"] },
                     "horizon": { "type": ["string", "null"] }
                 }
-            }
+            },
+            "reason": { "type": "string", "minLength": 1 }
         }
     })
 }
@@ -3233,14 +3233,6 @@ fn gemini_entry_response_schema() -> Value {
     json!({
         "type": "OBJECT",
         "properties": {
-            "analysis": {
-                "type": "OBJECT",
-                "properties": {
-                    "market_thesis": { "type": "STRING" },
-                    "trade_logic": { "type": "STRING" }
-                },
-                "required": ["market_thesis", "trade_logic"]
-            },
             "trade_quality": trade_quality_schema_gemini(),
             "decision": {
                 "type": "STRING",
@@ -3257,9 +3249,17 @@ fn gemini_entry_response_schema() -> Value {
                 },
                 "required": ["entry", "tp", "sl", "leverage", "horizon"]
             },
-            "reason": { "type": "STRING" }
+            "reason": { "type": "STRING" },
+            "analysis": {
+                "type": "OBJECT",
+                "properties": {
+                    "market_thesis": { "type": "STRING" },
+                    "trade_logic": { "type": "STRING" }
+                },
+                "required": ["market_thesis", "trade_logic"]
+            }
         },
-        "required": ["analysis", "trade_quality", "decision", "params", "reason"]
+        "required": ["trade_quality", "decision", "params", "reason", "analysis"]
     })
 }
 
@@ -4587,7 +4587,13 @@ mod tests {
         assert!(schema
             .get("required")
             .and_then(Value::as_array)
-            .map(|required| required.iter().any(|v| v.as_str() == Some("trade_quality")))
+            .map(|required| {
+                required
+                    .iter()
+                    .map(|v| v.as_str().unwrap_or_default())
+                    .collect::<Vec<_>>()
+                    == vec!["trade_quality", "decision", "params", "reason"]
+            })
             .unwrap_or(false));
     }
 
@@ -4756,6 +4762,7 @@ mod tests {
             "medium_large_opportunity",
         );
         assert!(contract.contains("trade_quality"));
+        assert!(contract.contains("`trade_quality`, `decision`, `params`, and `reason`"));
         assert!(contract.contains("thesis_clarity"));
         assert!(contract.contains("execution_quality"));
         assert!(contract.contains("path_to_target_quality"));
