@@ -2194,8 +2194,7 @@ fn custom_llm_management_response_schema() -> Value {
             },
             "management_context": management_context_schema_openai(),
             "params": management_params_schema_base_openai()
-        },
-        "allOf": management_action_constraints_openai()
+        }
     })
 }
 
@@ -3175,8 +3174,7 @@ fn ml_custom_llm_management_schema() -> Value {
             "reason": { "type": "string", "minLength": 1 },
             "management_context": management_context_schema_openai(),
             "params": management_params_schema_base_openai()
-        },
-        "allOf": management_action_constraints_openai()
+        }
     })
 }
 
@@ -4609,8 +4607,24 @@ mod tests {
             .and_then(Value::as_array)
             .map(|required| required
                 .iter()
-                .any(|v| v.as_str() == Some("management_context")))
+            .any(|v| v.as_str() == Some("management_context")))
             .unwrap_or(false));
+    }
+
+    #[test]
+    fn custom_llm_management_schema_omits_allof() {
+        for prompt_template in ["big_opportunity", "medium_large_opportunity"] {
+            let schema = super::custom_llm_response_schema(
+                true,
+                false,
+                super::prompt::EntryPromptStage::Finalize,
+                prompt_template,
+            );
+            assert!(
+                schema.get("allOf").is_none(),
+                "custom_llm management schema for {prompt_template} should not contain allOf"
+            );
+        }
     }
 
     #[test]
