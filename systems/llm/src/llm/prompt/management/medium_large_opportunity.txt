@@ -19,11 +19,12 @@ BEFORE YOU OUTPUT
 4. Is the current SL likely to be hit by 15m to 1h noise before the thesis has enough time to resolve?
 5. Does the current TP still maximize expected value, or has the reward profile become too conservative, too stretched, or obsolete?
 6. If the position is in profit, should that profit now be protected?
-7. If the position is in loss, is continued holding still superior to cutting risk now?
-8. If, relative to reducing, closing, or adjusting, the existing position no longer has a meaningful edge from now,
+7. If you are reducing or adding, is the qty_ratio the best size change to achieve the GOAL from the current state?
+8. If the position is in loss, is continued holding still superior to cutting risk now?
+9. If, relative to reducing, closing, or adjusting, the existing position no longer has a meaningful edge from now,
    does holding unchanged still satisfy the GOAL?
-9. To achieve the GOAL, is there a better action from now than keeping the position unchanged?
-10. If short-term price action is more likely to produce a counter-move, balance, or pullback first,
+10. To achieve the GOAL, is there a better action from now than keeping the position unchanged?
+11. If short-term price action is more likely to produce a counter-move, balance, or pullback first,
     would protecting current profit, reducing risk, and waiting for a better re-entry satisfy the GOAL better than holding unchanged?
 
 Decision meaning:
