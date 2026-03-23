@@ -1830,6 +1830,83 @@ fn compute_rr_from_levels(entry: f64, tp: f64, sl: f64) -> Option<f64> {
     }
 }
 
+fn pending_direction_to_trade_decision(direction: &str) -> Result<TradeDecision> {
+    let raw = direction.trim();
+    if raw.eq_ignore_ascii_case("LONG") {
+        Ok(TradeDecision::Long)
+    } else if raw.eq_ignore_ascii_case("SHORT") {
+        Ok(TradeDecision::Short)
+    } else {
+        Err(anyhow!(
+            "pending safety gate requires LONG/SHORT direction, got {}",
+            direction
+        ))
+    }
+}
+
+fn build_pending_modify_trade_intent(
+    intent: &crate::llm::decision::PendingOrderManagementIntent,
+    input: &ModelInvocationInput,
+) -> Result<Option<TradeIntent>> {
+    if !matches!(
+        intent.decision,
+        crate::llm::decision::PendingOrderManagementDecision::ModifyMaker
+    ) {
+        return Ok(None);
+    }
+
+    let pending = input
+        .management_snapshot
+        .as_ref()
+        .and_then(|snapshot| snapshot.pending_order.as_ref())
+        .ok_or_else(|| anyhow!("pending safety gate requires pending_order snapshot"))?;
+    let decision = pending_direction_to_trade_decision(&pending.direction)?;
+    let entry_price = intent
+        .new_entry
+        .or(pending.entry_price)
+        .ok_or_else(|| anyhow!("pending safety gate requires entry price"))?;
+    let take_profit = intent
+        .new_tp
+        .or(pending.current_tp_price)
+        .or(pending.planned_tp_price)
+        .ok_or_else(|| anyhow!("pending safety gate requires take profit"))?;
+    let stop_loss = intent
+        .new_sl
+        .or(pending.current_sl_price)
+        .or(pending.planned_sl_price)
+        .ok_or_else(|| anyhow!("pending safety gate requires stop loss"))?;
+    let leverage = intent
+        .new_leverage
+        .or(pending.leverage.map(|value| value as f64))
+        .or_else(|| {
+            input.management_snapshot.as_ref().and_then(|snapshot| {
+                snapshot
+                    .position_context
+                    .as_ref()
+                    .and_then(|ctx| ctx.effective_leverage.map(|value| value as f64))
+            })
+        });
+    let horizon = input.management_snapshot.as_ref().and_then(|snapshot| {
+        snapshot
+            .position_context
+            .as_ref()
+            .and_then(|ctx| ctx.entry_context.as_ref())
+            .and_then(|ctx| ctx.horizon.clone())
+    });
+
+    Ok(Some(TradeIntent {
+        decision,
+        entry_price: Some(entry_price),
+        take_profit: Some(take_profit),
+        stop_loss: Some(stop_loss),
+        leverage,
+        risk_reward_ratio: compute_rr_from_levels(entry_price, take_profit, stop_loss),
+        horizon,
+        swing_logic: None,
+        reason: intent.reason.clone(),
+    }))
+}
+
 fn with_telegram_field_overrides(
     mut fields: TelegramPositionFields,
     entry_price: Option<f64>,
@@ -3923,7 +4000,7 @@ async fn invoke_bundle_models(
                     current_leverage: po.and_then(|p| p.leverage.map(|v| v as f64)),
                 }
             };
-            let intent = match pending_order_management_intent_from_value_with_context(
+            let mut intent = match pending_order_management_intent_from_value_with_context(
                 parsed_decision,
                 &pending_ctx,
             ) {
@@ -3959,6 +4036,193 @@ async fn invoke_bundle_models(
                     continue;
                 }
             };
+            let mut pending_safety_gate_forced_close = false;
+            if matches!(intent.decision, PendingOrderManagementDecision::ModifyMaker) {
+                match build_pending_modify_trade_intent(&intent, &input) {
+                    Ok(Some(candidate)) => {
+                        let mut failure_notes = Vec::new();
+                        match evaluate_trade_entry_v_gate(
+                            &config.llm.execution,
+                            &candidate,
+                            &input,
+                            out.entry_stage_trace.as_deref(),
+                        ) {
+                            Ok(Some(gate)) if !gate.passed => {
+                                failure_notes.push(format!(
+                                    "V gate failed: tp_in_v {:.4} < min_distance_v {:.4} (entry {}, tp {}, sl {}, v {} {})",
+                                    gate.take_profit_distance_v,
+                                    gate.min_distance_v,
+                                    format_metric_number(candidate.entry_price),
+                                    format_metric_number(candidate.take_profit),
+                                    format_metric_number(candidate.stop_loss),
+                                    gate.resolved_v.value,
+                                    gate.resolved_v.timeframe,
+                                ));
+                                println!(
+                                    "LLM_PENDING_ORDER_V_GATE_FAILED ts_bucket={} trigger={} symbol={} model={} decision={} entry={} tp={} sl={} selected_v={} v_timeframe={} tp_in_v={} min_distance_v={} gate_passed=false reason={}",
+                                    bundle.raw.ts_bucket,
+                                    &*trigger,
+                                    bundle.raw.symbol,
+                                    out.model_name,
+                                    candidate.decision.as_str(),
+                                    format_metric_number(candidate.entry_price),
+                                    format_metric_number(candidate.take_profit),
+                                    format_metric_number(candidate.stop_loss),
+                                    gate.resolved_v.value,
+                                    gate.resolved_v.timeframe,
+                                    gate.take_profit_distance_v,
+                                    gate.min_distance_v,
+                                    intent.reason.replace('\n', " "),
+                                );
+                                let event = json!({
+                                    "event_type": "llm_pending_order_v_gate_failed",
+                                    "event_ts": Utc::now().to_rfc3339(),
+                                    "ts_bucket": bundle.raw.ts_bucket.to_rfc3339(),
+                                    "trigger": &*trigger,
+                                    "symbol": bundle.raw.symbol,
+                                    "model_name": out.model_name.clone(),
+                                    "decision": candidate.decision.as_str(),
+                                    "entry_price": candidate.entry_price,
+                                    "take_profit": candidate.take_profit,
+                                    "stop_loss": candidate.stop_loss,
+                                    "selected_v": gate.resolved_v.value,
+                                    "v_timeframe": gate.resolved_v.timeframe,
+                                    "v_basis": gate.resolved_v.basis.clone(),
+                                    "take_profit_distance_v": gate.take_profit_distance_v,
+                                    "min_distance_v": gate.min_distance_v,
+                                    "gate_passed": false,
+                                    "reason": intent.reason.clone(),
+                                });
+                                if let Err(err) = append_journal_event(event) {
+                                    warn!(error = %err, "append llm_pending_order_v_gate_failed journal failed");
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(err) => {
+                                warn!(
+                                    model_name = %out.model_name,
+                                    symbol = %bundle.raw.symbol,
+                                    action = intent.decision.as_str(),
+                                    error = %err,
+                                    "pending safety gate: V gate evaluation failed; keeping original pending intent"
+                                );
+                            }
+                        }
+                        match evaluate_trade_rr_gate(&config.llm.execution, &candidate) {
+                            Ok(Some(gate)) if !gate.passed => {
+                                failure_notes.push(format!(
+                                    "RR gate failed: rr {:.4} < min_rr {:.4} (entry {}, tp {}, sl {})",
+                                    gate.risk_reward_ratio,
+                                    gate.min_rr,
+                                    format_metric_number(candidate.entry_price),
+                                    format_metric_number(candidate.take_profit),
+                                    format_metric_number(candidate.stop_loss),
+                                ));
+                                println!(
+                                    "LLM_PENDING_ORDER_RR_GATE_FAILED ts_bucket={} trigger={} symbol={} model={} decision={} entry={} tp={} sl={} rr={} min_rr={} gate_passed=false reason={}",
+                                    bundle.raw.ts_bucket,
+                                    &*trigger,
+                                    bundle.raw.symbol,
+                                    out.model_name,
+                                    candidate.decision.as_str(),
+                                    format_metric_number(candidate.entry_price),
+                                    format_metric_number(candidate.take_profit),
+                                    format_metric_number(candidate.stop_loss),
+                                    gate.risk_reward_ratio,
+                                    gate.min_rr,
+                                    intent.reason.replace('\n', " "),
+                                );
+                                let event = json!({
+                                    "event_type": "llm_pending_order_rr_gate_failed",
+                                    "event_ts": Utc::now().to_rfc3339(),
+                                    "ts_bucket": bundle.raw.ts_bucket.to_rfc3339(),
+                                    "trigger": &*trigger,
+                                    "symbol": bundle.raw.symbol,
+                                    "model_name": out.model_name.clone(),
+                                    "decision": candidate.decision.as_str(),
+                                    "entry_price": candidate.entry_price,
+                                    "take_profit": candidate.take_profit,
+                                    "stop_loss": candidate.stop_loss,
+                                    "risk_reward_ratio": gate.risk_reward_ratio,
+                                    "reward_distance": gate.reward_distance,
+                                    "risk_distance": gate.risk_distance,
+                                    "min_rr": gate.min_rr,
+                                    "gate_passed": false,
+                                    "reason": intent.reason.clone(),
+                                });
+                                if let Err(err) = append_journal_event(event) {
+                                    warn!(error = %err, "append llm_pending_order_rr_gate_failed journal failed");
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(err) => {
+                                warn!(
+                                    model_name = %out.model_name,
+                                    symbol = %bundle.raw.symbol,
+                                    action = intent.decision.as_str(),
+                                    error = %err,
+                                    "pending safety gate: RR gate evaluation failed; keeping original pending intent"
+                                );
+                            }
+                        }
+                        if !failure_notes.is_empty() {
+                            let safety_reason = format!(
+                                "{} Pending safety gate triggered; canceling pending order because {}.",
+                                intent.reason,
+                                failure_notes.join("; ")
+                            );
+                            println!(
+                                "LLM_PENDING_ORDER_SAFETY_CLOSE ts_bucket={} trigger={} symbol={} model={} requested_action={} requested_entry={} requested_tp={} requested_sl={} resulting_action=CLOSE reason={}",
+                                bundle.raw.ts_bucket,
+                                &*trigger,
+                                bundle.raw.symbol,
+                                out.model_name,
+                                intent.decision.as_str(),
+                                format_metric_number(candidate.entry_price),
+                                format_metric_number(candidate.take_profit),
+                                format_metric_number(candidate.stop_loss),
+                                safety_reason.replace('\n', " "),
+                            );
+                            let event = json!({
+                                "event_type": "llm_pending_order_safety_close",
+                                "event_ts": Utc::now().to_rfc3339(),
+                                "ts_bucket": bundle.raw.ts_bucket.to_rfc3339(),
+                                "trigger": &*trigger,
+                                "symbol": bundle.raw.symbol,
+                                "model_name": out.model_name.clone(),
+                                "requested_action": intent.decision.as_str(),
+                                "requested_entry": candidate.entry_price,
+                                "requested_tp": candidate.take_profit,
+                                "requested_sl": candidate.stop_loss,
+                                "resulting_action": PendingOrderManagementDecision::Close.as_str(),
+                                "reason": safety_reason.clone(),
+                            });
+                            if let Err(err) = append_journal_event(event) {
+                                warn!(error = %err, "append llm_pending_order_safety_close journal failed");
+                            }
+                            intent = crate::llm::decision::PendingOrderManagementIntent {
+                                decision: PendingOrderManagementDecision::Close,
+                                new_entry: None,
+                                new_tp: None,
+                                new_sl: None,
+                                new_leverage: None,
+                                reason: safety_reason,
+                            };
+                            pending_safety_gate_forced_close = true;
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        warn!(
+                            model_name = %out.model_name,
+                            symbol = %bundle.raw.symbol,
+                            action = intent.decision.as_str(),
+                            error = %err,
+                            "pending safety gate: could not build trade candidate; keeping original pending intent"
+                        );
+                    }
+                }
+            }
             if matches!(intent.decision, PendingOrderManagementDecision::Hold) {
                 {
                     let mut guard = runtime_lifecycle_state.lock().await;
@@ -4037,7 +4301,7 @@ async fn invoke_bundle_models(
                 .await;
                 continue;
             }
-            if execution_blocked_due_to_stale {
+            if execution_blocked_due_to_stale && !pending_safety_gate_forced_close {
                 execution_done = true;
                 let fields = with_telegram_field_overrides(
                     derive_pending_order_telegram_fields(
@@ -6394,7 +6658,10 @@ mod tests {
         ActivePositionSnapshot, OpenOrderSnapshot, TradingStateSnapshot,
     };
     use crate::llm::decision::{TradeDecision, TradeIntent};
-    use crate::llm::provider::serialize_llm_input_minified;
+    use crate::llm::provider::{
+        serialize_llm_input_minified, EntryContextForLlm, ManagementSnapshotForLlm,
+        PendingOrderSummaryForLlm, PositionContextForLlm,
+    };
 
     fn sample_model_input(indicators: Value) -> ModelInvocationInput {
         ModelInvocationInput {
@@ -6411,6 +6678,59 @@ mod tests {
             pending_order_mode: false,
             trading_state: None,
             management_snapshot: None,
+        }
+    }
+
+    fn sample_pending_model_input(indicators: Value) -> ModelInvocationInput {
+        ModelInvocationInput {
+            management_mode: false,
+            pending_order_mode: true,
+            management_snapshot: Some(ManagementSnapshotForLlm {
+                context_state: "OPEN_ORDERS_ONLY".to_string(),
+                has_active_positions: false,
+                has_open_orders: true,
+                active_position_count: 0,
+                open_order_count: 1,
+                positions: vec![],
+                pending_order: Some(PendingOrderSummaryForLlm {
+                    position_side: "SHORT".to_string(),
+                    direction: "SHORT".to_string(),
+                    quantity: 0.2,
+                    leverage: Some(4),
+                    entry_price: Some(2100.0),
+                    current_tp_price: None,
+                    current_sl_price: None,
+                    planned_tp_price: Some(2050.0),
+                    planned_tp_source: Some("shadow".to_string()),
+                    planned_sl_price: Some(2120.0),
+                    planned_sl_source: Some("shadow".to_string()),
+                }),
+                last_management_reason: None,
+                position_context: Some(PositionContextForLlm {
+                    original_qty: 0.2,
+                    current_qty: 0.2,
+                    current_pct_of_original: 1.0,
+                    effective_leverage: Some(4),
+                    effective_entry_price: Some(2100.0),
+                    effective_take_profit: Some(2050.0),
+                    effective_stop_loss: Some(2120.0),
+                    reduction_history: vec![],
+                    times_reduced_at_current_level: 0,
+                    last_management_action: None,
+                    last_management_reason: None,
+                    entry_context: Some(EntryContextForLlm {
+                        entry_strategy: None,
+                        stop_model: None,
+                        entry_mode: None,
+                        original_tp: Some(2050.0),
+                        original_sl: Some(2120.0),
+                        sweep_wick_extreme: None,
+                        horizon: Some("1d".to_string()),
+                        entry_reason: String::new(),
+                    }),
+                }),
+            }),
+            ..sample_model_input(indicators)
         }
     }
 
@@ -7954,6 +8274,51 @@ mod tests {
         assert!((gate.risk_reward_ratio - 2.0).abs() < 1e-9);
         assert!((gate.reward_distance - 20.0).abs() < 1e-9);
         assert!((gate.risk_distance - 10.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn build_pending_modify_trade_intent_uses_pending_direction_and_shadow_levels() {
+        let intent = crate::llm::decision::PendingOrderManagementIntent {
+            decision: crate::llm::decision::PendingOrderManagementDecision::ModifyMaker,
+            new_entry: Some(2095.0),
+            new_tp: None,
+            new_sl: None,
+            new_leverage: None,
+            reason: "pending test".to_string(),
+        };
+        let input = sample_pending_model_input(sample_indicators_with_known_v());
+
+        let candidate = build_pending_modify_trade_intent(&intent, &input)
+            .expect("candidate should build")
+            .expect("candidate should exist");
+
+        assert_eq!(candidate.decision, TradeDecision::Short);
+        assert_eq!(candidate.entry_price, Some(2095.0));
+        assert_eq!(candidate.take_profit, Some(2050.0));
+        assert_eq!(candidate.stop_loss, Some(2120.0));
+        assert_eq!(candidate.horizon.as_deref(), Some("1d"));
+        assert!(candidate
+            .risk_reward_ratio
+            .map(|value| (value - (45.0 / 25.0)).abs() < 1e-9)
+            .unwrap_or(false));
+    }
+
+    #[test]
+    fn build_pending_modify_trade_intent_returns_none_for_non_modify_actions() {
+        let intent = crate::llm::decision::PendingOrderManagementIntent {
+            decision: crate::llm::decision::PendingOrderManagementDecision::Hold,
+            new_entry: None,
+            new_tp: None,
+            new_sl: None,
+            new_leverage: None,
+            reason: "pending test".to_string(),
+        };
+        let input = sample_pending_model_input(sample_indicators_with_known_v());
+
+        let candidate =
+            build_pending_modify_trade_intent(&intent, &input).expect("helper should evaluate");
+
+        assert!(candidate.is_none());
     }
 
     #[test]

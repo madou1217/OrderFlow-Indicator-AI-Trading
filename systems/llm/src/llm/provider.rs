@@ -1588,9 +1588,9 @@ fn qwen_output_contract(
     } else if pending_order_mode {
         "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- Top-level keys must be `reason`, `pending_context`, and `params`. `analysis` and `self_check` may be present as extra objects.\n- `reason` must be a non-empty top-level string. Do not place `reason` inside `analysis`.\n- `pending_context` must include `preferred_direction`, `entry_state`, `entry_sweep_risk_15m`, `sl_noise_risk_15m`, `tp_state`, and `key_condition`.\n- `params` must contain exactly: `entry`, `tp`, `sl`, `leverage` — each a number or null.\n- Set all params to null if there is no valid setup.\n".to_string()
     } else if management_mode {
-        "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- Top-level keys must be `decision`, `reason`, `management_context`, and `params`. `analysis` may be present as an extra object.\n- `reason` must be a non-empty top-level string.\n- `management_context` must include `direction_state`, `ltf_move_meaning`, `sl_noise_risk_15m`, `tp_state`, and `key_condition`.\n- Allowed decisions: VALID, INVALID, ADJUST.\n- `params` must always be present.\n- For VALID: keep `params` present; action fields may be null.\n- For INVALID: set `params.close_price` to a number or null.\n- For ADJUST: set `params.adjust_fields` (array: [\"tp\"], [\"sl\"], [\"tp\",\"sl\"], [\"add\"], or [\"reduce\"]), and corresponding values: `new_tp`/`new_sl` for tp/sl adjustments, `qty_ratio` (number 0-1) for add/reduce.\n".to_string()
+        "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- Top-level keys must be `decision`, `reason`, `management_context`, and `params`. `analysis` may be present as an extra object.\n- `reason` must be a non-empty top-level string.\n- `management_context` must include `direction_state`, `near_term_risk_15m`, `sl_survival_risk`, `tp_state`, and `key_condition`.\n- Allowed decisions: HOLD, REDUCE, CLOSE, ADJUST, ADD.\n- `params` must always be present.\n- For HOLD: keep `params` present; action fields may be null.\n- For CLOSE: set `params.close_price` to a number or null.\n- For REDUCE or ADD: set `params.qty_ratio` to a number 0-1.\n- For ADJUST: set `params.adjust_fields` (array: [\"tp\"], [\"sl\"], or [\"tp\",\"sl\"]), and corresponding values: `new_tp`/`new_sl`.\n".to_string()
     } else {
-        "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- Keep `reason` as a top-level string. Do not place `reason` inside `analysis`.\n- Top-level keys must be `decision`, `reason`, `decision_context`, and `params`. `analysis` and `self_check` may be present as extra objects.\n- `decision_context` must include `thesis_flow_alignment`, `entry_readiness`, `entry_exposure`, and `key_condition`.\n- Allowed entry decisions: LONG, SHORT, NO_TRADE. Never use HOLD in entry mode.\n- For LONG or SHORT, params must include `entry`, `tp`, `sl`, `leverage`, and `horizon`.\n- For NO_TRADE, set `params.entry`, `params.tp`, `params.sl`, `params.leverage`, and `params.horizon` to null.\n".to_string()
+        "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- Keep `reason` as a top-level string. Do not place `reason` inside `analysis`.\n- Top-level keys must be `decision`, `reason`, `trade_quality`, and `params`. `analysis` and `self_check` may be present as extra objects.\n- `trade_quality` must include `thesis_clarity`, `execution_quality`, `path_to_target_quality`, `stopout_risk_before_resolution`, and `reward_to_risk_sufficiency`.\n- Allowed entry decisions: LONG, SHORT, NO_TRADE. Never use HOLD in entry mode.\n- For LONG or SHORT, params must include `entry`, `tp`, `sl`, `leverage`, and `horizon`.\n- For NO_TRADE, set `params.entry`, `params.tp`, `params.sl`, `params.leverage`, and `params.horizon` to null.\n".to_string()
     }
 }
 
@@ -1728,14 +1728,214 @@ fn qwen_entry_scan_response_schema() -> Value {
     })
 }
 
+fn management_params_schema_hold_openai() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["close_price", "adjust_fields", "qty_ratio", "new_tp", "new_sl"],
+        "properties": {
+            "close_price": { "type": "null" },
+            "adjust_fields": { "type": "null" },
+            "qty_ratio": { "type": "null" },
+            "new_tp": { "type": "null" },
+            "new_sl": { "type": "null" }
+        }
+    })
+}
+
+fn management_params_schema_close_openai() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["close_price", "adjust_fields", "qty_ratio", "new_tp", "new_sl"],
+        "properties": {
+            "close_price": { "type": ["number", "null"] },
+            "adjust_fields": { "type": "null" },
+            "qty_ratio": { "type": "null" },
+            "new_tp": { "type": "null" },
+            "new_sl": { "type": "null" }
+        }
+    })
+}
+
+fn management_params_schema_size_action_openai() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["close_price", "adjust_fields", "qty_ratio", "new_tp", "new_sl"],
+        "properties": {
+            "close_price": { "type": "null" },
+            "adjust_fields": { "type": "null" },
+            "qty_ratio": { "type": "number", "exclusiveMinimum": 0.0, "maximum": 1.0 },
+            "new_tp": { "type": "null" },
+            "new_sl": { "type": "null" }
+        }
+    })
+}
+
+fn management_params_schema_adjust_openai() -> Value {
+    json!({
+        "oneOf": [
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["close_price", "adjust_fields", "qty_ratio", "new_tp", "new_sl"],
+                "properties": {
+                    "close_price": { "type": "null" },
+                    "adjust_fields": { "type": "array", "items": { "type": "string", "enum": ["tp"] }, "minItems": 1, "maxItems": 1 },
+                    "qty_ratio": { "type": "null" },
+                    "new_tp": { "type": "number" },
+                    "new_sl": { "type": "null" }
+                }
+            },
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["close_price", "adjust_fields", "qty_ratio", "new_tp", "new_sl"],
+                "properties": {
+                    "close_price": { "type": "null" },
+                    "adjust_fields": { "type": "array", "items": { "type": "string", "enum": ["sl"] }, "minItems": 1, "maxItems": 1 },
+                    "qty_ratio": { "type": "null" },
+                    "new_tp": { "type": "null" },
+                    "new_sl": { "type": "number" }
+                }
+            },
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["close_price", "adjust_fields", "qty_ratio", "new_tp", "new_sl"],
+                "properties": {
+                    "close_price": { "type": "null" },
+                    "adjust_fields": { "type": "array", "items": { "type": "string", "enum": ["tp", "sl"] }, "minItems": 2, "maxItems": 2, "uniqueItems": true },
+                    "qty_ratio": { "type": "null" },
+                    "new_tp": { "type": "number" },
+                    "new_sl": { "type": "number" }
+                }
+            }
+        ]
+    })
+}
+
+fn management_action_params_condition_openai(decision: &str, params_schema: Value) -> Value {
+    json!({
+        "if": {
+            "properties": {
+                "decision": { "const": decision }
+            },
+            "required": ["decision"]
+        },
+        "then": {
+            "properties": {
+                "params": params_schema
+            }
+        }
+    })
+}
+
+fn management_action_constraints_openai() -> Value {
+    json!([
+        management_action_params_condition_openai("HOLD", management_params_schema_hold_openai()),
+        management_action_params_condition_openai("CLOSE", management_params_schema_close_openai()),
+        management_action_params_condition_openai("REDUCE", management_params_schema_size_action_openai()),
+        management_action_params_condition_openai("ADD", management_params_schema_size_action_openai()),
+        management_action_params_condition_openai("ADJUST", management_params_schema_adjust_openai())
+    ])
+}
+
+fn management_params_schema_base_openai() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["close_price", "adjust_fields", "qty_ratio", "new_tp", "new_sl"],
+        "properties": {
+            "close_price":    {"type": ["number", "null"]},
+            "adjust_fields":  {"type": ["array", "null"], "items": {"type": "string", "enum": ["tp", "sl"]}},
+            "qty_ratio":      {"type": ["number", "null"]},
+            "new_tp":         {"type": ["number", "null"]},
+            "new_sl":         {"type": ["number", "null"]}
+        }
+    })
+}
+
+fn trade_quality_schema_openai() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "thesis_clarity",
+            "execution_quality",
+            "path_to_target_quality",
+            "stopout_risk_before_resolution",
+            "reward_to_risk_sufficiency"
+        ],
+        "properties": {
+            "thesis_clarity": {
+                "type": "string",
+                "enum": ["strong", "moderate", "weak"]
+            },
+            "execution_quality": {
+                "type": "string",
+                "enum": ["strong", "moderate", "weak"]
+            },
+            "path_to_target_quality": {
+                "type": "string",
+                "enum": ["clean", "contested", "poor"]
+            },
+            "stopout_risk_before_resolution": {
+                "type": "string",
+                "enum": ["low", "medium", "high"]
+            },
+            "reward_to_risk_sufficiency": {
+                "type": "string",
+                "enum": ["ample", "adequate", "insufficient"]
+            }
+        }
+    })
+}
+
+fn trade_quality_schema_gemini() -> Value {
+    json!({
+        "type": "OBJECT",
+        "properties": {
+            "thesis_clarity": {
+                "type": "STRING",
+                "enum": ["strong", "moderate", "weak"]
+            },
+            "execution_quality": {
+                "type": "STRING",
+                "enum": ["strong", "moderate", "weak"]
+            },
+            "path_to_target_quality": {
+                "type": "STRING",
+                "enum": ["clean", "contested", "poor"]
+            },
+            "stopout_risk_before_resolution": {
+                "type": "STRING",
+                "enum": ["low", "medium", "high"]
+            },
+            "reward_to_risk_sufficiency": {
+                "type": "STRING",
+                "enum": ["ample", "adequate", "insufficient"]
+            }
+        },
+        "required": [
+            "thesis_clarity",
+            "execution_quality",
+            "path_to_target_quality",
+            "stopout_risk_before_resolution",
+            "reward_to_risk_sufficiency"
+        ]
+    })
+}
+
 fn management_context_schema_openai() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
         "required": [
             "direction_state",
-            "ltf_move_meaning",
-            "sl_noise_risk_15m",
+            "near_term_risk_15m",
+            "sl_survival_risk",
             "tp_state",
             "key_condition"
         ],
@@ -1744,11 +1944,11 @@ fn management_context_schema_openai() -> Value {
                 "type": "string",
                 "enum": ["aligned", "challenged", "reversed"]
             },
-            "ltf_move_meaning": {
+            "near_term_risk_15m": {
                 "type": "string",
-                "enum": ["noise", "caution", "invalidation"]
+                "enum": ["low", "medium", "high"]
             },
-            "sl_noise_risk_15m": {
+            "sl_survival_risk": {
                 "type": "string",
                 "enum": ["low", "medium", "high"]
             },
@@ -1772,11 +1972,11 @@ fn management_context_schema_gemini() -> Value {
                 "type": "STRING",
                 "enum": ["aligned", "challenged", "reversed"]
             },
-            "ltf_move_meaning": {
+            "near_term_risk_15m": {
                 "type": "STRING",
-                "enum": ["noise", "caution", "invalidation"]
+                "enum": ["low", "medium", "high"]
             },
-            "sl_noise_risk_15m": {
+            "sl_survival_risk": {
                 "type": "STRING",
                 "enum": ["low", "medium", "high"]
             },
@@ -1788,8 +1988,8 @@ fn management_context_schema_gemini() -> Value {
         },
         "required": [
             "direction_state",
-            "ltf_move_meaning",
-            "sl_noise_risk_15m",
+            "near_term_risk_15m",
+            "sl_survival_risk",
             "tp_state",
             "key_condition"
         ]
@@ -1878,7 +2078,7 @@ fn qwen_entry_response_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": true,
-        "required": ["decision", "reason", "decision_context", "params"],
+        "required": ["decision", "reason", "trade_quality", "params"],
         "properties": {
             "decision": {
                 "type": "string",
@@ -1888,29 +2088,7 @@ fn qwen_entry_response_schema() -> Value {
                 "type": "string",
                 "minLength": 1
             },
-            "decision_context": {
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["thesis_flow_alignment", "entry_readiness", "entry_exposure", "key_condition"],
-                "properties": {
-                    "thesis_flow_alignment": {
-                        "type": "string",
-                        "enum": ["aligned", "mixed", "opposed"]
-                    },
-                    "entry_readiness": {
-                        "type": "string",
-                        "enum": ["ready", "developing", "not_ready"]
-                    },
-                    "entry_exposure": {
-                        "type": "string",
-                        "enum": ["favorable", "vulnerable", "poor"]
-                    },
-                    "key_condition": {
-                        "type": "string",
-                        "minLength": 1
-                    }
-                }
-            },
+            "trade_quality": trade_quality_schema_openai(),
             "params": {
                 "type": "object",
                 "additionalProperties": true
@@ -1945,7 +2123,7 @@ fn custom_llm_entry_response_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["decision", "reason", "decision_context", "params"],
+        "required": ["decision", "reason", "trade_quality", "params"],
         "properties": {
             "decision": {
                 "type": "string",
@@ -1955,29 +2133,7 @@ fn custom_llm_entry_response_schema() -> Value {
                 "type": "string",
                 "minLength": 1
             },
-            "decision_context": {
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["thesis_flow_alignment", "entry_readiness", "entry_exposure", "key_condition"],
-                "properties": {
-                    "thesis_flow_alignment": {
-                        "type": "string",
-                        "enum": ["aligned", "mixed", "opposed"]
-                    },
-                    "entry_readiness": {
-                        "type": "string",
-                        "enum": ["ready", "developing", "not_ready"]
-                    },
-                    "entry_exposure": {
-                        "type": "string",
-                        "enum": ["favorable", "vulnerable", "poor"]
-                    },
-                    "key_condition": {
-                        "type": "string",
-                        "minLength": 1
-                    }
-                }
-            },
+            "trade_quality": trade_quality_schema_openai(),
             "params": {
                 "type": "object",
                 "additionalProperties": false,
@@ -2002,7 +2158,7 @@ fn qwen_management_response_schema() -> Value {
         "properties": {
             "decision": {
                 "type": "string",
-                "enum": ["VALID", "INVALID", "ADJUST"]
+                "enum": ["HOLD", "REDUCE", "CLOSE", "ADJUST", "ADD"]
             },
             "reason": {
                 "type": "string",
@@ -2017,7 +2173,8 @@ fn qwen_management_response_schema() -> Value {
                 "type": ["object", "null"],
                 "additionalProperties": true
             }
-        }
+        },
+        "allOf": management_action_constraints_openai()
     })
 }
 
@@ -2029,26 +2186,16 @@ fn custom_llm_management_response_schema() -> Value {
         "properties": {
             "decision": {
                 "type": "string",
-                "enum": ["VALID", "INVALID", "ADJUST"]
+                "enum": ["HOLD", "REDUCE", "CLOSE", "ADJUST", "ADD"]
             },
             "reason": {
                 "type": "string",
                 "minLength": 1
             },
             "management_context": management_context_schema_openai(),
-            "params": {
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["close_price", "adjust_fields", "qty_ratio", "new_tp", "new_sl"],
-                "properties": {
-                    "close_price":    {"type": ["number", "null"]},
-                    "adjust_fields":  {"type": ["array", "null"], "items": {"type": "string", "enum": ["tp", "sl", "add", "reduce"]}},
-                    "qty_ratio":      {"type": ["number", "null"]},
-                    "new_tp":         {"type": ["number", "null"]},
-                    "new_sl":         {"type": ["number", "null"]}
-                }
-            }
-        }
+            "params": management_params_schema_base_openai()
+        },
+        "allOf": management_action_constraints_openai()
     })
 }
 
@@ -2519,7 +2666,7 @@ fn grok_entry_response_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["analysis", "decision", "decision_context", "params", "reason"],
+        "required": ["analysis", "decision", "trade_quality", "params", "reason"],
         "properties": {
             "analysis": {
                 "type": "object",
@@ -2534,17 +2681,7 @@ fn grok_entry_response_schema() -> Value {
                 "type": "string",
                 "enum": ["LONG", "SHORT", "NO_TRADE"]
             },
-            "decision_context": {
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["thesis_flow_alignment", "entry_readiness", "entry_exposure", "key_condition"],
-                "properties": {
-                    "thesis_flow_alignment": { "type": "string", "enum": ["aligned", "mixed", "opposed"] },
-                    "entry_readiness": { "type": "string", "enum": ["ready", "developing", "not_ready"] },
-                    "entry_exposure": { "type": "string", "enum": ["favorable", "vulnerable", "poor"] },
-                    "key_condition": { "type": "string" }
-                }
-            },
+            "trade_quality": trade_quality_schema_openai(),
             "params": {
                 "type": "object",
                 "additionalProperties": false,
@@ -2570,23 +2707,13 @@ fn grok_management_response_schema() -> Value {
         "properties": {
             "decision": {
                 "type": "string",
-                "enum": ["VALID", "INVALID", "ADJUST"]
+                "enum": ["HOLD", "REDUCE", "CLOSE", "ADJUST", "ADD"]
             },
             "management_context": management_context_schema_openai(),
-            "params": {
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["close_price", "adjust_fields", "qty_ratio", "new_tp", "new_sl"],
-                "properties": {
-                    "close_price":    { "type": ["number", "null"] },
-                    "adjust_fields":  { "type": ["array", "null"], "items": { "type": "string", "enum": ["tp", "sl", "add", "reduce"] } },
-                    "qty_ratio":      { "type": ["number", "null"] },
-                    "new_tp":         { "type": ["number", "null"] },
-                    "new_sl":         { "type": ["number", "null"] }
-                }
-            },
+            "params": management_params_schema_base_openai(),
             "reason": { "type": "string" }
-        }
+        },
+        "allOf": management_action_constraints_openai()
     })
 }
 
@@ -2842,7 +2969,7 @@ fn ml_grok_entry_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["analysis", "decision", "decision_context", "params", "reason"],
+        "required": ["analysis", "decision", "trade_quality", "params", "reason"],
         "properties": {
             "analysis": {
                 "type": "object",
@@ -2854,17 +2981,7 @@ fn ml_grok_entry_schema() -> Value {
                 }
             },
             "decision": { "type": "string", "enum": ["LONG", "SHORT", "NO_TRADE"] },
-            "decision_context": {
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["thesis_flow_alignment", "entry_readiness", "entry_exposure", "key_condition"],
-                "properties": {
-                    "thesis_flow_alignment": { "type": "string", "enum": ["aligned", "mixed", "opposed"] },
-                    "entry_readiness": { "type": "string", "enum": ["ready", "developing", "not_ready"] },
-                    "entry_exposure": { "type": "string", "enum": ["favorable", "vulnerable", "poor"] },
-                    "key_condition": { "type": "string" }
-                }
-            },
+            "trade_quality": trade_quality_schema_openai(),
             "params": {
                 "type": "object",
                 "additionalProperties": false,
@@ -2888,22 +3005,12 @@ fn ml_grok_management_schema() -> Value {
         "additionalProperties": false,
         "required": ["decision", "management_context", "params", "reason"],
         "properties": {
-            "decision": { "type": "string", "enum": ["VALID", "INVALID", "ADJUST"] },
+            "decision": { "type": "string", "enum": ["HOLD", "REDUCE", "CLOSE", "ADJUST", "ADD"] },
             "management_context": management_context_schema_openai(),
-            "params": {
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["close_price", "adjust_fields", "qty_ratio", "new_tp", "new_sl"],
-                "properties": {
-                    "close_price":    { "type": ["number", "null"] },
-                    "adjust_fields":  { "type": ["array", "null"], "items": { "type": "string", "enum": ["tp", "sl", "add", "reduce"] } },
-                    "qty_ratio":      { "type": ["number", "null"] },
-                    "new_tp":         { "type": ["number", "null"] },
-                    "new_sl":         { "type": ["number", "null"] }
-                }
-            },
+            "params": management_params_schema_base_openai(),
             "reason": { "type": "string" }
-        }
+        },
+        "allOf": management_action_constraints_openai()
     })
 }
 
@@ -2933,25 +3040,7 @@ fn ml_gemini_entry_schema() -> Value {
                 "required": ["market_thesis", "trade_logic"]
             },
             "decision": { "type": "STRING", "enum": ["LONG", "SHORT", "NO_TRADE"] },
-            "decision_context": {
-                "type": "OBJECT",
-                "properties": {
-                    "thesis_flow_alignment": {
-                        "type": "STRING",
-                        "enum": ["aligned", "mixed", "opposed"]
-                    },
-                    "entry_readiness": {
-                        "type": "STRING",
-                        "enum": ["ready", "developing", "not_ready"]
-                    },
-                    "entry_exposure": {
-                        "type": "STRING",
-                        "enum": ["favorable", "vulnerable", "poor"]
-                    },
-                    "key_condition": { "type": "STRING" }
-                },
-                "required": ["thesis_flow_alignment", "entry_readiness", "entry_exposure", "key_condition"]
-            },
+            "trade_quality": trade_quality_schema_gemini(),
             "params": {
                 "type": "OBJECT",
                 "properties": {
@@ -2965,7 +3054,7 @@ fn ml_gemini_entry_schema() -> Value {
             },
             "reason": { "type": "STRING" }
         },
-        "required": ["analysis", "decision", "decision_context", "params", "reason"]
+        "required": ["analysis", "decision", "trade_quality", "params", "reason"]
     })
 }
 
@@ -2973,13 +3062,13 @@ fn ml_gemini_management_schema() -> Value {
     json!({
         "type": "OBJECT",
         "properties": {
-            "decision": { "type": "STRING", "enum": ["VALID", "INVALID", "ADJUST"] },
+            "decision": { "type": "STRING", "enum": ["HOLD", "REDUCE", "CLOSE", "ADJUST", "ADD"] },
             "management_context": management_context_schema_gemini(),
             "params": {
                 "type": "OBJECT",
                 "properties": {
                     "close_price":   { "type": "NUMBER", "nullable": true },
-                    "adjust_fields": { "type": "ARRAY", "nullable": true, "items": { "type": "STRING" } },
+                    "adjust_fields": { "type": "ARRAY", "nullable": true, "items": { "type": "STRING", "enum": ["tp", "sl"] } },
                     "qty_ratio":     { "type": "NUMBER", "nullable": true },
                     "new_tp":        { "type": "NUMBER", "nullable": true },
                     "new_sl":        { "type": "NUMBER", "nullable": true }
@@ -3010,33 +3099,11 @@ fn ml_qwen_entry_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": true,
-        "required": ["decision", "reason", "decision_context", "params"],
+        "required": ["decision", "reason", "trade_quality", "params"],
         "properties": {
             "decision": { "type": "string", "enum": ["LONG", "SHORT", "NO_TRADE"] },
             "reason": { "type": "string", "minLength": 1 },
-            "decision_context": {
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["thesis_flow_alignment", "entry_readiness", "entry_exposure", "key_condition"],
-                "properties": {
-                    "thesis_flow_alignment": {
-                        "type": "string",
-                        "enum": ["aligned", "mixed", "opposed"]
-                    },
-                    "entry_readiness": {
-                        "type": "string",
-                        "enum": ["ready", "developing", "not_ready"]
-                    },
-                    "entry_exposure": {
-                        "type": "string",
-                        "enum": ["favorable", "vulnerable", "poor"]
-                    },
-                    "key_condition": {
-                        "type": "string",
-                        "minLength": 1
-                    }
-                }
-            },
+            "trade_quality": trade_quality_schema_openai(),
             "params": { "type": "object", "additionalProperties": true },
             "analysis": { "type": ["object", "null"], "additionalProperties": true }
         }
@@ -3049,12 +3116,13 @@ fn ml_qwen_management_schema() -> Value {
         "additionalProperties": true,
         "required": ["decision", "reason", "management_context", "params"],
         "properties": {
-            "decision": { "type": "string", "enum": ["VALID", "INVALID", "ADJUST"] },
+            "decision": { "type": "string", "enum": ["HOLD", "REDUCE", "CLOSE", "ADJUST", "ADD"] },
             "reason": { "type": "string", "minLength": 1 },
             "management_context": management_context_schema_openai(),
             "params": { "type": "object", "additionalProperties": true },
             "analysis": { "type": ["object", "null"], "additionalProperties": true }
-        }
+        },
+        "allOf": management_action_constraints_openai()
     })
 }
 
@@ -3076,33 +3144,11 @@ fn ml_custom_llm_entry_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["decision", "reason", "decision_context", "params"],
+        "required": ["decision", "reason", "trade_quality", "params"],
         "properties": {
             "decision": { "type": "string", "enum": ["LONG", "SHORT", "NO_TRADE"] },
             "reason": { "type": "string", "minLength": 1 },
-            "decision_context": {
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["thesis_flow_alignment", "entry_readiness", "entry_exposure", "key_condition"],
-                "properties": {
-                    "thesis_flow_alignment": {
-                        "type": "string",
-                        "enum": ["aligned", "mixed", "opposed"]
-                    },
-                    "entry_readiness": {
-                        "type": "string",
-                        "enum": ["ready", "developing", "not_ready"]
-                    },
-                    "entry_exposure": {
-                        "type": "string",
-                        "enum": ["favorable", "vulnerable", "poor"]
-                    },
-                    "key_condition": {
-                        "type": "string",
-                        "minLength": 1
-                    }
-                }
-            },
+            "trade_quality": trade_quality_schema_openai(),
             "params": {
                 "type": "object",
                 "additionalProperties": false,
@@ -3125,22 +3171,12 @@ fn ml_custom_llm_management_schema() -> Value {
         "additionalProperties": false,
         "required": ["decision", "reason", "management_context", "params"],
         "properties": {
-            "decision": { "type": "string", "enum": ["VALID", "INVALID", "ADJUST"] },
+            "decision": { "type": "string", "enum": ["HOLD", "REDUCE", "CLOSE", "ADJUST", "ADD"] },
             "reason": { "type": "string", "minLength": 1 },
             "management_context": management_context_schema_openai(),
-            "params": {
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["close_price", "adjust_fields", "qty_ratio", "new_tp", "new_sl"],
-                "properties": {
-                    "close_price":    { "type": ["number", "null"] },
-                    "adjust_fields":  { "type": ["array", "null"], "items": { "type": "string", "enum": ["tp", "sl", "add", "reduce"] } },
-                    "qty_ratio":      { "type": ["number", "null"] },
-                    "new_tp":         { "type": ["number", "null"] },
-                    "new_sl":         { "type": ["number", "null"] }
-                }
-            }
-        }
+            "params": management_params_schema_base_openai()
+        },
+        "allOf": management_action_constraints_openai()
     })
 }
 
@@ -3202,25 +3238,7 @@ fn gemini_entry_response_schema() -> Value {
                 "type": "STRING",
                 "enum": ["LONG", "SHORT", "NO_TRADE"]
             },
-            "decision_context": {
-                "type": "OBJECT",
-                "properties": {
-                    "thesis_flow_alignment": {
-                        "type": "STRING",
-                        "enum": ["aligned", "mixed", "opposed"]
-                    },
-                    "entry_readiness": {
-                        "type": "STRING",
-                        "enum": ["ready", "developing", "not_ready"]
-                    },
-                    "entry_exposure": {
-                        "type": "STRING",
-                        "enum": ["favorable", "vulnerable", "poor"]
-                    },
-                    "key_condition": { "type": "STRING" }
-                },
-                "required": ["thesis_flow_alignment", "entry_readiness", "entry_exposure", "key_condition"]
-            },
+            "trade_quality": trade_quality_schema_gemini(),
             "params": {
                 "type": "OBJECT",
                 "properties": {
@@ -3234,7 +3252,7 @@ fn gemini_entry_response_schema() -> Value {
             },
             "reason": { "type": "STRING" }
         },
-        "required": ["analysis", "decision", "decision_context", "params", "reason"]
+        "required": ["analysis", "decision", "trade_quality", "params", "reason"]
     })
 }
 
@@ -3244,14 +3262,14 @@ fn gemini_management_response_schema() -> Value {
         "properties": {
             "decision": {
                 "type": "STRING",
-                "enum": ["VALID", "INVALID", "ADJUST"]
+                "enum": ["HOLD", "REDUCE", "CLOSE", "ADJUST", "ADD"]
             },
             "management_context": management_context_schema_gemini(),
             "params": {
                 "type": "OBJECT",
                 "properties": {
                     "close_price":   { "type": "NUMBER", "nullable": true },
-                    "adjust_fields": { "type": "ARRAY", "nullable": true, "items": { "type": "STRING" } },
+                    "adjust_fields": { "type": "ARRAY", "nullable": true, "items": { "type": "STRING", "enum": ["tp", "sl"] } },
                     "qty_ratio":     { "type": "NUMBER", "nullable": true },
                     "new_tp":        { "type": "NUMBER", "nullable": true },
                     "new_sl":        { "type": "NUMBER", "nullable": true }
@@ -4555,7 +4573,7 @@ mod tests {
         );
         assert_eq!(
             schema
-                .pointer("/properties/decision_context/additionalProperties")
+                .pointer("/properties/trade_quality/additionalProperties")
                 .and_then(|v| v.as_bool()),
             Some(false)
         );
@@ -4564,7 +4582,7 @@ mod tests {
             .and_then(Value::as_array)
             .map(|required| required
                 .iter()
-                .any(|v| v.as_str() == Some("decision_context")))
+                .any(|v| v.as_str() == Some("trade_quality")))
             .unwrap_or(false));
     }
 
@@ -4696,18 +4714,19 @@ mod tests {
     }
 
     #[test]
-    fn qwen_entry_output_contract_mentions_decision_context() {
+    fn qwen_entry_output_contract_mentions_trade_quality() {
         let contract = super::qwen_output_contract(
             false,
             false,
             super::prompt::EntryPromptStage::Finalize,
             "medium_large_opportunity",
         );
-        assert!(contract.contains("decision_context"));
-        assert!(contract.contains("thesis_flow_alignment"));
-        assert!(contract.contains("entry_readiness"));
-        assert!(contract.contains("entry_exposure"));
-        assert!(contract.contains("key_condition"));
+        assert!(contract.contains("trade_quality"));
+        assert!(contract.contains("thesis_clarity"));
+        assert!(contract.contains("execution_quality"));
+        assert!(contract.contains("path_to_target_quality"));
+        assert!(contract.contains("stopout_risk_before_resolution"));
+        assert!(contract.contains("reward_to_risk_sufficiency"));
     }
 
     #[test]
@@ -4720,8 +4739,8 @@ mod tests {
         );
         assert!(contract.contains("management_context"));
         assert!(contract.contains("direction_state"));
-        assert!(contract.contains("ltf_move_meaning"));
-        assert!(contract.contains("sl_noise_risk_15m"));
+        assert!(contract.contains("near_term_risk_15m"));
+        assert!(contract.contains("sl_survival_risk"));
         assert!(contract.contains("tp_state"));
         assert!(contract.contains("key_condition"));
     }

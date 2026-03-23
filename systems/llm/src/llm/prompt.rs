@@ -12,9 +12,6 @@ pub const DECISION_REDUCE: &str = "REDUCE";
 pub const DECISION_HOLD: &str = "HOLD";
 pub const DECISION_MODIFY_TPSL: &str = "MODIFY_TPSL";
 pub const DECISION_MODIFY_MAKER: &str = "MODIFY_MAKER";
-// Management review decisions (model output)
-pub const DECISION_VALID: &str = "VALID";
-pub const DECISION_INVALID: &str = "INVALID";
 pub const DECISION_ADJUST: &str = "ADJUST";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

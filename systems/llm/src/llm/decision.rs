@@ -126,6 +126,8 @@ pub fn validate_model_output(
 }
 
 pub fn trade_intent_from_value(value: &Value) -> Result<TradeIntent> {
+    validate_trade_quality(value)?;
+
     let decision_raw = value
         .get("decision")
         .and_then(Value::as_str)
@@ -219,6 +221,63 @@ pub fn trade_intent_from_value(value: &Value) -> Result<TradeIntent> {
     }
 }
 
+fn validate_trade_quality(value: &Value) -> Result<()> {
+    let trade_quality = value
+        .get("trade_quality")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow!("trade_quality must be an object"))?;
+
+    validate_enum_field(
+        trade_quality,
+        "thesis_clarity",
+        &["strong", "moderate", "weak"],
+    )?;
+    validate_enum_field(
+        trade_quality,
+        "execution_quality",
+        &["strong", "moderate", "weak"],
+    )?;
+    validate_enum_field(
+        trade_quality,
+        "path_to_target_quality",
+        &["clean", "contested", "poor"],
+    )?;
+    validate_enum_field(
+        trade_quality,
+        "stopout_risk_before_resolution",
+        &["low", "medium", "high"],
+    )?;
+    validate_enum_field(
+        trade_quality,
+        "reward_to_risk_sufficiency",
+        &["ample", "adequate", "insufficient"],
+    )?;
+
+    Ok(())
+}
+
+fn validate_enum_field(
+    obj: &serde_json::Map<String, Value>,
+    key: &str,
+    allowed: &[&str],
+) -> Result<()> {
+    let raw = obj
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .ok_or_else(|| anyhow!("{key} must be a non-empty string"))?;
+
+    if allowed.iter().any(|candidate| raw.eq_ignore_ascii_case(candidate)) {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "{key} must be one of {}",
+            allowed.join("/")
+        ))
+    }
+}
+
 pub fn position_management_intent_from_value(value: &Value) -> Result<PositionManagementIntent> {
     let decision_raw = value
         .get("decision")
@@ -226,10 +285,12 @@ pub fn position_management_intent_from_value(value: &Value) -> Result<PositionMa
         .map(str::trim)
         .ok_or_else(|| {
             anyhow!(
-                "decision must be {}/{}/{}",
-                prompt::DECISION_VALID,
-                prompt::DECISION_INVALID,
+                "decision must be {}/{}/{}/{}/{}",
+                prompt::DECISION_HOLD,
+                prompt::DECISION_REDUCE,
+                prompt::DECISION_CLOSE,
                 prompt::DECISION_ADJUST,
+                prompt::DECISION_ADD,
             )
         })?;
     let decision = parse_management_decision(decision_raw)?;
@@ -245,47 +306,59 @@ pub fn position_management_intent_from_value(value: &Value) -> Result<PositionMa
     let close_price = find_f64(value, &["params.close_price", "close_price"]);
     let qty_ratio = find_f64(value, &["params.qty_ratio", "qty_ratio"]);
 
-    // For ADJUST, refine the decision based on adjust_fields content
-    let decision = if matches!(decision, PositionManagementDecision::ModifyTpSl) {
-        let adjust_fields = value
-            .pointer("/params/adjust_fields")
-            .or_else(|| value.get("adjust_fields"))
-            .and_then(Value::as_array)
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_ascii_lowercase)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+    let adjust_fields = value
+        .pointer("/params/adjust_fields")
+        .or_else(|| value.get("adjust_fields"))
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_ascii_lowercase)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
 
-        if adjust_fields.iter().any(|f| f == "add") {
-            if qty_ratio.is_none() {
-                return Err(anyhow!("ADJUST with add requires params.qty_ratio"));
+    let decision = match decision {
+        PositionManagementDecision::ModifyTpSl => {
+            // Backward compatibility: legacy ADJUST may still encode add/reduce via adjust_fields.
+            if adjust_fields.iter().any(|f| f == "add") {
+                if qty_ratio.is_none() {
+                    return Err(anyhow!("ADD requires params.qty_ratio"));
+                }
+                PositionManagementDecision::Add
+            } else if adjust_fields.iter().any(|f| f == "reduce") {
+                if qty_ratio.is_none() {
+                    return Err(anyhow!("REDUCE requires params.qty_ratio"));
+                }
+                PositionManagementDecision::Reduce
+            } else {
+                if new_tp.is_none() && new_sl.is_none() {
+                    return Err(anyhow!(
+                        "ADJUST requires at least one of params.new_tp or params.new_sl"
+                    ));
+                }
+                if new_tp.is_some_and(|v| v <= 0.0) {
+                    return Err(anyhow!("new_tp must be > 0 when provided"));
+                }
+                if new_sl.is_some_and(|v| v <= 0.0) {
+                    return Err(anyhow!("new_sl must be > 0 when provided"));
+                }
+                PositionManagementDecision::ModifyTpSl
             }
-            PositionManagementDecision::Add
-        } else if adjust_fields.iter().any(|f| f == "reduce") {
-            if qty_ratio.is_none() {
-                return Err(anyhow!("ADJUST with reduce requires params.qty_ratio"));
-            }
-            PositionManagementDecision::Reduce
-        } else {
-            // tp / sl adjustment
-            if new_tp.is_none() && new_sl.is_none() {
-                return Err(anyhow!(
-                    "ADJUST requires at least one of: adjust_fields=[add|reduce] with qty_ratio, or params.new_tp/params.new_sl"
-                ));
-            }
-            if new_tp.is_some_and(|v| v <= 0.0) {
-                return Err(anyhow!("new_tp must be > 0 when provided"));
-            }
-            if new_sl.is_some_and(|v| v <= 0.0) {
-                return Err(anyhow!("new_sl must be > 0 when provided"));
-            }
-            PositionManagementDecision::ModifyTpSl
         }
-    } else {
-        decision
+        PositionManagementDecision::Add | PositionManagementDecision::Reduce => {
+            let qty_ratio = qty_ratio.ok_or_else(|| {
+                anyhow!(
+                    "{} requires params.qty_ratio",
+                    decision.as_str()
+                )
+            })?;
+            if !(qty_ratio > 0.0 && qty_ratio <= 1.0) {
+                return Err(anyhow!("qty_ratio must be > 0 and <= 1"));
+            }
+            decision
+        }
+        PositionManagementDecision::Hold | PositionManagementDecision::Close => decision,
     };
 
     Ok(PositionManagementIntent {
@@ -314,7 +387,7 @@ pub fn position_management_intent_from_value_with_context(
         && matches!(intent.decision, PositionManagementDecision::Close)
     {
         return Err(anyhow!(
-            "INVALID is not actionable when neither active positions nor open orders exist"
+            "CLOSE is not actionable when neither active positions nor open orders exist"
         ));
     }
     Ok(intent)
@@ -451,15 +524,22 @@ fn parse_trade_decision(raw: &str) -> Result<TradeDecision> {
 
 fn parse_management_decision(raw: &str) -> Result<PositionManagementDecision> {
     match raw.trim().to_ascii_uppercase().as_str() {
-        // New review-style decisions from model
+        // Primary action-based decisions
+        "HOLD" => Ok(PositionManagementDecision::Hold),
+        "REDUCE" => Ok(PositionManagementDecision::Reduce),
+        "CLOSE" => Ok(PositionManagementDecision::Close),
+        "ADD" => Ok(PositionManagementDecision::Add),
+        "ADJUST" | "MODIFY_TPSL" => Ok(PositionManagementDecision::ModifyTpSl),
+        // Legacy review-style decisions, kept for parser compatibility
         "VALID" => Ok(PositionManagementDecision::Hold),
         "INVALID" => Ok(PositionManagementDecision::Close),
-        "ADJUST" => Ok(PositionManagementDecision::ModifyTpSl),
         _ => Err(anyhow!(
-            "decision must be {}/{}/{}",
-            prompt::DECISION_VALID,
-            prompt::DECISION_INVALID,
+            "decision must be {}/{}/{}/{}/{}",
+            prompt::DECISION_HOLD,
+            prompt::DECISION_REDUCE,
+            prompt::DECISION_CLOSE,
             prompt::DECISION_ADJUST,
+            prompt::DECISION_ADD,
         )),
     }
 }
@@ -506,9 +586,11 @@ fn get_path<'a>(value: &'a Value, path: &str) -> Option<&'a Value> {
 #[cfg(test)]
 mod tests {
     use super::{
+        position_management_intent_from_value,
         pending_order_management_intent_from_value,
         pending_order_management_intent_from_value_with_context, trade_intent_from_value,
-        PendingOrderContext, PendingOrderManagementDecision, TradeDecision,
+        PendingOrderContext, PendingOrderManagementDecision, PositionManagementDecision,
+        TradeDecision,
     };
     use serde_json::json;
 
@@ -555,6 +637,13 @@ mod tests {
         let value = json!({
             "decision": "LONG",
             "reason": "range horizon text should not block execution",
+            "trade_quality": {
+                "thesis_clarity": "strong",
+                "execution_quality": "strong",
+                "path_to_target_quality": "clean",
+                "stopout_risk_before_resolution": "low",
+                "reward_to_risk_sufficiency": "ample"
+            },
             "params": {
                 "entry": 2018.33,
                 "tp": 2054.96,
@@ -575,6 +664,13 @@ mod tests {
         let value = json!({
             "decision": "LONG",
             "reason": "free-form horizon text should be preserved",
+            "trade_quality": {
+                "thesis_clarity": "strong",
+                "execution_quality": "moderate",
+                "path_to_target_quality": "clean",
+                "stopout_risk_before_resolution": "medium",
+                "reward_to_risk_sufficiency": "adequate"
+            },
             "params": {
                 "entry": 2018.33,
                 "tp": 2054.96,
@@ -594,6 +690,13 @@ mod tests {
         let value = json!({
             "decision": "LONG",
             "reason": "schema-compliant entry without rr should still parse",
+            "trade_quality": {
+                "thesis_clarity": "moderate",
+                "execution_quality": "strong",
+                "path_to_target_quality": "contested",
+                "stopout_risk_before_resolution": "medium",
+                "reward_to_risk_sufficiency": "adequate"
+            },
             "params": {
                 "entry": 2000.0,
                 "tp": 2040.0,
@@ -605,6 +708,24 @@ mod tests {
 
         let intent = trade_intent_from_value(&value).expect("trade intent should derive rr");
         assert_eq!(intent.risk_reward_ratio, Some(2.0));
+    }
+
+    #[test]
+    fn trade_intent_requires_trade_quality() {
+        let value = json!({
+            "decision": "LONG",
+            "reason": "missing trade quality should fail",
+            "params": {
+                "entry": 2000.0,
+                "tp": 2040.0,
+                "sl": 1980.0,
+                "leverage": 3,
+                "horizon": "4h"
+            }
+        });
+
+        let err = trade_intent_from_value(&value).expect_err("trade quality should be required");
+        assert!(err.to_string().contains("trade_quality"));
     }
 
     #[test]
@@ -701,5 +822,114 @@ mod tests {
         let intent = pending_order_management_intent_from_value_with_context(&value, &ctx)
             .expect("pending intent parses");
         assert_eq!(intent.decision, PendingOrderManagementDecision::ModifyMaker);
+    }
+
+    #[test]
+    fn management_action_decisions_parse_directly() {
+        let hold = json!({
+            "decision": "HOLD",
+            "reason": "forward edge remains favorable",
+            "params": {
+                "close_price": null,
+                "adjust_fields": null,
+                "qty_ratio": null,
+                "new_tp": null,
+                "new_sl": null
+            }
+        });
+        let reduce = json!({
+            "decision": "REDUCE",
+            "reason": "risk has increased enough to lower exposure",
+            "params": {
+                "close_price": null,
+                "adjust_fields": null,
+                "qty_ratio": 0.35,
+                "new_tp": null,
+                "new_sl": null
+            }
+        });
+        let close = json!({
+            "decision": "CLOSE",
+            "reason": "exit now has higher expected value than holding",
+            "params": {
+                "close_price": null,
+                "adjust_fields": null,
+                "qty_ratio": null,
+                "new_tp": null,
+                "new_sl": null
+            }
+        });
+        let add = json!({
+            "decision": "ADD",
+            "reason": "current structure supports increasing exposure",
+            "params": {
+                "close_price": null,
+                "adjust_fields": null,
+                "qty_ratio": 0.25,
+                "new_tp": null,
+                "new_sl": null
+            }
+        });
+        let adjust = json!({
+            "decision": "ADJUST",
+            "reason": "tp and sl should be updated",
+            "params": {
+                "close_price": null,
+                "adjust_fields": ["tp", "sl"],
+                "qty_ratio": null,
+                "new_tp": 2050.0,
+                "new_sl": 2108.0
+            }
+        });
+
+        assert_eq!(
+            position_management_intent_from_value(&hold)
+                .expect("hold parses")
+                .decision,
+            PositionManagementDecision::Hold
+        );
+        assert_eq!(
+            position_management_intent_from_value(&reduce)
+                .expect("reduce parses")
+                .decision,
+            PositionManagementDecision::Reduce
+        );
+        assert_eq!(
+            position_management_intent_from_value(&close)
+                .expect("close parses")
+                .decision,
+            PositionManagementDecision::Close
+        );
+        assert_eq!(
+            position_management_intent_from_value(&add)
+                .expect("add parses")
+                .decision,
+            PositionManagementDecision::Add
+        );
+        assert_eq!(
+            position_management_intent_from_value(&adjust)
+                .expect("adjust parses")
+                .decision,
+            PositionManagementDecision::ModifyTpSl
+        );
+    }
+
+    #[test]
+    fn management_legacy_adjust_with_reduce_still_maps_to_reduce() {
+        let value = json!({
+            "decision": "ADJUST",
+            "reason": "legacy reduce path should remain parseable",
+            "params": {
+                "close_price": null,
+                "adjust_fields": ["reduce"],
+                "qty_ratio": 0.4,
+                "new_tp": null,
+                "new_sl": null
+            }
+        });
+
+        let intent = position_management_intent_from_value(&value).expect("legacy reduce parses");
+        assert_eq!(intent.decision, PositionManagementDecision::Reduce);
+        assert_eq!(intent.qty_ratio, Some(0.4));
     }
 }
