@@ -1586,7 +1586,7 @@ fn qwen_output_contract(
             "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- No extra top-level keys.\n- Top-level keys must be `15m`, `4h`, `1d`, and `scan_audit`.\n- Each timeframe key must include `trend`, `signal_agreement`, `range`, `supporting_signals`, `conflicting_signals`, `opportunity`, and `risk`.\n- `scan_audit` must include `15m`, `4h`, and `1d`, and each audit object must include `direction_basis`, `recent_closed_bars_align_with_trend`, `cvd_slope_aligns_with_trend`, `current_partial_bar_aligns_with_trend`, `invalidation_level`, and `range_width_vs_atr`.\n".to_string()
         }
     } else if pending_order_mode {
-        "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- Top-level keys must be `reason`, `pending_context`, and `params`. `analysis` and `self_check` may be present as extra objects.\n- `reason` must be a non-empty top-level string. Do not place `reason` inside `analysis`.\n- `pending_context` must include `preferred_direction`, `entry_state`, `entry_sweep_risk_15m`, `sl_noise_risk_15m`, `tp_state`, and `key_condition`.\n- `params` must contain exactly: `entry`, `tp`, `sl`, `leverage` — each a number or null.\n- Set all params to null if there is no valid setup.\n".to_string()
+        "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- Top-level keys must appear in this order: `pending_context`, `params`, and `reason`. `analysis` and `self_check` may be present as extra objects.\n- `reason` must be a non-empty top-level string. Do not place `reason` inside `analysis`.\n- `pending_context` must include `preferred_direction`, `entry_state`, `entry_sweep_risk_15m`, `thesis_freshness`, `tp_state`, and `key_condition`.\n- `params` must contain exactly: `entry`, `tp`, `sl`, `leverage` — each a number or null.\n- Set all params to null if there is no valid setup.\n".to_string()
     } else if management_mode {
         "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- Top-level keys must be `decision`, `reason`, `management_context`, and `params`. `analysis` may be present as an extra object.\n- `reason` must be a non-empty top-level string.\n- `management_context` must include `direction_state`, `near_term_risk_15m`, `sl_survival_risk`, `tp_state`, and `key_condition`.\n- Allowed decisions: HOLD, REDUCE, CLOSE, ADJUST, ADD.\n- `params` must always be present.\n- For HOLD: keep `params` present; action fields may be null.\n- For CLOSE: set `params.close_price` to a number or null.\n- For REDUCE or ADD: set `params.qty_ratio` to a number 0-1.\n- For ADJUST: set `params.adjust_fields` (array: [\"tp\"], [\"sl\"], or [\"tp\",\"sl\"]), and corresponding values: `new_tp`/`new_sl`.\n".to_string()
     } else {
@@ -2013,7 +2013,7 @@ fn pending_context_schema_openai() -> Value {
             "preferred_direction",
             "entry_state",
             "entry_sweep_risk_15m",
-            "sl_noise_risk_15m",
+            "thesis_freshness",
             "tp_state",
             "key_condition"
         ],
@@ -2030,9 +2030,9 @@ fn pending_context_schema_openai() -> Value {
                 "type": "string",
                 "enum": ["low", "medium", "high"]
             },
-            "sl_noise_risk_15m": {
+            "thesis_freshness": {
                 "type": "string",
-                "enum": ["low", "medium", "high"]
+                "enum": ["fresh", "weakening", "spent"]
             },
             "tp_state": {
                 "type": "string",
@@ -2062,9 +2062,9 @@ fn pending_context_schema_gemini() -> Value {
                 "type": "STRING",
                 "enum": ["low", "medium", "high"]
             },
-            "sl_noise_risk_15m": {
+            "thesis_freshness": {
                 "type": "STRING",
-                "enum": ["low", "medium", "high"]
+                "enum": ["fresh", "weakening", "spent"]
             },
             "tp_state": {
                 "type": "STRING",
@@ -2076,7 +2076,7 @@ fn pending_context_schema_gemini() -> Value {
             "preferred_direction",
             "entry_state",
             "entry_sweep_risk_15m",
-            "sl_noise_risk_15m",
+            "thesis_freshness",
             "tp_state",
             "key_condition"
         ]
@@ -2211,16 +2211,16 @@ fn qwen_pending_order_response_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": true,
-        "required": ["reason", "pending_context", "params"],
+        "required": ["pending_context", "params", "reason"],
         "properties": {
-            "reason": {
-                "type": "string",
-                "minLength": 1
-            },
             "pending_context": pending_context_schema_openai(),
             "params": {
                 "type": "object",
                 "additionalProperties": true
+            },
+            "reason": {
+                "type": "string",
+                "minLength": 1
             },
             "analysis": {
                 "type": ["object", "null"],
@@ -2238,12 +2238,8 @@ fn custom_llm_pending_order_response_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["reason", "pending_context", "params"],
+        "required": ["pending_context", "params", "reason"],
         "properties": {
-            "reason": {
-                "type": "string",
-                "minLength": 1
-            },
             "pending_context": pending_context_schema_openai(),
             "params": {
                 "type": "object",
@@ -2255,6 +2251,10 @@ fn custom_llm_pending_order_response_schema() -> Value {
                     "sl":       {"type": ["number", "null"]},
                     "leverage": {"type": ["number", "null"]}
                 }
+            },
+            "reason": {
+                "type": "string",
+                "minLength": 1
             }
         }
     })
@@ -4657,8 +4657,21 @@ mod tests {
             .and_then(Value::as_array)
             .map(|required| required
                 .iter()
-                .any(|v| v.as_str() == Some("pending_context")))
+                .map(|v| v.as_str().unwrap_or_default())
+                .collect::<Vec<_>>()
+                == vec!["pending_context", "params", "reason"])
             .unwrap_or(false));
+        assert_eq!(
+            schema
+                .pointer("/properties/pending_context/properties/thesis_freshness/type")
+                .and_then(|v| v.as_str()),
+            Some("string")
+        );
+        assert!(
+            schema
+                .pointer("/properties/pending_context/properties/sl_noise_risk_15m")
+                .is_none()
+        );
     }
 
     #[test]
@@ -4775,10 +4788,11 @@ mod tests {
             "medium_large_opportunity",
         );
         assert!(contract.contains("pending_context"));
+        assert!(contract.contains("`pending_context`, `params`, and `reason`"));
         assert!(contract.contains("preferred_direction"));
         assert!(contract.contains("entry_state"));
         assert!(contract.contains("entry_sweep_risk_15m"));
-        assert!(contract.contains("sl_noise_risk_15m"));
+        assert!(contract.contains("thesis_freshness"));
         assert!(contract.contains("tp_state"));
         assert!(contract.contains("key_condition"));
     }
