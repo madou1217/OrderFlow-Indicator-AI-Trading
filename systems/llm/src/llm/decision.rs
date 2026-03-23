@@ -268,13 +268,13 @@ fn validate_enum_field(
         .filter(|text| !text.is_empty())
         .ok_or_else(|| anyhow!("{key} must be a non-empty string"))?;
 
-    if allowed.iter().any(|candidate| raw.eq_ignore_ascii_case(candidate)) {
+    if allowed
+        .iter()
+        .any(|candidate| raw.eq_ignore_ascii_case(candidate))
+    {
         Ok(())
     } else {
-        Err(anyhow!(
-            "{key} must be one of {}",
-            allowed.join("/")
-        ))
+        Err(anyhow!("{key} must be one of {}", allowed.join("/")))
     }
 }
 
@@ -347,12 +347,8 @@ pub fn position_management_intent_from_value(value: &Value) -> Result<PositionMa
             }
         }
         PositionManagementDecision::Add | PositionManagementDecision::Reduce => {
-            let qty_ratio = qty_ratio.ok_or_else(|| {
-                anyhow!(
-                    "{} requires params.qty_ratio",
-                    decision.as_str()
-                )
-            })?;
+            let qty_ratio = qty_ratio
+                .ok_or_else(|| anyhow!("{} requires params.qty_ratio", decision.as_str()))?;
             if !(qty_ratio > 0.0 && qty_ratio <= 1.0) {
                 return Err(anyhow!("qty_ratio must be > 0 and <= 1"));
             }
@@ -586,11 +582,10 @@ fn get_path<'a>(value: &'a Value, path: &str) -> Option<&'a Value> {
 #[cfg(test)]
 mod tests {
     use super::{
-        position_management_intent_from_value,
         pending_order_management_intent_from_value,
-        pending_order_management_intent_from_value_with_context, trade_intent_from_value,
-        PendingOrderContext, PendingOrderManagementDecision, PositionManagementDecision,
-        TradeDecision,
+        pending_order_management_intent_from_value_with_context,
+        position_management_intent_from_value, trade_intent_from_value, PendingOrderContext,
+        PendingOrderManagementDecision, PositionManagementDecision, TradeDecision,
     };
     use serde_json::json;
 

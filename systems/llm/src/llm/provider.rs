@@ -1836,9 +1836,18 @@ fn management_action_constraints_openai() -> Value {
     json!([
         management_action_params_condition_openai("HOLD", management_params_schema_hold_openai()),
         management_action_params_condition_openai("CLOSE", management_params_schema_close_openai()),
-        management_action_params_condition_openai("REDUCE", management_params_schema_size_action_openai()),
-        management_action_params_condition_openai("ADD", management_params_schema_size_action_openai()),
-        management_action_params_condition_openai("ADJUST", management_params_schema_adjust_openai())
+        management_action_params_condition_openai(
+            "REDUCE",
+            management_params_schema_size_action_openai()
+        ),
+        management_action_params_condition_openai(
+            "ADD",
+            management_params_schema_size_action_openai()
+        ),
+        management_action_params_condition_openai(
+            "ADJUST",
+            management_params_schema_adjust_openai()
+        )
     ])
 }
 
@@ -4578,9 +4587,7 @@ mod tests {
         assert!(schema
             .get("required")
             .and_then(Value::as_array)
-            .map(|required| required
-                .iter()
-                .any(|v| v.as_str() == Some("trade_quality")))
+            .map(|required| required.iter().any(|v| v.as_str() == Some("trade_quality")))
             .unwrap_or(false));
     }
 
@@ -4607,7 +4614,7 @@ mod tests {
             .and_then(Value::as_array)
             .map(|required| required
                 .iter()
-            .any(|v| v.as_str() == Some("management_context")))
+                .any(|v| v.as_str() == Some("management_context")))
             .unwrap_or(false));
     }
 

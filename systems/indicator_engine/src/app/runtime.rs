@@ -11,6 +11,7 @@ use crate::observability::heartbeat;
 use crate::observability::metrics::AppMetrics;
 use crate::publish::ind_publisher::IndPublisher;
 use crate::publish::outbox_dispatcher::OutboxDispatcher;
+use crate::publish::snapshot_fanout_projector::SnapshotFanoutProjector;
 use crate::runtime::dispatcher::{DispatchMode, Dispatcher};
 use crate::runtime::state_store::{
     CanonicalFrontierSnapshot, CanonicalMinutePresence, MinuteHistory, StateSnapshot, StateStore,
@@ -267,8 +268,27 @@ pub async fn run(ctx: AppContext) -> Result<()> {
         snapshot_writer,
         level_writer,
         event_writer,
-        publisher,
+        publisher.clone(),
     );
+    let outbox_dispatcher = OutboxDispatcher::new(
+        ctx.db_pool.clone(),
+        ctx.mq_publish_channel.clone(),
+        ctx.config.mq.exchanges.ind.name.clone(),
+    );
+    outbox_dispatcher
+        .ensure_schema()
+        .await
+        .context("ensure indicator bundle outbox schema")?;
+    let snapshot_fanout_projector = SnapshotFanoutProjector::new(
+        ctx.db_pool.clone(),
+        ctx.mq_publish_channel.clone(),
+        publisher.clone(),
+        ctx.config.indicator.symbol.clone(),
+    );
+    snapshot_fanout_projector
+        .ensure_schema()
+        .await
+        .context("ensure indicator snapshot fanout projector schema")?;
     let mut state_store = StateStore::new(
         ctx.config.indicator.symbol.to_uppercase(),
         ctx.config.indicator.whale_threshold_usdt,
@@ -378,12 +398,13 @@ pub async fn run(ctx: AppContext) -> Result<()> {
     metrics.set_backfill_mode(false);
 
     let mut startup_cutover_completed = startup_replay_cutoff_bucket.is_none();
-    let outbox_dispatcher = OutboxDispatcher::new(
-        ctx.db_pool.clone(),
-        ctx.mq_publish_channel.clone(),
-        ctx.config.mq.exchanges.ind.name.clone(),
-    );
     let outbox_handle = tokio::spawn(async move { outbox_dispatcher.run_loop().await });
+    snapshot_fanout_projector
+        .initialize_progress_if_absent()
+        .await
+        .context("initialize indicator snapshot fanout progress")?;
+    let snapshot_fanout_handle =
+        tokio::spawn(async move { snapshot_fanout_projector.run_loop().await });
 
     let mut trade_channel_closed = false;
     let mut non_trade_channel_closed = false;
@@ -723,6 +744,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
 
     heartbeat_handle.abort();
     outbox_handle.abort();
+    snapshot_fanout_handle.abort();
     for h in consumer_handles {
         h.abort();
     }

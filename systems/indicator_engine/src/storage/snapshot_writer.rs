@@ -205,6 +205,24 @@ impl SnapshotWriter {
 
         sqlx::query(
             r#"
+            DELETE FROM ops.indicator_bundle_outbox
+            WHERE exchange_name = $1
+              AND upper(payload_json->>'symbol') = $2
+              AND COALESCE(
+                    NULLIF(payload_json->>'ts_bucket', '')::timestamptz,
+                    NULLIF(payload_json->>'event_ts', '')::timestamptz
+                  ) >= $3
+            "#,
+        )
+        .bind(exchange_name)
+        .bind(&symbol_upper)
+        .bind(repair_start_ts)
+        .execute(&mut *tx)
+        .await
+        .context("delete indicator bundle outbox tail for overlap repair")?;
+
+        sqlx::query(
+            r#"
             DELETE FROM ops.outbox_event
             WHERE exchange_name = $1
               AND upper(payload_json->>'symbol') = $2
@@ -272,6 +290,32 @@ impl SnapshotWriter {
                 .with_context(|| format!("delete {table} tail for overlap repair"))?;
         }
 
+        sqlx::query(
+            r#"
+            INSERT INTO ops.indicator_snapshot_fanout_progress (
+                symbol,
+                last_published_snapshot_ts
+            )
+            VALUES ($1, $2)
+            ON CONFLICT (symbol)
+            DO UPDATE SET
+                last_published_snapshot_ts = CASE
+                    WHEN ops.indicator_snapshot_fanout_progress.last_published_snapshot_ts IS NULL
+                        THEN EXCLUDED.last_published_snapshot_ts
+                    ELSE LEAST(
+                        ops.indicator_snapshot_fanout_progress.last_published_snapshot_ts,
+                        EXCLUDED.last_published_snapshot_ts
+                    )
+                END,
+                updated_at = now()
+            "#,
+        )
+        .bind(&symbol_upper)
+        .bind(rewind_target_ts)
+        .execute(&mut *tx)
+        .await
+        .context("rewind indicator snapshot fanout progress")?;
+
         set_indicator_progress_exact(&mut tx, &symbol_upper, rewind_target_ts).await?;
         tx.commit()
             .await
@@ -290,7 +334,7 @@ async fn enqueue_outbox_batch_in_tx(
 
     let mut builder = QueryBuilder::<Postgres>::new(
         r#"
-        INSERT INTO ops.outbox_event (
+        INSERT INTO ops.indicator_bundle_outbox (
             exchange_name, routing_key, message_id, schema_version, headers_json, payload_json
         )
         "#,

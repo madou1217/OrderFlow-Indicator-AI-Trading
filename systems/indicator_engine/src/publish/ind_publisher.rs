@@ -38,15 +38,32 @@ impl IndPublisher {
         symbol: &str,
         snapshot: &IndicatorSnapshotRow,
     ) -> Result<OutboxMessage> {
+        self.build_snapshot_message_from_parts(
+            ts_bucket,
+            symbol,
+            snapshot.indicator_code,
+            snapshot.window_code,
+            &snapshot.payload_json,
+        )
+    }
+
+    pub fn build_snapshot_message_from_parts(
+        &self,
+        ts_bucket: DateTime<Utc>,
+        symbol: &str,
+        indicator_code: &str,
+        window_code: &str,
+        payload_json: &Value,
+    ) -> Result<OutboxMessage> {
         let symbol_low = symbol.to_lowercase();
-        let routing_key = format!("evt.{}.{}", snapshot.indicator_code, symbol_low);
+        let routing_key = format!("evt.{}.{}", indicator_code, symbol_low);
         let identity = format!(
             "ind.snapshot|{}|{}|{}|{}|{}",
             symbol.to_uppercase(),
             ts_bucket.to_rfc3339(),
-            snapshot.indicator_code,
-            snapshot.window_code,
-            snapshot.payload_json
+            indicator_code,
+            window_code,
+            payload_json
         );
         let message_id = stable_uuid("message", &identity);
         let trace_id = stable_uuid("trace", &identity);
@@ -63,8 +80,8 @@ impl IndPublisher {
                 "message_id": message_id,
                 "trace_id": trace_id,
                 "routing_key": routing_key,
-                "indicator_code": snapshot.indicator_code,
-                "window_code": snapshot.window_code,
+                "indicator_code": indicator_code,
+                "window_code": window_code,
                 "symbol": symbol,
                 "event_ts": ts_bucket.to_rfc3339(),
                 "published_at": Utc::now().to_rfc3339(),
@@ -72,7 +89,7 @@ impl IndPublisher {
                     "service": "indicator_engine",
                     "instance_id": self.producer_instance_id,
                 },
-                "data": snapshot.payload_json,
+                "data": payload_json,
             }),
         })
     }

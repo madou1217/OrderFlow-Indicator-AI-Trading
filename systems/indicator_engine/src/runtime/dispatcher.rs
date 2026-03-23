@@ -179,20 +179,13 @@ impl Dispatcher {
         }
         let live_messages = if mode.publish_outputs() {
             let indicators_json_value = Value::Object(indicators_json.clone());
-            let mut messages = Vec::with_capacity(snapshots.len() + 1);
+            let mut messages = Vec::with_capacity(1);
             messages.push(self.publisher.build_minute_bundle_message(
                 ctx.ts_bucket,
                 &ctx.symbol,
                 &indicators_json_value,
                 snapshots.len(),
             )?);
-            for snapshot in &snapshots {
-                messages.push(self.publisher.build_snapshot_message(
-                    ctx.ts_bucket,
-                    &ctx.symbol,
-                    snapshot,
-                )?);
-            }
             Some(messages)
         } else {
             None
