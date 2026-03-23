@@ -47,6 +47,10 @@ const DIRTY_RECOMPUTE_WINDOW_BUDGET_PER_TICK: usize = 50;
 const PROCESS_READY_MINUTES_WARN_MS: u128 = 2_000;
 const STUCK_PROGRESS_IDLE_SECS: u64 = 60;
 const STUCK_WARN_INTERVAL_SECS: u64 = 60;
+const LIVE_CANONICAL_GAP_REPAIR_RETRY_SECS: u64 = 15;
+const LIVE_CANONICAL_TAIL_RECONCILE_INTERVAL_SECS: u64 = 60;
+const LIVE_CANONICAL_TAIL_RECONCILE_LOOKBACK_MINUTES: i64 = STARTUP_BACKFILL_OVERLAP_MINUTES;
+const CANONICAL_REPLAY_FETCH_WINDOW_MINUTES: i64 = 120;
 
 #[derive(Debug, Clone)]
 pub struct ReplayRow {
@@ -72,6 +76,75 @@ struct RuntimeStallDetector {
     last_persisted_ts: Option<DateTime<Utc>>,
     last_progress_advance_at: Instant,
     last_warn_at: Option<Instant>,
+}
+
+#[derive(Debug, Default)]
+struct LiveCanonicalRepairController {
+    last_gap_repair_attempt_at: Option<Instant>,
+    last_gap_repair_minute: Option<DateTime<Utc>>,
+    last_tail_reconcile_at: Option<Instant>,
+}
+
+impl LiveCanonicalRepairController {
+    fn gap_repair_due(&self, next_minute: DateTime<Utc>) -> bool {
+        match (self.last_gap_repair_minute, self.last_gap_repair_attempt_at) {
+            (Some(prev_minute), Some(last_attempt))
+                if prev_minute == next_minute
+                    && last_attempt.elapsed()
+                        < Duration::from_secs(LIVE_CANONICAL_GAP_REPAIR_RETRY_SECS) =>
+            {
+                false
+            }
+            _ => true,
+        }
+    }
+
+    fn mark_gap_repair_attempt(&mut self, next_minute: DateTime<Utc>) {
+        self.last_gap_repair_minute = Some(next_minute);
+        self.last_gap_repair_attempt_at = Some(Instant::now());
+    }
+
+    fn tail_reconcile_due(&self) -> bool {
+        self.last_tail_reconcile_at
+            .map(|last| {
+                last.elapsed() >= Duration::from_secs(LIVE_CANONICAL_TAIL_RECONCILE_INTERVAL_SECS)
+            })
+            .unwrap_or(true)
+    }
+
+    fn mark_tail_reconcile_attempt(&mut self) {
+        self.last_tail_reconcile_at = Some(Instant::now());
+    }
+}
+
+#[derive(Debug, Default)]
+struct CanonicalRepairStats {
+    fetched_rows: usize,
+    ingested_rows: usize,
+    touched_minutes: HashSet<i64>,
+    first_bucket: Option<DateTime<Utc>>,
+    last_bucket: Option<DateTime<Utc>>,
+}
+
+impl CanonicalRepairStats {
+    fn record_event(&mut self, event: &EngineEvent) {
+        let bucket = logical_event_bucket_ts(event);
+        self.first_bucket = Some(
+            self.first_bucket
+                .map(|prev| prev.min(bucket))
+                .unwrap_or(bucket),
+        );
+        self.last_bucket = Some(
+            self.last_bucket
+                .map(|prev| prev.max(bucket))
+                .unwrap_or(bucket),
+        );
+        self.touched_minutes.insert(bucket.timestamp());
+    }
+
+    fn touched_minute_count(&self) -> usize {
+        self.touched_minutes.len()
+    }
 }
 
 impl RuntimeStallDetector {
@@ -316,6 +389,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
     let mut non_trade_channel_closed = false;
     let mut stall_detector =
         RuntimeStallDetector::new(ts_from_millis(metrics.snapshot().last_persisted_ts_ms));
+    let mut live_repair_controller = LiveCanonicalRepairController::default();
 
     loop {
         tokio::select! {
@@ -438,8 +512,144 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                     stale_drop_last_report = Instant::now();
                 }
 
-                let next_minute = scheduler.next_minute_to_emit();
                 let latest_closed = scheduler.closed_minute(Utc::now());
+                if startup_cutover_completed {
+                    if let Some(next_minute) = scheduler.next_minute_to_emit() {
+                        let next_minute_presence = state_store.canonical_minute_presence(next_minute);
+                        if next_minute <= latest_closed
+                            && !next_minute_presence.complete_under_current_policy()
+                            && live_repair_controller.gap_repair_due(next_minute)
+                        {
+                            live_repair_controller.mark_gap_repair_attempt(next_minute);
+                            let repair_to_ts = latest_closed + ChronoDuration::minutes(1);
+                            match ingest_canonical_range_from_db(
+                                &ctx.db_pool,
+                                &ctx.config.indicator.symbol,
+                                &metrics,
+                                &mut state_store,
+                                &mut scheduler,
+                                next_minute,
+                                repair_to_ts,
+                                "live_gap_repair",
+                            )
+                            .await
+                            {
+                                Ok(stats) => {
+                                    let next_minute_presence_after =
+                                        state_store.canonical_minute_presence(next_minute);
+                                    let healed = next_minute_presence_after
+                                        .complete_under_current_policy();
+                                    let healed_ready_through = if healed {
+                                        state_store.latest_contiguous_complete_canonical_minute_from(
+                                            next_minute,
+                                            latest_closed,
+                                        )
+                                    } else {
+                                        None
+                                    };
+                                    if stats.ingested_rows > 0 || healed {
+                                        info!(
+                                            reason = "live_gap_repair",
+                                            from_ts = %next_minute,
+                                            to_ts_exclusive = %repair_to_ts,
+                                            latest_closed = %latest_closed,
+                                            fetched_rows = stats.fetched_rows,
+                                            ingested_rows = stats.ingested_rows,
+                                            touched_minutes = stats.touched_minute_count(),
+                                            first_bucket = ?stats.first_bucket,
+                                            last_bucket = ?stats.last_bucket,
+                                            next_minute_complete_before = next_minute_presence.complete_under_current_policy(),
+                                            next_minute_complete_after = next_minute_presence_after.complete_under_current_policy(),
+                                            ready_through_after = ?healed_ready_through,
+                                            missing_required_before = %format_missing_required_sources(&next_minute_presence),
+                                            missing_required_after = %format_missing_required_sources(&next_minute_presence_after),
+                                            "live canonical gap repair completed"
+                                        );
+                                    } else {
+                                        warn!(
+                                            reason = "live_gap_repair",
+                                            from_ts = %next_minute,
+                                            to_ts_exclusive = %repair_to_ts,
+                                            latest_closed = %latest_closed,
+                                            fetched_rows = stats.fetched_rows,
+                                            ingested_rows = stats.ingested_rows,
+                                            next_minute_complete_after = next_minute_presence_after.complete_under_current_policy(),
+                                            missing_required_after = %format_missing_required_sources(&next_minute_presence_after),
+                                            "live canonical gap repair found no new rows"
+                                        );
+                                    }
+                                }
+                                Err(err) => {
+                                    warn!(
+                                        error = %err,
+                                        reason = "live_gap_repair",
+                                        from_ts = %next_minute,
+                                        to_ts_exclusive = %repair_to_ts,
+                                        latest_closed = %latest_closed,
+                                        "live canonical gap repair failed"
+                                    );
+                                }
+                            }
+                        }
+                    }
+
+                    if let Some(last_finalized_minute) = state_store.last_finalized_minute() {
+                        if live_repair_controller.tail_reconcile_due() {
+                            live_repair_controller.mark_tail_reconcile_attempt();
+                            let effective_history_floor_ts = state_store
+                                .canonical_frontier_snapshot()
+                                .effective_history_floor_ts;
+                            let tail_start_ts = live_tail_reconcile_start_ts(
+                                last_finalized_minute,
+                                effective_history_floor_ts,
+                            );
+                            let tail_to_ts =
+                                last_finalized_minute + ChronoDuration::minutes(1);
+                            match ingest_canonical_range_from_db(
+                                &ctx.db_pool,
+                                &ctx.config.indicator.symbol,
+                                &metrics,
+                                &mut state_store,
+                                &mut scheduler,
+                                tail_start_ts,
+                                tail_to_ts,
+                                "live_tail_reconcile",
+                            )
+                            .await
+                            {
+                                Ok(stats) => {
+                                    if stats.ingested_rows > 0 {
+                                        info!(
+                                            reason = "live_tail_reconcile",
+                                            from_ts = %tail_start_ts,
+                                            to_ts_exclusive = %tail_to_ts,
+                                            last_finalized_minute = %last_finalized_minute,
+                                            fetched_rows = stats.fetched_rows,
+                                            ingested_rows = stats.ingested_rows,
+                                            touched_minutes = stats.touched_minute_count(),
+                                            first_bucket = ?stats.first_bucket,
+                                            last_bucket = ?stats.last_bucket,
+                                            dirty_recompute_pending = state_store.has_pending_dirty_recompute(),
+                                            "live canonical tail reconcile ingested db truth"
+                                        );
+                                    }
+                                }
+                                Err(err) => {
+                                    warn!(
+                                        error = %err,
+                                        reason = "live_tail_reconcile",
+                                        from_ts = %tail_start_ts,
+                                        to_ts_exclusive = %tail_to_ts,
+                                        last_finalized_minute = %last_finalized_minute,
+                                        "live canonical tail reconcile failed"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let next_minute = scheduler.next_minute_to_emit();
                 let ready_through_ts = next_minute.and_then(|minute| {
                     state_store.latest_contiguous_complete_canonical_minute_from(minute, latest_closed)
                 });
@@ -1431,6 +1641,77 @@ fn handle_ingest_event(
     state_store.ingest(event);
 }
 
+async fn ingest_canonical_range_from_db(
+    pool: &PgPool,
+    symbol: &str,
+    metrics: &Arc<AppMetrics>,
+    state_store: &mut StateStore,
+    scheduler: &mut WindowScheduler,
+    from_ts: DateTime<Utc>,
+    to_ts_exclusive: DateTime<Utc>,
+    reason: &'static str,
+) -> Result<CanonicalRepairStats> {
+    if from_ts >= to_ts_exclusive {
+        return Ok(CanonicalRepairStats::default());
+    }
+
+    let mut stats = CanonicalRepairStats::default();
+    let mut window_from_ts = from_ts;
+    while window_from_ts < to_ts_exclusive {
+        let window_to_ts = (window_from_ts
+            + ChronoDuration::minutes(CANONICAL_REPLAY_FETCH_WINDOW_MINUTES))
+        .min(to_ts_exclusive);
+        let rows = fetch_backfill_window(
+            pool,
+            window_from_ts,
+            window_to_ts,
+            symbol,
+            STARTUP_BACKFILL_MARKET,
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "{reason} fetch canonical replay rows from_ts={window_from_ts} to_ts_exclusive={window_to_ts}"
+            )
+        })?;
+        stats.fetched_rows += rows.len();
+
+        for row in rows {
+            match replay_row_to_engine_event(row) {
+                Ok(event) => {
+                    metrics.inc_processed(event.event_ts.timestamp_millis());
+                    if matches!(
+                        &event.data,
+                        MdData::AggTrade1m(_)
+                            | MdData::AggOrderbook1m(_)
+                            | MdData::AggLiq1m(_)
+                            | MdData::AggFundingMark1m(_)
+                    ) {
+                        scheduler.prime_start_from(logical_event_bucket_ts(&event));
+                    }
+                    stats.record_event(&event);
+                    state_store.ingest(event);
+                    stats.ingested_rows += 1;
+                }
+                Err(err) => {
+                    metrics.inc_decode_error();
+                    warn!(
+                        error = %err,
+                        reason = reason,
+                        from_ts = %window_from_ts,
+                        to_ts_exclusive = %window_to_ts,
+                        "decode live canonical repair row failed"
+                    );
+                }
+            }
+        }
+
+        window_from_ts = window_to_ts;
+    }
+
+    Ok(stats)
+}
+
 fn logical_event_bucket_ts(event: &EngineEvent) -> DateTime<Utc> {
     match &event.data {
         MdData::AggTrade1m(v) => v.ts_bucket,
@@ -1439,6 +1720,17 @@ fn logical_event_bucket_ts(event: &EngineEvent) -> DateTime<Utc> {
         MdData::AggFundingMark1m(v) => v.ts_bucket,
         _ => floor_minute(event.event_ts),
     }
+}
+
+fn live_tail_reconcile_start_ts(
+    last_finalized_minute: DateTime<Utc>,
+    effective_history_floor_ts: Option<DateTime<Utc>>,
+) -> DateTime<Utc> {
+    let lookback_start = last_finalized_minute
+        - ChronoDuration::minutes(LIVE_CANONICAL_TAIL_RECONCILE_LOOKBACK_MINUTES);
+    effective_history_floor_ts
+        .map(|floor| lookback_start.max(floor))
+        .unwrap_or(lookback_start)
 }
 
 async fn process_ready_minutes(
@@ -1861,34 +2153,20 @@ async fn run_startup_backfill(
         "startup historical backfill begin"
     );
 
-    let mut cursor: Option<BackfillCursor> = None;
     let mut total_rows = 0_u64;
-    let startup_backfill_batch_size = ctx.config.indicator.startup_backfill_batch_size.max(100);
-
-    loop {
-        let rows = fetch_backfill_batch(
+    let mut window_from_ts = from_ts;
+    while window_from_ts < to_ts {
+        let window_to_ts = (window_from_ts
+            + ChronoDuration::minutes(CANONICAL_REPLAY_FETCH_WINDOW_MINUTES))
+        .min(to_ts);
+        let rows = fetch_backfill_window(
             &ctx.db_pool,
-            from_ts,
-            to_ts,
+            window_from_ts,
+            window_to_ts,
             &ctx.config.indicator.symbol,
             STARTUP_BACKFILL_MARKET,
-            startup_backfill_batch_size,
-            cursor.as_ref(),
         )
         .await?;
-        if rows.is_empty() {
-            break;
-        }
-
-        if let Some(last) = rows.last() {
-            cursor = Some(BackfillCursor {
-                event_ts: last.event_ts,
-                msg_type: last.msg_type.clone(),
-                market: last.market.clone(),
-                symbol: last.symbol.clone(),
-                routing_key: last.routing_key.clone(),
-            });
-        }
 
         for row in rows {
             match replay_row_to_engine_event(row) {
@@ -1902,6 +2180,8 @@ async fn run_startup_backfill(
                 }
             }
         }
+
+        window_from_ts = window_to_ts;
     }
 
     if total_rows == 0 {
@@ -2816,6 +3096,258 @@ fn build_backfill_data_json(row: &PgRow, src: &str) -> Result<Value> {
     }
 }
 
+async fn fetch_backfill_window(
+    pool: &PgPool,
+    from_ts: DateTime<Utc>,
+    to_ts: DateTime<Utc>,
+    symbol: &str,
+    market: &str,
+) -> Result<Vec<ReplayRow>> {
+    if from_ts >= to_ts {
+        return Ok(Vec::new());
+    }
+
+    let symbol_upper = symbol.to_uppercase();
+    let include_all = market.eq_ignore_ascii_case("all");
+    let include_futures = include_all || market.eq_ignore_ascii_case("futures");
+    let include_spot = include_all || market.eq_ignore_ascii_case("spot");
+    let mut rows = Vec::new();
+
+    if include_futures {
+        rows.extend(
+            fetch_backfill_source_rows(
+                pool,
+                TRADE_BACKFILL_WINDOW_SQL,
+                "trade",
+                from_ts,
+                to_ts,
+                &symbol_upper,
+                "futures",
+            )
+            .await?,
+        );
+        rows.extend(
+            fetch_backfill_source_rows(
+                pool,
+                ORDERBOOK_BACKFILL_WINDOW_SQL,
+                "orderbook",
+                from_ts,
+                to_ts,
+                &symbol_upper,
+                "futures",
+            )
+            .await?,
+        );
+        rows.extend(
+            fetch_backfill_source_rows(
+                pool,
+                LIQ_BACKFILL_WINDOW_SQL,
+                "liq",
+                from_ts,
+                to_ts,
+                &symbol_upper,
+                "futures",
+            )
+            .await?,
+        );
+        rows.extend(
+            fetch_backfill_source_rows(
+                pool,
+                FUNDING_BACKFILL_WINDOW_SQL,
+                "funding_mark",
+                from_ts,
+                to_ts,
+                &symbol_upper,
+                "futures",
+            )
+            .await?,
+        );
+    }
+
+    if include_spot {
+        rows.extend(
+            fetch_backfill_source_rows(
+                pool,
+                TRADE_BACKFILL_WINDOW_SQL,
+                "trade",
+                from_ts,
+                to_ts,
+                &symbol_upper,
+                "spot",
+            )
+            .await?,
+        );
+        rows.extend(
+            fetch_backfill_source_rows(
+                pool,
+                ORDERBOOK_BACKFILL_WINDOW_SQL,
+                "orderbook",
+                from_ts,
+                to_ts,
+                &symbol_upper,
+                "spot",
+            )
+            .await?,
+        );
+    }
+
+    rows.sort_by(|a, b| {
+        a.event_ts
+            .cmp(&b.event_ts)
+            .then_with(|| a.msg_type.cmp(&b.msg_type))
+            .then_with(|| a.market.cmp(&b.market))
+            .then_with(|| a.symbol.cmp(&b.symbol))
+            .then_with(|| a.routing_key.cmp(&b.routing_key))
+    });
+    Ok(rows)
+}
+
+async fn fetch_backfill_source_rows(
+    pool: &PgPool,
+    sql: &str,
+    src: &'static str,
+    from_ts: DateTime<Utc>,
+    to_ts: DateTime<Utc>,
+    symbol_upper: &str,
+    market: &str,
+) -> Result<Vec<ReplayRow>> {
+    let rows = sqlx::query(sql)
+        .bind(from_ts)
+        .bind(to_ts)
+        .bind(symbol_upper)
+        .bind(market)
+        .fetch_all(pool)
+        .await
+        .with_context(|| {
+            format!(
+                "fetch {src} startup/live repair rows from_ts={from_ts} to_ts={to_ts} symbol={symbol_upper} market={market}"
+            )
+        })?;
+
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let data_json = build_backfill_data_json(&row, src)
+            .with_context(|| format!("build replay payload for src={src}"))?;
+        out.push(ReplayRow {
+            event_ts: row.get("event_ts"),
+            msg_type: row.get("msg_type"),
+            market: row.get("market"),
+            symbol: row.get("symbol"),
+            routing_key: row.get("routing_key"),
+            data_json,
+        });
+    }
+    Ok(out)
+}
+
+const TRADE_BACKFILL_WINDOW_SQL: &str = r#"
+    SELECT
+        ts_event AS event_ts,
+        'md.agg.trade.1m'::text AS msg_type,
+        market::text AS market,
+        symbol,
+        format('md.agg.%s.trade.1m.%s', market::text, lower(symbol)) AS routing_key,
+        ts_bucket AS t_ts_bucket,
+        chunk_start_ts AS t_chunk_start_ts,
+        chunk_end_ts AS t_chunk_end_ts,
+        source_event_count AS t_source_event_count,
+        trade_count AS t_trade_count,
+        buy_qty AS t_buy_qty,
+        sell_qty AS t_sell_qty,
+        buy_notional AS t_buy_notional,
+        sell_notional AS t_sell_notional,
+        first_price AS t_first_price,
+        last_price AS t_last_price,
+        high_price AS t_high_price,
+        low_price AS t_low_price,
+        profile_levels AS t_profile_levels,
+        whale_json AS t_whale_json,
+        payload_json AS t_payload_json
+    FROM md.agg_trade_1m
+    WHERE ts_bucket >= $1
+      AND ts_bucket < $2
+      AND symbol = $3
+      AND market::text = $4
+    ORDER BY ts_event ASC, market ASC, symbol ASC
+"#;
+
+const ORDERBOOK_BACKFILL_WINDOW_SQL: &str = r#"
+    SELECT
+        ts_event AS event_ts,
+        'md.agg.orderbook.1m'::text AS msg_type,
+        market::text AS market,
+        symbol,
+        format('md.agg.%s.orderbook.1m.%s', market::text, lower(symbol)) AS routing_key,
+        ts_bucket AS b_ts_bucket,
+        chunk_start_ts AS b_chunk_start_ts,
+        chunk_end_ts AS b_chunk_end_ts,
+        source_event_count AS b_source_event_count,
+        sample_count AS b_sample_count,
+        bbo_updates AS b_bbo_updates,
+        spread_sum AS b_spread_sum,
+        topk_depth_sum AS b_topk_depth_sum,
+        obi_sum AS b_obi_sum,
+        obi_l1_sum AS b_obi_l1_sum,
+        obi_k_sum AS b_obi_k_sum,
+        obi_k_dw_sum AS b_obi_k_dw_sum,
+        obi_k_dw_change_sum AS b_obi_k_dw_change_sum,
+        obi_k_dw_adj_sum AS b_obi_k_dw_adj_sum,
+        microprice_sum AS b_microprice_sum,
+        microprice_classic_sum AS b_microprice_classic_sum,
+        microprice_kappa_sum AS b_microprice_kappa_sum,
+        microprice_adj_sum AS b_microprice_adj_sum,
+        ofi_sum AS b_ofi_sum,
+        obi_k_dw_close AS b_obi_k_dw_close,
+        heatmap_levels AS b_heatmap_levels
+    FROM md.agg_orderbook_1m
+    WHERE ts_bucket >= $1
+      AND ts_bucket < $2
+      AND symbol = $3
+      AND market::text = $4
+    ORDER BY ts_event ASC, market ASC, symbol ASC
+"#;
+
+const LIQ_BACKFILL_WINDOW_SQL: &str = r#"
+    SELECT
+        ts_event AS event_ts,
+        'md.agg.liq.1m'::text AS msg_type,
+        market::text AS market,
+        symbol,
+        format('md.agg.%s.liq.1m.%s', market::text, lower(symbol)) AS routing_key,
+        ts_bucket AS l_ts_bucket,
+        chunk_start_ts AS l_chunk_start_ts,
+        chunk_end_ts AS l_chunk_end_ts,
+        source_event_count AS l_source_event_count,
+        force_liq_levels AS l_force_liq_levels
+    FROM md.agg_liq_1m
+    WHERE ts_bucket >= $1
+      AND ts_bucket < $2
+      AND symbol = $3
+      AND market::text = $4
+    ORDER BY ts_event ASC, market ASC, symbol ASC
+"#;
+
+const FUNDING_BACKFILL_WINDOW_SQL: &str = r#"
+    SELECT
+        ts_event AS event_ts,
+        'md.agg.funding_mark.1m'::text AS msg_type,
+        market::text AS market,
+        symbol,
+        format('md.agg.%s.funding_mark.1m.%s', market::text, lower(symbol)) AS routing_key,
+        ts_bucket AS f_ts_bucket,
+        chunk_start_ts AS f_chunk_start_ts,
+        chunk_end_ts AS f_chunk_end_ts,
+        source_event_count AS f_source_event_count,
+        mark_points AS f_mark_points,
+        funding_points AS f_funding_points
+    FROM md.agg_funding_mark_1m
+    WHERE ts_bucket >= $1
+      AND ts_bucket < $2
+      AND symbol = $3
+      AND market::text = $4
+    ORDER BY ts_event ASC, market ASC, symbol ASC
+"#;
+
 pub async fn fetch_backfill_batch(
     pool: &PgPool,
     from_ts: DateTime<Utc>,
@@ -2959,8 +3491,9 @@ async fn export_snapshots(
 mod tests {
     use super::{
         build_backfill_sql, find_long_null_price_run, handle_ingest_event,
-        minute_exclusive_upper_bound, minute_history_is_strictly_contiguous,
-        snapshot_has_required_history, snapshot_null_price_run_reaches_recent_tail,
+        live_tail_reconcile_start_ts, minute_exclusive_upper_bound,
+        minute_history_is_strictly_contiguous, snapshot_has_required_history,
+        snapshot_null_price_run_reaches_recent_tail, LiveCanonicalRepairController,
     };
     use crate::ingest::decoder::{EngineEvent, MarketKind, MdData, TradeEvent};
     use crate::observability::metrics::AppMetrics;
@@ -3338,5 +3871,48 @@ mod tests {
 
         let ready = scheduler.ready_minutes(first_live_bucket_ts + ChronoDuration::minutes(2));
         assert_eq!(ready.first().copied(), Some(first_live_bucket_ts));
+    }
+
+    #[test]
+    fn live_tail_reconcile_start_ts_respects_effective_history_floor() {
+        let last_finalized = Utc
+            .with_ymd_and_hms(2026, 3, 23, 12, 0, 0)
+            .single()
+            .unwrap();
+        let effective_floor = last_finalized - ChronoDuration::minutes(30);
+
+        assert_eq!(
+            live_tail_reconcile_start_ts(last_finalized, Some(effective_floor)),
+            effective_floor
+        );
+    }
+
+    #[test]
+    fn live_tail_reconcile_start_ts_uses_lookback_when_floor_is_older() {
+        let last_finalized = Utc
+            .with_ymd_and_hms(2026, 3, 23, 12, 0, 0)
+            .single()
+            .unwrap();
+        let effective_floor = last_finalized - ChronoDuration::minutes(600);
+
+        assert_eq!(
+            live_tail_reconcile_start_ts(last_finalized, Some(effective_floor)),
+            last_finalized - ChronoDuration::minutes(180)
+        );
+    }
+
+    #[test]
+    fn live_gap_repair_controller_throttles_same_blocking_minute() {
+        let blocking_minute = Utc
+            .with_ymd_and_hms(2026, 3, 23, 12, 0, 0)
+            .single()
+            .unwrap();
+        let next_minute = blocking_minute + ChronoDuration::minutes(1);
+        let mut controller = LiveCanonicalRepairController::default();
+
+        assert!(controller.gap_repair_due(blocking_minute));
+        controller.mark_gap_repair_attempt(blocking_minute);
+        assert!(!controller.gap_repair_due(blocking_minute));
+        assert!(controller.gap_repair_due(next_minute));
     }
 }
