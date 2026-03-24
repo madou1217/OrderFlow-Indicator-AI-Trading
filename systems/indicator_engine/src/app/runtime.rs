@@ -51,7 +51,7 @@ const STUCK_PROGRESS_IDLE_SECS: u64 = 60;
 const STUCK_WARN_INTERVAL_SECS: u64 = 60;
 const LIVE_CANONICAL_GAP_REPAIR_RETRY_SECS: u64 = 15;
 const LIVE_CANONICAL_TAIL_RECONCILE_INTERVAL_SECS: u64 = 60;
-const LIVE_CANONICAL_TAIL_RECONCILE_LOOKBACK_MINUTES: i64 = STARTUP_BACKFILL_OVERLAP_MINUTES;
+const LIVE_CANONICAL_TAIL_RECONCILE_LOOKBACK_MINUTES: i64 = 31;
 const CANONICAL_REPLAY_FETCH_WINDOW_MINUTES: i64 = 360;
 
 async fn build_publish_db_pool(config: &Arc<RootConfig>) -> Result<PgPool> {
@@ -3911,6 +3911,7 @@ mod tests {
     use super::{
         build_backfill_sql, find_long_null_price_run, handle_ingest_event,
         hydrate_futures_orderbook_heatmaps_for_range_with_fetch, live_tail_reconcile_start_ts,
+        LIVE_CANONICAL_TAIL_RECONCILE_LOOKBACK_MINUTES,
         minute_exclusive_upper_bound, minute_history_is_strictly_contiguous,
         replay_heatmap_hydration_batch_end, shutdown_ready_through_candidate,
         snapshot_has_required_history, snapshot_null_price_run_reaches_recent_tail,
@@ -4429,7 +4430,8 @@ mod tests {
 
         assert_eq!(
             live_tail_reconcile_start_ts(last_finalized, Some(effective_floor)),
-            last_finalized - ChronoDuration::minutes(180)
+            last_finalized
+                - ChronoDuration::minutes(LIVE_CANONICAL_TAIL_RECONCILE_LOOKBACK_MINUTES)
         );
     }
 
