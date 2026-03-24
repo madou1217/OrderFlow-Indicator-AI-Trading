@@ -52,11 +52,7 @@ impl CoreFilter {
         if let Some(root) = value.as_object_mut() {
             root.insert(
                 "finalize_focus".to_string(),
-                json!({
-                    "scan_15m_trend": prior_scan.pointer("/15m/trend").and_then(Value::as_str).unwrap_or("unknown"),
-                    "scan_4h_trend": prior_scan.pointer("/4h/trend").and_then(Value::as_str).unwrap_or("unknown"),
-                    "scan_1d_trend": prior_scan.pointer("/1d/trend").and_then(Value::as_str).unwrap_or("unknown"),
-                }),
+                build_finalize_focus(prior_scan),
             );
         }
         Ok(value)
@@ -100,6 +96,89 @@ impl CoreFilter {
         pending_order_mode: bool,
     ) -> &'static str {
         CoreMode::from_flags(management_mode, pending_order_mode).stage_label()
+    }
+}
+
+fn build_finalize_focus(prior_scan: &Value) -> Value {
+    json!({
+        "scan_schema_version": prior_scan
+            .get("schema_version")
+            .and_then(Value::as_str)
+            .unwrap_or("legacy"),
+        // Keep the legacy trend-style fields for compatibility with existing stage-2 prompt input.
+        "scan_15m_trend": legacy_scan_trend_label(prior_scan, "15m"),
+        "scan_4h_trend": legacy_scan_trend_label(prior_scan, "4h"),
+        "scan_1d_trend": legacy_scan_trend_label(prior_scan, "1d"),
+        "scan_15m_control_side": scan_timeframe_state(prior_scan, "15m", "control_side"),
+        "scan_15m_control_clarity": scan_timeframe_state(prior_scan, "15m", "control_clarity"),
+        "scan_15m_sponsorship_state": scan_timeframe_state(prior_scan, "15m", "sponsorship_state"),
+        "scan_4h_control_side": scan_timeframe_state(prior_scan, "4h", "control_side"),
+        "scan_4h_control_clarity": scan_timeframe_state(prior_scan, "4h", "control_clarity"),
+        "scan_4h_sponsorship_state": scan_timeframe_state(prior_scan, "4h", "sponsorship_state"),
+        "scan_1d_control_side": scan_timeframe_state(prior_scan, "1d", "control_side"),
+        "scan_1d_control_clarity": scan_timeframe_state(prior_scan, "1d", "control_clarity"),
+        "scan_1d_sponsorship_state": scan_timeframe_state(prior_scan, "1d", "sponsorship_state"),
+        "broader_regime_owner": prior_scan
+            .pointer("/cross_timeframe_map/ownership_map/broader_regime_owner")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown"),
+        "active_swing_owner": prior_scan
+            .pointer("/cross_timeframe_map/ownership_map/active_swing_owner")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown"),
+        "immediate_owner": prior_scan
+            .pointer("/cross_timeframe_map/ownership_map/immediate_owner")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown"),
+        "relationship_15m_vs_4h": prior_scan
+            .pointer("/cross_timeframe_map/relationship_map/15m_vs_4h/control_relation")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown"),
+        "relationship_4h_vs_1d": prior_scan
+            .pointer("/cross_timeframe_map/relationship_map/4h_vs_1d/control_relation")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown"),
+        "relationship_15m_vs_1d": prior_scan
+            .pointer("/cross_timeframe_map/relationship_map/15m_vs_1d/control_relation")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown"),
+        "main_tension": prior_scan
+            .pointer("/cross_timeframe_map/cross_timeframe_structure/main_tension")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown"),
+        "main_unresolved_factors": prior_scan
+            .pointer("/cross_timeframe_map/cross_timeframe_structure/main_unresolved_factors")
+            .cloned()
+            .unwrap_or_else(|| Value::Array(vec![])),
+    })
+}
+
+fn scan_timeframe_state<'a>(prior_scan: &'a Value, tf: &str, field: &str) -> &'a str {
+    prior_scan
+        .pointer(&format!("/timeframes/{tf}/state/{field}"))
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+}
+
+fn legacy_scan_trend_label(prior_scan: &Value, tf: &str) -> &'static str {
+    if let Some(legacy) = prior_scan
+        .pointer(&format!("/{tf}/trend"))
+        .and_then(Value::as_str)
+    {
+        return match legacy {
+            "Bullish" => "Bullish",
+            "Bearish" => "Bearish",
+            "Sideways" => "Sideways",
+            _ => "unknown",
+        };
+    }
+
+    match scan_timeframe_state(prior_scan, tf, "control_side") {
+        "buyers" => "Bullish",
+        "sellers" => "Bearish",
+        "balanced" => "Sideways",
+        "unclear" => "unknown",
+        _ => "unknown",
     }
 }
 

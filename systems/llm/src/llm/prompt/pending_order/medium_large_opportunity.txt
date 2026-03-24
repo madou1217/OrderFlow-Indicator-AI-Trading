@@ -3,7 +3,7 @@ Use ONLY the provided indicators and market scan. Do not invent signals.
 
 WHAT YOU RECEIVE
 - Core price and order-flow indicator snapshot
-- Market scan: 15m, 4h, 1d trend direction, signal agreement, and structural range
+- Market scan: `timeframes.15m`, `timeframes.4h`, `timeframes.1d` with `state`, `flow_map`, `structure_map`, and `validation`, plus `cross_timeframe_map`
 - Live pending order: entry_price, tp, sl, leverage, and direction
 
 GOAL

@@ -48,14 +48,14 @@ pub fn user_prompt_prefix(
     entry_stage: EntryPromptStage,
 ) -> &'static str {
     if matches!(entry_stage, EntryPromptStage::Scan) {
-        return "You are in market scan mode. Analyze the order-flow snapshot and return only a market structure scan JSON. This scan will be passed to a subsequent stage to make a context-specific trading decision based on the current account state.\n\n";
+        return "You are in market scan mode. Analyze the order-flow snapshot and return only a market scan JSON.\n\n";
     }
     if pending_order_mode {
         "You are in pending-order management mode. Analyze the current stage-2 indicators plus the live pending maker-order context from `trading_state` and `management_snapshot` (especially `management_snapshot.pending_order` and `management_snapshot.position_context.entry_context`). Also review the STAGE_1_MARKET_SCAN_JSON provided above as earlier structural context, while treating the current stage-2 prompt input as the authoritative execution-time dataset. Decide whether to keep the pending order, cancel it, or modify the maker entry / TP / SL. Return only a pending-order management decision JSON.\n\n"
     } else if management_mode {
         "You are in management mode. Analyze the current stage-2 indicators plus current position/order context from `trading_state` and `management_snapshot` (especially `context_state`, leverage, direction, position quantity, open orders, and last management reason). Also review the STAGE_1_MARKET_SCAN_JSON provided above as earlier structural context, while treating the current stage-2 prompt input as the authoritative execution-time dataset. IMPORTANT: `management_snapshot.positions[].current_tp_price` and `current_sl_price` are the ACTUAL placed TP/SL order trigger prices on the exchange (sourced directly from Binance open orders — not model estimates). Use them as baselines for all MODIFY_TPSL decisions: HC-6 requires new values to differ from these actual current prices; HC-9 requires new_sl to be tighter (more favorable) than current_sl_price. Return only a management decision JSON.\n\n"
     } else {
-        "You are in entry finalize mode. Analyze the current stage-2 order-flow snapshot together with the STAGE_1_MARKET_SCAN_JSON. Treat the current stage-2 prompt input as the authoritative execution-time dataset. Use STAGE_1_MARKET_SCAN_JSON as earlier structural context. Use the current stage-2 dataset to decide the best present-time expression of the most meaningful 4h to 1d opportunity. Return only the final entry decision JSON.\n\n"
+        ""
     }
 }
 

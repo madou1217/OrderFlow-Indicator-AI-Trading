@@ -2,7 +2,7 @@
 
 
 
-请根据最新重启后stage2 core entry产出物: 20260316T121800Z_ETHUSDT_entry_core_20260316T122015301Z.json再次确认本次针对entry filter的优化实现了：llm阅读数据后清晰的准确的给出交易的方向，tp,sl,entry
+请根据最新重启后stage2 core entry产出物: 20260316T121800Z_ETHUSDT_entry_core_20260316T122015301Z.json再次确认本次针对entry filter的优化实现了：llm阅读数据后清晰的准确的给出交易的方向，tp,sl,entry，leverage
 
 
 
@@ -11,5 +11,4 @@
 是否可以让现在的stage2 的management管理可以让模型准确的识别4h,1d的原有趋势是否延续，并关注15m的风险，能够对持仓的机会和风险做出很好的管理
 
 我的目的是scan filter -> 候选证据，让模型根据数据给出15m,4h,1d方向和区间
-
 

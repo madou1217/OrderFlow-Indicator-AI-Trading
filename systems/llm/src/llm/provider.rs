@@ -9,7 +9,7 @@ use chrono::{DateTime, Utc};
 use futures_util::future::join_all;
 use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use std::time::Instant;
 use tokio::time::{sleep, Duration};
 use tracing::warn;
@@ -258,9 +258,27 @@ fn build_entry_finalize_trace_event(
             "entry"
         },
         "latency_ms": latency_ms,
-        "scan_15m_trend": prior_scan.pointer("/15m/trend").cloned().unwrap_or(Value::Null),
-        "scan_4h_trend": prior_scan.pointer("/4h/trend").cloned().unwrap_or(Value::Null),
-        "scan_1d_trend": prior_scan.pointer("/1d/trend").cloned().unwrap_or(Value::Null),
+        "scan_15m_trend": scan_trace_trend_value(prior_scan, "15m"),
+        "scan_4h_trend": scan_trace_trend_value(prior_scan, "4h"),
+        "scan_1d_trend": scan_trace_trend_value(prior_scan, "1d"),
+        "scan_15m_control_side": scan_trace_state_value(prior_scan, "15m", "control_side"),
+        "scan_4h_control_side": scan_trace_state_value(prior_scan, "4h", "control_side"),
+        "scan_1d_control_side": scan_trace_state_value(prior_scan, "1d", "control_side"),
+        "scan_15m_control_clarity": scan_trace_state_value(prior_scan, "15m", "control_clarity"),
+        "scan_4h_control_clarity": scan_trace_state_value(prior_scan, "4h", "control_clarity"),
+        "scan_1d_control_clarity": scan_trace_state_value(prior_scan, "1d", "control_clarity"),
+        "broader_regime_owner": prior_scan
+            .pointer("/cross_timeframe_map/ownership_map/broader_regime_owner")
+            .cloned()
+            .unwrap_or(Value::Null),
+        "active_swing_owner": prior_scan
+            .pointer("/cross_timeframe_map/ownership_map/active_swing_owner")
+            .cloned()
+            .unwrap_or(Value::Null),
+        "immediate_owner": prior_scan
+            .pointer("/cross_timeframe_map/ownership_map/immediate_owner")
+            .cloned()
+            .unwrap_or(Value::Null),
         "stage_1_scan_ts_bucket": prior_scan.get("stage_1_scan_ts_bucket").cloned().unwrap_or(Value::Null),
         "stage_2_core_ts_bucket": prior_scan
             .get("stage_2_core_ts_bucket")
@@ -278,6 +296,30 @@ fn build_entry_finalize_trace_event(
         "raw_indicator_count": input.indicators.as_object().map(|obj| obj.len()).unwrap_or(0),
         "missing_indicator_codes": &input.missing_indicator_codes,
     })
+}
+
+fn scan_trace_trend_value(prior_scan: &Value, tf: &str) -> Value {
+    if let Some(legacy) = prior_scan.pointer(&format!("/{tf}/trend")).cloned() {
+        return legacy;
+    }
+
+    match prior_scan
+        .pointer(&format!("/timeframes/{tf}/state/control_side"))
+        .and_then(Value::as_str)
+    {
+        Some("buyers") => Value::String("Bullish".to_string()),
+        Some("sellers") => Value::String("Bearish".to_string()),
+        Some("balanced") => Value::String("Sideways".to_string()),
+        Some("unclear") => Value::String("unknown".to_string()),
+        _ => Value::Null,
+    }
+}
+
+fn scan_trace_state_value(prior_scan: &Value, tf: &str, field: &str) -> Value {
+    prior_scan
+        .pointer(&format!("/timeframes/{tf}/state/{field}"))
+        .cloned()
+        .unwrap_or(Value::Null)
 }
 
 fn is_entry_mode(input: &ModelInvocationInput) -> bool {
@@ -422,6 +464,18 @@ fn parse_entry_scan_output(provider: &str, raw_text: &str) -> Result<Value, Prov
 }
 
 fn validate_scan_output(value: &Value) -> Result<()> {
+    if value
+        .get("schema_version")
+        .and_then(Value::as_str)
+        .is_some_and(|version| version == "scan_v1_7")
+    {
+        return validate_scan_output_v1_7(value);
+    }
+
+    validate_scan_output_legacy(value)
+}
+
+fn validate_scan_output_legacy(value: &Value) -> Result<()> {
     for tf in ["15m", "4h", "1d"] {
         let tf_obj = value
             .get(tf)
@@ -546,18 +600,361 @@ fn validate_scan_output(value: &Value) -> Result<()> {
     Ok(())
 }
 
-fn sanitize_scan_for_stage2(value: &Value) -> Value {
-    let mut sanitized = value.clone();
-    if let Some(root) = sanitized.as_object_mut() {
-        root.remove("market_narrative");
-        root.remove("scan_audit");
+fn validate_scan_output_v1_7(value: &Value) -> Result<()> {
+    let schema_version = value
+        .get("schema_version")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("scan schema_version is missing"))?;
+    if schema_version != "scan_v1_7" {
+        return Err(anyhow!(
+            "scan schema_version must be scan_v1_7, got {}",
+            schema_version
+        ));
     }
+
+    let meta = expect_object(value, "/meta")?;
+    meta.get("symbol")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| anyhow!("scan meta.symbol is missing"))?;
+    let scan_ts_bucket = meta
+        .get("scan_ts_bucket")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| anyhow!("scan meta.scan_ts_bucket is missing"))?;
+    DateTime::parse_from_rfc3339(scan_ts_bucket)
+        .map_err(|_| anyhow!("scan meta.scan_ts_bucket must be RFC3339 date-time"))?;
+
+    expect_object(value, "/timeframes")?;
     for tf in ["15m", "4h", "1d"] {
-        if let Some(tf_obj) = sanitized.get_mut(tf).and_then(Value::as_object_mut) {
-            tf_obj.remove("story");
-        }
+        validate_scan_output_v1_7_timeframe(value, tf)?;
     }
-    sanitized
+
+    expect_enum(
+        value,
+        "/cross_timeframe_map/ownership_map/broader_regime_owner",
+        &["buyers", "sellers", "balanced", "unclear"],
+    )?;
+    expect_enum(
+        value,
+        "/cross_timeframe_map/ownership_map/active_swing_owner",
+        &["buyers", "sellers", "balanced", "unclear"],
+    )?;
+    expect_enum(
+        value,
+        "/cross_timeframe_map/ownership_map/immediate_owner",
+        &["buyers", "sellers", "balanced", "unclear"],
+    )?;
+
+    for pair in ["15m_vs_4h", "4h_vs_1d", "15m_vs_1d"] {
+        let base = format!("/cross_timeframe_map/relationship_map/{pair}");
+        expect_enum(
+            value,
+            &format!("{base}/control_relation"),
+            &["aligned", "opposed", "neutral"],
+        )?;
+        expect_enum(
+            value,
+            &format!("{base}/lower_tf_value_location_vs_higher_tf"),
+            &[
+                "above_higher_tf_value",
+                "inside_higher_tf_value",
+                "below_higher_tf_value",
+            ],
+        )?;
+        expect_enum(
+            value,
+            &format!("{base}/lower_tf_range_location_vs_higher_tf"),
+            &[
+                "above_higher_tf_range",
+                "inside_higher_tf_range",
+                "below_higher_tf_range",
+            ],
+        )?;
+    }
+
+    expect_string(
+        value,
+        "/cross_timeframe_map/cross_timeframe_structure/main_tension",
+    )?;
+    validate_key_levels_with_max(
+        value,
+        "/cross_timeframe_map/cross_timeframe_structure/key_shared_levels",
+        6,
+    )?;
+    validate_string_array_with_max(
+        value,
+        "/cross_timeframe_map/cross_timeframe_structure/main_unresolved_factors",
+        4,
+    )?;
+
+    Ok(())
+}
+
+fn validate_scan_output_v1_7_timeframe(value: &Value, tf: &str) -> Result<()> {
+    let base = format!("/timeframes/{tf}");
+    expect_enum(
+        value,
+        &format!("{base}/state/control_side"),
+        &["buyers", "sellers", "balanced", "unclear"],
+    )?;
+    expect_enum(
+        value,
+        &format!("{base}/state/control_clarity"),
+        &["strong", "mixed", "conflicted"],
+    )?;
+    expect_enum(
+        value,
+        &format!("{base}/state/value_location"),
+        &[
+            "above_value",
+            "below_value",
+            "inside_value",
+            "accepted_above",
+            "accepted_below",
+            "rejected_from_above",
+            "rejected_from_below",
+        ],
+    )?;
+    expect_enum(
+        value,
+        &format!("{base}/state/range_state"),
+        &[
+            "inside_range",
+            "accepting_above_range",
+            "accepting_below_range",
+            "rejecting_above_range",
+            "rejecting_below_range",
+            "testing_range_high",
+            "testing_range_low",
+            "range_unresolved",
+        ],
+    )?;
+    expect_enum(
+        value,
+        &format!("{base}/state/sponsorship_state"),
+        &["active", "fragile", "fading", "absent", "unresolved"],
+    )?;
+
+    expect_enum(
+        value,
+        &format!("{base}/flow_map/aggressive_side"),
+        &["buyers", "sellers", "balanced", "unclear"],
+    )?;
+    expect_enum(
+        value,
+        &format!("{base}/flow_map/absorption_side"),
+        &["buyers", "sellers", "none", "unclear"],
+    )?;
+    expect_enum(
+        value,
+        &format!("{base}/flow_map/trapped_side"),
+        &["buyers", "sellers", "none", "unclear"],
+    )?;
+    let role_observations = expect_array(value, &format!("{base}/flow_map/role_observations"))?;
+    ensure_max_items(
+        role_observations.len(),
+        &format!("{base}/flow_map/role_observations"),
+        3,
+    )?;
+    for (idx, _) in role_observations.iter().enumerate() {
+        let role_base = format!("{base}/flow_map/role_observations/{idx}");
+        expect_enum(
+            value,
+            &format!("{role_base}/role"),
+            &[
+                "large_directional_flow",
+                "higher_timeframe_sponsorship",
+                "crowd_behavior",
+                "passive_liquidity",
+            ],
+        )?;
+        expect_string(value, &format!("{role_base}/observed_behavior"))?;
+        validate_string_array_with_max(value, &format!("{role_base}/evidence"), 3)?;
+        expect_enum(
+            value,
+            &format!("{role_base}/confidence"),
+            &["high", "medium", "low"],
+        )?;
+    }
+
+    expect_number(value, &format!("{base}/structure_map/active_range/low"))?;
+    expect_number(value, &format!("{base}/structure_map/active_range/high"))?;
+    expect_enum(
+        value,
+        &format!("{base}/structure_map/range_width_vs_atr"),
+        &["narrow", "normal", "wide"],
+    )?;
+    validate_optional_price_zone(value, &format!("{base}/structure_map/dominant_demand_zone"))?;
+    validate_optional_price_zone(value, &format!("{base}/structure_map/dominant_supply_zone"))?;
+    validate_key_levels_with_max(value, &format!("{base}/structure_map/key_levels"), 6)?;
+    expect_number_or_null(value, &format!("{base}/structure_map/invalidation_level"))?;
+    for side in ["upside", "downside"] {
+        let path_base = format!("{base}/structure_map/path_map/{side}");
+        validate_level_reference(value, &format!("{path_base}/first_objective_ref"))?;
+        validate_level_reference(value, &format!("{path_base}/first_barrier_ref"))?;
+    }
+
+    expect_enum(
+        value,
+        &format!("{base}/validation/read_basis"),
+        &[
+            "closed_bar_continuation",
+            "live_flow_reversal",
+            "exhaustion_inference",
+            "structural_inference",
+            "mixed",
+        ],
+    )?;
+    validate_string_array_with_max(value, &format!("{base}/validation/supporting_facts"), 4)?;
+    validate_string_array_with_max(value, &format!("{base}/validation/conflicting_facts"), 4)?;
+    expect_bool(
+        value,
+        &format!("{base}/validation/recent_closed_bars_align_with_read"),
+    )?;
+    expect_bool(
+        value,
+        &format!("{base}/validation/cvd_slope_aligns_with_read"),
+    )?;
+    expect_bool(
+        value,
+        &format!("{base}/validation/current_partial_bar_aligns_with_read"),
+    )?;
+    expect_string(value, &format!("{base}/validation/fragility_summary"))?;
+
+    Ok(())
+}
+
+fn expect_object<'a>(value: &'a Value, path: &str) -> Result<&'a Map<String, Value>> {
+    value
+        .pointer(path)
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow!("scan {} is missing or not an object", path))
+}
+
+fn expect_array<'a>(value: &'a Value, path: &str) -> Result<&'a Vec<Value>> {
+    value
+        .pointer(path)
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("scan {} is missing or not an array", path))
+}
+
+fn expect_string<'a>(value: &'a Value, path: &str) -> Result<&'a str> {
+    value
+        .pointer(path)
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| anyhow!("scan {} is missing or empty", path))
+}
+
+fn expect_number(value: &Value, path: &str) -> Result<f64> {
+    value
+        .pointer(path)
+        .and_then(Value::as_f64)
+        .ok_or_else(|| anyhow!("scan {} is missing or not a number", path))
+}
+
+fn expect_bool(value: &Value, path: &str) -> Result<bool> {
+    value
+        .pointer(path)
+        .and_then(Value::as_bool)
+        .ok_or_else(|| anyhow!("scan {} is missing or not a boolean", path))
+}
+
+fn expect_number_or_null(value: &Value, path: &str) -> Result<()> {
+    match value.pointer(path) {
+        Some(Value::Number(_)) | Some(Value::Null) => Ok(()),
+        _ => Err(anyhow!("scan {} must be a number or null", path)),
+    }
+}
+
+fn expect_enum<'a>(value: &'a Value, path: &str, allowed: &[&str]) -> Result<&'a str> {
+    let actual = expect_string(value, path)?;
+    if allowed.contains(&actual) {
+        Ok(actual)
+    } else {
+        Err(anyhow!(
+            "scan {} must be one of {}",
+            path,
+            allowed.join("/")
+        ))
+    }
+}
+
+fn ensure_max_items(len: usize, path: &str, max: usize) -> Result<()> {
+    if len > max {
+        Err(anyhow!("scan {} must contain at most {} items", path, max))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_string_array_with_max(value: &Value, path: &str, max: usize) -> Result<()> {
+    let items = expect_array(value, path)?;
+    ensure_max_items(items.len(), path, max)?;
+    for (idx, _) in items.iter().enumerate() {
+        expect_string(value, &format!("{path}/{idx}"))?;
+    }
+    Ok(())
+}
+
+fn validate_optional_price_zone(value: &Value, path: &str) -> Result<()> {
+    match value.pointer(path) {
+        Some(Value::Null) => Ok(()),
+        Some(Value::Object(_)) => {
+            expect_number(value, &format!("{path}/low"))?;
+            expect_number(value, &format!("{path}/high"))?;
+            expect_string(value, &format!("{path}/reason"))?;
+            Ok(())
+        }
+        _ => Err(anyhow!("scan {} must be an object or null", path)),
+    }
+}
+
+fn validate_key_levels_with_max(value: &Value, path: &str, max: usize) -> Result<()> {
+    let levels = expect_array(value, path)?;
+    ensure_max_items(levels.len(), path, max)?;
+    for (idx, _) in levels.iter().enumerate() {
+        let level_base = format!("{path}/{idx}");
+        expect_number(value, &format!("{level_base}/price"))?;
+        expect_enum(
+            value,
+            &format!("{level_base}/type"),
+            &[
+                "support",
+                "resistance",
+                "pivot",
+                "value_edge",
+                "liquidity_wall",
+                "imbalance_edge",
+            ],
+        )?;
+        expect_string(value, &format!("{level_base}/reason"))?;
+    }
+    Ok(())
+}
+
+fn validate_level_reference(value: &Value, path: &str) -> Result<()> {
+    expect_enum(
+        value,
+        &format!("{path}/ref_kind"),
+        &[
+            "key_level",
+            "demand_zone_edge",
+            "supply_zone_edge",
+            "active_range_low",
+            "active_range_high",
+            "external_price",
+            "none",
+        ],
+    )?;
+    expect_number_or_null(value, &format!("{path}/price"))?;
+    expect_string(value, &format!("{path}/label"))?;
+    Ok(())
+}
+
+fn sanitize_scan_for_stage2(value: &Value) -> Value {
+    value.clone()
 }
 
 fn annotate_scan_for_stage2(value: &Value, context: FinalizeStageContext) -> Value {
@@ -1581,7 +1978,7 @@ fn qwen_output_contract(
 ) -> String {
     if matches!(entry_stage, prompt::EntryPromptStage::Scan) {
         if is_medium_large(prompt_template) {
-            "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- No extra top-level keys.\n- Top-level keys must be `15m`, `4h`, `1d`, and `scan_audit`.\n- Each timeframe key must include `trend`, `signal_agreement`, `range`, `supporting_signals`, `conflicting_signals`, `opportunity`, and `risk`.\n- `scan_audit` must include `15m`, `4h`, and `1d`, and each audit object must include `direction_basis`, `recent_closed_bars_align_with_trend`, `cvd_slope_aligns_with_trend`, `current_partial_bar_aligns_with_trend`, `invalidation_level`, and `range_width_vs_atr`.\n".to_string()
+            "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- No extra top-level keys.\n- Top-level keys must be `schema_version`, `meta`, `timeframes`, and `cross_timeframe_map`.\n- `schema_version` must be `scan_v1_7`.\n- `timeframes` must contain `15m`, `4h`, and `1d`.\n- Each timeframe must include `state`, `flow_map`, `structure_map`, and `validation`.\n- `cross_timeframe_map` must include `ownership_map`, `relationship_map`, and `cross_timeframe_structure`.\n".to_string()
         } else {
             "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- No extra top-level keys.\n- Top-level keys must be `15m`, `4h`, `1d`, and `scan_audit`.\n- Each timeframe key must include `trend`, `signal_agreement`, `range`, `supporting_signals`, `conflicting_signals`, `opportunity`, and `risk`.\n- `scan_audit` must include `15m`, `4h`, and `1d`, and each audit object must include `direction_basis`, `recent_closed_bars_align_with_trend`, `cvd_slope_aligns_with_trend`, `current_partial_bar_aligns_with_trend`, `invalidation_level`, and `range_width_vs_atr`.\n".to_string()
         }
@@ -2959,18 +3356,697 @@ fn scan_timeframe_schema_gemini() -> Value {
     })
 }
 
-fn ml_grok_entry_scan_schema() -> Value {
+fn scan_v1_7_price_zone_schema_openai() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["15m", "4h", "1d", "scan_audit"],
+        "required": ["low", "high", "reason"],
         "properties": {
-            "15m": scan_timeframe_schema_grok(),
-            "4h": scan_timeframe_schema_grok(),
-            "1d": scan_timeframe_schema_grok(),
-            "scan_audit": scan_audit_schema_openai()
+            "low": { "type": "number" },
+            "high": { "type": "number" },
+            "reason": { "type": "string" }
         }
     })
+}
+
+fn scan_v1_7_key_level_schema_openai() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["price", "type", "reason"],
+        "properties": {
+            "price": { "type": "number" },
+            "type": {
+                "type": "string",
+                "enum": ["support", "resistance", "pivot", "value_edge", "liquidity_wall", "imbalance_edge"]
+            },
+            "reason": { "type": "string" }
+        }
+    })
+}
+
+fn scan_v1_7_level_reference_schema_openai() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["ref_kind", "price", "label"],
+        "properties": {
+            "ref_kind": {
+                "type": "string",
+                "enum": [
+                    "key_level",
+                    "demand_zone_edge",
+                    "supply_zone_edge",
+                    "active_range_low",
+                    "active_range_high",
+                    "external_price",
+                    "none"
+                ]
+            },
+            "price": { "type": ["number", "null"] },
+            "label": { "type": "string" }
+        }
+    })
+}
+
+fn scan_v1_7_path_side_schema_openai() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["first_objective_ref", "first_barrier_ref"],
+        "properties": {
+            "first_objective_ref": scan_v1_7_level_reference_schema_openai(),
+            "first_barrier_ref": scan_v1_7_level_reference_schema_openai()
+        }
+    })
+}
+
+fn scan_v1_7_role_observation_schema_openai() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["role", "observed_behavior", "evidence", "confidence"],
+        "properties": {
+            "role": {
+                "type": "string",
+                "enum": [
+                    "large_directional_flow",
+                    "higher_timeframe_sponsorship",
+                    "crowd_behavior",
+                    "passive_liquidity"
+                ]
+            },
+            "observed_behavior": { "type": "string" },
+            "evidence": {
+                "type": "array",
+                "maxItems": 3,
+                "items": { "type": "string" }
+            },
+            "confidence": {
+                "type": "string",
+                "enum": ["high", "medium", "low"]
+            }
+        }
+    })
+}
+
+fn scan_v1_7_state_schema_openai() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["control_side", "control_clarity", "value_location", "range_state", "sponsorship_state"],
+        "properties": {
+            "control_side": {
+                "type": "string",
+                "enum": ["buyers", "sellers", "balanced", "unclear"]
+            },
+            "control_clarity": {
+                "type": "string",
+                "enum": ["strong", "mixed", "conflicted"]
+            },
+            "value_location": {
+                "type": "string",
+                "enum": [
+                    "above_value",
+                    "below_value",
+                    "inside_value",
+                    "accepted_above",
+                    "accepted_below",
+                    "rejected_from_above",
+                    "rejected_from_below"
+                ]
+            },
+            "range_state": {
+                "type": "string",
+                "enum": [
+                    "inside_range",
+                    "accepting_above_range",
+                    "accepting_below_range",
+                    "rejecting_above_range",
+                    "rejecting_below_range",
+                    "testing_range_high",
+                    "testing_range_low",
+                    "range_unresolved"
+                ]
+            },
+            "sponsorship_state": {
+                "type": "string",
+                "enum": ["active", "fragile", "fading", "absent", "unresolved"]
+            }
+        }
+    })
+}
+
+fn scan_v1_7_flow_map_schema_openai() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["aggressive_side", "absorption_side", "trapped_side", "role_observations"],
+        "properties": {
+            "aggressive_side": {
+                "type": "string",
+                "enum": ["buyers", "sellers", "balanced", "unclear"]
+            },
+            "absorption_side": {
+                "type": "string",
+                "enum": ["buyers", "sellers", "none", "unclear"]
+            },
+            "trapped_side": {
+                "type": "string",
+                "enum": ["buyers", "sellers", "none", "unclear"]
+            },
+            "role_observations": {
+                "type": "array",
+                "maxItems": 3,
+                "items": scan_v1_7_role_observation_schema_openai()
+            }
+        }
+    })
+}
+
+fn scan_v1_7_structure_map_schema_openai() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "active_range",
+            "range_width_vs_atr",
+            "dominant_demand_zone",
+            "dominant_supply_zone",
+            "key_levels",
+            "invalidation_level",
+            "path_map"
+        ],
+        "properties": {
+            "active_range": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["low", "high"],
+                "properties": {
+                    "low": { "type": "number" },
+                    "high": { "type": "number" }
+                }
+            },
+            "range_width_vs_atr": {
+                "type": "string",
+                "enum": ["narrow", "normal", "wide"]
+            },
+            "dominant_demand_zone": {
+                "anyOf": [
+                    scan_v1_7_price_zone_schema_openai(),
+                    { "type": "null" }
+                ]
+            },
+            "dominant_supply_zone": {
+                "anyOf": [
+                    scan_v1_7_price_zone_schema_openai(),
+                    { "type": "null" }
+                ]
+            },
+            "key_levels": {
+                "type": "array",
+                "maxItems": 6,
+                "items": scan_v1_7_key_level_schema_openai()
+            },
+            "invalidation_level": { "type": ["number", "null"] },
+            "path_map": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["upside", "downside"],
+                "properties": {
+                    "upside": scan_v1_7_path_side_schema_openai(),
+                    "downside": scan_v1_7_path_side_schema_openai()
+                }
+            }
+        }
+    })
+}
+
+fn scan_v1_7_validation_schema_openai() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "read_basis",
+            "supporting_facts",
+            "conflicting_facts",
+            "recent_closed_bars_align_with_read",
+            "cvd_slope_aligns_with_read",
+            "current_partial_bar_aligns_with_read",
+            "fragility_summary"
+        ],
+        "properties": {
+            "read_basis": {
+                "type": "string",
+                "enum": [
+                    "closed_bar_continuation",
+                    "live_flow_reversal",
+                    "exhaustion_inference",
+                    "structural_inference",
+                    "mixed"
+                ]
+            },
+            "supporting_facts": {
+                "type": "array",
+                "maxItems": 4,
+                "items": { "type": "string" }
+            },
+            "conflicting_facts": {
+                "type": "array",
+                "maxItems": 4,
+                "items": { "type": "string" }
+            },
+            "recent_closed_bars_align_with_read": { "type": "boolean" },
+            "cvd_slope_aligns_with_read": { "type": "boolean" },
+            "current_partial_bar_aligns_with_read": { "type": "boolean" },
+            "fragility_summary": { "type": "string" }
+        }
+    })
+}
+
+fn scan_v1_7_timeframe_schema_openai() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["state", "flow_map", "structure_map", "validation"],
+        "properties": {
+            "state": scan_v1_7_state_schema_openai(),
+            "flow_map": scan_v1_7_flow_map_schema_openai(),
+            "structure_map": scan_v1_7_structure_map_schema_openai(),
+            "validation": scan_v1_7_validation_schema_openai()
+        }
+    })
+}
+
+fn scan_v1_7_timeframe_relationship_schema_openai() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["control_relation", "lower_tf_value_location_vs_higher_tf", "lower_tf_range_location_vs_higher_tf"],
+        "properties": {
+            "control_relation": {
+                "type": "string",
+                "enum": ["aligned", "opposed", "neutral"]
+            },
+            "lower_tf_value_location_vs_higher_tf": {
+                "type": "string",
+                "enum": ["above_higher_tf_value", "inside_higher_tf_value", "below_higher_tf_value"]
+            },
+            "lower_tf_range_location_vs_higher_tf": {
+                "type": "string",
+                "enum": ["above_higher_tf_range", "inside_higher_tf_range", "below_higher_tf_range"]
+            }
+        }
+    })
+}
+
+fn scan_v1_7_schema_openai() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["schema_version", "meta", "timeframes", "cross_timeframe_map"],
+        "properties": {
+            "schema_version": { "type": "string", "enum": ["scan_v1_7"] },
+            "meta": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["symbol", "scan_ts_bucket"],
+                "properties": {
+                    "symbol": { "type": "string" },
+                    "scan_ts_bucket": { "type": "string", "format": "date-time" }
+                }
+            },
+            "timeframes": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["15m", "4h", "1d"],
+                "properties": {
+                    "15m": scan_v1_7_timeframe_schema_openai(),
+                    "4h": scan_v1_7_timeframe_schema_openai(),
+                    "1d": scan_v1_7_timeframe_schema_openai()
+                }
+            },
+            "cross_timeframe_map": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["ownership_map", "relationship_map", "cross_timeframe_structure"],
+                "properties": {
+                    "ownership_map": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["broader_regime_owner", "active_swing_owner", "immediate_owner"],
+                        "properties": {
+                            "broader_regime_owner": { "type": "string", "enum": ["buyers", "sellers", "balanced", "unclear"] },
+                            "active_swing_owner": { "type": "string", "enum": ["buyers", "sellers", "balanced", "unclear"] },
+                            "immediate_owner": { "type": "string", "enum": ["buyers", "sellers", "balanced", "unclear"] }
+                        }
+                    },
+                    "relationship_map": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["15m_vs_4h", "4h_vs_1d", "15m_vs_1d"],
+                        "properties": {
+                            "15m_vs_4h": scan_v1_7_timeframe_relationship_schema_openai(),
+                            "4h_vs_1d": scan_v1_7_timeframe_relationship_schema_openai(),
+                            "15m_vs_1d": scan_v1_7_timeframe_relationship_schema_openai()
+                        }
+                    },
+                    "cross_timeframe_structure": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["main_tension", "key_shared_levels", "main_unresolved_factors"],
+                        "properties": {
+                            "main_tension": { "type": "string" },
+                            "key_shared_levels": {
+                                "type": "array",
+                                "maxItems": 6,
+                                "items": scan_v1_7_key_level_schema_openai()
+                            },
+                            "main_unresolved_factors": {
+                                "type": "array",
+                                "maxItems": 4,
+                                "items": { "type": "string" }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    })
+}
+
+fn scan_v1_7_price_zone_schema_gemini() -> Value {
+    json!({
+        "type": "OBJECT",
+        "nullable": true,
+        "properties": {
+            "low": { "type": "NUMBER" },
+            "high": { "type": "NUMBER" },
+            "reason": { "type": "STRING" }
+        },
+        "required": ["low", "high", "reason"]
+    })
+}
+
+fn scan_v1_7_key_level_schema_gemini() -> Value {
+    json!({
+        "type": "OBJECT",
+        "properties": {
+            "price": { "type": "NUMBER" },
+            "type": {
+                "type": "STRING",
+                "enum": ["support", "resistance", "pivot", "value_edge", "liquidity_wall", "imbalance_edge"]
+            },
+            "reason": { "type": "STRING" }
+        },
+        "required": ["price", "type", "reason"]
+    })
+}
+
+fn scan_v1_7_level_reference_schema_gemini() -> Value {
+    json!({
+        "type": "OBJECT",
+        "properties": {
+            "ref_kind": {
+                "type": "STRING",
+                "enum": [
+                    "key_level",
+                    "demand_zone_edge",
+                    "supply_zone_edge",
+                    "active_range_low",
+                    "active_range_high",
+                    "external_price",
+                    "none"
+                ]
+            },
+            "price": { "type": "NUMBER", "nullable": true },
+            "label": { "type": "STRING" }
+        },
+        "required": ["ref_kind", "price", "label"]
+    })
+}
+
+fn scan_v1_7_path_side_schema_gemini() -> Value {
+    json!({
+        "type": "OBJECT",
+        "properties": {
+            "first_objective_ref": scan_v1_7_level_reference_schema_gemini(),
+            "first_barrier_ref": scan_v1_7_level_reference_schema_gemini()
+        },
+        "required": ["first_objective_ref", "first_barrier_ref"]
+    })
+}
+
+fn scan_v1_7_role_observation_schema_gemini() -> Value {
+    json!({
+        "type": "OBJECT",
+        "properties": {
+            "role": {
+                "type": "STRING",
+                "enum": [
+                    "large_directional_flow",
+                    "higher_timeframe_sponsorship",
+                    "crowd_behavior",
+                    "passive_liquidity"
+                ]
+            },
+            "observed_behavior": { "type": "STRING" },
+            "evidence": {
+                "type": "ARRAY",
+                "maxItems": 3,
+                "items": { "type": "STRING" }
+            },
+            "confidence": {
+                "type": "STRING",
+                "enum": ["high", "medium", "low"]
+            }
+        },
+        "required": ["role", "observed_behavior", "evidence", "confidence"]
+    })
+}
+
+fn scan_v1_7_state_schema_gemini() -> Value {
+    json!({
+        "type": "OBJECT",
+        "properties": {
+            "control_side": { "type": "STRING", "enum": ["buyers", "sellers", "balanced", "unclear"] },
+            "control_clarity": { "type": "STRING", "enum": ["strong", "mixed", "conflicted"] },
+            "value_location": {
+                "type": "STRING",
+                "enum": [
+                    "above_value",
+                    "below_value",
+                    "inside_value",
+                    "accepted_above",
+                    "accepted_below",
+                    "rejected_from_above",
+                    "rejected_from_below"
+                ]
+            },
+            "range_state": {
+                "type": "STRING",
+                "enum": [
+                    "inside_range",
+                    "accepting_above_range",
+                    "accepting_below_range",
+                    "rejecting_above_range",
+                    "rejecting_below_range",
+                    "testing_range_high",
+                    "testing_range_low",
+                    "range_unresolved"
+                ]
+            },
+            "sponsorship_state": { "type": "STRING", "enum": ["active", "fragile", "fading", "absent", "unresolved"] }
+        },
+        "required": ["control_side", "control_clarity", "value_location", "range_state", "sponsorship_state"]
+    })
+}
+
+fn scan_v1_7_flow_map_schema_gemini() -> Value {
+    json!({
+        "type": "OBJECT",
+        "properties": {
+            "aggressive_side": { "type": "STRING", "enum": ["buyers", "sellers", "balanced", "unclear"] },
+            "absorption_side": { "type": "STRING", "enum": ["buyers", "sellers", "none", "unclear"] },
+            "trapped_side": { "type": "STRING", "enum": ["buyers", "sellers", "none", "unclear"] },
+            "role_observations": {
+                "type": "ARRAY",
+                "maxItems": 3,
+                "items": scan_v1_7_role_observation_schema_gemini()
+            }
+        },
+        "required": ["aggressive_side", "absorption_side", "trapped_side", "role_observations"]
+    })
+}
+
+fn scan_v1_7_structure_map_schema_gemini() -> Value {
+    json!({
+        "type": "OBJECT",
+        "properties": {
+            "active_range": {
+                "type": "OBJECT",
+                "properties": {
+                    "low": { "type": "NUMBER" },
+                    "high": { "type": "NUMBER" }
+                },
+                "required": ["low", "high"]
+            },
+            "range_width_vs_atr": { "type": "STRING", "enum": ["narrow", "normal", "wide"] },
+            "dominant_demand_zone": scan_v1_7_price_zone_schema_gemini(),
+            "dominant_supply_zone": scan_v1_7_price_zone_schema_gemini(),
+            "key_levels": {
+                "type": "ARRAY",
+                "maxItems": 6,
+                "items": scan_v1_7_key_level_schema_gemini()
+            },
+            "invalidation_level": { "type": "NUMBER", "nullable": true },
+            "path_map": {
+                "type": "OBJECT",
+                "properties": {
+                    "upside": scan_v1_7_path_side_schema_gemini(),
+                    "downside": scan_v1_7_path_side_schema_gemini()
+                },
+                "required": ["upside", "downside"]
+            }
+        },
+        "required": [
+            "active_range",
+            "range_width_vs_atr",
+            "dominant_demand_zone",
+            "dominant_supply_zone",
+            "key_levels",
+            "invalidation_level",
+            "path_map"
+        ]
+    })
+}
+
+fn scan_v1_7_validation_schema_gemini() -> Value {
+    json!({
+        "type": "OBJECT",
+        "properties": {
+            "read_basis": {
+                "type": "STRING",
+                "enum": [
+                    "closed_bar_continuation",
+                    "live_flow_reversal",
+                    "exhaustion_inference",
+                    "structural_inference",
+                    "mixed"
+                ]
+            },
+            "supporting_facts": { "type": "ARRAY", "maxItems": 4, "items": { "type": "STRING" } },
+            "conflicting_facts": { "type": "ARRAY", "maxItems": 4, "items": { "type": "STRING" } },
+            "recent_closed_bars_align_with_read": { "type": "BOOLEAN" },
+            "cvd_slope_aligns_with_read": { "type": "BOOLEAN" },
+            "current_partial_bar_aligns_with_read": { "type": "BOOLEAN" },
+            "fragility_summary": { "type": "STRING" }
+        },
+        "required": [
+            "read_basis",
+            "supporting_facts",
+            "conflicting_facts",
+            "recent_closed_bars_align_with_read",
+            "cvd_slope_aligns_with_read",
+            "current_partial_bar_aligns_with_read",
+            "fragility_summary"
+        ]
+    })
+}
+
+fn scan_v1_7_timeframe_schema_gemini() -> Value {
+    json!({
+        "type": "OBJECT",
+        "properties": {
+            "state": scan_v1_7_state_schema_gemini(),
+            "flow_map": scan_v1_7_flow_map_schema_gemini(),
+            "structure_map": scan_v1_7_structure_map_schema_gemini(),
+            "validation": scan_v1_7_validation_schema_gemini()
+        },
+        "required": ["state", "flow_map", "structure_map", "validation"]
+    })
+}
+
+fn scan_v1_7_timeframe_relationship_schema_gemini() -> Value {
+    json!({
+        "type": "OBJECT",
+        "properties": {
+            "control_relation": { "type": "STRING", "enum": ["aligned", "opposed", "neutral"] },
+            "lower_tf_value_location_vs_higher_tf": {
+                "type": "STRING",
+                "enum": ["above_higher_tf_value", "inside_higher_tf_value", "below_higher_tf_value"]
+            },
+            "lower_tf_range_location_vs_higher_tf": {
+                "type": "STRING",
+                "enum": ["above_higher_tf_range", "inside_higher_tf_range", "below_higher_tf_range"]
+            }
+        },
+        "required": ["control_relation", "lower_tf_value_location_vs_higher_tf", "lower_tf_range_location_vs_higher_tf"]
+    })
+}
+
+fn scan_v1_7_schema_gemini() -> Value {
+    json!({
+        "type": "OBJECT",
+        "properties": {
+            "schema_version": { "type": "STRING", "enum": ["scan_v1_7"] },
+            "meta": {
+                "type": "OBJECT",
+                "properties": {
+                    "symbol": { "type": "STRING" },
+                    "scan_ts_bucket": { "type": "STRING", "format": "date-time" }
+                },
+                "required": ["symbol", "scan_ts_bucket"]
+            },
+            "timeframes": {
+                "type": "OBJECT",
+                "properties": {
+                    "15m": scan_v1_7_timeframe_schema_gemini(),
+                    "4h": scan_v1_7_timeframe_schema_gemini(),
+                    "1d": scan_v1_7_timeframe_schema_gemini()
+                },
+                "required": ["15m", "4h", "1d"]
+            },
+            "cross_timeframe_map": {
+                "type": "OBJECT",
+                "properties": {
+                    "ownership_map": {
+                        "type": "OBJECT",
+                        "properties": {
+                            "broader_regime_owner": { "type": "STRING", "enum": ["buyers", "sellers", "balanced", "unclear"] },
+                            "active_swing_owner": { "type": "STRING", "enum": ["buyers", "sellers", "balanced", "unclear"] },
+                            "immediate_owner": { "type": "STRING", "enum": ["buyers", "sellers", "balanced", "unclear"] }
+                        },
+                        "required": ["broader_regime_owner", "active_swing_owner", "immediate_owner"]
+                    },
+                    "relationship_map": {
+                        "type": "OBJECT",
+                        "properties": {
+                            "15m_vs_4h": scan_v1_7_timeframe_relationship_schema_gemini(),
+                            "4h_vs_1d": scan_v1_7_timeframe_relationship_schema_gemini(),
+                            "15m_vs_1d": scan_v1_7_timeframe_relationship_schema_gemini()
+                        },
+                        "required": ["15m_vs_4h", "4h_vs_1d", "15m_vs_1d"]
+                    },
+                    "cross_timeframe_structure": {
+                        "type": "OBJECT",
+                        "properties": {
+                            "main_tension": { "type": "STRING" },
+                            "key_shared_levels": { "type": "ARRAY", "maxItems": 6, "items": scan_v1_7_key_level_schema_gemini() },
+                            "main_unresolved_factors": { "type": "ARRAY", "maxItems": 4, "items": { "type": "STRING" } }
+                        },
+                        "required": ["main_tension", "key_shared_levels", "main_unresolved_factors"]
+                    }
+                },
+                "required": ["ownership_map", "relationship_map", "cross_timeframe_structure"]
+            }
+        },
+        "required": ["schema_version", "meta", "timeframes", "cross_timeframe_map"]
+    })
+}
+
+fn ml_grok_entry_scan_schema() -> Value {
+    scan_v1_7_schema_openai()
 }
 
 fn ml_grok_entry_schema() -> Value {
@@ -3023,16 +4099,7 @@ fn ml_grok_management_schema() -> Value {
 }
 
 fn ml_gemini_entry_scan_schema() -> Value {
-    json!({
-        "type": "OBJECT",
-        "properties": {
-            "15m": scan_timeframe_schema_gemini(),
-            "4h": scan_timeframe_schema_gemini(),
-            "1d": scan_timeframe_schema_gemini(),
-            "scan_audit": scan_audit_schema_gemini()
-        },
-        "required": ["15m", "4h", "1d", "scan_audit"]
-    })
+    scan_v1_7_schema_gemini()
 }
 
 fn ml_gemini_entry_schema() -> Value {
@@ -3090,17 +4157,7 @@ fn ml_gemini_management_schema() -> Value {
 }
 
 fn ml_qwen_entry_scan_schema() -> Value {
-    json!({
-        "type": "object",
-        "additionalProperties": true,
-        "required": ["15m", "4h", "1d", "scan_audit"],
-        "properties": {
-            "15m": scan_timeframe_schema_openai(),
-            "4h": scan_timeframe_schema_openai(),
-            "1d": scan_timeframe_schema_openai(),
-            "scan_audit": scan_audit_schema_openai()
-        }
-    })
+    scan_v1_7_schema_openai()
 }
 
 fn ml_qwen_entry_schema() -> Value {
@@ -3135,17 +4192,7 @@ fn ml_qwen_management_schema() -> Value {
 }
 
 fn ml_custom_llm_entry_scan_schema() -> Value {
-    json!({
-        "type": "object",
-        "additionalProperties": false,
-        "required": ["15m", "4h", "1d", "scan_audit"],
-        "properties": {
-            "15m": scan_timeframe_schema_openai(),
-            "4h": scan_timeframe_schema_openai(),
-            "1d": scan_timeframe_schema_openai(),
-            "scan_audit": scan_audit_schema_openai()
-        }
-    })
+    scan_v1_7_schema_openai()
 }
 
 fn ml_custom_llm_entry_schema() -> Value {
@@ -3326,27 +4373,18 @@ async fn invoke_claude_batch(
     } = build_prompt_pair(input, prompt_template, entry_stage, prior_scan)?;
     let mut trace = provider_trace_with_prompt_input_capture(prompt_input_capture);
     let system = vec![ClaudeTextBlock::cacheable(system, "1h")];
+    let user_prefix =
+        prompt::user_prompt_prefix(input.management_mode, input.pending_order_mode, entry_stage);
+    let mut message_content = Vec::new();
+    if !user_prefix.is_empty() {
+        message_content.push(ClaudeTextBlock::cacheable(user_prefix.to_string(), "1h"));
+    }
+    message_content.push(ClaudeTextBlock::plain(
+        user.trim_start_matches(user_prefix).to_string(),
+    ));
     let messages = vec![ClaudeInputMessage {
         role: "user".to_string(),
-        content: vec![
-            ClaudeTextBlock::cacheable(
-                prompt::user_prompt_prefix(
-                    input.management_mode,
-                    input.pending_order_mode,
-                    entry_stage,
-                )
-                .to_string(),
-                "1h",
-            ),
-            ClaudeTextBlock::plain(
-                user.trim_start_matches(prompt::user_prompt_prefix(
-                    input.management_mode,
-                    input.pending_order_mode,
-                    entry_stage,
-                ))
-                .to_string(),
-            ),
-        ],
+        content: message_content,
     }];
     log_claude_token_stats(http_client, claude_cfg, model, input, &system, &messages).await;
     let params = ClaudeMessageRequest {
@@ -3984,81 +5022,205 @@ mod tests {
         })
     }
 
-    fn sample_scan_audit_tf(
-        direction_basis: &str,
-        recent_closed_bars_align_with_trend: bool,
-        cvd_slope_aligns_with_trend: bool,
-        current_partial_bar_aligns_with_trend: bool,
-        invalidation_level: Option<f64>,
-        range_width_vs_atr: &str,
-    ) -> Value {
-        json!({
-            "direction_basis": direction_basis,
-            "recent_closed_bars_align_with_trend": recent_closed_bars_align_with_trend,
-            "cvd_slope_aligns_with_trend": cvd_slope_aligns_with_trend,
-            "current_partial_bar_aligns_with_trend": current_partial_bar_aligns_with_trend,
-            "invalidation_level": invalidation_level,
-            "range_width_vs_atr": range_width_vs_atr
-        })
-    }
-
     fn sample_stage_1_scan() -> Value {
         json!({
-            "15m": sample_scan_tf(
-                "Bullish",
-                "strong",
-                1994.0,
-                2018.0,
-                &["15m ema bull", "cvd bullish"],
-                &["absorption bearish"],
-                "Break above 2018 extends local impulse",
-                "Loss of 1994 weakens trigger context"
-            ),
-            "4h": sample_scan_tf(
-                "Bullish",
-                "mixed",
-                1988.0,
-                2035.0,
-                &["4h ema bull", "higher support intact"],
-                &["whale bias bearish"],
-                "Acceptance above 2035 opens continuation",
-                "Failure back through 1988 breaks setup"
-            ),
-            "1d": sample_scan_tf(
-                "Sideways",
-                "mixed",
-                1960.0,
-                2050.0,
-                &["daily value area intact"],
-                &["trend/flow not fully aligned"],
-                "Breakout above 2050 improves macro structure",
-                "Loss of 1960 reopens downside auction"
-            ),
-            "scan_audit": {
-                "15m": sample_scan_audit_tf(
-                    "closed_bar_continuation",
-                    true,
-                    true,
-                    false,
-                    Some(1994.0),
-                    "normal"
-                ),
-                "4h": sample_scan_audit_tf(
-                    "mixed",
-                    true,
-                    true,
-                    true,
-                    Some(1988.0),
-                    "normal"
-                ),
-                "1d": sample_scan_audit_tf(
-                    "structural_inference",
-                    false,
-                    false,
-                    true,
-                    None,
-                    "wide"
-                )
+            "schema_version": "scan_v1_7",
+            "meta": {
+                "symbol": "TESTUSDT",
+                "scan_ts_bucket": "2026-03-18T07:00:00+00:00"
+            },
+            "timeframes": {
+                "15m": {
+                    "state": {
+                        "control_side": "buyers",
+                        "control_clarity": "mixed",
+                        "value_location": "inside_value",
+                        "range_state": "testing_range_high",
+                        "sponsorship_state": "active"
+                    },
+                    "flow_map": {
+                        "aggressive_side": "buyers",
+                        "absorption_side": "sellers",
+                        "trapped_side": "sellers",
+                        "role_observations": [
+                            {
+                                "role": "large_directional_flow",
+                                "observed_behavior": "buyers are lifting into local resistance with positive delta",
+                                "evidence": ["positive cvd", "range high is being tested"],
+                                "confidence": "medium"
+                            }
+                        ]
+                    },
+                    "structure_map": {
+                        "active_range": {"low": 1994.0, "high": 2018.0},
+                        "range_width_vs_atr": "normal",
+                        "dominant_demand_zone": {"low": 1994.0, "high": 1998.0, "reason": "local bid defense"},
+                        "dominant_supply_zone": {"low": 2015.0, "high": 2018.0, "reason": "nearby offer cap"},
+                        "key_levels": [
+                            {"price": 1994.0, "type": "support", "reason": "15m local floor"},
+                            {"price": 2018.0, "type": "resistance", "reason": "15m local cap"}
+                        ],
+                        "invalidation_level": 1994.0,
+                        "path_map": {
+                            "upside": {
+                                "first_objective_ref": {"ref_kind": "active_range_high", "price": 2018.0, "label": "15m range high"},
+                                "first_barrier_ref": {"ref_kind": "supply_zone_edge", "price": 2018.0, "label": "15m supply high"}
+                            },
+                            "downside": {
+                                "first_objective_ref": {"ref_kind": "active_range_low", "price": 1994.0, "label": "15m range low"},
+                                "first_barrier_ref": {"ref_kind": "demand_zone_edge", "price": 1994.0, "label": "15m demand low"}
+                            }
+                        }
+                    },
+                    "validation": {
+                        "read_basis": "closed_bar_continuation",
+                        "supporting_facts": ["15m ema bull", "cvd bullish"],
+                        "conflicting_facts": ["absorption bearish"],
+                        "recent_closed_bars_align_with_read": true,
+                        "cvd_slope_aligns_with_read": true,
+                        "current_partial_bar_aligns_with_read": false,
+                        "fragility_summary": "15m upside is active but still pressing into nearby supply."
+                    }
+                },
+                "4h": {
+                    "state": {
+                        "control_side": "buyers",
+                        "control_clarity": "mixed",
+                        "value_location": "accepted_above",
+                        "range_state": "inside_range",
+                        "sponsorship_state": "fragile"
+                    },
+                    "flow_map": {
+                        "aggressive_side": "buyers",
+                        "absorption_side": "sellers",
+                        "trapped_side": "none",
+                        "role_observations": [
+                            {
+                                "role": "higher_timeframe_sponsorship",
+                                "observed_behavior": "higher timeframe bids still support the swing but follow-through is not clean",
+                                "evidence": ["4h ema bull", "higher support intact"],
+                                "confidence": "medium"
+                            }
+                        ]
+                    },
+                    "structure_map": {
+                        "active_range": {"low": 1988.0, "high": 2035.0},
+                        "range_width_vs_atr": "normal",
+                        "dominant_demand_zone": {"low": 1988.0, "high": 1996.0, "reason": "4h defended support"},
+                        "dominant_supply_zone": {"low": 2028.0, "high": 2035.0, "reason": "4h upper supply"},
+                        "key_levels": [
+                            {"price": 1988.0, "type": "support", "reason": "4h defended support"},
+                            {"price": 2035.0, "type": "resistance", "reason": "4h upper cap"}
+                        ],
+                        "invalidation_level": 1988.0,
+                        "path_map": {
+                            "upside": {
+                                "first_objective_ref": {"ref_kind": "active_range_high", "price": 2035.0, "label": "4h range high"},
+                                "first_barrier_ref": {"ref_kind": "supply_zone_edge", "price": 2035.0, "label": "4h supply high"}
+                            },
+                            "downside": {
+                                "first_objective_ref": {"ref_kind": "active_range_low", "price": 1988.0, "label": "4h range low"},
+                                "first_barrier_ref": {"ref_kind": "demand_zone_edge", "price": 1988.0, "label": "4h demand low"}
+                            }
+                        }
+                    },
+                    "validation": {
+                        "read_basis": "mixed",
+                        "supporting_facts": ["4h ema bull", "higher support intact"],
+                        "conflicting_facts": ["whale bias bearish"],
+                        "recent_closed_bars_align_with_read": true,
+                        "cvd_slope_aligns_with_read": true,
+                        "current_partial_bar_aligns_with_read": true,
+                        "fragility_summary": "4h buyers still control, but sponsorship is not fully clean."
+                    }
+                },
+                "1d": {
+                    "state": {
+                        "control_side": "balanced",
+                        "control_clarity": "mixed",
+                        "value_location": "inside_value",
+                        "range_state": "inside_range",
+                        "sponsorship_state": "unresolved"
+                    },
+                    "flow_map": {
+                        "aggressive_side": "balanced",
+                        "absorption_side": "none",
+                        "trapped_side": "none",
+                        "role_observations": [
+                            {
+                                "role": "crowd_behavior",
+                                "observed_behavior": "daily participation is present but trend/flow are not fully aligned",
+                                "evidence": ["daily value area intact", "trend/flow not fully aligned"],
+                                "confidence": "low"
+                            }
+                        ]
+                    },
+                    "structure_map": {
+                        "active_range": {"low": 1960.0, "high": 2050.0},
+                        "range_width_vs_atr": "wide",
+                        "dominant_demand_zone": {"low": 1960.0, "high": 1980.0, "reason": "daily lower demand"},
+                        "dominant_supply_zone": {"low": 2040.0, "high": 2050.0, "reason": "daily upper supply"},
+                        "key_levels": [
+                            {"price": 1960.0, "type": "support", "reason": "daily lower support"},
+                            {"price": 2050.0, "type": "resistance", "reason": "daily upper resistance"}
+                        ],
+                        "invalidation_level": null,
+                        "path_map": {
+                            "upside": {
+                                "first_objective_ref": {"ref_kind": "active_range_high", "price": 2050.0, "label": "1d range high"},
+                                "first_barrier_ref": {"ref_kind": "supply_zone_edge", "price": 2050.0, "label": "1d supply high"}
+                            },
+                            "downside": {
+                                "first_objective_ref": {"ref_kind": "active_range_low", "price": 1960.0, "label": "1d range low"},
+                                "first_barrier_ref": {"ref_kind": "demand_zone_edge", "price": 1960.0, "label": "1d demand low"}
+                            }
+                        }
+                    },
+                    "validation": {
+                        "read_basis": "structural_inference",
+                        "supporting_facts": ["daily value area intact"],
+                        "conflicting_facts": ["trend/flow not fully aligned"],
+                        "recent_closed_bars_align_with_read": false,
+                        "cvd_slope_aligns_with_read": false,
+                        "current_partial_bar_aligns_with_read": true,
+                        "fragility_summary": "Daily backdrop is balanced and not yet cleanly sponsored."
+                    }
+                }
+            },
+            "cross_timeframe_map": {
+                "ownership_map": {
+                    "broader_regime_owner": "balanced",
+                    "active_swing_owner": "buyers",
+                    "immediate_owner": "buyers"
+                },
+                "relationship_map": {
+                    "15m_vs_4h": {
+                        "control_relation": "aligned",
+                        "lower_tf_value_location_vs_higher_tf": "inside_higher_tf_value",
+                        "lower_tf_range_location_vs_higher_tf": "inside_higher_tf_range"
+                    },
+                    "4h_vs_1d": {
+                        "control_relation": "neutral",
+                        "lower_tf_value_location_vs_higher_tf": "inside_higher_tf_value",
+                        "lower_tf_range_location_vs_higher_tf": "inside_higher_tf_range"
+                    },
+                    "15m_vs_1d": {
+                        "control_relation": "neutral",
+                        "lower_tf_value_location_vs_higher_tf": "inside_higher_tf_value",
+                        "lower_tf_range_location_vs_higher_tf": "inside_higher_tf_range"
+                    }
+                },
+                "cross_timeframe_structure": {
+                    "main_tension": "15m and 4h buyers are pressing higher while the 1d backdrop remains only partially sponsored.",
+                    "key_shared_levels": [
+                        {"price": 1988.0, "type": "support", "reason": "shared 4h support"},
+                        {"price": 2035.0, "type": "resistance", "reason": "shared 4h resistance"}
+                    ],
+                    "main_unresolved_factors": [
+                        "daily sponsorship is unresolved",
+                        "4h flow is constructive but not fully clean"
+                    ]
+                }
             }
         })
     }
@@ -4677,11 +5839,9 @@ mod tests {
                 .and_then(|v| v.as_str()),
             Some("string")
         );
-        assert!(
-            schema
-                .pointer("/properties/pending_context/properties/sl_noise_risk_15m")
-                .is_none()
-        );
+        assert!(schema
+            .pointer("/properties/pending_context/properties/sl_noise_risk_15m")
+            .is_none());
     }
 
     #[test]
@@ -4698,43 +5858,76 @@ mod tests {
                 Some(false),
                 "root should be strict for {prompt_template}"
             );
-            assert_eq!(
-                schema
-                    .pointer("/properties/15m/additionalProperties")
-                    .and_then(|v| v.as_bool()),
-                Some(false),
-                "15m should be strict for {prompt_template}"
-            );
-            assert_eq!(
-                schema
-                    .pointer("/properties/15m/properties/range/additionalProperties")
-                    .and_then(|v| v.as_bool()),
-                Some(false),
-                "range should be strict for {prompt_template}"
-            );
-            assert_eq!(
-                schema
-                    .pointer("/properties/15m/properties/supporting_signals/type")
-                    .and_then(|v| v.as_str()),
-                Some("array"),
-                "supporting_signals should exist for {prompt_template}"
-            );
-            assert_eq!(
-                schema
-                    .pointer("/properties/scan_audit/additionalProperties")
-                    .and_then(|v| v.as_bool()),
-                Some(false),
-                "scan_audit should be strict for {prompt_template}"
-            );
-            assert_eq!(
-                schema
-                    .pointer(
-                        "/properties/scan_audit/properties/15m/properties/direction_basis/type"
-                    )
-                    .and_then(|v| v.as_str()),
-                Some("string"),
-                "scan_audit.direction_basis should exist for {prompt_template}"
-            );
+            if prompt_template == "medium_large_opportunity" {
+                assert_eq!(
+                    schema
+                        .pointer("/properties/schema_version/enum/0")
+                        .and_then(|v| v.as_str()),
+                    Some("scan_v1_7")
+                );
+                assert_eq!(
+                    schema
+                        .pointer("/properties/timeframes/additionalProperties")
+                        .and_then(|v| v.as_bool()),
+                    Some(false)
+                );
+                assert_eq!(
+                    schema
+                        .pointer("/properties/timeframes/properties/15m/additionalProperties")
+                        .and_then(|v| v.as_bool()),
+                    Some(false)
+                );
+                assert_eq!(
+                    schema
+                        .pointer("/properties/timeframes/properties/15m/properties/flow_map/additionalProperties")
+                        .and_then(|v| v.as_bool()),
+                    Some(false)
+                );
+                assert_eq!(
+                    schema
+                        .pointer("/properties/cross_timeframe_map/additionalProperties")
+                        .and_then(|v| v.as_bool()),
+                    Some(false)
+                );
+            } else {
+                assert_eq!(
+                    schema
+                        .pointer("/properties/15m/additionalProperties")
+                        .and_then(|v| v.as_bool()),
+                    Some(false),
+                    "15m should be strict for {prompt_template}"
+                );
+                assert_eq!(
+                    schema
+                        .pointer("/properties/15m/properties/range/additionalProperties")
+                        .and_then(|v| v.as_bool()),
+                    Some(false),
+                    "range should be strict for {prompt_template}"
+                );
+                assert_eq!(
+                    schema
+                        .pointer("/properties/15m/properties/supporting_signals/type")
+                        .and_then(|v| v.as_str()),
+                    Some("array"),
+                    "supporting_signals should exist for {prompt_template}"
+                );
+                assert_eq!(
+                    schema
+                        .pointer("/properties/scan_audit/additionalProperties")
+                        .and_then(|v| v.as_bool()),
+                    Some(false),
+                    "scan_audit should be strict for {prompt_template}"
+                );
+                assert_eq!(
+                    schema
+                        .pointer(
+                            "/properties/scan_audit/properties/15m/properties/direction_basis/type"
+                        )
+                        .and_then(|v| v.as_str()),
+                    Some("string"),
+                    "scan_audit.direction_basis should exist for {prompt_template}"
+                );
+            }
         }
     }
 
@@ -4747,13 +5940,25 @@ mod tests {
                 super::prompt::EntryPromptStage::Scan,
                 prompt_template,
             );
-            assert!(contract.contains("`15m`, `4h`, `1d`, and `scan_audit`"));
-            assert!(contract.contains("`supporting_signals`"));
-            assert!(contract.contains("direction_basis"));
-            assert!(!contract.contains("`range_basis`"));
-            assert!(!contract.contains("`range_role_used`"));
-            assert!(!contract.contains("`decision`, `reason`, and `scan`"));
-            assert!(!contract.contains("story"));
+            if prompt_template == "medium_large_opportunity" {
+                assert!(contract
+                    .contains("`schema_version`, `meta`, `timeframes`, and `cross_timeframe_map`"));
+                assert!(contract.contains("`scan_v1_7`"));
+                assert!(contract.contains("`state`, `flow_map`, `structure_map`, and `validation`"));
+                assert!(contract.contains(
+                    "`ownership_map`, `relationship_map`, and `cross_timeframe_structure`"
+                ));
+                assert!(!contract.contains("scan_audit"));
+                assert!(!contract.contains("supporting_signals"));
+            } else {
+                assert!(contract.contains("`15m`, `4h`, `1d`, and `scan_audit`"));
+                assert!(contract.contains("`supporting_signals`"));
+                assert!(contract.contains("direction_basis"));
+                assert!(!contract.contains("`range_basis`"));
+                assert!(!contract.contains("`range_role_used`"));
+                assert!(!contract.contains("`decision`, `reason`, and `scan`"));
+                assert!(!contract.contains("story"));
+            }
         }
     }
 
@@ -5137,6 +6342,14 @@ mod tests {
             .prompt_input_capture
             .expect("capture should exist for entry finalize");
         assert_eq!(capture.stage, "finalize");
+        assert_eq!(
+            super::prompt::user_prompt_prefix(
+                false,
+                false,
+                super::prompt::EntryPromptStage::Finalize,
+            ),
+            ""
+        );
         assert_eq!(
             capture
                 .stage_1_setup_scan_json
