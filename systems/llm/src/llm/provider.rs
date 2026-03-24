@@ -186,6 +186,23 @@ struct ProviderFailure {
     trace: ProviderTrace,
 }
 
+fn format_error_chain(error: &anyhow::Error) -> String {
+    error
+        .chain()
+        .map(|cause| cause.to_string())
+        .collect::<Vec<_>>()
+        .join(" | caused_by: ")
+}
+
+fn custom_llm_request_id(stage_name: &str, attempt: u32) -> String {
+    format!(
+        "llm-{}-a{}-{}",
+        stage_name,
+        attempt,
+        Uuid::new_v4().simple()
+    )
+}
+
 impl ProviderTrace {
     fn push_entry_stage_event(&mut self, event: Value) {
         self.entry_stage_trace.push(event);
@@ -1692,16 +1709,30 @@ async fn invoke_custom_llm_stage(
     let mut last_err: Option<ProviderFailure> = None;
     for attempt in 0..max_attempts {
         if attempt > 0 {
+            let error_chain = last_err
+                .as_ref()
+                .map(|failure| format_error_chain(&failure.error))
+                .unwrap_or_else(|| "unknown retryable failure".to_string());
             tracing::warn!(
-                "custom_llm retry attempt {} after retryable error stage={}",
+                "custom_llm retry attempt {} after retryable error stage={} error_chain={}",
                 attempt,
-                stage_name
+                stage_name,
+                error_chain
             );
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         }
+        let request_id = custom_llm_request_id(stage_name, attempt);
+        tracing::info!(
+            "custom_llm chat completions request start stage={} attempt={} request_id={} url={}",
+            stage_name,
+            attempt,
+            request_id,
+            url
+        );
         let mut request = client
             .post(&url)
             .bearer_auth(custom_llm_cfg.resolved_api_key())
+            .header("x-request-id", &request_id)
             .json(&req);
         if is_loopback {
             request = request.header("Connection", "close");
@@ -1709,8 +1740,16 @@ async fn invoke_custom_llm_stage(
         let response = match request.send().await {
             Ok(r) => r,
             Err(e) => {
+                let error = anyhow::Error::from(e).context("call custom_llm chat completions api");
+                tracing::warn!(
+                    "custom_llm chat completions request failed stage={} attempt={} request_id={} error_chain={}",
+                    stage_name,
+                    attempt,
+                    request_id,
+                    format_error_chain(&error)
+                );
                 last_err = Some(ProviderFailure {
-                    error: anyhow::Error::from(e).context("call custom_llm chat completions api"),
+                    error,
                     trace: trace.clone(),
                 });
                 continue;
@@ -1721,8 +1760,10 @@ async fn invoke_custom_llm_stage(
         if status.is_server_error() {
             let body = response.text().await.unwrap_or_default();
             tracing::warn!(
-                "custom_llm chat completions server error stage={} status={} body={}",
+                "custom_llm chat completions server error stage={} attempt={} request_id={} status={} body={}",
                 stage_name,
+                attempt,
+                request_id,
                 status,
                 body
             );
@@ -1752,15 +1793,18 @@ async fn invoke_custom_llm_stage(
         let response_text = match response.text().await {
             Ok(text) => text,
             Err(error) => {
+                let error = anyhow::Error::from(error)
+                    .context("read custom_llm chat completions response body");
                 tracing::warn!(
-                    "custom_llm chat completions body read failed stage={} status={} error={}",
+                    "custom_llm chat completions body read failed stage={} attempt={} request_id={} status={} error_chain={}",
                     stage_name,
+                    attempt,
+                    request_id,
                     status,
-                    error
+                    format_error_chain(&error)
                 );
                 last_err = Some(ProviderFailure {
-                    error: anyhow::Error::from(error)
-                        .context("read custom_llm chat completions response body"),
+                    error,
                     trace: trace.clone(),
                 });
                 continue;
@@ -1769,8 +1813,10 @@ async fn invoke_custom_llm_stage(
 
         if response_text.trim().is_empty() {
             tracing::warn!(
-                "custom_llm chat completions returned empty body stage={} status={}",
+                "custom_llm chat completions returned empty body stage={} attempt={} request_id={} status={}",
                 stage_name,
+                attempt,
+                request_id,
                 status
             );
             last_err = Some(ProviderFailure {
@@ -1780,25 +1826,30 @@ async fn invoke_custom_llm_stage(
             continue;
         }
 
-        let body: QwenChatCompletionsResponse =
-            match serde_json::from_str::<QwenChatCompletionsResponse>(&response_text) {
-                Ok(body) => body,
-                Err(error) => {
+        let body: QwenChatCompletionsResponse = match serde_json::from_str::<
+            QwenChatCompletionsResponse,
+        >(&response_text)
+        {
+            Ok(body) => body,
+            Err(error) => {
+                let error = anyhow::Error::from(error)
+                    .context("decode custom_llm chat completions response body");
                     tracing::warn!(
-                    "custom_llm chat completions decode failed stage={} status={} error={} body={}",
-                    stage_name,
-                    status,
+                        "custom_llm chat completions decode failed stage={} attempt={} request_id={} status={} error_chain={} body={}",
+                        stage_name,
+                        attempt,
+                        request_id,
+                        status,
+                        format_error_chain(&error),
+                        response_text
+                    );
+                last_err = Some(ProviderFailure {
                     error,
-                    response_text
-                );
-                    last_err = Some(ProviderFailure {
-                        error: anyhow::Error::from(error)
-                            .context("decode custom_llm chat completions response body"),
-                        trace: trace.clone(),
-                    });
-                    continue;
-                }
-            };
+                    trace: trace.clone(),
+                });
+                continue;
+            }
+        };
 
         let text = body
             .choices
@@ -1807,8 +1858,10 @@ async fn invoke_custom_llm_stage(
             .unwrap_or_default();
         if text.is_empty() {
             tracing::warn!(
-                "custom_llm chat completions response text is empty stage={} status={}",
+                "custom_llm chat completions response text is empty stage={} attempt={} request_id={} status={}",
                 stage_name,
+                attempt,
+                request_id,
                 status
             );
             last_err = Some(ProviderFailure {
