@@ -62,21 +62,34 @@ It is an objective market-state snapshot.
 FIELD MEANINGS
 
 `sponsorship_state`
-- This describes whether observed flow is actually being accepted and structurally carried by price on that timeframe.
+- This describes whether observed flow is being accepted and structurally carried by price on that timeframe, and how clean or fragile that sponsorship currently is.
 
 `trapped_side`
-- Use this when one side has already lost advantageous structural positioning and failed acceptance or failed continuation is evident.
+- Use this when one side has already lost advantageous structural positioning and the market is showing failed acceptance, failed continuation, or increasingly forced exit risk for that side.
 
 `path_map`
 - `first_objective_ref` is the nearest structural magnet if the current read continues.
 - `first_barrier_ref` is the first meaningful opposing structure likely to resist or degrade that path.
 - These are not the same thing.
 
+`role_observations`
+- Keep `observed_behavior` evidence-first and market-native.
+- Describe observable behavior and market effect, not hidden motives or participant stories.
+
 `validation`
 - `supporting_facts` should record the main facts that genuinely support the current read.
 - `conflicting_facts` should record materially relevant disagreements that make the read less clean.
 - If PVS and TPO disagree in a way that changes the read, that belongs in `conflicting_facts`.
 - If spot and futures diverge in a way that changes the read, that also belongs in `conflicting_facts` or `fragility_summary`.
+
+OUTPUT STYLE
+
+- Keep `observed_behavior`, `reason`, `fragility_summary`, `main_tension`, and `main_unresolved_factors` short, market-native, and evidence-first.
+- Prefer short factual phrases over long explanatory sentences.
+- Avoid repeating the same market fact across `role_observations`, zone `reason`, `key_levels.reason`, `validation`, and `cross_timeframe_structure`.
+- `key_levels.reason` should identify the level's structural role, not restate the full market read.
+- `dominant_*_zone.reason` should explain why the zone exists, not repeat validation conflicts.
+- `role_observations` should describe observed behavior only, not summarize the whole timeframe.
 
 Use `supporting_context` only when it materially sharpens, weakens, or changes the scan.
 Do not cite it mechanically.
@@ -118,9 +131,11 @@ BEFORE YOU OUTPUT, VERIFY
 
 - Did you keep each timeframe grounded in observable control, value, structure, flow, and validation?
 - If the market is mixed, conflicted, or unclear, did you say so explicitly?
-- Did you keep `active_range` tied to the live rotation bracket rather than historical extremes?
-- Does `sponsorship_state` reflect price-accepted flow rather than delta alone?
-- If you used `trapped_side`, does it reflect real structural entrapment rather than simple weakness, overhead resistance, or general vulnerability?
+- Did you keep `active_range` tied to the live rotation bracket?
+- Does `sponsorship_state` describe the quality of price-accepted flow on that timeframe, rather than just the presence of directional flow?
+- If you used `trapped_side`, does it reflect real structural entrapment or growing forced-exit risk, rather than simple weakness or temporary pressure?
+- Are `role_observations` written as evidence-first market observations rather than participant stories?
+- Did you keep descriptive fields short and avoid repeating the same market fact across blocks?
 - Does `path_map` clearly distinguish structural objective from structural barrier?
 - Did you surface materially relevant PVS/TPO or spot/futures disagreement inside `validation` when they changed the read?
 
