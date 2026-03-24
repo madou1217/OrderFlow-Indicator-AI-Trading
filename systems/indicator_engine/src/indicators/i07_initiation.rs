@@ -21,7 +21,7 @@ const RDELTA_MIN: f64 = 0.20;
 const MIN_FOLLOW_MINUTES: usize = 5;
 const HOLD_BREAK_TICKS: f64 = 1.0;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct InitiationEventData {
     pub direction: i16,
     pub event_type: String,
@@ -48,29 +48,20 @@ pub(crate) struct InitiationEventData {
     pub payload: Value,
 }
 
-pub(crate) fn detect_initiation_all_history(ctx: &IndicatorContext) -> Vec<InitiationEventData> {
-    let n = ctx.history_futures.len().min(ctx.history_spot.len());
+fn compute_initiation_all_history(ctx: &IndicatorContext) -> Vec<InitiationEventData> {
+    let series = ctx.basic_event_history_series();
+    let n = series.n;
     if n < ZDELTA_LOOKBACK + MIN_FOLLOW_MINUTES + 3 {
         return Vec::new();
     }
     let fut = &ctx.history_futures[ctx.history_futures.len() - n..];
-    let spot = &ctx.history_spot[ctx.history_spot.len() - n..];
-    let high = fut
-        .iter()
-        .map(|h| h.high_price.or(h.last_price).unwrap_or(0.0))
-        .collect::<Vec<_>>();
-    let low = fut
-        .iter()
-        .map(|h| h.low_price.or(h.last_price).unwrap_or(0.0))
-        .collect::<Vec<_>>();
-    let close = fut
-        .iter()
-        .map(|h| h.close_price.or(h.last_price).unwrap_or(0.0))
-        .collect::<Vec<_>>();
-    let delta = fut.iter().map(|h| h.delta).collect::<Vec<_>>();
-    let rdelta = fut.iter().map(|h| h.relative_delta).collect::<Vec<_>>();
-    let spot_rdelta = spot.iter().map(|h| h.relative_delta).collect::<Vec<_>>();
-    let spot_cvd = spot.iter().map(|h| h.cvd).collect::<Vec<_>>();
+    let high = &series.high;
+    let low = &series.low;
+    let close = &series.close;
+    let delta = &series.delta;
+    let rdelta = &series.rdelta;
+    let spot_rdelta = &series.spot_rdelta;
+    let spot_cvd = &series.spot_cvd;
 
     let mut zdelta = vec![None; n];
     for i in (ZDELTA_LOOKBACK - 1)..n {
@@ -199,15 +190,8 @@ pub(crate) fn detect_initiation_all_history(ctx: &IndicatorContext) -> Vec<Initi
         let spot_cvd_change = spot_cvd[end_idx] - spot_cvd[i];
         let spot_break_confirm =
             (dir as f64 * spot_rd_mean) >= 0.05 && (dir as f64 * spot_cvd_change) >= 0.0;
-        let spot_whale_confirm = spot[i..=end_idx]
-            .iter()
-            .map(|h| {
-                let px = h.close_price.or(h.last_price).unwrap_or_default();
-                h.delta * px
-            })
-            .sum::<f64>()
-            * dir as f64
-            > 0.0;
+        let spot_whale_confirm =
+            series.spot_whale_notional[i..=end_idx].iter().sum::<f64>() * dir as f64 > 0.0;
         let strength_score_xmk = 0.80 * score
             + 0.15 * clip01(dir as f64 * spot_rd_mean)
             + 0.05 * if spot_whale_confirm { 1.0 } else { 0.0 };
@@ -273,11 +257,18 @@ pub(crate) fn detect_initiation_all_history(ctx: &IndicatorContext) -> Vec<Initi
     out
 }
 
+pub(crate) fn detect_initiation_all_history(
+    ctx: &IndicatorContext,
+) -> std::sync::Arc<Vec<InitiationEventData>> {
+    ctx.initiation_all_events_or_init(compute_initiation_all_history)
+}
+
 pub(crate) fn detect_initiation_events(ctx: &IndicatorContext) -> Vec<InitiationEventData> {
     let current_available_ts = ctx.ts_bucket + Duration::minutes(1);
     detect_initiation_all_history(ctx)
-        .into_iter()
+        .iter()
         .filter(|event| event.confirm_ts == current_available_ts)
+        .cloned()
         .collect()
 }
 
@@ -445,17 +436,188 @@ impl Indicator for I07Initiation {
             ..Default::default()
         };
 
-        append_initiation_rows(&mut out, &ctx.symbol, self.code(), &all_events);
+        append_initiation_rows(&mut out, &ctx.symbol, self.code(), all_events.as_slice());
         out
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{initiation_event_json, InitiationEventData};
+    use super::{
+        compute_initiation_all_history, detect_initiation_all_history, detect_initiation_events,
+        initiation_event_json, InitiationEventData,
+    };
+    use crate::indicators::context::{
+        DivergenceSigTestMode, IndicatorContext, IndicatorSharedCaches,
+    };
     use crate::indicators::shared::event_ids::build_initiation_event_id;
+    use crate::ingest::decoder::MarketKind;
+    use crate::runtime::state_store::{LevelAgg, MinuteHistory, MinuteWindowData};
     use chrono::{TimeZone, Utc};
     use serde_json::json;
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    fn sample_minute(
+        ts_bucket: chrono::DateTime<Utc>,
+        open: f64,
+        high: f64,
+        low: f64,
+        close: f64,
+        buy_qty: f64,
+        sell_qty: f64,
+        cvd: f64,
+    ) -> MinuteHistory {
+        let mut profile = BTreeMap::new();
+        profile.insert(
+            100,
+            LevelAgg {
+                buy_qty: 12.0,
+                sell_qty: 1.0,
+            },
+        );
+        profile.insert(
+            101,
+            LevelAgg {
+                buy_qty: 12.0,
+                sell_qty: 1.0,
+            },
+        );
+        profile.insert(
+            102,
+            LevelAgg {
+                buy_qty: 12.0,
+                sell_qty: 1.0,
+            },
+        );
+        profile.insert(
+            103,
+            LevelAgg {
+                buy_qty: 1.0,
+                sell_qty: 12.0,
+            },
+        );
+        MinuteHistory {
+            ts_bucket,
+            market: MarketKind::Futures,
+            open_price: Some(open),
+            high_price: Some(high),
+            low_price: Some(low),
+            close_price: Some(close),
+            last_price: Some(close),
+            buy_qty,
+            sell_qty,
+            total_qty: buy_qty + sell_qty,
+            total_notional: (buy_qty + sell_qty) * close,
+            delta: buy_qty - sell_qty,
+            relative_delta: if (buy_qty + sell_qty) > 0.0 {
+                (buy_qty - sell_qty) / (buy_qty + sell_qty)
+            } else {
+                0.0
+            },
+            force_liq: BTreeMap::new(),
+            ofi: 0.0,
+            spread_twa: None,
+            topk_depth_twa: None,
+            obi_twa: None,
+            obi_l1_twa: None,
+            obi_k_twa: None,
+            obi_k_dw_twa: None,
+            obi_k_dw_close: None,
+            obi_k_dw_change: None,
+            obi_k_dw_adj_twa: None,
+            bbo_updates: 0,
+            microprice_twa: None,
+            microprice_classic_twa: None,
+            microprice_kappa_twa: None,
+            microprice_adj_twa: None,
+            cvd,
+            vpin: 0.0,
+            avwap_minute: Some(close),
+            whale_trade_count: 0,
+            whale_buy_count: 0,
+            whale_sell_count: 0,
+            whale_notional_total: 0.0,
+            whale_notional_buy: 0.0,
+            whale_notional_sell: 0.0,
+            whale_qty_eth_total: 0.0,
+            whale_qty_eth_buy: 0.0,
+            whale_qty_eth_sell: 0.0,
+            whale_max_single_notional: 0.0,
+            profile,
+        }
+    }
+
+    fn test_ctx(
+        ts_bucket: chrono::DateTime<Utc>,
+        history_futures: Vec<MinuteHistory>,
+        history_spot: Vec<MinuteHistory>,
+    ) -> IndicatorContext {
+        IndicatorContext {
+            ts_bucket,
+            symbol: "TESTUSDT".to_string(),
+            futures: MinuteWindowData::empty(MarketKind::Futures, ts_bucket),
+            spot: MinuteWindowData::empty(MarketKind::Spot, ts_bucket),
+            history_futures,
+            history_spot,
+            trade_history_futures: Vec::new(),
+            trade_history_spot: Vec::new(),
+            latest_mark: None,
+            latest_funding: None,
+            funding_changes_in_window: Vec::new(),
+            funding_points_in_window: Vec::new(),
+            mark_points_in_window: Vec::new(),
+            funding_changes_recent: Vec::new(),
+            funding_points_recent: Vec::new(),
+            mark_points_recent: Vec::new(),
+            whale_threshold_usdt: 300_000.0,
+            kline_history_bars_1m: 1024,
+            kline_history_bars_15m: 120,
+            kline_history_bars_4h: 120,
+            kline_history_bars_1d: 120,
+            kline_history_fill_1d_from_db: true,
+            fvg_windows: vec!["15m".to_string(), "4h".to_string(), "1d".to_string()],
+            fvg_fill_from_db: true,
+            fvg_db_bars_4h: 256,
+            fvg_db_bars_1d: 256,
+            fvg_epsilon_gap_ticks: 2,
+            fvg_atr_lookback: 14,
+            fvg_min_body_ratio: 0.60,
+            fvg_min_impulse_atr_ratio: 1.30,
+            fvg_min_gap_atr_ratio: 0.15,
+            fvg_max_gap_atr_ratio: 1.20,
+            fvg_mitigated_fill_threshold: 0.80,
+            fvg_invalid_close_bars: 1,
+            kline_history_futures_4h_db: Vec::new(),
+            kline_history_futures_1d_db: Vec::new(),
+            kline_history_spot_4h_db: Vec::new(),
+            kline_history_spot_1d_db: Vec::new(),
+            tpo_rows_nb: 64,
+            tpo_value_area_pct: 0.70,
+            tpo_session_windows: vec!["4h".to_string(), "1d".to_string()],
+            tpo_ib_minutes: 60,
+            tpo_dev_output_windows: vec!["15m".to_string(), "1h".to_string()],
+            rvwap_windows: vec!["15m".to_string(), "4h".to_string(), "1d".to_string()],
+            rvwap_output_windows: vec!["15m".to_string(), "1h".to_string()],
+            rvwap_min_samples: 5,
+            high_volume_pulse_z_windows: vec!["1h".to_string(), "4h".to_string(), "1d".to_string()],
+            high_volume_pulse_summary_windows: vec!["15m".to_string(), "1h".to_string()],
+            high_volume_pulse_min_samples: 5,
+            ema_base_periods: vec![13, 21, 34],
+            ema_htf_periods: vec![100, 200],
+            ema_htf_windows: vec!["4h".to_string(), "1d".to_string()],
+            ema_output_windows: vec!["15m".to_string(), "1h".to_string()],
+            ema_fill_from_db: true,
+            ema_db_bars_4h: 256,
+            ema_db_bars_1d: 256,
+            divergence_sig_test_mode: DivergenceSigTestMode::Threshold,
+            divergence_bootstrap_b: 200,
+            divergence_bootstrap_block_len: 5,
+            divergence_p_value_threshold: 0.05,
+            window_codes: vec!["1m".to_string()],
+            shared_caches: Arc::new(IndicatorSharedCaches::default()),
+        }
+    }
 
     #[test]
     fn initiation_event_json_exposes_follow_through_fields() {
@@ -546,5 +708,56 @@ mod tests {
                 .and_then(|v| v.as_f64()),
             Some(1.5)
         );
+    }
+
+    #[test]
+    fn cached_initiation_all_history_matches_direct_compute() {
+        let base = Utc.with_ymd_and_hms(2026, 3, 9, 2, 0, 0).unwrap();
+        let history_futures = (0..12)
+            .map(|i| {
+                let ts = base + chrono::Duration::minutes(i as i64);
+                sample_minute(
+                    ts,
+                    100.0 + i as f64 * 0.05,
+                    101.0 + i as f64 * 0.05,
+                    99.0 + i as f64 * 0.05,
+                    100.3 + i as f64 * 0.05,
+                    6.0 + i as f64,
+                    3.0 + (i % 2) as f64,
+                    i as f64,
+                )
+            })
+            .collect::<Vec<_>>();
+        let history_spot = (0..12)
+            .map(|i| {
+                let ts = base + chrono::Duration::minutes(i as i64);
+                sample_minute(
+                    ts,
+                    99.8 + i as f64 * 0.05,
+                    100.8 + i as f64 * 0.05,
+                    98.8 + i as f64 * 0.05,
+                    100.1 + i as f64 * 0.05,
+                    4.0 + i as f64,
+                    2.5 + (i % 3) as f64,
+                    (i * 2) as f64,
+                )
+            })
+            .collect::<Vec<_>>();
+        let ctx = test_ctx(
+            base + chrono::Duration::minutes(11),
+            history_futures,
+            history_spot,
+        );
+
+        let direct = compute_initiation_all_history(&ctx);
+        let cached = detect_initiation_all_history(&ctx);
+        assert_eq!(direct, *cached);
+
+        let expected_current = direct
+            .iter()
+            .filter(|event| event.confirm_ts == ctx.ts_bucket + chrono::Duration::minutes(1))
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(detect_initiation_events(&ctx), expected_current);
     }
 }

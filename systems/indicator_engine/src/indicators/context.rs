@@ -1,9 +1,14 @@
+use crate::indicators::i05_orderbook_depth::OrderbookDepthPrecomputed;
+use crate::indicators::i06_absorption::AbsorptionEventData;
+use crate::indicators::i07_initiation::InitiationEventData;
+use crate::indicators::i12_buying_exhaustion::ExhaustionEventData;
 use crate::runtime::state_store::{
     FundingChange, LatestFundingState, LatestMarkState, LevelAgg, MinuteHistory, MinuteWindowData,
     WindowBundle,
 };
 use chrono::{DateTime, Duration, Utc};
 use serde_json::Value;
+use std::sync::{Arc, OnceLock};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DivergenceSigTestMode {
@@ -135,6 +140,30 @@ pub struct IndicatorContext {
     pub divergence_bootstrap_block_len: usize,
     pub divergence_p_value_threshold: f64,
     pub window_codes: Vec<String>,
+    pub shared_caches: Arc<IndicatorSharedCaches>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BasicEventHistorySeries {
+    pub n: usize,
+    pub open: Vec<f64>,
+    pub high: Vec<f64>,
+    pub low: Vec<f64>,
+    pub close: Vec<f64>,
+    pub delta: Vec<f64>,
+    pub rdelta: Vec<f64>,
+    pub spot_rdelta: Vec<f64>,
+    pub spot_cvd: Vec<f64>,
+    pub spot_whale_notional: Vec<f64>,
+}
+
+#[derive(Debug, Default)]
+pub struct IndicatorSharedCaches {
+    basic_event_history_series: OnceLock<Arc<BasicEventHistorySeries>>,
+    absorption_all_events: OnceLock<Arc<Vec<AbsorptionEventData>>>,
+    initiation_all_events: OnceLock<Arc<Vec<InitiationEventData>>>,
+    exhaustion_all_events: OnceLock<Arc<Vec<ExhaustionEventData>>>,
+    orderbook_depth_precomputed: OnceLock<Arc<OrderbookDepthPrecomputed>>,
 }
 
 #[derive(Debug, Clone)]
@@ -228,7 +257,58 @@ impl IndicatorContext {
             divergence_bootstrap_block_len: options.divergence_bootstrap_block_len,
             divergence_p_value_threshold: options.divergence_p_value_threshold,
             window_codes: options.window_codes.clone(),
+            shared_caches: Arc::new(IndicatorSharedCaches::default()),
         }
+    }
+
+    pub(crate) fn basic_event_history_series(&self) -> Arc<BasicEventHistorySeries> {
+        self.shared_caches
+            .basic_event_history_series
+            .get_or_init(|| Arc::new(BasicEventHistorySeries::from_context(self)))
+            .clone()
+    }
+
+    pub(crate) fn absorption_all_events_or_init<F>(&self, build: F) -> Arc<Vec<AbsorptionEventData>>
+    where
+        F: FnOnce(&IndicatorContext) -> Vec<AbsorptionEventData>,
+    {
+        self.shared_caches
+            .absorption_all_events
+            .get_or_init(|| Arc::new(build(self)))
+            .clone()
+    }
+
+    pub(crate) fn initiation_all_events_or_init<F>(&self, build: F) -> Arc<Vec<InitiationEventData>>
+    where
+        F: FnOnce(&IndicatorContext) -> Vec<InitiationEventData>,
+    {
+        self.shared_caches
+            .initiation_all_events
+            .get_or_init(|| Arc::new(build(self)))
+            .clone()
+    }
+
+    pub(crate) fn exhaustion_all_events_or_init<F>(&self, build: F) -> Arc<Vec<ExhaustionEventData>>
+    where
+        F: FnOnce(&IndicatorContext) -> Vec<ExhaustionEventData>,
+    {
+        self.shared_caches
+            .exhaustion_all_events
+            .get_or_init(|| Arc::new(build(self)))
+            .clone()
+    }
+
+    pub(crate) fn orderbook_depth_precomputed_or_init<F>(
+        &self,
+        build: F,
+    ) -> Arc<OrderbookDepthPrecomputed>
+    where
+        F: FnOnce(&IndicatorContext) -> OrderbookDepthPrecomputed,
+    {
+        self.shared_caches
+            .orderbook_depth_precomputed
+            .get_or_init(|| Arc::new(build(self)))
+            .clone()
     }
 
     pub fn enabled_windows(&self) -> Vec<(String, i64)> {
@@ -444,6 +524,60 @@ impl IndicatorContext {
                         .flatten()
                 })
             })
+    }
+}
+
+impl BasicEventHistorySeries {
+    fn from_context(ctx: &IndicatorContext) -> Self {
+        let n = ctx.history_futures.len().min(ctx.history_spot.len());
+        let fut = &ctx.history_futures[ctx.history_futures.len().saturating_sub(n)..];
+        let spot = &ctx.history_spot[ctx.history_spot.len().saturating_sub(n)..];
+
+        let open = fut
+            .iter()
+            .map(|h| {
+                h.open_price
+                    .or(h.close_price)
+                    .or(h.last_price)
+                    .unwrap_or(0.0)
+            })
+            .collect::<Vec<_>>();
+        let high = fut
+            .iter()
+            .map(|h| h.high_price.or(h.last_price).unwrap_or(0.0))
+            .collect::<Vec<_>>();
+        let low = fut
+            .iter()
+            .map(|h| h.low_price.or(h.last_price).unwrap_or(0.0))
+            .collect::<Vec<_>>();
+        let close = fut
+            .iter()
+            .map(|h| h.close_price.or(h.last_price).unwrap_or(0.0))
+            .collect::<Vec<_>>();
+        let delta = fut.iter().map(|h| h.delta).collect::<Vec<_>>();
+        let rdelta = fut.iter().map(|h| h.relative_delta).collect::<Vec<_>>();
+        let spot_rdelta = spot.iter().map(|h| h.relative_delta).collect::<Vec<_>>();
+        let spot_cvd = spot.iter().map(|h| h.cvd).collect::<Vec<_>>();
+        let spot_whale_notional = spot
+            .iter()
+            .map(|h| {
+                let px = h.close_price.or(h.last_price).unwrap_or(0.0);
+                h.delta * px
+            })
+            .collect::<Vec<_>>();
+
+        Self {
+            n,
+            open,
+            high,
+            low,
+            close,
+            delta,
+            rdelta,
+            spot_rdelta,
+            spot_cvd,
+            spot_whale_notional,
+        }
     }
 }
 

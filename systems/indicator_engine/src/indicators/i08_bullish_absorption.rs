@@ -18,8 +18,9 @@ impl Indicator for I08BullishAbsorption {
 
     fn evaluate(&self, ctx: &IndicatorContext) -> IndicatorComputation {
         let all_events = detect_absorption_all_history(ctx)
-            .into_iter()
+            .iter()
             .filter(|e| e.direction > 0)
+            .cloned()
             .collect::<Vec<_>>();
         let window_view = build_event_window_view(
             ctx.ts_bucket,

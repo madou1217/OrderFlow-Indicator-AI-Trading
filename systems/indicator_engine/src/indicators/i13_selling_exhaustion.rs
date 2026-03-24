@@ -15,8 +15,9 @@ impl Indicator for I13SellingExhaustion {
 
     fn evaluate(&self, ctx: &IndicatorContext) -> IndicatorComputation {
         let all_events = detect_exhaustion_all_history(ctx)
-            .into_iter()
+            .iter()
             .filter(|e| e.event_type == "selling_exhaustion")
+            .cloned()
             .collect::<Vec<_>>();
         let window_view = build_event_window_view(
             ctx.ts_bucket,

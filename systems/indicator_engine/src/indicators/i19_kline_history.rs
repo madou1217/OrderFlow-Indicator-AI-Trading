@@ -378,6 +378,7 @@ mod tests {
             whale_qty_eth_total: 0.0,
             whale_qty_eth_buy: 0.0,
             whale_qty_eth_sell: 0.0,
+            whale_max_single_notional: 0.0,
             profile: BTreeMap::new(),
         }
     }

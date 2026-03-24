@@ -106,7 +106,7 @@ impl Dispatcher {
 
     pub async fn process_window(
         &self,
-        ctx: &IndicatorContext,
+        ctx: Arc<IndicatorContext>,
         mode: DispatchMode,
     ) -> Result<Vec<IndicatorSnapshotRow>> {
         let total_started_at = Instant::now();
@@ -205,7 +205,7 @@ impl Dispatcher {
                 .write_liquidation_levels(ctx.ts_bucket, &ctx.symbol, &liq_rows)
                 .await?;
             let level_write_ms = level_started_at.elapsed().as_millis();
-            let event_history_start_ts = event_history_start_ts(ctx);
+            let event_history_start_ts = event_history_start_ts(&ctx);
             let event_history_end_ts = ctx.ts_bucket + chrono::Duration::minutes(1);
             let event_started_at = Instant::now();
             self.event_writer
@@ -250,7 +250,7 @@ impl Dispatcher {
                 .await?;
             let event_write_ms = event_started_at.elapsed().as_millis();
             let feature_started_at = Instant::now();
-            self.feature_writer.write_all(ctx).await?;
+            self.feature_writer.write_all(&ctx).await?;
             let feature_write_ms = feature_started_at.elapsed().as_millis();
             let progress_started_at = Instant::now();
             if let Some(messages) = live_messages.as_ref() {
@@ -343,9 +343,9 @@ impl Dispatcher {
 
 fn spawn_group_worker(
     indicators: Vec<Arc<dyn Indicator>>,
-    ctx: IndicatorContext,
+    ctx: Arc<IndicatorContext>,
 ) -> JoinHandle<GroupOutput> {
-    tokio::task::spawn_blocking(move || evaluate_indicator_group(indicators, &ctx))
+    tokio::task::spawn_blocking(move || evaluate_indicator_group(indicators, ctx.as_ref()))
 }
 
 fn event_history_start_ts(ctx: &IndicatorContext) -> chrono::DateTime<chrono::Utc> {
