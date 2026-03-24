@@ -643,7 +643,7 @@ fn default_call_interval_secs() -> u64 {
 }
 
 fn default_request_timeout_secs() -> u64 {
-    45
+    1200
 }
 
 fn default_bundle_settle_ms() -> u64 {
