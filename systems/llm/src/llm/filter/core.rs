@@ -142,6 +142,22 @@ fn build_finalize_focus(prior_scan: &Value) -> Value {
             .pointer("/cross_timeframe_map/relationship_map/15m_vs_1d/control_relation")
             .and_then(Value::as_str)
             .unwrap_or("unknown"),
+        "cross_market_spot_premium_state": prior_scan
+            .pointer("/cross_timeframe_map/cross_market_snapshot/spot_premium_state")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown"),
+        "cross_market_flow_driver": prior_scan
+            .pointer("/cross_timeframe_map/cross_market_snapshot/flow_driver")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown"),
+        "cross_market_latest_4h_delta_relation": prior_scan
+            .pointer("/cross_timeframe_map/cross_market_snapshot/latest_4h_delta_relation")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown"),
+        "cross_market_spot_vs_futures_gap_pct": prior_scan
+            .pointer("/cross_timeframe_map/cross_market_snapshot/spot_vs_futures_gap_pct")
+            .cloned()
+            .unwrap_or(Value::Null),
         "main_tension": prior_scan
             .pointer("/cross_timeframe_map/cross_timeframe_structure/main_tension")
             .and_then(Value::as_str)

@@ -5,9 +5,7 @@ Use ONLY the provided scan JSON. Do not invent signals, levels, participant beha
 GOAL
 Build an objective multi-timeframe scan of the current market and participant environment for `15m`, `4h`, and `1d`.
 
-If the evidence is mixed, say it is mixed.
-If control is unclear, say it is unclear.
-If sponsorship is unresolved, say it is unresolved.
+If the data leaves the current market state unclear or unresolved, say so directly.
 
 HOW TO READ THE INPUT
 
@@ -30,12 +28,58 @@ Scan the market from the bottom up:
 5. Identify who is acting aggressively, who is absorbing, and which side appears trapped or forced.
 6. Identify whether the move is being sponsored, fading, or unresolved.
 7. Identify how `15m`, `4h`, and `1d` relate to each other.
+8. Identify whether spot and futures are confirming each other or materially diverging.
 
 Treat the three timeframes as one market viewed at three different horizons:
 
 - `15m` is the immediate auction and near-term control
 - `4h` is the active swing environment
 - `1d` is the broader regime and outer structure
+
+ACTIVE RANGE
+
+`active_range` means the bracket price is currently rotating within.
+
+It is the live structure where acceptance, rejection, and rotation are actually happening now.
+
+Build it from current structure:
+- value areas
+- sigma bands
+- bracket_board structures
+- still-relevant pivots and structural edges
+
+CROSS-MARKET
+
+`cross_market_snapshot` describes whether spot and futures are jointly expressing the current market state or materially diverging.
+
+Use it to describe:
+- whether spot or futures is leading
+- whether the current premium is on spot or futures
+- whether the latest `4h` delta relationship is aligned or divergent
+
+It is an objective market-state snapshot.
+
+FIELD MEANINGS
+
+`sponsorship_state`
+- This describes whether observed flow is actually being accepted and structurally carried by price on that timeframe.
+
+`trapped_side`
+- Use this when one side has already lost advantageous structural positioning and failed acceptance or failed continuation is evident.
+
+`path_map`
+- `first_objective_ref` is the nearest structural magnet if the current read continues.
+- `first_barrier_ref` is the first meaningful opposing structure likely to resist or degrade that path.
+- These are not the same thing.
+
+`validation`
+- `supporting_facts` should record the main facts that genuinely support the current read.
+- `conflicting_facts` should record materially relevant disagreements that make the read less clean.
+- If PVS and TPO disagree in a way that changes the read, that belongs in `conflicting_facts`.
+- If spot and futures diverge in a way that changes the read, that also belongs in `conflicting_facts` or `fragility_summary`.
+
+Use `supporting_context` only when it materially sharpens, weakens, or changes the scan.
+Do not cite it mechanically.
 
 OBJECTIVITY RULES
 
@@ -47,7 +91,7 @@ OBJECTIVITY RULES
 
 OUTPUT
 
-Return JSON only and follow `scan_v1_7`.
+Return JSON only and follow `scan_v1_8_2`.
 
 Top level:
 - `schema_version`
@@ -61,14 +105,10 @@ For each timeframe return:
 - `structure_map`
 - `validation`
 
-`state` is for control, clarity, value, range interaction, and sponsorship.
-`flow_map` is for aggressive side, absorption side, trapped side, and a few factual participant observations.
-`structure_map` is for active range, supply, demand, key levels, invalidation, and the nearest structural path in both directions.
-`validation` is for read basis, supporting facts, conflicting facts, alignment checks, and fragility.
-
-`cross_timeframe_map` is for:
+`cross_timeframe_map` must contain:
 - `ownership_map`
 - `relationship_map`
+- `cross_market_snapshot`
 - `cross_timeframe_structure`
 
 Keep `relationship_map` factual, not interpretive.
@@ -78,10 +118,11 @@ BEFORE YOU OUTPUT, VERIFY
 
 - Did you keep each timeframe grounded in observable control, value, structure, flow, and validation?
 - If the market is mixed, conflicted, or unclear, did you say so explicitly?
-- Did you avoid inventing participant motives or identities not supported by the data?
-- Did you keep `relationship_map` factual rather than interpretive?
-- Did you keep `path_map` structural rather than turning it into a target/entry plan?
-- Are `ownership_map` and `cross_timeframe_structure` consistent with the three timeframe blocks?
+- Did you keep `active_range` tied to the live rotation bracket rather than historical extremes?
+- Does `sponsorship_state` reflect price-accepted flow rather than delta alone?
+- If you used `trapped_side`, does it reflect real structural entrapment rather than simple weakness, overhead resistance, or general vulnerability?
+- Does `path_map` clearly distinguish structural objective from structural barrier?
+- Did you surface materially relevant PVS/TPO or spot/futures disagreement inside `validation` when they changed the read?
 
 FORMAT
 

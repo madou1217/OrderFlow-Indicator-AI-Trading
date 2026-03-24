@@ -481,12 +481,13 @@ fn parse_entry_scan_output(provider: &str, raw_text: &str) -> Result<Value, Prov
 }
 
 fn validate_scan_output(value: &Value) -> Result<()> {
-    if value
-        .get("schema_version")
-        .and_then(Value::as_str)
-        .is_some_and(|version| version == "scan_v1_7")
-    {
-        return validate_scan_output_v1_7(value);
+    if let Some(schema_version) = value.get("schema_version").and_then(Value::as_str) {
+        if schema_version == "scan_v1_8_2" {
+            return validate_scan_output_v1_8_2(value);
+        }
+        if schema_version == "scan_v1_7" {
+            return validate_scan_output_v1_7(value);
+        }
     }
 
     validate_scan_output_legacy(value)
@@ -689,6 +690,117 @@ fn validate_scan_output_v1_7(value: &Value) -> Result<()> {
             ],
         )?;
     }
+
+    expect_string(
+        value,
+        "/cross_timeframe_map/cross_timeframe_structure/main_tension",
+    )?;
+    validate_key_levels_with_max(
+        value,
+        "/cross_timeframe_map/cross_timeframe_structure/key_shared_levels",
+        6,
+    )?;
+    validate_string_array_with_max(
+        value,
+        "/cross_timeframe_map/cross_timeframe_structure/main_unresolved_factors",
+        4,
+    )?;
+
+    Ok(())
+}
+
+fn validate_scan_output_v1_8_2(value: &Value) -> Result<()> {
+    let schema_version = value
+        .get("schema_version")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("scan schema_version is missing"))?;
+    if schema_version != "scan_v1_8_2" {
+        return Err(anyhow!(
+            "scan schema_version must be scan_v1_8_2, got {}",
+            schema_version
+        ));
+    }
+
+    let meta = expect_object(value, "/meta")?;
+    meta.get("symbol")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| anyhow!("scan meta.symbol is missing"))?;
+    let scan_ts_bucket = meta
+        .get("scan_ts_bucket")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| anyhow!("scan meta.scan_ts_bucket is missing"))?;
+    DateTime::parse_from_rfc3339(scan_ts_bucket)
+        .map_err(|_| anyhow!("scan meta.scan_ts_bucket must be RFC3339 date-time"))?;
+
+    expect_object(value, "/timeframes")?;
+    for tf in ["15m", "4h", "1d"] {
+        validate_scan_output_v1_7_timeframe(value, tf)?;
+    }
+
+    expect_enum(
+        value,
+        "/cross_timeframe_map/ownership_map/broader_regime_owner",
+        &["buyers", "sellers", "balanced", "unclear"],
+    )?;
+    expect_enum(
+        value,
+        "/cross_timeframe_map/ownership_map/active_swing_owner",
+        &["buyers", "sellers", "balanced", "unclear"],
+    )?;
+    expect_enum(
+        value,
+        "/cross_timeframe_map/ownership_map/immediate_owner",
+        &["buyers", "sellers", "balanced", "unclear"],
+    )?;
+
+    for pair in ["15m_vs_4h", "4h_vs_1d", "15m_vs_1d"] {
+        let base = format!("/cross_timeframe_map/relationship_map/{pair}");
+        expect_enum(
+            value,
+            &format!("{base}/control_relation"),
+            &["aligned", "opposed", "neutral"],
+        )?;
+        expect_enum(
+            value,
+            &format!("{base}/lower_tf_value_location_vs_higher_tf"),
+            &[
+                "above_higher_tf_value",
+                "inside_higher_tf_value",
+                "below_higher_tf_value",
+            ],
+        )?;
+        expect_enum(
+            value,
+            &format!("{base}/lower_tf_range_location_vs_higher_tf"),
+            &[
+                "above_higher_tf_range",
+                "inside_higher_tf_range",
+                "below_higher_tf_range",
+            ],
+        )?;
+    }
+
+    expect_enum(
+        value,
+        "/cross_timeframe_map/cross_market_snapshot/spot_premium_state",
+        &["spot_premium", "futures_premium", "near_flat"],
+    )?;
+    expect_number(
+        value,
+        "/cross_timeframe_map/cross_market_snapshot/spot_vs_futures_gap_pct",
+    )?;
+    expect_enum(
+        value,
+        "/cross_timeframe_map/cross_market_snapshot/flow_driver",
+        &["futures_led", "spot_led", "balanced", "unclear"],
+    )?;
+    expect_enum(
+        value,
+        "/cross_timeframe_map/cross_market_snapshot/latest_4h_delta_relation",
+        &["aligned", "divergent", "flat_or_unclear"],
+    )?;
 
     expect_string(
         value,
@@ -1834,7 +1946,7 @@ async fn invoke_custom_llm_stage(
             Err(error) => {
                 let error = anyhow::Error::from(error)
                     .context("decode custom_llm chat completions response body");
-                    tracing::warn!(
+                tracing::warn!(
                         "custom_llm chat completions decode failed stage={} attempt={} request_id={} status={} error_chain={} body={}",
                         stage_name,
                         attempt,
@@ -2031,7 +2143,7 @@ fn qwen_output_contract(
 ) -> String {
     if matches!(entry_stage, prompt::EntryPromptStage::Scan) {
         if is_medium_large(prompt_template) {
-            "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- No extra top-level keys.\n- Top-level keys must be `schema_version`, `meta`, `timeframes`, and `cross_timeframe_map`.\n- `schema_version` must be `scan_v1_7`.\n- `timeframes` must contain `15m`, `4h`, and `1d`.\n- Each timeframe must include `state`, `flow_map`, `structure_map`, and `validation`.\n- `cross_timeframe_map` must include `ownership_map`, `relationship_map`, and `cross_timeframe_structure`.\n".to_string()
+            "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- No extra top-level keys.\n- Top-level keys must be `schema_version`, `meta`, `timeframes`, and `cross_timeframe_map`.\n- `schema_version` must be `scan_v1_8_2`.\n- `timeframes` must contain `15m`, `4h`, and `1d`.\n- Each timeframe must include `state`, `flow_map`, `structure_map`, and `validation`.\n- `cross_timeframe_map` must include `ownership_map`, `relationship_map`, `cross_market_snapshot`, and `cross_timeframe_structure`.\n".to_string()
         } else {
             "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- No extra top-level keys.\n- Top-level keys must be `15m`, `4h`, `1d`, and `scan_audit`.\n- Each timeframe key must include `trend`, `signal_agreement`, `range`, `supporting_signals`, `conflicting_signals`, `opportunity`, and `risk`.\n- `scan_audit` must include `15m`, `4h`, and `1d`, and each audit object must include `direction_basis`, `recent_closed_bars_align_with_trend`, `cvd_slope_aligns_with_trend`, `current_partial_bar_aligns_with_trend`, `invalidation_level`, and `range_width_vs_atr`.\n".to_string()
         }
@@ -3788,6 +3900,126 @@ fn scan_v1_7_schema_openai() -> Value {
     })
 }
 
+fn scan_v1_8_2_cross_market_snapshot_schema_openai() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "spot_premium_state",
+            "spot_vs_futures_gap_pct",
+            "flow_driver",
+            "latest_4h_delta_relation"
+        ],
+        "properties": {
+            "spot_premium_state": {
+                "type": "string",
+                "enum": ["spot_premium", "futures_premium", "near_flat"],
+                "description": "Whether spot, futures, or neither currently carries the visible premium."
+            },
+            "spot_vs_futures_gap_pct": {
+                "type": "number",
+                "description": "Current spot-versus-futures price gap in percent terms."
+            },
+            "flow_driver": {
+                "type": "string",
+                "enum": ["futures_led", "spot_led", "balanced", "unclear"],
+                "description": "Which venue appears to be expressing the current move more clearly."
+            },
+            "latest_4h_delta_relation": {
+                "type": "string",
+                "enum": ["aligned", "divergent", "flat_or_unclear"],
+                "description": "Whether the latest observable 4h spot and futures delta relationship confirms or diverges."
+            }
+        }
+    })
+}
+
+fn scan_v1_8_2_set_schema_descriptions(schema: &mut Value) {
+    if let Some(version) = schema.pointer_mut("/properties/schema_version/enum/0") {
+        *version = json!("scan_v1_8_2");
+    }
+
+    if let Some(required) = schema
+        .pointer_mut("/properties/cross_timeframe_map/required")
+        .and_then(Value::as_array_mut)
+    {
+        let already_present = required
+            .iter()
+            .any(|item| item.as_str() == Some("cross_market_snapshot"));
+        if !already_present {
+            required.insert(2, json!("cross_market_snapshot"));
+        }
+    }
+
+    for tf in ["15m", "4h", "1d"] {
+        let tf_base = format!("/properties/timeframes/properties/{tf}/properties");
+
+        if let Some(slot) = schema.pointer_mut(&format!(
+            "{tf_base}/state/properties/sponsorship_state/description"
+        )) {
+            *slot = json!(
+                "Describe whether observed flow is being accepted and structurally carried by price on this timeframe."
+            );
+        }
+
+        if let Some(slot) = schema.pointer_mut(&format!(
+            "{tf_base}/flow_map/properties/trapped_side/description"
+        )) {
+            *slot = json!(
+                "Use trapped_side when one side has already lost advantageous structural positioning and failed acceptance or failed continuation is evident."
+            );
+        }
+
+        if let Some(slot) = schema.pointer_mut(&format!(
+            "{tf_base}/structure_map/properties/invalidation_level/description"
+        )) {
+            *slot = json!(
+                "Use a concrete price only when this timeframe read has an objectively supported directional break anchor. Use null when the read is balanced or structurally unresolved and no single-sided invalidation is cleanly supported."
+            );
+        }
+
+        for side in ["upside", "downside"] {
+            if let Some(slot) = schema.pointer_mut(&format!(
+                "{tf_base}/structure_map/properties/path_map/properties/{side}/properties/first_objective_ref/description"
+            )) {
+                *slot = json!(
+                    "Nearest structural magnet if the current directional read continues from here. This is not necessarily the first opposing barrier."
+                );
+            }
+            if let Some(slot) = schema.pointer_mut(&format!(
+                "{tf_base}/structure_map/properties/path_map/properties/{side}/properties/first_barrier_ref/description"
+            )) {
+                *slot = json!(
+                    "First meaningful opposing structure likely to resist, cap, or degrade the path before further extension."
+                );
+            }
+        }
+
+        if let Some(slot) = schema.pointer_mut(&format!(
+            "{tf_base}/validation/properties/conflicting_facts/description"
+        )) {
+            *slot = json!(
+                "Material disagreements that weaken, delay, or dirty the current read. Use this for meaningful PVS/TPO disagreement, spot/futures divergence, or flow-versus-price acceptance conflict when relevant."
+            );
+        }
+    }
+}
+
+fn scan_v1_8_2_schema_openai() -> Value {
+    let mut schema = scan_v1_7_schema_openai();
+    scan_v1_8_2_set_schema_descriptions(&mut schema);
+    if let Some(properties) = schema
+        .pointer_mut("/properties/cross_timeframe_map/properties")
+        .and_then(Value::as_object_mut)
+    {
+        properties.insert(
+            "cross_market_snapshot".to_string(),
+            scan_v1_8_2_cross_market_snapshot_schema_openai(),
+        );
+    }
+    schema
+}
+
 fn scan_v1_7_price_zone_schema_gemini() -> Value {
     json!({
         "type": "OBJECT",
@@ -4098,8 +4330,56 @@ fn scan_v1_7_schema_gemini() -> Value {
     })
 }
 
+fn scan_v1_8_2_cross_market_snapshot_schema_gemini() -> Value {
+    json!({
+        "type": "OBJECT",
+        "properties": {
+            "spot_premium_state": {
+                "type": "STRING",
+                "enum": ["spot_premium", "futures_premium", "near_flat"],
+                "description": "Whether spot, futures, or neither currently carries the visible premium."
+            },
+            "spot_vs_futures_gap_pct": {
+                "type": "NUMBER",
+                "description": "Current spot-versus-futures price gap in percent terms."
+            },
+            "flow_driver": {
+                "type": "STRING",
+                "enum": ["futures_led", "spot_led", "balanced", "unclear"],
+                "description": "Which venue appears to be expressing the current move more clearly."
+            },
+            "latest_4h_delta_relation": {
+                "type": "STRING",
+                "enum": ["aligned", "divergent", "flat_or_unclear"],
+                "description": "Whether the latest observable 4h spot and futures delta relationship confirms or diverges."
+            }
+        },
+        "required": [
+            "spot_premium_state",
+            "spot_vs_futures_gap_pct",
+            "flow_driver",
+            "latest_4h_delta_relation"
+        ]
+    })
+}
+
+fn scan_v1_8_2_schema_gemini() -> Value {
+    let mut schema = scan_v1_7_schema_gemini();
+    scan_v1_8_2_set_schema_descriptions(&mut schema);
+    if let Some(properties) = schema
+        .pointer_mut("/properties/cross_timeframe_map/properties")
+        .and_then(Value::as_object_mut)
+    {
+        properties.insert(
+            "cross_market_snapshot".to_string(),
+            scan_v1_8_2_cross_market_snapshot_schema_gemini(),
+        );
+    }
+    schema
+}
+
 fn ml_grok_entry_scan_schema() -> Value {
-    scan_v1_7_schema_openai()
+    scan_v1_8_2_schema_openai()
 }
 
 fn ml_grok_entry_schema() -> Value {
@@ -4152,7 +4432,7 @@ fn ml_grok_management_schema() -> Value {
 }
 
 fn ml_gemini_entry_scan_schema() -> Value {
-    scan_v1_7_schema_gemini()
+    scan_v1_8_2_schema_gemini()
 }
 
 fn ml_gemini_entry_schema() -> Value {
@@ -4210,7 +4490,7 @@ fn ml_gemini_management_schema() -> Value {
 }
 
 fn ml_qwen_entry_scan_schema() -> Value {
-    scan_v1_7_schema_openai()
+    scan_v1_8_2_schema_openai()
 }
 
 fn ml_qwen_entry_schema() -> Value {
@@ -4245,7 +4525,7 @@ fn ml_qwen_management_schema() -> Value {
 }
 
 fn ml_custom_llm_entry_scan_schema() -> Value {
-    scan_v1_7_schema_openai()
+    scan_v1_8_2_schema_openai()
 }
 
 fn ml_custom_llm_entry_schema() -> Value {
@@ -5077,7 +5357,7 @@ mod tests {
 
     fn sample_stage_1_scan() -> Value {
         json!({
-            "schema_version": "scan_v1_7",
+            "schema_version": "scan_v1_8_2",
             "meta": {
                 "symbol": "TESTUSDT",
                 "scan_ts_bucket": "2026-03-18T07:00:00+00:00"
@@ -5262,6 +5542,12 @@ mod tests {
                         "lower_tf_value_location_vs_higher_tf": "inside_higher_tf_value",
                         "lower_tf_range_location_vs_higher_tf": "inside_higher_tf_range"
                     }
+                },
+                "cross_market_snapshot": {
+                    "spot_premium_state": "near_flat",
+                    "spot_vs_futures_gap_pct": 0.05,
+                    "flow_driver": "balanced",
+                    "latest_4h_delta_relation": "aligned"
                 },
                 "cross_timeframe_structure": {
                     "main_tension": "15m and 4h buyers are pressing higher while the 1d backdrop remains only partially sponsored.",
@@ -5916,7 +6202,7 @@ mod tests {
                     schema
                         .pointer("/properties/schema_version/enum/0")
                         .and_then(|v| v.as_str()),
-                    Some("scan_v1_7")
+                    Some("scan_v1_8_2")
                 );
                 assert_eq!(
                     schema
@@ -5939,6 +6225,14 @@ mod tests {
                 assert_eq!(
                     schema
                         .pointer("/properties/cross_timeframe_map/additionalProperties")
+                        .and_then(|v| v.as_bool()),
+                    Some(false)
+                );
+                assert_eq!(
+                    schema
+                        .pointer(
+                            "/properties/cross_timeframe_map/properties/cross_market_snapshot/additionalProperties"
+                        )
                         .and_then(|v| v.as_bool()),
                     Some(false)
                 );
@@ -5996,10 +6290,10 @@ mod tests {
             if prompt_template == "medium_large_opportunity" {
                 assert!(contract
                     .contains("`schema_version`, `meta`, `timeframes`, and `cross_timeframe_map`"));
-                assert!(contract.contains("`scan_v1_7`"));
+                assert!(contract.contains("`scan_v1_8_2`"));
                 assert!(contract.contains("`state`, `flow_map`, `structure_map`, and `validation`"));
                 assert!(contract.contains(
-                    "`ownership_map`, `relationship_map`, and `cross_timeframe_structure`"
+                    "`ownership_map`, `relationship_map`, `cross_market_snapshot`, and `cross_timeframe_structure`"
                 ));
                 assert!(!contract.contains("scan_audit"));
                 assert!(!contract.contains("supporting_signals"));
