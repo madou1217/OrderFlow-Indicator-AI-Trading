@@ -25,6 +25,7 @@ pub enum DispatchMode {
     WarmStateOnly,
     ReplayMaterialize,
     Live,
+    ShutdownFlush,
 }
 
 impl DispatchMode {
@@ -33,7 +34,7 @@ impl DispatchMode {
     }
 
     fn publish_outputs(self) -> bool {
-        matches!(self, Self::Live)
+        matches!(self, Self::Live | Self::ShutdownFlush)
     }
 }
 
@@ -418,4 +419,15 @@ fn merge_group_output(
     initiation_rows.extend(group.initiation_rows);
     exhaustion_rows.extend(group.exhaustion_rows);
     liq_rows.extend(group.liq_rows);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DispatchMode;
+
+    #[test]
+    fn shutdown_flush_still_persists_and_publishes_outputs() {
+        assert!(DispatchMode::ShutdownFlush.persist_outputs());
+        assert!(DispatchMode::ShutdownFlush.publish_outputs());
+    }
 }

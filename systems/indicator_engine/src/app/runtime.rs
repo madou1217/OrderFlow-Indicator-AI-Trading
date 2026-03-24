@@ -440,6 +440,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
     let mut trade_channel_closed = false;
     let mut non_trade_channel_closed = false;
     let mut shutdown_requested = false;
+    let mut shutdown_closed_minute: Option<DateTime<Utc>> = None;
     let mut stall_detector =
         RuntimeStallDetector::new(ts_from_millis(metrics.snapshot().last_persisted_ts_ms));
     let mut live_repair_controller = LiveCanonicalRepairController::default();
@@ -447,13 +448,17 @@ pub async fn run(ctx: AppContext) -> Result<()> {
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
-                info!("Ctrl+C received, shutting down");
+                let cutoff = scheduler.closed_minute(Utc::now());
+                info!(shutdown_closed_minute = %cutoff, "Ctrl+C received, shutting down");
                 shutdown_requested = true;
+                shutdown_closed_minute = Some(cutoff);
                 break;
             }
             _ = sigterm.recv() => {
-                info!("SIGTERM received, shutting down");
+                let cutoff = scheduler.closed_minute(Utc::now());
+                info!(shutdown_closed_minute = %cutoff, "SIGTERM received, shutting down");
                 shutdown_requested = true;
+                shutdown_closed_minute = Some(cutoff);
                 break;
             }
             maybe_event = trade_rx.recv(), if !trade_channel_closed => {
@@ -745,6 +750,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                     &mut scheduler,
                     &runtime_options,
                     ready_through_ts,
+                    DispatchMode::Live,
                 )
                 .await
                 {
@@ -756,7 +762,12 @@ pub async fn run(ctx: AppContext) -> Result<()> {
     }
 
     if shutdown_requested {
-        info!("stopping ingress and flushing ready indicator minutes before snapshot save");
+        let shutdown_closed_minute =
+            shutdown_closed_minute.unwrap_or_else(|| scheduler.closed_minute(Utc::now()));
+        info!(
+            shutdown_closed_minute = %shutdown_closed_minute,
+            "stopping ingress and flushing ready indicator minutes before snapshot save"
+        );
         for h in &consumer_handles {
             h.abort();
         }
@@ -776,6 +787,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
             &mut non_trade_channel_closed,
             startup_replay_cutoff_bucket,
             &mut startup_cutover_completed,
+            shutdown_closed_minute,
             consume_mode_live,
             live_drop_stale_enabled,
             stale_limit_secs,
@@ -942,6 +954,7 @@ async fn shutdown_drain_and_persist(
     non_trade_channel_closed: &mut bool,
     startup_replay_cutoff_bucket: Option<DateTime<Utc>>,
     startup_cutover_completed: &mut bool,
+    shutdown_closed_minute: DateTime<Utc>,
     consume_mode_live: bool,
     live_drop_stale_enabled: bool,
     stale_limit_secs: i64,
@@ -987,9 +1000,14 @@ async fn shutdown_drain_and_persist(
         );
         total_drained += drain_result.drained_count;
 
-        let latest_closed = scheduler.closed_minute(Utc::now());
-        let ready_through_ts = scheduler.next_minute_to_emit().and_then(|minute| {
-            state_store.latest_contiguous_complete_canonical_minute_from(minute, latest_closed)
+        let ready_through_ts = shutdown_ready_through_candidate(
+            scheduler.next_minute_to_emit(),
+            shutdown_closed_minute,
+        )
+        .and_then(|latest_closed| {
+            scheduler.next_minute_to_emit().and_then(|minute| {
+                state_store.latest_contiguous_complete_canonical_minute_from(minute, latest_closed)
+            })
         });
 
         if let Some(ready_through) = ready_through_ts {
@@ -1001,6 +1019,7 @@ async fn shutdown_drain_and_persist(
                 scheduler,
                 runtime_options,
                 ready_through,
+                DispatchMode::ShutdownFlush,
             )
             .await?;
         }
@@ -1031,6 +1050,7 @@ async fn shutdown_drain_and_persist(
                 channels_closed = drain_result.all_channels_closed,
                 next_minute = ?next_minute_after,
                 ready_through_ts = ?ready_through_ts,
+                shutdown_closed_minute = %shutdown_closed_minute,
                 last_persisted_ts = ?last_persisted_after,
                 dirty_recompute_pending = dirty_pending_after,
                 elapsed_ms = started_at.elapsed().as_millis(),
@@ -1950,6 +1970,15 @@ fn live_tail_reconcile_start_ts(
         .unwrap_or(lookback_start)
 }
 
+fn shutdown_ready_through_candidate(
+    next_minute: Option<DateTime<Utc>>,
+    shutdown_closed_minute: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    next_minute
+        .filter(|minute| *minute <= shutdown_closed_minute)
+        .map(|_| shutdown_closed_minute)
+}
+
 async fn process_ready_minutes(
     ctx: &Arc<AppContext>,
     metrics: Arc<AppMetrics>,
@@ -1958,6 +1987,7 @@ async fn process_ready_minutes(
     scheduler: &mut WindowScheduler,
     runtime_options: &IndicatorRuntimeOptions,
     ready_through_ts: DateTime<Utc>,
+    dispatch_mode: DispatchMode,
 ) -> Result<()> {
     let batch_started_at = Instant::now();
     let batch_start_minute = scheduler.next_minute_to_emit();
@@ -2005,14 +2035,9 @@ async fn process_ready_minutes(
         dirty_windows_processed += dirty_batch.len();
         for window in dirty_batch {
             let minute = window.ts_bucket;
-            let snapshots = process_window_bundle(
-                ctx,
-                dispatcher,
-                runtime_options,
-                &window,
-                DispatchMode::Live,
-            )
-            .await?;
+            let snapshots =
+                process_window_bundle(ctx, dispatcher, runtime_options, &window, dispatch_mode)
+                    .await?;
             metrics.inc_exported_window();
             metrics.set_last_persisted_ts(Some(minute.timestamp_millis()));
             let (computed, missing) = indicator_coverage(&snapshots);
@@ -2070,14 +2095,7 @@ async fn process_ready_minutes(
 
     for minute in scheduler.ready_minutes_through(ready_through_ts) {
         let window = state_store.finalize_minute(minute);
-        match process_window_bundle(
-            ctx,
-            dispatcher,
-            runtime_options,
-            &window,
-            DispatchMode::Live,
-        )
-        .await
+        match process_window_bundle(ctx, dispatcher, runtime_options, &window, dispatch_mode).await
         {
             Ok(snapshots) => {
                 metrics.inc_exported_window();
@@ -3894,10 +3912,11 @@ mod tests {
         build_backfill_sql, find_long_null_price_run, handle_ingest_event,
         hydrate_futures_orderbook_heatmaps_for_range_with_fetch, live_tail_reconcile_start_ts,
         minute_exclusive_upper_bound, minute_history_is_strictly_contiguous,
-        replay_heatmap_hydration_batch_end, snapshot_has_required_history,
-        snapshot_null_price_run_reaches_recent_tail, LiveCanonicalRepairController,
-        FUNDING_BACKFILL_WINDOW_SQL, LIQ_BACKFILL_WINDOW_SQL, ORDERBOOK_BACKFILL_WINDOW_SQL_SCALAR,
-        ORDERBOOK_BACKFILL_WINDOW_SQL_WITH_HEATMAP, TRADE_BACKFILL_WINDOW_SQL,
+        replay_heatmap_hydration_batch_end, shutdown_ready_through_candidate,
+        snapshot_has_required_history, snapshot_null_price_run_reaches_recent_tail,
+        LiveCanonicalRepairController, FUNDING_BACKFILL_WINDOW_SQL, LIQ_BACKFILL_WINDOW_SQL,
+        ORDERBOOK_BACKFILL_WINDOW_SQL_SCALAR, ORDERBOOK_BACKFILL_WINDOW_SQL_WITH_HEATMAP,
+        TRADE_BACKFILL_WINDOW_SQL,
     };
     use crate::ingest::decoder::{
         AggHeatmapLevel, AggOrderbook1mEvent, EngineEvent, MarketKind, MdData, TradeEvent,
@@ -4427,5 +4446,27 @@ mod tests {
         controller.mark_gap_repair_attempt(blocking_minute);
         assert!(!controller.gap_repair_due(blocking_minute));
         assert!(controller.gap_repair_due(next_minute));
+    }
+
+    #[test]
+    fn shutdown_ready_through_candidate_freezes_at_shutdown_cutoff() {
+        let shutdown_closed_minute = Utc.with_ymd_and_hms(2026, 3, 24, 7, 0, 0).single().unwrap();
+        let next_minute = shutdown_closed_minute - ChronoDuration::minutes(2);
+
+        assert_eq!(
+            shutdown_ready_through_candidate(Some(next_minute), shutdown_closed_minute),
+            Some(shutdown_closed_minute)
+        );
+    }
+
+    #[test]
+    fn shutdown_ready_through_candidate_rejects_minutes_beyond_shutdown_cutoff() {
+        let shutdown_closed_minute = Utc.with_ymd_and_hms(2026, 3, 24, 7, 0, 0).single().unwrap();
+        let next_minute = shutdown_closed_minute + ChronoDuration::minutes(1);
+
+        assert_eq!(
+            shutdown_ready_through_candidate(Some(next_minute), shutdown_closed_minute),
+            None
+        );
     }
 }
