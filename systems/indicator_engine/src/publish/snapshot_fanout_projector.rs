@@ -124,10 +124,12 @@ impl SnapshotFanoutProjector {
         let last_published_ts = self.last_published_snapshot_ts().await?;
         let Some(next_ts) = sqlx::query_scalar::<_, DateTime<Utc>>(
             r#"
-            SELECT min(ts_snapshot)
+            SELECT ts_snapshot
             FROM feat.indicator_snapshot
             WHERE symbol = $1
               AND ts_snapshot > $2
+            ORDER BY ts_snapshot ASC
+            LIMIT 1
             "#,
         )
         .bind(&symbol)

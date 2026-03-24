@@ -206,6 +206,32 @@ pub struct AggOrderbook1mEvent {
     pub ofi_sum: f64,
     pub obi_k_dw_close: Option<f64>,
     pub heatmap_levels: Vec<AggHeatmapLevel>,
+    pub heatmap_loaded: bool,
+}
+
+impl AggOrderbook1mEvent {
+    pub fn scalar_eq(&self, other: &Self) -> bool {
+        self.ts_bucket == other.ts_bucket
+            && self.chunk_start_ts == other.chunk_start_ts
+            && self.chunk_end_ts == other.chunk_end_ts
+            && self.source_event_count == other.source_event_count
+            && self.sample_count == other.sample_count
+            && self.bbo_updates == other.bbo_updates
+            && self.spread_sum == other.spread_sum
+            && self.topk_depth_sum == other.topk_depth_sum
+            && self.obi_sum == other.obi_sum
+            && self.obi_l1_sum == other.obi_l1_sum
+            && self.obi_k_sum == other.obi_k_sum
+            && self.obi_k_dw_sum == other.obi_k_dw_sum
+            && self.obi_k_dw_change_sum == other.obi_k_dw_change_sum
+            && self.obi_k_dw_adj_sum == other.obi_k_dw_adj_sum
+            && self.microprice_sum == other.microprice_sum
+            && self.microprice_classic_sum == other.microprice_classic_sum
+            && self.microprice_kappa_sum == other.microprice_kappa_sum
+            && self.microprice_adj_sum == other.microprice_adj_sum
+            && self.ofi_sum == other.ofi_sum
+            && self.obi_k_dw_close == other.obi_k_dw_close
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -510,6 +536,7 @@ fn parse_agg_orderbook_1m(data: &Value) -> Result<AggOrderbook1mEvent> {
         ofi_sum: optional_f64(data, "ofi_sum")?.unwrap_or(0.0),
         obi_k_dw_close: optional_f64(data, "obi_k_dw_close")?,
         heatmap_levels: parse_heatmap_levels(required_value(data, "heatmap_levels")?)?,
+        heatmap_loaded: optional_bool(data, "heatmap_loaded").unwrap_or(true),
     })
 }
 
@@ -718,6 +745,10 @@ fn required_i64(value: &Value, key: &str) -> Result<i64> {
 
 fn optional_i64(value: &Value, key: &str) -> Option<i64> {
     value.get(key).and_then(Value::as_i64)
+}
+
+fn optional_bool(value: &Value, key: &str) -> Option<bool> {
+    value.get(key).and_then(Value::as_bool)
 }
 
 fn required_f64(value: &Value, key: &str) -> Result<f64> {

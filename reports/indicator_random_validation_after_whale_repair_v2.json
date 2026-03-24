@@ -1,0 +1,379 @@
+{
+  "symbol": "BTCUSDT",
+  "sample_count": 20,
+  "candidate_count": 5000,
+  "seed": 42,
+  "expected_indicator_codes": [
+    "absorption",
+    "avwap",
+    "bearish_absorption",
+    "bearish_initiation",
+    "bullish_absorption",
+    "bullish_initiation",
+    "buying_exhaustion",
+    "cvd_pack",
+    "divergence",
+    "ema_trend_regime",
+    "footprint",
+    "funding_rate",
+    "fvg",
+    "high_volume_pulse",
+    "initiation",
+    "kline_history",
+    "liquidation_density",
+    "orderbook_depth",
+    "price_volume_structure",
+    "rvwap_sigma_bands",
+    "selling_exhaustion",
+    "tpo_market_profile",
+    "vpin",
+    "whale_trades"
+  ],
+  "samples": [
+    "2026-03-20 05:41:00+00",
+    "2026-03-20 05:54:00+00",
+    "2026-03-20 06:21:00+00",
+    "2026-03-20 06:37:00+00",
+    "2026-03-20 14:09:00+00",
+    "2026-03-20 15:04:00+00",
+    "2026-03-20 16:16:00+00",
+    "2026-03-20 17:29:00+00",
+    "2026-03-20 21:20:00+00",
+    "2026-03-21 11:33:00+00",
+    "2026-03-21 12:10:00+00",
+    "2026-03-21 13:27:00+00",
+    "2026-03-21 15:08:00+00",
+    "2026-03-21 19:15:00+00",
+    "2026-03-22 15:18:00+00",
+    "2026-03-23 02:41:00+00",
+    "2026-03-23 08:09:00+00",
+    "2026-03-23 10:19:00+00",
+    "2026-03-23 14:19:00+00",
+    "2026-03-23 15:53:00+00"
+  ],
+  "per_sample": [
+    {
+      "ts": "2026-03-20 05:41:00+00",
+      "snapshot_count": 24,
+      "snapshot_codes_ok": true,
+      "checks_run": [
+        "price_volume_structure.source",
+        "footprint.source",
+        "cvd_pack.source",
+        "cvd_pack.feature_1m",
+        "orderbook_depth.source",
+        "orderbook_depth.feature_1m",
+        "funding_rate.feature_1m",
+        "avwap.feature_1m",
+        "whale_trades.feature_1m"
+      ]
+    },
+    {
+      "ts": "2026-03-20 05:54:00+00",
+      "snapshot_count": 24,
+      "snapshot_codes_ok": true,
+      "checks_run": [
+        "price_volume_structure.source",
+        "footprint.source",
+        "cvd_pack.source",
+        "cvd_pack.feature_1m",
+        "orderbook_depth.source",
+        "orderbook_depth.feature_1m",
+        "funding_rate.feature_1m",
+        "avwap.feature_1m",
+        "whale_trades.feature_1m"
+      ]
+    },
+    {
+      "ts": "2026-03-20 06:21:00+00",
+      "snapshot_count": 24,
+      "snapshot_codes_ok": true,
+      "checks_run": [
+        "price_volume_structure.source",
+        "footprint.source",
+        "cvd_pack.source",
+        "cvd_pack.feature_1m",
+        "orderbook_depth.source",
+        "orderbook_depth.feature_1m",
+        "funding_rate.feature_1m",
+        "avwap.feature_1m",
+        "whale_trades.feature_1m"
+      ]
+    },
+    {
+      "ts": "2026-03-20 06:37:00+00",
+      "snapshot_count": 24,
+      "snapshot_codes_ok": true,
+      "checks_run": [
+        "price_volume_structure.source",
+        "footprint.source",
+        "cvd_pack.source",
+        "cvd_pack.feature_1m",
+        "orderbook_depth.source",
+        "orderbook_depth.feature_1m",
+        "funding_rate.feature_1m",
+        "avwap.feature_1m",
+        "whale_trades.feature_1m"
+      ]
+    },
+    {
+      "ts": "2026-03-20 14:09:00+00",
+      "snapshot_count": 24,
+      "snapshot_codes_ok": true,
+      "checks_run": [
+        "price_volume_structure.source",
+        "footprint.source",
+        "cvd_pack.source",
+        "cvd_pack.feature_1m",
+        "orderbook_depth.source",
+        "orderbook_depth.feature_1m",
+        "funding_rate.feature_1m",
+        "avwap.feature_1m",
+        "whale_trades.feature_1m"
+      ]
+    },
+    {
+      "ts": "2026-03-20 15:04:00+00",
+      "snapshot_count": 24,
+      "snapshot_codes_ok": true,
+      "checks_run": [
+        "price_volume_structure.source",
+        "footprint.source",
+        "cvd_pack.source",
+        "cvd_pack.feature_1m",
+        "orderbook_depth.source",
+        "orderbook_depth.feature_1m",
+        "funding_rate.feature_1m",
+        "avwap.feature_1m",
+        "whale_trades.feature_1m"
+      ]
+    },
+    {
+      "ts": "2026-03-20 16:16:00+00",
+      "snapshot_count": 24,
+      "snapshot_codes_ok": true,
+      "checks_run": [
+        "price_volume_structure.source",
+        "footprint.source",
+        "cvd_pack.source",
+        "cvd_pack.feature_1m",
+        "orderbook_depth.source",
+        "orderbook_depth.feature_1m",
+        "funding_rate.feature_1m",
+        "avwap.feature_1m",
+        "whale_trades.feature_1m"
+      ]
+    },
+    {
+      "ts": "2026-03-20 17:29:00+00",
+      "snapshot_count": 24,
+      "snapshot_codes_ok": true,
+      "checks_run": [
+        "price_volume_structure.source",
+        "footprint.source",
+        "cvd_pack.source",
+        "cvd_pack.feature_1m",
+        "orderbook_depth.source",
+        "orderbook_depth.feature_1m",
+        "funding_rate.feature_1m",
+        "avwap.feature_1m",
+        "whale_trades.feature_1m"
+      ]
+    },
+    {
+      "ts": "2026-03-20 21:20:00+00",
+      "snapshot_count": 24,
+      "snapshot_codes_ok": true,
+      "checks_run": [
+        "price_volume_structure.source",
+        "footprint.source",
+        "cvd_pack.source",
+        "cvd_pack.feature_1m",
+        "orderbook_depth.source",
+        "orderbook_depth.feature_1m",
+        "funding_rate.feature_1m",
+        "avwap.feature_1m",
+        "whale_trades.feature_1m"
+      ]
+    },
+    {
+      "ts": "2026-03-21 11:33:00+00",
+      "snapshot_count": 24,
+      "snapshot_codes_ok": true,
+      "checks_run": [
+        "price_volume_structure.source",
+        "footprint.source",
+        "cvd_pack.source",
+        "cvd_pack.feature_1m",
+        "orderbook_depth.source",
+        "orderbook_depth.feature_1m",
+        "funding_rate.feature_1m",
+        "avwap.feature_1m",
+        "whale_trades.feature_1m"
+      ]
+    },
+    {
+      "ts": "2026-03-21 12:10:00+00",
+      "snapshot_count": 24,
+      "snapshot_codes_ok": true,
+      "checks_run": [
+        "price_volume_structure.source",
+        "footprint.source",
+        "cvd_pack.source",
+        "cvd_pack.feature_1m",
+        "orderbook_depth.source",
+        "orderbook_depth.feature_1m",
+        "funding_rate.feature_1m",
+        "avwap.feature_1m",
+        "whale_trades.feature_1m"
+      ]
+    },
+    {
+      "ts": "2026-03-21 13:27:00+00",
+      "snapshot_count": 24,
+      "snapshot_codes_ok": true,
+      "checks_run": [
+        "price_volume_structure.source",
+        "footprint.source",
+        "cvd_pack.source",
+        "cvd_pack.feature_1m",
+        "orderbook_depth.source",
+        "orderbook_depth.feature_1m",
+        "funding_rate.feature_1m",
+        "avwap.feature_1m",
+        "whale_trades.feature_1m"
+      ]
+    },
+    {
+      "ts": "2026-03-21 15:08:00+00",
+      "snapshot_count": 24,
+      "snapshot_codes_ok": true,
+      "checks_run": [
+        "price_volume_structure.source",
+        "footprint.source",
+        "cvd_pack.source",
+        "cvd_pack.feature_1m",
+        "orderbook_depth.source",
+        "orderbook_depth.feature_1m",
+        "funding_rate.feature_1m",
+        "avwap.feature_1m",
+        "whale_trades.feature_1m"
+      ]
+    },
+    {
+      "ts": "2026-03-21 19:15:00+00",
+      "snapshot_count": 24,
+      "snapshot_codes_ok": true,
+      "checks_run": [
+        "price_volume_structure.source",
+        "footprint.source",
+        "cvd_pack.source",
+        "cvd_pack.feature_1m",
+        "orderbook_depth.source",
+        "orderbook_depth.feature_1m",
+        "funding_rate.feature_1m",
+        "avwap.feature_1m",
+        "whale_trades.feature_1m"
+      ]
+    },
+    {
+      "ts": "2026-03-22 15:18:00+00",
+      "snapshot_count": 24,
+      "snapshot_codes_ok": true,
+      "checks_run": [
+        "price_volume_structure.source",
+        "footprint.source",
+        "cvd_pack.source",
+        "cvd_pack.feature_1m",
+        "orderbook_depth.source",
+        "orderbook_depth.feature_1m",
+        "funding_rate.feature_1m",
+        "avwap.feature_1m",
+        "whale_trades.feature_1m"
+      ]
+    },
+    {
+      "ts": "2026-03-23 02:41:00+00",
+      "snapshot_count": 24,
+      "snapshot_codes_ok": true,
+      "checks_run": [
+        "price_volume_structure.source",
+        "footprint.source",
+        "cvd_pack.source",
+        "cvd_pack.feature_1m",
+        "orderbook_depth.source",
+        "orderbook_depth.feature_1m",
+        "funding_rate.feature_1m",
+        "avwap.feature_1m",
+        "whale_trades.feature_1m"
+      ]
+    },
+    {
+      "ts": "2026-03-23 08:09:00+00",
+      "snapshot_count": 24,
+      "snapshot_codes_ok": true,
+      "checks_run": [
+        "price_volume_structure.source",
+        "footprint.source",
+        "cvd_pack.source",
+        "cvd_pack.feature_1m",
+        "orderbook_depth.source",
+        "orderbook_depth.feature_1m",
+        "funding_rate.feature_1m",
+        "avwap.feature_1m",
+        "whale_trades.feature_1m"
+      ]
+    },
+    {
+      "ts": "2026-03-23 10:19:00+00",
+      "snapshot_count": 24,
+      "snapshot_codes_ok": true,
+      "checks_run": [
+        "price_volume_structure.source",
+        "footprint.source",
+        "cvd_pack.source",
+        "cvd_pack.feature_1m",
+        "orderbook_depth.source",
+        "orderbook_depth.feature_1m",
+        "funding_rate.feature_1m",
+        "avwap.feature_1m",
+        "whale_trades.feature_1m"
+      ]
+    },
+    {
+      "ts": "2026-03-23 14:19:00+00",
+      "snapshot_count": 24,
+      "snapshot_codes_ok": true,
+      "checks_run": [
+        "price_volume_structure.source",
+        "footprint.source",
+        "cvd_pack.source",
+        "cvd_pack.feature_1m",
+        "orderbook_depth.source",
+        "orderbook_depth.feature_1m",
+        "funding_rate.feature_1m",
+        "avwap.feature_1m",
+        "whale_trades.feature_1m"
+      ]
+    },
+    {
+      "ts": "2026-03-23 15:53:00+00",
+      "snapshot_count": 24,
+      "snapshot_codes_ok": true,
+      "checks_run": [
+        "price_volume_structure.source",
+        "footprint.source",
+        "cvd_pack.source",
+        "cvd_pack.feature_1m",
+        "orderbook_depth.source",
+        "orderbook_depth.feature_1m",
+        "funding_rate.feature_1m",
+        "avwap.feature_1m",
+        "whale_trades.feature_1m"
+      ]
+    }
+  ],
+  "failure_count": 0,
+  "failures_by_check": {},
+  "failures": []
+}

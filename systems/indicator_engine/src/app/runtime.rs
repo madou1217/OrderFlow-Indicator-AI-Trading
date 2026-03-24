@@ -27,6 +27,7 @@ use chrono::{DateTime, Duration as ChronoDuration, TimeZone, Utc};
 use serde_json::{json, Value};
 use sqlx::{postgres::PgRow, PgPool, Row};
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::future::Future;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -51,7 +52,7 @@ const STUCK_WARN_INTERVAL_SECS: u64 = 60;
 const LIVE_CANONICAL_GAP_REPAIR_RETRY_SECS: u64 = 15;
 const LIVE_CANONICAL_TAIL_RECONCILE_INTERVAL_SECS: u64 = 60;
 const LIVE_CANONICAL_TAIL_RECONCILE_LOOKBACK_MINUTES: i64 = STARTUP_BACKFILL_OVERLAP_MINUTES;
-const CANONICAL_REPLAY_FETCH_WINDOW_MINUTES: i64 = 120;
+const CANONICAL_REPLAY_FETCH_WINDOW_MINUTES: i64 = 360;
 
 #[derive(Debug, Clone)]
 pub struct ReplayRow {
@@ -408,6 +409,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
 
     let mut trade_channel_closed = false;
     let mut non_trade_channel_closed = false;
+    let mut shutdown_requested = false;
     let mut stall_detector =
         RuntimeStallDetector::new(ts_from_millis(metrics.snapshot().last_persisted_ts_ms));
     let mut live_repair_controller = LiveCanonicalRepairController::default();
@@ -416,10 +418,12 @@ pub async fn run(ctx: AppContext) -> Result<()> {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
                 info!("Ctrl+C received, shutting down");
+                shutdown_requested = true;
                 break;
             }
             _ = sigterm.recv() => {
                 info!("SIGTERM received, shutting down");
+                shutdown_requested = true;
                 break;
             }
             maybe_event = trade_rx.recv(), if !trade_channel_closed => {
@@ -479,7 +483,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                 }
             }
             _ = tick.tick() => {
-                if drain_pending_ingest_events(
+                let drain_result = drain_pending_ingest_events(
                     &mut trade_rx,
                     &mut non_trade_rx,
                     &mut trade_channel_closed,
@@ -499,7 +503,8 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                     &metrics,
                     &mut state_store,
                     &mut scheduler,
-                ) {
+                );
+                if drain_result.all_channels_closed {
                     warn!("all mq consumers ended, stopping indicator engine");
                     break;
                 }
@@ -720,6 +725,44 @@ pub async fn run(ctx: AppContext) -> Result<()> {
         }
     }
 
+    if shutdown_requested {
+        info!("stopping ingress and flushing ready indicator minutes before snapshot save");
+        for h in &consumer_handles {
+            h.abort();
+        }
+        outbox_handle.abort();
+        snapshot_fanout_handle.abort();
+
+        if let Err(err) = shutdown_drain_and_persist(
+            &ctx,
+            metrics.clone(),
+            &dispatcher,
+            &mut state_store,
+            &mut scheduler,
+            &runtime_options,
+            &mut trade_rx,
+            &mut non_trade_rx,
+            &mut trade_channel_closed,
+            &mut non_trade_channel_closed,
+            startup_replay_cutoff_bucket,
+            &mut startup_cutover_completed,
+            consume_mode_live,
+            live_drop_stale_enabled,
+            stale_limit_secs,
+            &mut stale_drop_count,
+            &mut stale_drop_max_lag_secs,
+            &mut stale_drop_max_publish_delay_secs,
+            &mut stale_drop_max_transport_lag_secs,
+            &mut stale_drop_oldest_ts,
+            &mut stale_drop_newest_ts,
+            &mut stale_drop_by_msg_type,
+        )
+        .await
+        {
+            warn!(error = %err, "shutdown drain + persist failed before snapshot save");
+        }
+    }
+
     // Save state snapshot for fast next startup
     // Support {symbol} placeholder in path (e.g. "/tmp/indicator_engine_{symbol}.json.gz")
     let snapshot_path = ctx
@@ -752,6 +795,11 @@ pub async fn run(ctx: AppContext) -> Result<()> {
     Ok(())
 }
 
+struct DrainPendingIngestResult {
+    all_channels_closed: bool,
+    drained_count: usize,
+}
+
 fn drain_pending_ingest_events(
     trade_rx: &mut mpsc::Receiver<EngineEvent>,
     non_trade_rx: &mut mpsc::Receiver<EngineEvent>,
@@ -772,7 +820,7 @@ fn drain_pending_ingest_events(
     metrics: &Arc<AppMetrics>,
     state_store: &mut StateStore,
     scheduler: &mut WindowScheduler,
-) -> bool {
+) -> DrainPendingIngestResult {
     let mut drained = 0usize;
 
     while drained < INGEST_DRAIN_PER_TICK_LIMIT {
@@ -845,7 +893,124 @@ fn drain_pending_ingest_events(
         }
     }
 
-    *trade_channel_closed && *non_trade_channel_closed
+    DrainPendingIngestResult {
+        all_channels_closed: *trade_channel_closed && *non_trade_channel_closed,
+        drained_count: drained,
+    }
+}
+
+async fn shutdown_drain_and_persist(
+    ctx: &Arc<AppContext>,
+    metrics: Arc<AppMetrics>,
+    dispatcher: &Dispatcher,
+    state_store: &mut StateStore,
+    scheduler: &mut WindowScheduler,
+    runtime_options: &IndicatorRuntimeOptions,
+    trade_rx: &mut mpsc::Receiver<EngineEvent>,
+    non_trade_rx: &mut mpsc::Receiver<EngineEvent>,
+    trade_channel_closed: &mut bool,
+    non_trade_channel_closed: &mut bool,
+    startup_replay_cutoff_bucket: Option<DateTime<Utc>>,
+    startup_cutover_completed: &mut bool,
+    consume_mode_live: bool,
+    live_drop_stale_enabled: bool,
+    stale_limit_secs: i64,
+    stale_drop_count: &mut u64,
+    stale_drop_max_lag_secs: &mut i64,
+    stale_drop_max_publish_delay_secs: &mut i64,
+    stale_drop_max_transport_lag_secs: &mut i64,
+    stale_drop_oldest_ts: &mut Option<DateTime<Utc>>,
+    stale_drop_newest_ts: &mut Option<DateTime<Utc>>,
+    stale_drop_by_msg_type: &mut HashMap<String, u64>,
+) -> Result<()> {
+    let started_at = Instant::now();
+    let mut rounds = 0usize;
+    let mut total_drained = 0usize;
+    let mut total_processed = 0usize;
+
+    loop {
+        rounds += 1;
+        let last_persisted_before = ts_from_millis(metrics.snapshot().last_persisted_ts_ms);
+        let next_minute_before = scheduler.next_minute_to_emit();
+        let dirty_pending_before = state_store.has_pending_dirty_recompute();
+
+        let drain_result = drain_pending_ingest_events(
+            trade_rx,
+            non_trade_rx,
+            trade_channel_closed,
+            non_trade_channel_closed,
+            startup_replay_cutoff_bucket,
+            startup_cutover_completed,
+            consume_mode_live,
+            live_drop_stale_enabled,
+            stale_limit_secs,
+            stale_drop_count,
+            stale_drop_max_lag_secs,
+            stale_drop_max_publish_delay_secs,
+            stale_drop_max_transport_lag_secs,
+            stale_drop_oldest_ts,
+            stale_drop_newest_ts,
+            stale_drop_by_msg_type,
+            &metrics,
+            state_store,
+            scheduler,
+        );
+        total_drained += drain_result.drained_count;
+
+        let latest_closed = scheduler.closed_minute(Utc::now());
+        let ready_through_ts = scheduler.next_minute_to_emit().and_then(|minute| {
+            state_store.latest_contiguous_complete_canonical_minute_from(minute, latest_closed)
+        });
+
+        if let Some(ready_through) = ready_through_ts {
+            process_ready_minutes(
+                ctx,
+                metrics.clone(),
+                dispatcher,
+                state_store,
+                scheduler,
+                runtime_options,
+                ready_through,
+            )
+            .await?;
+        }
+
+        let last_persisted_after = ts_from_millis(metrics.snapshot().last_persisted_ts_ms);
+        let next_minute_after = scheduler.next_minute_to_emit();
+        let dirty_pending_after = state_store.has_pending_dirty_recompute();
+
+        let processed_this_round = match (next_minute_before, next_minute_after) {
+            (Some(before), Some(after)) if after > before => {
+                (after - before).num_minutes().max(0) as usize
+            }
+            (Some(_), None) => 1,
+            _ => 0,
+        };
+        total_processed += processed_this_round;
+
+        let made_progress = drain_result.drained_count > 0
+            || last_persisted_before != last_persisted_after
+            || next_minute_before != next_minute_after
+            || (dirty_pending_before && !dirty_pending_after);
+
+        if !made_progress {
+            info!(
+                rounds = rounds,
+                total_drained = total_drained,
+                total_processed = total_processed,
+                channels_closed = drain_result.all_channels_closed,
+                next_minute = ?next_minute_after,
+                ready_through_ts = ?ready_through_ts,
+                last_persisted_ts = ?last_persisted_after,
+                dirty_recompute_pending = dirty_pending_after,
+                elapsed_ms = started_at.elapsed().as_millis(),
+                "shutdown drain + persist reached a stable frontier"
+            );
+            break;
+        }
+    }
+
+    Ok(())
 }
 
 const INDICATOR_COVERAGE_ORDER: [(&str, &str); 24] = [
@@ -1789,6 +1954,19 @@ async fn process_ready_minutes(
         }
         let remaining_budget =
             DIRTY_RECOMPUTE_WINDOW_BUDGET_PER_TICK.saturating_sub(dirty_windows_processed);
+        if let Some((dirty_from, dirty_to)) = state_store
+            .pending_dirty_recompute_batch_range(DIRTY_RECOMPUTE_BATCH_SIZE.min(remaining_budget))
+        {
+            hydrate_futures_orderbook_heatmaps_for_range(
+                &ctx.db_pool,
+                &ctx.config.indicator.symbol,
+                state_store,
+                dirty_from,
+                dirty_to + ChronoDuration::minutes(1),
+                "live dirty recompute",
+            )
+            .await?;
+        }
         let dirty_batch = state_store
             .recompute_dirty_finalized_minutes(DIRTY_RECOMPUTE_BATCH_SIZE.min(remaining_budget));
         if dirty_batch.is_empty() {
@@ -1846,6 +2024,18 @@ async fn process_ready_minutes(
             );
         }
         return Ok(());
+    }
+
+    if let Some(first_ready_minute) = scheduler.next_minute_to_emit() {
+        hydrate_futures_orderbook_heatmaps_for_range(
+            &ctx.db_pool,
+            &ctx.config.indicator.symbol,
+            state_store,
+            first_ready_minute,
+            ready_through_ts + ChronoDuration::minutes(1),
+            "live ready minute materialization",
+        )
+        .await?;
     }
 
     for minute in scheduler.ready_minutes_through(ready_through_ts) {
@@ -1944,6 +2134,15 @@ async fn process_ready_minutes(
     Ok(())
 }
 
+fn replay_heatmap_hydration_batch_end(
+    start_ts: DateTime<Utc>,
+    inclusive_end_ts: DateTime<Utc>,
+) -> DateTime<Utc> {
+    let batch_span_minutes =
+        ChronoDuration::minutes(CANONICAL_REPLAY_FETCH_WINDOW_MINUTES.saturating_sub(1));
+    inclusive_end_ts.min(start_ts + batch_span_minutes)
+}
+
 async fn process_window_bundle(
     ctx: &Arc<AppContext>,
     dispatcher: &Dispatcher,
@@ -1970,9 +2169,13 @@ async fn process_window_bundle(
         minute + ChronoDuration::minutes(1),
     )
     .await;
-    let ictx = IndicatorContext::from_bundle(window, runtime_options, kline_history_supplement);
+    let ictx = Arc::new(IndicatorContext::from_bundle(
+        window,
+        runtime_options,
+        kline_history_supplement,
+    ));
 
-    dispatcher.process_window(&ictx, mode).await
+    dispatcher.process_window(ictx, mode).await
 }
 
 #[allow(dead_code)]
@@ -2335,6 +2538,17 @@ async fn run_startup_backfill(
 
     let mut minute = repair_start_ts;
     while minute <= replay_end_ts {
+        let batch_end_ts = replay_heatmap_hydration_batch_end(minute, replay_end_ts);
+        hydrate_futures_orderbook_heatmaps_for_range(
+            &ctx.db_pool,
+            &ctx.config.indicator.symbol,
+            state_store,
+            minute,
+            batch_end_ts + ChronoDuration::minutes(1),
+            "startup materialization",
+        )
+        .await?;
+
         refresh_runtime_observability_metrics(
             &metrics,
             state_store,
@@ -2343,38 +2557,40 @@ async fn run_startup_backfill(
             0,
             0,
         );
-        let window = state_store.finalize_minute(minute);
-        let snapshots = process_window_bundle(
-            ctx,
-            dispatcher,
-            runtime_options,
-            &window,
-            DispatchMode::ReplayMaterialize,
-        )
-        .await?;
-        metrics.inc_exported_window();
-        metrics.set_last_persisted_ts(Some(minute.timestamp_millis()));
-        materialized_windows += 1;
-        first_materialized_bucket.get_or_insert(minute);
-        last_materialized_bucket = Some(minute);
-        let (computed, missing) = indicator_coverage(&snapshots);
-        last_computed = computed;
-        for item in missing {
-            missing_union.insert(item);
-        }
-        if ctx.config.indicator.enable_file_export {
-            if let Err(err) = export_snapshots(
-                &ctx.config.indicator.export_dir,
-                minute,
-                &ctx.config.indicator.symbol,
-                &snapshots,
+        while minute <= batch_end_ts {
+            let window = state_store.finalize_minute(minute);
+            let snapshots = process_window_bundle(
+                ctx,
+                dispatcher,
+                runtime_options,
+                &window,
+                DispatchMode::ReplayMaterialize,
             )
-            .await
-            {
-                warn!(error = %err, "export indicator snapshot file failed");
+            .await?;
+            metrics.inc_exported_window();
+            metrics.set_last_persisted_ts(Some(minute.timestamp_millis()));
+            materialized_windows += 1;
+            first_materialized_bucket.get_or_insert(minute);
+            last_materialized_bucket = Some(minute);
+            let (computed, missing) = indicator_coverage(&snapshots);
+            last_computed = computed;
+            for item in missing {
+                missing_union.insert(item);
             }
+            if ctx.config.indicator.enable_file_export {
+                if let Err(err) = export_snapshots(
+                    &ctx.config.indicator.export_dir,
+                    minute,
+                    &ctx.config.indicator.symbol,
+                    &snapshots,
+                )
+                .await
+                {
+                    warn!(error = %err, "export indicator snapshot file failed");
+                }
+            }
+            minute += ChronoDuration::minutes(1);
         }
-        minute += ChronoDuration::minutes(1);
     }
 
     if let Some(last_bucket) = last_materialized_bucket {
@@ -3018,6 +3234,9 @@ fn build_backfill_data_json(row: &PgRow, src: &str) -> Result<Value> {
             )?;
             let ofi_sum =
                 require_backfill_field(src, "b_ofi_sum", row.get::<Option<f64>, _>("b_ofi_sum"))?;
+            let heatmap_loaded = row
+                .get::<Option<bool>, _>("b_heatmap_loaded")
+                .unwrap_or(true);
             let heatmap_levels = require_backfill_field(
                 src,
                 "b_heatmap_levels",
@@ -3045,7 +3264,8 @@ fn build_backfill_data_json(row: &PgRow, src: &str) -> Result<Value> {
                 "microprice_adj_sum": microprice_adj_sum,
                 "ofi_sum": ofi_sum,
                 "obi_k_dw_close": row.get::<Option<f64>, _>("b_obi_k_dw_close"),
-                "heatmap_levels": heatmap_levels
+                "heatmap_levels": heatmap_levels,
+                "heatmap_loaded": heatmap_loaded
             }))
         }
         "liq" => {
@@ -3136,7 +3356,7 @@ async fn fetch_backfill_window(
     let mut rows = Vec::new();
 
     if include_futures {
-        rows.extend(
+        let (trade_rows, orderbook_rows, liq_rows, funding_rows) = tokio::try_join!(
             fetch_backfill_source_rows(
                 pool,
                 TRADE_BACKFILL_WINDOW_SQL,
@@ -3145,22 +3365,16 @@ async fn fetch_backfill_window(
                 to_ts,
                 &symbol_upper,
                 "futures",
-            )
-            .await?,
-        );
-        rows.extend(
+            ),
             fetch_backfill_source_rows(
                 pool,
-                ORDERBOOK_BACKFILL_WINDOW_SQL,
+                ORDERBOOK_BACKFILL_WINDOW_SQL_SCALAR,
                 "orderbook",
                 from_ts,
                 to_ts,
                 &symbol_upper,
                 "futures",
-            )
-            .await?,
-        );
-        rows.extend(
+            ),
             fetch_backfill_source_rows(
                 pool,
                 LIQ_BACKFILL_WINDOW_SQL,
@@ -3169,10 +3383,7 @@ async fn fetch_backfill_window(
                 to_ts,
                 &symbol_upper,
                 "futures",
-            )
-            .await?,
-        );
-        rows.extend(
+            ),
             fetch_backfill_source_rows(
                 pool,
                 FUNDING_BACKFILL_WINDOW_SQL,
@@ -3181,13 +3392,16 @@ async fn fetch_backfill_window(
                 to_ts,
                 &symbol_upper,
                 "futures",
-            )
-            .await?,
-        );
+            ),
+        )?;
+        rows.extend(trade_rows);
+        rows.extend(orderbook_rows);
+        rows.extend(liq_rows);
+        rows.extend(funding_rows);
     }
 
     if include_spot {
-        rows.extend(
+        let (trade_rows, orderbook_rows) = tokio::try_join!(
             fetch_backfill_source_rows(
                 pool,
                 TRADE_BACKFILL_WINDOW_SQL,
@@ -3196,21 +3410,19 @@ async fn fetch_backfill_window(
                 to_ts,
                 &symbol_upper,
                 "spot",
-            )
-            .await?,
-        );
-        rows.extend(
+            ),
             fetch_backfill_source_rows(
                 pool,
-                ORDERBOOK_BACKFILL_WINDOW_SQL,
+                ORDERBOOK_BACKFILL_WINDOW_SQL_SCALAR,
                 "orderbook",
                 from_ts,
                 to_ts,
                 &symbol_upper,
                 "spot",
-            )
-            .await?,
-        );
+            ),
+        )?;
+        rows.extend(trade_rows);
+        rows.extend(orderbook_rows);
     }
 
     rows.sort_by(|a, b| {
@@ -3289,11 +3501,11 @@ const TRADE_BACKFILL_WINDOW_SQL: &str = r#"
     WHERE ts_bucket >= $1
       AND ts_bucket < $2
       AND symbol = $3
-      AND market::text = $4
+      AND market = $4::cfg.market_type
     ORDER BY ts_event ASC, market ASC, symbol ASC
 "#;
 
-const ORDERBOOK_BACKFILL_WINDOW_SQL: &str = r#"
+const ORDERBOOK_BACKFILL_WINDOW_SQL_SCALAR: &str = r#"
     SELECT
         ts_event AS event_ts,
         'md.agg.orderbook.1m'::text AS msg_type,
@@ -3320,12 +3532,50 @@ const ORDERBOOK_BACKFILL_WINDOW_SQL: &str = r#"
         microprice_adj_sum AS b_microprice_adj_sum,
         ofi_sum AS b_ofi_sum,
         obi_k_dw_close AS b_obi_k_dw_close,
-        heatmap_levels AS b_heatmap_levels
+        '[]'::jsonb AS b_heatmap_levels,
+        FALSE AS b_heatmap_loaded
     FROM md.agg_orderbook_1m
     WHERE ts_bucket >= $1
       AND ts_bucket < $2
       AND symbol = $3
-      AND market::text = $4
+      AND market = $4::cfg.market_type
+    ORDER BY ts_event ASC, market ASC, symbol ASC
+"#;
+
+const ORDERBOOK_BACKFILL_WINDOW_SQL_WITH_HEATMAP: &str = r#"
+    SELECT
+        ts_event AS event_ts,
+        'md.agg.orderbook.1m'::text AS msg_type,
+        market::text AS market,
+        symbol,
+        format('md.agg.%s.orderbook.1m.%s', market::text, lower(symbol)) AS routing_key,
+        ts_bucket AS b_ts_bucket,
+        chunk_start_ts AS b_chunk_start_ts,
+        chunk_end_ts AS b_chunk_end_ts,
+        source_event_count AS b_source_event_count,
+        sample_count AS b_sample_count,
+        bbo_updates AS b_bbo_updates,
+        spread_sum AS b_spread_sum,
+        topk_depth_sum AS b_topk_depth_sum,
+        obi_sum AS b_obi_sum,
+        obi_l1_sum AS b_obi_l1_sum,
+        obi_k_sum AS b_obi_k_sum,
+        obi_k_dw_sum AS b_obi_k_dw_sum,
+        obi_k_dw_change_sum AS b_obi_k_dw_change_sum,
+        obi_k_dw_adj_sum AS b_obi_k_dw_adj_sum,
+        microprice_sum AS b_microprice_sum,
+        microprice_classic_sum AS b_microprice_classic_sum,
+        microprice_kappa_sum AS b_microprice_kappa_sum,
+        microprice_adj_sum AS b_microprice_adj_sum,
+        ofi_sum AS b_ofi_sum,
+        obi_k_dw_close AS b_obi_k_dw_close,
+        heatmap_levels AS b_heatmap_levels,
+        TRUE AS b_heatmap_loaded
+    FROM md.agg_orderbook_1m
+    WHERE ts_bucket >= $1
+      AND ts_bucket < $2
+      AND symbol = $3
+      AND market = $4::cfg.market_type
     ORDER BY ts_event ASC, market ASC, symbol ASC
 "#;
 
@@ -3345,7 +3595,7 @@ const LIQ_BACKFILL_WINDOW_SQL: &str = r#"
     WHERE ts_bucket >= $1
       AND ts_bucket < $2
       AND symbol = $3
-      AND market::text = $4
+      AND market = $4::cfg.market_type
     ORDER BY ts_event ASC, market ASC, symbol ASC
 "#;
 
@@ -3366,7 +3616,7 @@ const FUNDING_BACKFILL_WINDOW_SQL: &str = r#"
     WHERE ts_bucket >= $1
       AND ts_bucket < $2
       AND symbol = $3
-      AND market::text = $4
+      AND market = $4::cfg.market_type
     ORDER BY ts_event ASC, market ASC, symbol ASC
 "#;
 
@@ -3455,6 +3705,105 @@ pub async fn fetch_backfill_batch(
     Ok(out)
 }
 
+async fn hydrate_futures_orderbook_heatmaps_for_range_with_fetch<F, Fut>(
+    _symbol: &str,
+    state_store: &mut StateStore,
+    from_ts: DateTime<Utc>,
+    to_ts_exclusive: DateTime<Utc>,
+    reason: &'static str,
+    mut fetch_rows: F,
+) -> Result<()>
+where
+    F: FnMut(DateTime<Utc>, DateTime<Utc>) -> Fut,
+    Fut: Future<Output = Result<Vec<ReplayRow>>>,
+{
+    let Some(to_ts_inclusive) = to_ts_exclusive.checked_sub_signed(ChronoDuration::minutes(1))
+    else {
+        return Ok(());
+    };
+    if from_ts > to_ts_inclusive {
+        return Ok(());
+    }
+    if !state_store.has_unhydrated_futures_orderbook_heatmap_in_range(from_ts, to_ts_inclusive) {
+        return Ok(());
+    }
+
+    let mut window_from_ts = from_ts;
+    let mut fetched_rows = 0usize;
+    while window_from_ts < to_ts_exclusive {
+        let window_to_ts = (window_from_ts
+            + ChronoDuration::minutes(CANONICAL_REPLAY_FETCH_WINDOW_MINUTES))
+        .min(to_ts_exclusive);
+        let rows = fetch_rows(window_from_ts, window_to_ts).await.with_context(|| {
+            format!(
+                "{reason} fetch futures orderbook heatmap rows from_ts={window_from_ts} to_ts_exclusive={window_to_ts}"
+            )
+        })?;
+        fetched_rows += rows.len();
+
+        for row in rows {
+            let event = replay_row_to_engine_event(row).with_context(|| {
+                format!(
+                    "{reason} decode futures orderbook heatmap row from_ts={window_from_ts} to_ts_exclusive={window_to_ts}"
+                )
+            })?;
+            state_store.ingest(event);
+        }
+
+        window_from_ts = window_to_ts;
+    }
+
+    if state_store.has_unhydrated_futures_orderbook_heatmap_in_range(from_ts, to_ts_inclusive) {
+        anyhow::bail!(
+            "{reason} left unhydrated futures orderbook heatmap in range {from_ts}..={to_ts_inclusive}"
+        );
+    }
+
+    info!(
+        reason = reason,
+        from_ts = %from_ts,
+        to_ts_exclusive = %to_ts_exclusive,
+        fetched_rows = fetched_rows,
+        "hydrated futures orderbook heatmaps for replay range"
+    );
+
+    Ok(())
+}
+
+async fn hydrate_futures_orderbook_heatmaps_for_range(
+    pool: &PgPool,
+    symbol: &str,
+    state_store: &mut StateStore,
+    from_ts: DateTime<Utc>,
+    to_ts_exclusive: DateTime<Utc>,
+    reason: &'static str,
+) -> Result<()> {
+    let symbol_upper = symbol.to_uppercase();
+    hydrate_futures_orderbook_heatmaps_for_range_with_fetch(
+        symbol,
+        state_store,
+        from_ts,
+        to_ts_exclusive,
+        reason,
+        |window_from_ts, window_to_ts| {
+            let symbol_upper = symbol_upper.clone();
+            async move {
+                fetch_backfill_source_rows(
+                    pool,
+                    ORDERBOOK_BACKFILL_WINDOW_SQL_WITH_HEATMAP,
+                    "orderbook",
+                    window_from_ts,
+                    window_to_ts,
+                    &symbol_upper,
+                    "futures",
+                )
+                .await
+            }
+        },
+    )
+    .await
+}
+
 pub fn replay_row_to_engine_event(row: ReplayRow) -> Result<EngineEvent> {
     let payload = json!({
         "schema_version": 1,
@@ -3513,15 +3862,20 @@ async fn export_snapshots(
 mod tests {
     use super::{
         build_backfill_sql, find_long_null_price_run, handle_ingest_event,
-        live_tail_reconcile_start_ts, minute_exclusive_upper_bound,
-        minute_history_is_strictly_contiguous, snapshot_has_required_history,
+        hydrate_futures_orderbook_heatmaps_for_range_with_fetch, live_tail_reconcile_start_ts,
+        minute_exclusive_upper_bound, minute_history_is_strictly_contiguous,
+        replay_heatmap_hydration_batch_end, snapshot_has_required_history,
         snapshot_null_price_run_reaches_recent_tail, LiveCanonicalRepairController,
+        FUNDING_BACKFILL_WINDOW_SQL, LIQ_BACKFILL_WINDOW_SQL, ORDERBOOK_BACKFILL_WINDOW_SQL_SCALAR,
+        ORDERBOOK_BACKFILL_WINDOW_SQL_WITH_HEATMAP, TRADE_BACKFILL_WINDOW_SQL,
     };
-    use crate::ingest::decoder::{EngineEvent, MarketKind, MdData, TradeEvent};
+    use crate::ingest::decoder::{
+        AggHeatmapLevel, AggOrderbook1mEvent, EngineEvent, MarketKind, MdData, TradeEvent,
+    };
     use crate::observability::metrics::AppMetrics;
     use crate::runtime::state_store::{
         FinalizedVpinState, FundingChange, LatestFundingState, LatestMarkState, MinuteHistory,
-        StateSnapshot, VpinState, HISTORY_LIMIT_MINUTES, STATE_SNAPSHOT_VERSION,
+        StateSnapshot, StateStore, VpinState, HISTORY_LIMIT_MINUTES, STATE_SNAPSHOT_VERSION,
     };
     use crate::runtime::window_scheduler::WindowScheduler;
     use chrono::{Duration as ChronoDuration, TimeZone, Utc};
@@ -3574,6 +3928,7 @@ mod tests {
             whale_qty_eth_total: 0.0,
             whale_qty_eth_buy: 0.0,
             whale_qty_eth_sell: 0.0,
+            whale_max_single_notional: 0.0,
             profile: BTreeMap::new(),
         }
     }
@@ -3606,6 +3961,48 @@ mod tests {
             published_at: event_ts,
             data,
         }
+    }
+
+    fn agg_orderbook_event(
+        ts_bucket: chrono::DateTime<Utc>,
+        heatmap_loaded: bool,
+        bid_liquidity: f64,
+    ) -> EngineEvent {
+        frontier_event(
+            ts_bucket,
+            MdData::AggOrderbook1m(AggOrderbook1mEvent {
+                ts_bucket,
+                chunk_start_ts: ts_bucket,
+                chunk_end_ts: ts_bucket + ChronoDuration::minutes(1),
+                source_event_count: 1,
+                sample_count: 1,
+                bbo_updates: 2,
+                spread_sum: 1.0,
+                topk_depth_sum: 10.0,
+                obi_sum: 0.4,
+                obi_l1_sum: 0.3,
+                obi_k_sum: 0.5,
+                obi_k_dw_sum: 0.6,
+                obi_k_dw_change_sum: 0.1,
+                obi_k_dw_adj_sum: 0.55,
+                microprice_sum: 100.0,
+                microprice_classic_sum: 100.0,
+                microprice_kappa_sum: 100.0,
+                microprice_adj_sum: 100.0,
+                ofi_sum: 5.0,
+                obi_k_dw_close: Some(0.6),
+                heatmap_levels: if heatmap_loaded {
+                    vec![AggHeatmapLevel {
+                        price: 100.0,
+                        bid_liquidity,
+                        ask_liquidity: 2.0,
+                    }]
+                } else {
+                    Vec::new()
+                },
+                heatmap_loaded,
+            }),
+        )
     }
 
     fn snapshot_fixture(
@@ -3649,6 +4046,70 @@ mod tests {
         assert!(sql.contains("AND f.ts_bucket < $2"));
         assert!(!sql.contains("WHERE t.ts_event >= $1"));
         assert!(!sql.contains("AND t.ts_event < $2"));
+    }
+
+    #[test]
+    fn backfill_source_sql_uses_typed_market_predicate() {
+        assert!(TRADE_BACKFILL_WINDOW_SQL.contains("AND market = $4::cfg.market_type"));
+        assert!(ORDERBOOK_BACKFILL_WINDOW_SQL_SCALAR.contains("AND market = $4::cfg.market_type"));
+        assert!(
+            ORDERBOOK_BACKFILL_WINDOW_SQL_WITH_HEATMAP.contains("AND market = $4::cfg.market_type")
+        );
+        assert!(LIQ_BACKFILL_WINDOW_SQL.contains("AND market = $4::cfg.market_type"));
+        assert!(FUNDING_BACKFILL_WINDOW_SQL.contains("AND market = $4::cfg.market_type"));
+        assert!(!TRADE_BACKFILL_WINDOW_SQL.contains("market::text = $4"));
+        assert!(!ORDERBOOK_BACKFILL_WINDOW_SQL_SCALAR.contains("market::text = $4"));
+        assert!(!ORDERBOOK_BACKFILL_WINDOW_SQL_WITH_HEATMAP.contains("market::text = $4"));
+        assert!(!LIQ_BACKFILL_WINDOW_SQL.contains("market::text = $4"));
+        assert!(!FUNDING_BACKFILL_WINDOW_SQL.contains("market::text = $4"));
+    }
+
+    #[test]
+    fn orderbook_backfill_sql_splits_scalar_and_heatmap_paths() {
+        assert!(ORDERBOOK_BACKFILL_WINDOW_SQL_SCALAR.contains("'[]'::jsonb AS b_heatmap_levels"));
+        assert!(ORDERBOOK_BACKFILL_WINDOW_SQL_SCALAR.contains("FALSE AS b_heatmap_loaded"));
+        assert!(ORDERBOOK_BACKFILL_WINDOW_SQL_WITH_HEATMAP
+            .contains("heatmap_levels AS b_heatmap_levels"));
+        assert!(ORDERBOOK_BACKFILL_WINDOW_SQL_WITH_HEATMAP.contains("TRUE AS b_heatmap_loaded"));
+    }
+
+    #[test]
+    fn startup_materialization_heatmap_hydration_is_batch_local() {
+        let start = Utc.with_ymd_and_hms(2026, 3, 24, 0, 0, 0).single().unwrap();
+        let replay_end = start + ChronoDuration::minutes(800);
+        assert_eq!(
+            replay_heatmap_hydration_batch_end(start, replay_end),
+            start + ChronoDuration::minutes(359)
+        );
+
+        let later_start = start + ChronoDuration::minutes(720);
+        assert_eq!(
+            replay_heatmap_hydration_batch_end(later_start, replay_end),
+            replay_end
+        );
+    }
+
+    #[tokio::test]
+    async fn heatmap_hydration_fails_closed_when_rows_remain_missing() {
+        let ts = Utc.with_ymd_and_hms(2026, 3, 24, 1, 0, 0).single().unwrap();
+        let mut state_store = StateStore::new("TESTUSDT".to_string(), 1_000.0);
+        state_store.ingest(agg_orderbook_event(ts, false, 0.0));
+        assert!(state_store.has_unhydrated_futures_orderbook_heatmap_in_range(ts, ts));
+
+        let err = hydrate_futures_orderbook_heatmaps_for_range_with_fetch(
+            "TESTUSDT",
+            &mut state_store,
+            ts,
+            ts + ChronoDuration::minutes(1),
+            "test live repair",
+            |_from_ts, _to_ts| async { Ok(Vec::new()) },
+        )
+        .await
+        .expect_err("missing heatmap should fail closed");
+
+        let err_text = format!("{err:#}");
+        assert!(err_text.contains("left unhydrated futures orderbook heatmap"));
+        assert!(state_store.has_unhydrated_futures_orderbook_heatmap_in_range(ts, ts));
     }
 
     #[test]

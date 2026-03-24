@@ -218,6 +218,7 @@ pub struct MinuteHistory {
     pub whale_qty_eth_total: f64,
     pub whale_qty_eth_buy: f64,
     pub whale_qty_eth_sell: f64,
+    pub whale_max_single_notional: f64,
     /// Per-tick trade profile for this closed bar.  Used by footprint multi-window aggregation.
     pub profile: BTreeMap<i64, LevelAgg>,
 }
@@ -840,6 +841,7 @@ impl MinuteBucket {
             whale_qty_eth_total: window.whale.qty_eth_total,
             whale_qty_eth_buy: window.whale.qty_eth_buy,
             whale_qty_eth_sell: window.whale.qty_eth_sell,
+            whale_max_single_notional: window.whale.max_single_notional,
             profile: window.profile.clone(),
         };
 
@@ -1598,6 +1600,42 @@ impl StateStore {
         self.dirty_recompute_from.is_some()
     }
 
+    pub fn pending_dirty_recompute_batch_range(
+        &self,
+        max_batch: usize,
+    ) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+        let start = self.dirty_recompute_from?;
+        let end = self.dirty_recompute_end.or(self.last_finalized_minute)?;
+        if start > end {
+            return None;
+        }
+        let batch_span_minutes = i64::try_from(max_batch.saturating_sub(1)).unwrap_or(i64::MAX);
+        Some((
+            start,
+            end.min(start + Duration::minutes(batch_span_minutes)),
+        ))
+    }
+
+    pub fn has_unhydrated_futures_orderbook_heatmap_in_range(
+        &self,
+        from_ts: DateTime<Utc>,
+        to_ts_inclusive: DateTime<Utc>,
+    ) -> bool {
+        if from_ts > to_ts_inclusive {
+            return false;
+        }
+        self.canonical_minutes
+            .range(from_ts.timestamp()..=to_ts_inclusive.timestamp())
+            .any(|(_, minute)| {
+                minute
+                    .futures
+                    .orderbook
+                    .as_ref()
+                    .map(|orderbook| !orderbook.heatmap_loaded)
+                    .unwrap_or(false)
+            })
+    }
+
     fn finalize_market(
         &mut self,
         market: MarketKind,
@@ -1667,7 +1705,17 @@ impl StateStore {
     fn store_canonical_orderbook(&mut self, market: MarketKind, orderbook: AggOrderbook1mEvent) {
         let changed = {
             let slot = self.canonical_slot_mut(market, orderbook.ts_bucket);
-            slot.orderbook.as_ref() != Some(&orderbook)
+            match slot.orderbook.as_ref() {
+                Some(existing)
+                    if existing.heatmap_loaded
+                        && !orderbook.heatmap_loaded
+                        && existing.scalar_eq(&orderbook) =>
+                {
+                    false
+                }
+                Some(existing) => existing != &orderbook,
+                None => true,
+            }
         };
         if changed {
             self.canonical_slot_mut(market, orderbook.ts_bucket)
@@ -2353,6 +2401,7 @@ fn build_trade_history_row_from_canonical(
         whale_qty_eth_total: trade.whale.qty_eth_total,
         whale_qty_eth_buy: trade.whale.qty_eth_buy,
         whale_qty_eth_sell: trade.whale.qty_eth_sell,
+        whale_max_single_notional: trade.whale.max_single_notional,
         profile,
     }
 }
@@ -2524,6 +2573,7 @@ mod tests {
                     bid_liquidity: 5.0,
                     ask_liquidity: 7.0,
                 }],
+                heatmap_loaded: true,
             }),
         }
     }
@@ -3230,6 +3280,41 @@ mod tests {
         assert_eq!(recomputed.len(), 1);
         assert_eq!(recomputed[0].futures.bbo_updates, 9);
         assert_eq!(recomputed[0].futures.obi_k_dw_twa, Some(2.0));
+    }
+
+    #[test]
+    fn scalar_only_orderbook_backfill_does_not_downgrade_loaded_heatmap() {
+        let mut store = StateStore::new("TESTUSDT".to_string(), 1_000.0);
+        let ts = Utc.with_ymd_and_hms(2026, 3, 6, 6, 11, 0).single().unwrap();
+
+        store.ingest(agg_orderbook_event(ts, 2, 4, 1.0));
+        assert!(!store.has_unhydrated_futures_orderbook_heatmap_in_range(ts, ts));
+
+        let mut scalar_only = agg_orderbook_event(ts, 2, 4, 1.0);
+        if let MdData::AggOrderbook1m(ref mut orderbook) = scalar_only.data {
+            orderbook.heatmap_levels.clear();
+            orderbook.heatmap_loaded = false;
+        }
+        store.ingest(scalar_only);
+
+        assert!(!store.has_unhydrated_futures_orderbook_heatmap_in_range(ts, ts));
+    }
+
+    #[test]
+    fn scalar_only_orderbook_backfill_can_be_upgraded_with_full_heatmap() {
+        let mut store = StateStore::new("TESTUSDT".to_string(), 1_000.0);
+        let ts = Utc.with_ymd_and_hms(2026, 3, 6, 6, 12, 0).single().unwrap();
+
+        let mut scalar_only = agg_orderbook_event(ts, 2, 4, 1.0);
+        if let MdData::AggOrderbook1m(ref mut orderbook) = scalar_only.data {
+            orderbook.heatmap_levels.clear();
+            orderbook.heatmap_loaded = false;
+        }
+        store.ingest(scalar_only);
+        assert!(store.has_unhydrated_futures_orderbook_heatmap_in_range(ts, ts));
+
+        store.ingest(agg_orderbook_event(ts, 2, 4, 1.0));
+        assert!(!store.has_unhydrated_futures_orderbook_heatmap_in_range(ts, ts));
     }
 
     #[test]

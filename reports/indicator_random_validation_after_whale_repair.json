@@ -1,0 +1,452 @@
+{
+  "symbol": "BTCUSDT",
+  "sample_count": 20,
+  "candidate_count": 5000,
+  "seed": 42,
+  "expected_indicator_codes": [
+    "absorption",
+    "avwap",
+    "bearish_absorption",
+    "bearish_initiation",
+    "bullish_absorption",
+    "bullish_initiation",
+    "buying_exhaustion",
+    "cvd_pack",
+    "divergence",
+    "ema_trend_regime",
+    "footprint",
+    "funding_rate",
+    "fvg",
+    "high_volume_pulse",
+    "initiation",
+    "kline_history",
+    "liquidation_density",
+    "orderbook_depth",
+    "price_volume_structure",
+    "rvwap_sigma_bands",
+    "selling_exhaustion",
+    "tpo_market_profile",
+    "vpin",
+    "whale_trades"
+  ],
+  "samples": [
+    "2026-03-20 05:05:00+00",
+    "2026-03-20 05:18:00+00",
+    "2026-03-20 05:45:00+00",
+    "2026-03-20 06:01:00+00",
+    "2026-03-20 13:33:00+00",
+    "2026-03-20 14:28:00+00",
+    "2026-03-20 15:40:00+00",
+    "2026-03-20 16:53:00+00",
+    "2026-03-20 20:44:00+00",
+    "2026-03-21 10:57:00+00",
+    "2026-03-21 11:34:00+00",
+    "2026-03-21 12:51:00+00",
+    "2026-03-21 14:32:00+00",
+    "2026-03-21 18:39:00+00",
+    "2026-03-22 14:42:00+00",
+    "2026-03-23 02:05:00+00",
+    "2026-03-23 07:33:00+00",
+    "2026-03-23 09:43:00+00",
+    "2026-03-23 13:43:00+00",
+    "2026-03-23 15:17:00+00"
+  ],
+  "per_sample": [
+    {
+      "ts": "2026-03-20 05:05:00+00",
+      "snapshot_count": 24,
+      "snapshot_codes_ok": true,
+      "checks_run": [
+        "price_volume_structure.source",
+        "footprint.source",
+        "cvd_pack.source",
+        "cvd_pack.feature_1m",
+        "orderbook_depth.source",
+        "orderbook_depth.feature_1m",
+        "funding_rate.feature_1m",
+        "avwap.feature_1m",
+        "whale_trades.feature_1m"
+      ]
+    },
+    {
+      "ts": "2026-03-20 05:18:00+00",
+      "snapshot_count": 24,
+      "snapshot_codes_ok": true,
+      "checks_run": [
+        "price_volume_structure.source",
+        "footprint.source",
+        "cvd_pack.source",
+        "cvd_pack.feature_1m",
+        "orderbook_depth.source",
+        "orderbook_depth.feature_1m",
+        "funding_rate.feature_1m",
+        "avwap.feature_1m",
+        "whale_trades.feature_1m"
+      ]
+    },
+    {
+      "ts": "2026-03-20 05:45:00+00",
+      "snapshot_count": 24,
+      "snapshot_codes_ok": true,
+      "checks_run": [
+        "price_volume_structure.source",
+        "footprint.source",
+        "cvd_pack.source",
+        "cvd_pack.feature_1m",
+        "orderbook_depth.source",
+        "orderbook_depth.feature_1m",
+        "funding_rate.feature_1m",
+        "avwap.feature_1m",
+        "whale_trades.feature_1m"
+      ]
+    },
+    {
+      "ts": "2026-03-20 06:01:00+00",
+      "snapshot_count": 24,
+      "snapshot_codes_ok": true,
+      "checks_run": [
+        "price_volume_structure.source",
+        "footprint.source",
+        "cvd_pack.source",
+        "cvd_pack.feature_1m",
+        "orderbook_depth.source",
+        "orderbook_depth.feature_1m",
+        "funding_rate.feature_1m",
+        "avwap.feature_1m",
+        "whale_trades.feature_1m"
+      ]
+    },
+    {
+      "ts": "2026-03-20 13:33:00+00",
+      "snapshot_count": 24,
+      "snapshot_codes_ok": true,
+      "checks_run": [
+        "price_volume_structure.source",
+        "footprint.source",
+        "cvd_pack.source",
+        "cvd_pack.feature_1m",
+        "orderbook_depth.source",
+        "orderbook_depth.feature_1m",
+        "funding_rate.feature_1m",
+        "avwap.feature_1m",
+        "whale_trades.feature_1m"
+      ]
+    },
+    {
+      "ts": "2026-03-20 14:28:00+00",
+      "snapshot_count": 24,
+      "snapshot_codes_ok": true,
+      "checks_run": [
+        "price_volume_structure.source",
+        "footprint.source",
+        "cvd_pack.source",
+        "cvd_pack.feature_1m",
+        "orderbook_depth.source",
+        "orderbook_depth.feature_1m",
+        "funding_rate.feature_1m",
+        "avwap.feature_1m",
+        "whale_trades.feature_1m"
+      ]
+    },
+    {
+      "ts": "2026-03-20 15:40:00+00",
+      "snapshot_count": 24,
+      "snapshot_codes_ok": true,
+      "checks_run": [
+        "price_volume_structure.source",
+        "footprint.source",
+        "cvd_pack.source",
+        "cvd_pack.feature_1m",
+        "orderbook_depth.source",
+        "orderbook_depth.feature_1m",
+        "funding_rate.feature_1m",
+        "avwap.feature_1m",
+        "whale_trades.feature_1m"
+      ]
+    },
+    {
+      "ts": "2026-03-20 16:53:00+00",
+      "snapshot_count": 24,
+      "snapshot_codes_ok": true,
+      "checks_run": [
+        "price_volume_structure.source",
+        "footprint.source",
+        "cvd_pack.source",
+        "cvd_pack.feature_1m",
+        "orderbook_depth.source",
+        "orderbook_depth.feature_1m",
+        "funding_rate.feature_1m",
+        "avwap.feature_1m",
+        "whale_trades.feature_1m"
+      ]
+    },
+    {
+      "ts": "2026-03-20 20:44:00+00",
+      "snapshot_count": 24,
+      "snapshot_codes_ok": true,
+      "checks_run": [
+        "price_volume_structure.source",
+        "footprint.source",
+        "cvd_pack.source",
+        "cvd_pack.feature_1m",
+        "orderbook_depth.source",
+        "orderbook_depth.feature_1m",
+        "funding_rate.feature_1m",
+        "avwap.feature_1m",
+        "whale_trades.feature_1m"
+      ]
+    },
+    {
+      "ts": "2026-03-21 10:57:00+00",
+      "snapshot_count": 24,
+      "snapshot_codes_ok": true,
+      "checks_run": [
+        "price_volume_structure.source",
+        "footprint.source",
+        "cvd_pack.source",
+        "cvd_pack.feature_1m",
+        "orderbook_depth.source",
+        "orderbook_depth.feature_1m",
+        "funding_rate.feature_1m",
+        "avwap.feature_1m",
+        "whale_trades.feature_1m"
+      ]
+    },
+    {
+      "ts": "2026-03-21 11:34:00+00",
+      "snapshot_count": 24,
+      "snapshot_codes_ok": true,
+      "checks_run": [
+        "price_volume_structure.source",
+        "footprint.source",
+        "cvd_pack.source",
+        "cvd_pack.feature_1m",
+        "orderbook_depth.source",
+        "orderbook_depth.feature_1m",
+        "funding_rate.feature_1m",
+        "avwap.feature_1m",
+        "whale_trades.feature_1m"
+      ]
+    },
+    {
+      "ts": "2026-03-21 12:51:00+00",
+      "snapshot_count": 24,
+      "snapshot_codes_ok": true,
+      "checks_run": [
+        "price_volume_structure.source",
+        "footprint.source",
+        "cvd_pack.source",
+        "cvd_pack.feature_1m",
+        "orderbook_depth.source",
+        "orderbook_depth.feature_1m",
+        "funding_rate.feature_1m",
+        "avwap.feature_1m",
+        "whale_trades.feature_1m"
+      ]
+    },
+    {
+      "ts": "2026-03-21 14:32:00+00",
+      "snapshot_count": 24,
+      "snapshot_codes_ok": true,
+      "checks_run": [
+        "price_volume_structure.source",
+        "footprint.source",
+        "cvd_pack.source",
+        "cvd_pack.feature_1m",
+        "orderbook_depth.source",
+        "orderbook_depth.feature_1m",
+        "funding_rate.feature_1m",
+        "avwap.feature_1m",
+        "whale_trades.feature_1m"
+      ]
+    },
+    {
+      "ts": "2026-03-21 18:39:00+00",
+      "snapshot_count": 24,
+      "snapshot_codes_ok": true,
+      "checks_run": [
+        "price_volume_structure.source",
+        "footprint.source",
+        "cvd_pack.source",
+        "cvd_pack.feature_1m",
+        "orderbook_depth.source",
+        "orderbook_depth.feature_1m",
+        "funding_rate.feature_1m",
+        "avwap.feature_1m",
+        "whale_trades.feature_1m"
+      ]
+    },
+    {
+      "ts": "2026-03-22 14:42:00+00",
+      "snapshot_count": 24,
+      "snapshot_codes_ok": true,
+      "checks_run": [
+        "price_volume_structure.source",
+        "footprint.source",
+        "cvd_pack.source",
+        "cvd_pack.feature_1m",
+        "orderbook_depth.source",
+        "orderbook_depth.feature_1m",
+        "funding_rate.feature_1m",
+        "avwap.feature_1m",
+        "whale_trades.feature_1m"
+      ]
+    },
+    {
+      "ts": "2026-03-23 02:05:00+00",
+      "snapshot_count": 24,
+      "snapshot_codes_ok": true,
+      "checks_run": [
+        "price_volume_structure.source",
+        "footprint.source",
+        "cvd_pack.source",
+        "cvd_pack.feature_1m",
+        "orderbook_depth.source",
+        "orderbook_depth.feature_1m",
+        "funding_rate.feature_1m",
+        "avwap.feature_1m",
+        "whale_trades.feature_1m"
+      ]
+    },
+    {
+      "ts": "2026-03-23 07:33:00+00",
+      "snapshot_count": 24,
+      "snapshot_codes_ok": true,
+      "checks_run": [
+        "price_volume_structure.source",
+        "footprint.source",
+        "cvd_pack.source",
+        "cvd_pack.feature_1m",
+        "orderbook_depth.source",
+        "orderbook_depth.feature_1m",
+        "funding_rate.feature_1m",
+        "avwap.feature_1m",
+        "whale_trades.feature_1m"
+      ]
+    },
+    {
+      "ts": "2026-03-23 09:43:00+00",
+      "snapshot_count": 24,
+      "snapshot_codes_ok": true,
+      "checks_run": [
+        "price_volume_structure.source",
+        "footprint.source",
+        "cvd_pack.source",
+        "cvd_pack.feature_1m",
+        "orderbook_depth.source",
+        "orderbook_depth.feature_1m",
+        "funding_rate.feature_1m",
+        "avwap.feature_1m",
+        "whale_trades.feature_1m"
+      ]
+    },
+    {
+      "ts": "2026-03-23 13:43:00+00",
+      "snapshot_count": 24,
+      "snapshot_codes_ok": true,
+      "checks_run": [
+        "price_volume_structure.source",
+        "footprint.source",
+        "cvd_pack.source",
+        "cvd_pack.feature_1m",
+        "orderbook_depth.source",
+        "orderbook_depth.feature_1m",
+        "funding_rate.feature_1m",
+        "avwap.feature_1m",
+        "whale_trades.feature_1m"
+      ]
+    },
+    {
+      "ts": "2026-03-23 15:17:00+00",
+      "snapshot_count": 24,
+      "snapshot_codes_ok": true,
+      "checks_run": [
+        "price_volume_structure.source",
+        "footprint.source",
+        "cvd_pack.source",
+        "cvd_pack.feature_1m",
+        "orderbook_depth.source",
+        "orderbook_depth.feature_1m",
+        "funding_rate.feature_1m",
+        "avwap.feature_1m",
+        "whale_trades.feature_1m"
+      ]
+    }
+  ],
+  "failure_count": 10,
+  "failures_by_check": {
+    "whale_trades.feature_1m": 10
+  },
+  "failures": [
+    {
+      "ts": "2026-03-20 05:45:00+00",
+      "check": "whale_trades.feature_1m",
+      "field": "fut_notional_sum_usd",
+      "expected": 1.594889909029007e-08,
+      "actual": 0.0
+    },
+    {
+      "ts": "2026-03-20 05:45:00+00",
+      "check": "whale_trades.feature_1m",
+      "field": "fut_whale_delta_notional",
+      "expected": 1.5308614820241928e-08,
+      "actual": 0.0
+    },
+    {
+      "ts": "2026-03-20 20:44:00+00",
+      "check": "whale_trades.feature_1m",
+      "field": "fut_notional_sum_usd",
+      "expected": 3.073364496231079e-08,
+      "actual": 0.0
+    },
+    {
+      "ts": "2026-03-20 20:44:00+00",
+      "check": "whale_trades.feature_1m",
+      "field": "fut_whale_delta_notional",
+      "expected": 2.1886080503463745e-08,
+      "actual": 0.0
+    },
+    {
+      "ts": "2026-03-21 11:34:00+00",
+      "check": "whale_trades.feature_1m",
+      "field": "fut_notional_sum_usd",
+      "expected": 3.236345946788788e-08,
+      "actual": 0.0
+    },
+    {
+      "ts": "2026-03-21 11:34:00+00",
+      "check": "whale_trades.feature_1m",
+      "field": "fut_whale_delta_notional",
+      "expected": 2.1420419216156006e-08,
+      "actual": 0.0
+    },
+    {
+      "ts": "2026-03-21 14:32:00+00",
+      "check": "whale_trades.feature_1m",
+      "field": "fut_notional_sum_usd",
+      "expected": 2.7939677238464355e-08,
+      "actual": 0.0
+    },
+    {
+      "ts": "2026-03-21 14:32:00+00",
+      "check": "whale_trades.feature_1m",
+      "field": "fut_whale_delta_notional",
+      "expected": 2.0954757928848267e-08,
+      "actual": 0.0
+    },
+    {
+      "ts": "2026-03-23 09:43:00+00",
+      "check": "whale_trades.feature_1m",
+      "field": "fut_notional_sum_usd",
+      "expected": 3.166496753692627e-08,
+      "actual": 0.0
+    },
+    {
+      "ts": "2026-03-23 09:43:00+00",
+      "check": "whale_trades.feature_1m",
+      "field": "fut_whale_delta_notional",
+      "expected": 1.955777406692505e-08,
+      "actual": 0.0
+    }
+  ]
+}

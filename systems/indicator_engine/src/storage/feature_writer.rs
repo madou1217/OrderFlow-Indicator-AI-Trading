@@ -807,6 +807,7 @@ fn aggregate_window(
         whale.qty_eth_total += r.whale_qty_eth_total;
         whale.qty_eth_buy += r.whale_qty_eth_buy;
         whale.qty_eth_sell += r.whale_qty_eth_sell;
+        whale.max_single_notional = whale.max_single_notional.max(r.whale_max_single_notional);
     }
 
     Some(WindowAgg {
@@ -887,6 +888,78 @@ fn cumulative_avwap_7d(
             None
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::aggregate_window;
+    use crate::ingest::decoder::MarketKind;
+    use crate::runtime::state_store::MinuteHistory;
+    use chrono::{TimeZone, Utc};
+    use std::collections::BTreeMap;
+
+    fn history_minute(ts_bucket: chrono::DateTime<Utc>, max_single_notional: f64) -> MinuteHistory {
+        MinuteHistory {
+            ts_bucket,
+            market: MarketKind::Futures,
+            open_price: None,
+            high_price: None,
+            low_price: None,
+            close_price: None,
+            last_price: None,
+            buy_qty: 0.0,
+            sell_qty: 0.0,
+            total_qty: 0.0,
+            total_notional: 0.0,
+            delta: 0.0,
+            relative_delta: 0.0,
+            force_liq: BTreeMap::new(),
+            ofi: 0.0,
+            spread_twa: None,
+            topk_depth_twa: None,
+            obi_twa: None,
+            obi_l1_twa: None,
+            obi_k_twa: None,
+            obi_k_dw_twa: None,
+            obi_k_dw_close: None,
+            obi_k_dw_change: None,
+            obi_k_dw_adj_twa: None,
+            bbo_updates: 0,
+            microprice_twa: None,
+            microprice_classic_twa: None,
+            microprice_kappa_twa: None,
+            microprice_adj_twa: None,
+            cvd: 0.0,
+            vpin: 0.0,
+            avwap_minute: None,
+            whale_trade_count: 1,
+            whale_buy_count: 1,
+            whale_sell_count: 0,
+            whale_notional_total: max_single_notional,
+            whale_notional_buy: max_single_notional,
+            whale_notional_sell: 0.0,
+            whale_qty_eth_total: 1.0,
+            whale_qty_eth_buy: 1.0,
+            whale_qty_eth_sell: 0.0,
+            whale_max_single_notional: max_single_notional,
+            profile: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn aggregate_window_preserves_whale_max_single_notional() {
+        let ts = Utc
+            .with_ymd_and_hms(2026, 3, 24, 4, 0, 0)
+            .single()
+            .expect("valid ts");
+        let history = vec![
+            history_minute(ts - chrono::Duration::minutes(1), 125_000.0),
+            history_minute(ts, 725_000.0),
+        ];
+
+        let agg = aggregate_window(&history, ts, 1).expect("window agg");
+        assert_eq!(agg.whale.max_single_notional, 725_000.0);
+    }
 }
 
 fn funding_metrics(ctx: &IndicatorContext, mins: i64) -> FundingWindowMetrics {

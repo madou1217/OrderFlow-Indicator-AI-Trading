@@ -970,12 +970,15 @@ mod tests {
         PvsV2WindowConfig, MULTI_WINDOWS, RAW_AUDIT_HVN_CAP, RAW_AUDIT_LVN_CAP,
         RAW_AUDIT_TOP_RANKS_MULTI_WINDOW,
     };
-    use crate::indicators::context::{DivergenceSigTestMode, IndicatorContext};
+    use crate::indicators::context::{
+        DivergenceSigTestMode, IndicatorContext, IndicatorSharedCaches,
+    };
     use crate::indicators::indicator_trait::Indicator;
     use crate::ingest::decoder::MarketKind;
     use crate::runtime::state_store::{LevelAgg, MinuteHistory, MinuteWindowData};
     use chrono::{TimeZone, Utc};
     use std::collections::BTreeMap;
+    use std::sync::Arc;
 
     #[test]
     fn pvs_multi_windows_are_exactly_15m_4h_1d_3d() {
@@ -1070,6 +1073,7 @@ mod tests {
             divergence_bootstrap_block_len: 5,
             divergence_p_value_threshold: 0.05,
             window_codes: vec!["1m".to_string()],
+            shared_caches: Arc::new(IndicatorSharedCaches::default()),
         };
 
         let computation = I01PriceVolumeStructure.evaluate(&ctx);
@@ -1200,6 +1204,7 @@ mod tests {
                 whale_qty_eth_total: 0.0,
                 whale_qty_eth_buy: 0.0,
                 whale_qty_eth_sell: 0.0,
+                whale_max_single_notional: 0.0,
                 profile,
             }
         }
@@ -1296,6 +1301,7 @@ mod tests {
             divergence_bootstrap_block_len: 5,
             divergence_p_value_threshold: 0.05,
             window_codes: vec!["1m".to_string()],
+            shared_caches: Arc::new(IndicatorSharedCaches::default()),
         };
 
         let computation = I01PriceVolumeStructure.evaluate(&ctx);
@@ -1416,6 +1422,7 @@ mod tests {
             divergence_bootstrap_block_len: 5,
             divergence_p_value_threshold: 0.05,
             window_codes: vec!["1m".to_string()],
+            shared_caches: Arc::new(IndicatorSharedCaches::default()),
         };
 
         let computation = I01PriceVolumeStructure.evaluate(&ctx);
@@ -1509,6 +1516,7 @@ mod tests {
                 whale_qty_eth_total: 0.0,
                 whale_qty_eth_buy: 0.0,
                 whale_qty_eth_sell: 0.0,
+                whale_max_single_notional: 0.0,
                 profile,
             }
         }
@@ -1603,6 +1611,7 @@ mod tests {
             divergence_bootstrap_block_len: 5,
             divergence_p_value_threshold: 0.05,
             window_codes: vec!["1m".to_string()],
+            shared_caches: Arc::new(IndicatorSharedCaches::default()),
         };
 
         let computation = I01PriceVolumeStructure.evaluate(&ctx);

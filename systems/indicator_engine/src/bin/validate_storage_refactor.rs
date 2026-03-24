@@ -927,6 +927,7 @@ impl OrderbookAgg {
                         ask_liquidity: level.ask_liquidity,
                     })
                     .collect(),
+                heatmap_loaded: true,
             }),
         )
     }

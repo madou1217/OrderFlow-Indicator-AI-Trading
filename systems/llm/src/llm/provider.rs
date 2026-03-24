@@ -4677,11 +4677,9 @@ mod tests {
                 .and_then(|v| v.as_str()),
             Some("string")
         );
-        assert!(
-            schema
-                .pointer("/properties/pending_context/properties/sl_noise_risk_15m")
-                .is_none()
-        );
+        assert!(schema
+            .pointer("/properties/pending_context/properties/sl_noise_risk_15m")
+            .is_none());
     }
 
     #[test]

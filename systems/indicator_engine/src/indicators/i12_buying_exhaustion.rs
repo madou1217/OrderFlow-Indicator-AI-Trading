@@ -27,7 +27,7 @@ const THETA_BUY_WHALE: f64 = 100_000.0;
 const THETA_SELL_CVD: f64 = 0.0;
 const THETA_SELL_WHALE: f64 = -100_000.0;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ExhaustionEventData {
     pub direction: i16,
     pub event_type: String,
@@ -52,39 +52,23 @@ pub(crate) struct ExhaustionEventData {
     pub payload: Value,
 }
 
-pub(crate) fn detect_exhaustion_all_history(ctx: &IndicatorContext) -> Vec<ExhaustionEventData> {
-    let n = ctx.history_futures.len().min(ctx.history_spot.len());
+fn compute_exhaustion_all_history(ctx: &IndicatorContext) -> Vec<ExhaustionEventData> {
+    let series = ctx.basic_event_history_series();
+    let n = series.n;
     if n < (PIVOT_LEFT + PIVOT_RIGHT + CONFIRM_BARS + 3) {
         return Vec::new();
     }
 
     let fut = &ctx.history_futures[ctx.history_futures.len() - n..];
-    let spot = &ctx.history_spot[ctx.history_spot.len() - n..];
     let last_idx = n - 1;
 
-    let highs = fut
-        .iter()
-        .map(|h| h.high_price.or(h.last_price).unwrap_or(0.0))
-        .collect::<Vec<_>>();
-    let lows = fut
-        .iter()
-        .map(|h| h.low_price.or(h.last_price).unwrap_or(0.0))
-        .collect::<Vec<_>>();
-    let closes = fut
-        .iter()
-        .map(|h| h.close_price.or(h.last_price).unwrap_or(0.0))
-        .collect::<Vec<_>>();
-    let deltas = fut.iter().map(|h| h.delta).collect::<Vec<_>>();
-    let rdeltas = fut.iter().map(|h| h.relative_delta).collect::<Vec<_>>();
-
-    let spot_cvd = spot.iter().map(|h| h.cvd).collect::<Vec<_>>();
-    let spot_whale_notional = spot
-        .iter()
-        .map(|h| {
-            let px = h.close_price.or(h.last_price).unwrap_or(0.0);
-            h.delta * px
-        })
-        .collect::<Vec<_>>();
+    let highs = &series.high;
+    let lows = &series.low;
+    let closes = &series.close;
+    let deltas = &series.delta;
+    let rdeltas = &series.rdelta;
+    let spot_cvd = &series.spot_cvd;
+    let spot_whale_notional = &series.spot_whale_notional;
 
     let high_pivots = confirmed_high_pivots(&highs);
     let low_pivots = confirmed_low_pivots(&lows);
@@ -115,6 +99,12 @@ pub(crate) fn detect_exhaustion_all_history(ctx: &IndicatorContext) -> Vec<Exhau
         last_idx,
     ));
     out
+}
+
+pub(crate) fn detect_exhaustion_all_history(
+    ctx: &IndicatorContext,
+) -> std::sync::Arc<Vec<ExhaustionEventData>> {
+    ctx.exhaustion_all_events_or_init(compute_exhaustion_all_history)
 }
 
 pub(crate) fn exhaustion_event_json(
@@ -505,8 +495,9 @@ impl Indicator for I12BuyingExhaustion {
 
     fn evaluate(&self, ctx: &IndicatorContext) -> IndicatorComputation {
         let all_events = detect_exhaustion_all_history(ctx)
-            .into_iter()
+            .iter()
             .filter(|e| e.event_type == "buying_exhaustion")
+            .cloned()
             .collect::<Vec<_>>();
         let window_view = build_event_window_view(
             ctx.ts_bucket,
@@ -541,13 +532,18 @@ impl Indicator for I12BuyingExhaustion {
 #[cfg(test)]
 mod tests {
     use super::{
-        detect_buying_events, detect_selling_events, exhaustion_event_json, ExhaustionEventData,
+        compute_exhaustion_all_history, detect_buying_events, detect_exhaustion_all_history,
+        detect_selling_events, exhaustion_event_json, ExhaustionEventData,
+    };
+    use crate::indicators::context::{
+        DivergenceSigTestMode, IndicatorContext, IndicatorSharedCaches,
     };
     use crate::ingest::decoder::MarketKind;
-    use crate::runtime::state_store::MinuteHistory;
+    use crate::runtime::state_store::{MinuteHistory, MinuteWindowData};
     use chrono::{Duration, TimeZone, Utc};
     use serde_json::json;
     use std::collections::BTreeMap;
+    use std::sync::Arc;
 
     fn sample_minute(ts_bucket: chrono::DateTime<Utc>) -> MinuteHistory {
         MinuteHistory {
@@ -592,7 +588,79 @@ mod tests {
             whale_qty_eth_total: 0.0,
             whale_qty_eth_buy: 0.0,
             whale_qty_eth_sell: 0.0,
+            whale_max_single_notional: 0.0,
             profile: BTreeMap::new(),
+        }
+    }
+
+    fn test_ctx(
+        ts_bucket: chrono::DateTime<Utc>,
+        history_futures: Vec<MinuteHistory>,
+        history_spot: Vec<MinuteHistory>,
+    ) -> IndicatorContext {
+        IndicatorContext {
+            ts_bucket,
+            symbol: "TESTUSDT".to_string(),
+            futures: MinuteWindowData::empty(MarketKind::Futures, ts_bucket),
+            spot: MinuteWindowData::empty(MarketKind::Spot, ts_bucket),
+            history_futures,
+            history_spot,
+            trade_history_futures: Vec::new(),
+            trade_history_spot: Vec::new(),
+            latest_mark: None,
+            latest_funding: None,
+            funding_changes_in_window: Vec::new(),
+            funding_points_in_window: Vec::new(),
+            mark_points_in_window: Vec::new(),
+            funding_changes_recent: Vec::new(),
+            funding_points_recent: Vec::new(),
+            mark_points_recent: Vec::new(),
+            whale_threshold_usdt: 300_000.0,
+            kline_history_bars_1m: 1024,
+            kline_history_bars_15m: 120,
+            kline_history_bars_4h: 120,
+            kline_history_bars_1d: 120,
+            kline_history_fill_1d_from_db: true,
+            fvg_windows: vec!["15m".to_string(), "4h".to_string(), "1d".to_string()],
+            fvg_fill_from_db: true,
+            fvg_db_bars_4h: 256,
+            fvg_db_bars_1d: 256,
+            fvg_epsilon_gap_ticks: 2,
+            fvg_atr_lookback: 14,
+            fvg_min_body_ratio: 0.60,
+            fvg_min_impulse_atr_ratio: 1.30,
+            fvg_min_gap_atr_ratio: 0.15,
+            fvg_max_gap_atr_ratio: 1.20,
+            fvg_mitigated_fill_threshold: 0.80,
+            fvg_invalid_close_bars: 1,
+            kline_history_futures_4h_db: Vec::new(),
+            kline_history_futures_1d_db: Vec::new(),
+            kline_history_spot_4h_db: Vec::new(),
+            kline_history_spot_1d_db: Vec::new(),
+            tpo_rows_nb: 64,
+            tpo_value_area_pct: 0.70,
+            tpo_session_windows: vec!["4h".to_string(), "1d".to_string()],
+            tpo_ib_minutes: 60,
+            tpo_dev_output_windows: vec!["15m".to_string(), "1h".to_string()],
+            rvwap_windows: vec!["15m".to_string(), "4h".to_string(), "1d".to_string()],
+            rvwap_output_windows: vec!["15m".to_string(), "1h".to_string()],
+            rvwap_min_samples: 5,
+            high_volume_pulse_z_windows: vec!["1h".to_string(), "4h".to_string(), "1d".to_string()],
+            high_volume_pulse_summary_windows: vec!["15m".to_string(), "1h".to_string()],
+            high_volume_pulse_min_samples: 5,
+            ema_base_periods: vec![13, 21, 34],
+            ema_htf_periods: vec![100, 200],
+            ema_htf_windows: vec!["4h".to_string(), "1d".to_string()],
+            ema_output_windows: vec!["15m".to_string(), "1h".to_string()],
+            ema_fill_from_db: true,
+            ema_db_bars_4h: 256,
+            ema_db_bars_1d: 256,
+            divergence_sig_test_mode: DivergenceSigTestMode::Threshold,
+            divergence_bootstrap_b: 200,
+            divergence_bootstrap_block_len: 5,
+            divergence_p_value_threshold: 0.05,
+            window_codes: vec!["1m".to_string()],
+            shared_caches: Arc::new(IndicatorSharedCaches::default()),
         }
     }
 
@@ -788,5 +856,41 @@ mod tests {
         );
         assert!(payload.get("delta_change").is_none());
         assert!(payload.get("rdelta_change").is_none());
+    }
+
+    #[test]
+    fn cached_exhaustion_all_history_matches_direct_compute() {
+        let base = Utc.with_ymd_and_hms(2026, 3, 9, 12, 0, 0).unwrap();
+        let history_futures = (0..16)
+            .map(|i| {
+                let mut row = sample_minute(base + Duration::minutes(i as i64));
+                row.high_price = Some(100.0 + i as f64 * 0.1);
+                row.low_price = Some(99.0 + i as f64 * 0.1);
+                row.close_price = Some(99.5 + i as f64 * 0.1);
+                row.last_price = row.close_price;
+                row.delta = i as f64;
+                row.relative_delta = i as f64 / 100.0;
+                row.cvd = i as f64;
+                row
+            })
+            .collect::<Vec<_>>();
+        let history_spot = (0..16)
+            .map(|i| {
+                let mut row = sample_minute(base + Duration::minutes(i as i64));
+                row.high_price = Some(100.2 + i as f64 * 0.1);
+                row.low_price = Some(99.2 + i as f64 * 0.1);
+                row.close_price = Some(99.7 + i as f64 * 0.1);
+                row.last_price = row.close_price;
+                row.delta = (i as f64) / 2.0;
+                row.relative_delta = (i as f64) / 200.0;
+                row.cvd = (i as f64) * 2.0;
+                row
+            })
+            .collect::<Vec<_>>();
+        let ctx = test_ctx(base + Duration::minutes(15), history_futures, history_spot);
+
+        let direct = compute_exhaustion_all_history(&ctx);
+        let cached = detect_exhaustion_all_history(&ctx);
+        assert_eq!(direct, *cached);
     }
 }

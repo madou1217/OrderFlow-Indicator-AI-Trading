@@ -2,7 +2,9 @@ use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use indicator_engine::app::bootstrap::{build_db_pool, load_config};
 use indicator_engine::app::runtime::build_indicator_runtime_options;
-use indicator_engine::indicators::context::{DivergenceSigTestMode, IndicatorContext};
+use indicator_engine::indicators::context::{
+    DivergenceSigTestMode, IndicatorContext, IndicatorSharedCaches,
+};
 use indicator_engine::indicators::i01_price_volume_structure::I01PriceVolumeStructure;
 use indicator_engine::indicators::indicator_trait::Indicator;
 use indicator_engine::ingest::decoder::MarketKind;
@@ -14,6 +16,7 @@ use indicator_engine::storage::snapshot_writer::SnapshotWriter;
 use serde_json::Value;
 use sqlx::{PgPool, Row};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 const MAX_PVS_LOOKBACK_MINUTES: i64 = 1440;
 
@@ -366,6 +369,7 @@ fn empty_history(ts_bucket: DateTime<Utc>) -> MinuteHistory {
         whale_qty_eth_total: 0.0,
         whale_qty_eth_buy: 0.0,
         whale_qty_eth_sell: 0.0,
+        whale_max_single_notional: 0.0,
         profile: BTreeMap::new(),
     }
 }
@@ -420,6 +424,7 @@ fn history_from_trade_row(row: &TradeMinuteRow) -> MinuteHistory {
         whale_qty_eth_total: 0.0,
         whale_qty_eth_buy: 0.0,
         whale_qty_eth_sell: 0.0,
+        whale_max_single_notional: 0.0,
         profile: row.profile.clone(),
     }
 }
@@ -527,6 +532,7 @@ fn build_pvs_context(
         divergence_bootstrap_block_len: options.divergence_bootstrap_block_len,
         divergence_p_value_threshold: options.divergence_p_value_threshold,
         window_codes: options.window_codes.clone(),
+        shared_caches: Arc::new(IndicatorSharedCaches::default()),
     }
 }
 
