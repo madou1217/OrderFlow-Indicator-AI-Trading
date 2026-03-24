@@ -1,13 +1,17 @@
+use crate::publish::ind_publisher::IndPublisher;
 use anyhow::{anyhow, Context, Result};
+use chrono::{DateTime, Utc};
+use flate2::read::GzDecoder;
 use lapin::{
     options::BasicPublishOptions,
     publisher_confirm::{Confirmation, PublisherConfirm},
     types::{AMQPValue, FieldTable, LongString, ShortString},
     BasicProperties, Channel,
 };
-use serde_json::Value;
+use serde_json::{Map, Value};
 use sqlx::postgres::PgListener;
 use sqlx::{FromRow, PgPool};
+use std::io::Read;
 use std::time::Duration;
 use tokio::time::Instant;
 use tracing::{error, info, warn};
@@ -29,14 +33,21 @@ pub struct OutboxDispatcher {
     pool: PgPool,
     channel: Channel,
     exchange_name: String,
+    publisher: IndPublisher,
 }
 
 impl OutboxDispatcher {
-    pub fn new(pool: PgPool, channel: Channel, exchange_name: String) -> Self {
+    pub fn new(
+        pool: PgPool,
+        channel: Channel,
+        exchange_name: String,
+        publisher: IndPublisher,
+    ) -> Self {
         Self {
             pool,
             channel,
             exchange_name,
+            publisher,
         }
     }
 
@@ -135,13 +146,17 @@ impl OutboxDispatcher {
 
         let publish_started_at = Instant::now();
         for row in rows {
+            let payload = self
+                .build_publish_payload(&row)
+                .await
+                .with_context(|| format!("build bundle payload outbox_id={}", row.outbox_id))?;
             match publish_amqp_message(
                 &self.channel,
                 &row.exchange_name,
                 &row.routing_key,
                 row.message_id,
                 &row.headers_json,
-                &row.payload_json,
+                &payload,
             )
             .await
             {
@@ -227,6 +242,9 @@ impl OutboxDispatcher {
                 o.routing_key,
                 o.message_id,
                 o.headers_json,
+                o.symbol,
+                o.ts_bucket,
+                o.indicator_count,
                 o.payload_json
             "#,
         )
@@ -249,14 +267,21 @@ impl OutboxDispatcher {
 
         sqlx::query(
             r#"
-            DELETE FROM ops.indicator_bundle_outbox
-            WHERE outbox_id = ANY($1::BIGINT[])
+            WITH delivered AS (
+                DELETE FROM ops.indicator_bundle_outbox
+                WHERE outbox_id = ANY($1::BIGINT[])
+                RETURNING symbol, ts_bucket
+            )
+            DELETE FROM ops.indicator_bundle_payload_cache p
+            USING delivered d
+            WHERE p.symbol = d.symbol
+              AND p.ts_bucket = d.ts_bucket
             "#,
         )
         .bind(outbox_ids)
         .execute(&self.pool)
         .await
-        .context("delete delivered indicator bundle outbox rows")?;
+        .context("delete delivered indicator bundle outbox rows and payload cache")?;
         Ok(())
     }
 
@@ -308,9 +333,134 @@ impl OutboxDispatcher {
         }
         Ok(())
     }
+
+    async fn build_publish_payload(&self, row: &OutboxRow) -> Result<Value> {
+        if row
+            .payload_json
+            .get("indicators")
+            .and_then(Value::as_object)
+            .is_some()
+        {
+            return Ok(row.payload_json.clone());
+        }
+
+        let symbol = row
+            .symbol
+            .as_deref()
+            .or_else(|| row.payload_json.get("symbol").and_then(Value::as_str))
+            .ok_or_else(|| anyhow!("outbox row missing symbol"))?;
+        let ts_bucket = row.ts_bucket.or_else(|| {
+            row.payload_json
+                .get("ts_bucket")
+                .and_then(Value::as_str)
+                .and_then(|v| DateTime::parse_from_rfc3339(v).ok())
+                .map(|ts| ts.with_timezone(&Utc))
+        });
+        let ts_bucket = ts_bucket.ok_or_else(|| anyhow!("outbox row missing ts_bucket"))?;
+
+        if let Some(payload) = self
+            .fetch_cached_bundle_payload(symbol, ts_bucket)
+            .await
+            .with_context(|| {
+                format!(
+                    "fetch cached bundle payload symbol={} ts_bucket={}",
+                    symbol, ts_bucket
+                )
+            })?
+        {
+            return Ok(payload);
+        }
+
+        let rows: Vec<SnapshotPayloadRow> = sqlx::query_as(
+            r#"
+            SELECT indicator_code, window_code, payload_json
+            FROM feat.indicator_snapshot
+            WHERE symbol = $1
+              AND ts_snapshot = $2
+            ORDER BY indicator_code, window_code
+            "#,
+        )
+        .bind(symbol.to_uppercase())
+        .bind(ts_bucket)
+        .fetch_all(&self.pool)
+        .await
+        .context("fetch snapshot rows for minute bundle rebuild")?;
+
+        if rows.is_empty() {
+            return Err(anyhow!(
+                "no snapshot rows found for symbol={} ts_bucket={}",
+                symbol,
+                ts_bucket
+            ));
+        }
+
+        let mut indicators = Map::new();
+        for snap in &rows {
+            indicators.insert(
+                snap.indicator_code.clone(),
+                serde_json::json!({
+                    "window_code": snap.window_code,
+                    "payload": snap.payload_json,
+                }),
+            );
+        }
+
+        let rebuilt = self
+            .publisher
+            .build_minute_bundle_message(
+                ts_bucket,
+                symbol,
+                &Value::Object(indicators),
+                row.indicator_count.unwrap_or(rows.len() as i32).max(0) as usize,
+            )
+            .context("rebuild minute bundle payload from snapshots")?;
+
+        Ok(rebuilt.payload_json)
+    }
+
+    async fn fetch_cached_bundle_payload(
+        &self,
+        symbol: &str,
+        ts_bucket: DateTime<Utc>,
+    ) -> Result<Option<Value>> {
+        let row = sqlx::query_as::<_, CachedBundlePayloadRow>(
+            r#"
+            SELECT payload_encoding, payload_bytes
+            FROM ops.indicator_bundle_payload_cache
+            WHERE symbol = $1
+              AND ts_bucket = $2
+            "#,
+        )
+        .bind(symbol.to_uppercase())
+        .bind(ts_bucket)
+        .fetch_optional(&self.pool)
+        .await
+        .context("fetch cached indicator bundle payload row")?;
+
+        row.map(|r| decode_outbox_payload_bytes(&r.payload_encoding, &r.payload_bytes))
+            .transpose()
+    }
 }
 
 pub async fn ensure_indicator_bundle_outbox_schema(pool: &PgPool) -> Result<()> {
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS ops.indicator_bundle_payload_cache (
+            symbol TEXT NOT NULL,
+            ts_bucket TIMESTAMPTZ NOT NULL,
+            schema_version INTEGER NOT NULL,
+            indicator_count INTEGER,
+            payload_encoding TEXT NOT NULL DEFAULT 'gzip',
+            payload_bytes BYTEA NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            PRIMARY KEY (symbol, ts_bucket)
+        )
+        "#,
+    )
+    .execute(pool)
+    .await
+    .context("create ops.indicator_bundle_payload_cache")?;
+
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS ops.indicator_bundle_outbox (
@@ -323,6 +473,9 @@ pub async fn ensure_indicator_bundle_outbox_schema(pool: &PgPool) -> Result<()> 
             message_id UUID NOT NULL UNIQUE,
             schema_version INTEGER NOT NULL,
             headers_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+            symbol TEXT,
+            ts_bucket TIMESTAMPTZ,
+            indicator_count INTEGER,
             payload_json JSONB NOT NULL DEFAULT '{}'::jsonb,
             error_text TEXT,
             created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -338,6 +491,17 @@ pub async fn ensure_indicator_bundle_outbox_schema(pool: &PgPool) -> Result<()> 
     .execute(pool)
     .await
     .context("create ops.indicator_bundle_outbox")?;
+
+    for ddl in [
+        "ALTER TABLE ops.indicator_bundle_outbox ADD COLUMN IF NOT EXISTS symbol TEXT",
+        "ALTER TABLE ops.indicator_bundle_outbox ADD COLUMN IF NOT EXISTS ts_bucket TIMESTAMPTZ",
+        "ALTER TABLE ops.indicator_bundle_outbox ADD COLUMN IF NOT EXISTS indicator_count INTEGER",
+    ] {
+        sqlx::query(ddl)
+            .execute(pool)
+            .await
+            .with_context(|| format!("ensure indicator_bundle_outbox schema fragment: {ddl}"))?;
+    }
 
     sqlx::query(
         r#"
@@ -430,7 +594,42 @@ struct OutboxRow {
     routing_key: String,
     message_id: uuid::Uuid,
     headers_json: Value,
+    symbol: Option<String>,
+    ts_bucket: Option<DateTime<Utc>>,
+    indicator_count: Option<i32>,
     payload_json: Value,
+}
+
+#[derive(Debug, Clone, FromRow)]
+struct SnapshotPayloadRow {
+    indicator_code: String,
+    window_code: String,
+    payload_json: Value,
+}
+
+#[derive(Debug, Clone, FromRow)]
+struct CachedBundlePayloadRow {
+    payload_encoding: String,
+    payload_bytes: Vec<u8>,
+}
+
+fn decode_outbox_payload_bytes(payload_encoding: &str, payload_bytes: &[u8]) -> Result<Value> {
+    match payload_encoding {
+        "" | "identity" => serde_json::from_slice(payload_bytes)
+            .context("decode identity indicator bundle payload"),
+        "gzip" => {
+            let mut decoder = GzDecoder::new(payload_bytes);
+            let mut raw = Vec::new();
+            decoder
+                .read_to_end(&mut raw)
+                .context("gunzip indicator bundle payload")?;
+            serde_json::from_slice(&raw).context("decode gzip indicator bundle payload")
+        }
+        other => Err(anyhow!(
+            "unsupported indicator bundle payload encoding: {}",
+            other
+        )),
+    }
 }
 
 fn json_to_field_table(raw: &Value) -> Result<FieldTable> {

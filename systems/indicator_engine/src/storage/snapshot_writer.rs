@@ -1,5 +1,5 @@
 use crate::indicators::context::IndicatorSnapshotRow;
-use crate::publish::ind_publisher::OutboxMessage;
+use crate::publish::ind_publisher::BundleOutboxMessage;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde_json::{json, Map, Value};
@@ -132,7 +132,7 @@ impl SnapshotWriter {
         &self,
         symbol: &str,
         ts_bucket: DateTime<Utc>,
-        messages: &[OutboxMessage],
+        messages: &[BundleOutboxMessage],
     ) -> Result<()> {
         let total_started_at = Instant::now();
         let begin_started_at = Instant::now();
@@ -207,8 +207,9 @@ impl SnapshotWriter {
             r#"
             DELETE FROM ops.indicator_bundle_outbox
             WHERE exchange_name = $1
-              AND upper(payload_json->>'symbol') = $2
+              AND COALESCE(NULLIF(upper(symbol), ''), upper(payload_json->>'symbol')) = $2
               AND COALESCE(
+                    ts_bucket,
                     NULLIF(payload_json->>'ts_bucket', '')::timestamptz,
                     NULLIF(payload_json->>'event_ts', '')::timestamptz
                   ) >= $3
@@ -220,6 +221,19 @@ impl SnapshotWriter {
         .execute(&mut *tx)
         .await
         .context("delete indicator bundle outbox tail for overlap repair")?;
+
+        sqlx::query(
+            r#"
+            DELETE FROM ops.indicator_bundle_payload_cache
+            WHERE symbol = $1
+              AND ts_bucket >= $2
+            "#,
+        )
+        .bind(&symbol_upper)
+        .bind(repair_start_ts)
+        .execute(&mut *tx)
+        .await
+        .context("delete indicator bundle payload cache tail for overlap repair")?;
 
         sqlx::query(
             r#"
@@ -326,16 +340,56 @@ impl SnapshotWriter {
 
 async fn enqueue_outbox_batch_in_tx(
     tx: &mut Transaction<'_, Postgres>,
-    messages: &[OutboxMessage],
+    messages: &[BundleOutboxMessage],
 ) -> Result<()> {
     if messages.is_empty() {
         return Ok(());
     }
 
+    let mut payload_builder = QueryBuilder::<Postgres>::new(
+        r#"
+        INSERT INTO ops.indicator_bundle_payload_cache (
+            symbol, ts_bucket, schema_version, indicator_count, payload_encoding, payload_bytes
+        )
+        "#,
+    );
+
+    payload_builder.push_values(messages, |mut b, message| {
+        b.push_bind(&message.symbol)
+            .push_bind(message.ts_bucket)
+            .push_bind(message.schema_version)
+            .push_bind(message.indicator_count)
+            .push_bind(&message.payload_encoding)
+            .push_bind(&message.payload_bytes);
+    });
+
+    payload_builder.push(
+        r#"
+        ON CONFLICT (symbol, ts_bucket)
+        DO UPDATE SET
+            schema_version = EXCLUDED.schema_version,
+            indicator_count = EXCLUDED.indicator_count,
+            payload_encoding = EXCLUDED.payload_encoding,
+            payload_bytes = EXCLUDED.payload_bytes,
+            created_at = now()
+        "#,
+    );
+    payload_builder
+        .build()
+        .execute(tx.as_mut())
+        .await
+        .with_context(|| {
+            format!(
+                "upsert indicator bundle payload cache count={}",
+                messages.len()
+            )
+        })?;
+
     let mut builder = QueryBuilder::<Postgres>::new(
         r#"
         INSERT INTO ops.indicator_bundle_outbox (
-            exchange_name, routing_key, message_id, schema_version, headers_json, payload_json
+            exchange_name, routing_key, message_id, schema_version, headers_json,
+            symbol, ts_bucket, indicator_count, payload_json
         )
         "#,
     );
@@ -346,6 +400,9 @@ async fn enqueue_outbox_batch_in_tx(
             .push_bind(message.message_id)
             .push_bind(message.schema_version)
             .push_bind(&message.headers_json)
+            .push_bind(&message.symbol)
+            .push_bind(message.ts_bucket)
+            .push_bind(message.indicator_count)
             .push_bind(&message.payload_json);
     });
 

@@ -1,4 +1,4 @@
-use crate::app::bootstrap::AppContext;
+use crate::app::bootstrap::{build_db_pool, AppContext, DbPoolConfig, RootConfig};
 use crate::indicators::context::{
     DivergenceSigTestMode, IndicatorContext, IndicatorRuntimeOptions, IndicatorSnapshotRow,
     KlineHistoryBar, KlineHistorySupplement,
@@ -53,6 +53,34 @@ const LIVE_CANONICAL_GAP_REPAIR_RETRY_SECS: u64 = 15;
 const LIVE_CANONICAL_TAIL_RECONCILE_INTERVAL_SECS: u64 = 60;
 const LIVE_CANONICAL_TAIL_RECONCILE_LOOKBACK_MINUTES: i64 = STARTUP_BACKFILL_OVERLAP_MINUTES;
 const CANONICAL_REPLAY_FETCH_WINDOW_MINUTES: i64 = 360;
+
+async fn build_publish_db_pool(config: &Arc<RootConfig>) -> Result<PgPool> {
+    let mut publish_cfg = (**config).clone();
+    let base_name = publish_cfg
+        .database
+        .application_name
+        .clone()
+        .unwrap_or_else(|| "indicator_engine".to_string());
+    publish_cfg.database.application_name = Some(format!("{base_name}_publish"));
+    let existing = publish_cfg.database.pool.clone();
+    publish_cfg.database.pool = Some(DbPoolConfig {
+        min_connections: Some(1),
+        max_connections: Some(
+            existing
+                .as_ref()
+                .and_then(|p| p.max_connections)
+                .unwrap_or(20)
+                .min(4),
+        ),
+        acquire_timeout_secs: existing.as_ref().and_then(|p| p.acquire_timeout_secs),
+        idle_timeout_secs: existing.as_ref().and_then(|p| p.idle_timeout_secs),
+        max_lifetime_secs: existing.as_ref().and_then(|p| p.max_lifetime_secs),
+        test_before_acquire: existing.as_ref().and_then(|p| p.test_before_acquire),
+    });
+    build_db_pool(&publish_cfg)
+        .await
+        .context("build publish db pool")
+}
 
 #[derive(Debug, Clone)]
 pub struct ReplayRow {
@@ -271,17 +299,19 @@ pub async fn run(ctx: AppContext) -> Result<()> {
         event_writer,
         publisher.clone(),
     );
+    let publish_db_pool = build_publish_db_pool(&ctx.config).await?;
     let outbox_dispatcher = OutboxDispatcher::new(
-        ctx.db_pool.clone(),
+        publish_db_pool.clone(),
         ctx.mq_publish_channel.clone(),
         ctx.config.mq.exchanges.ind.name.clone(),
+        publisher.clone(),
     );
     outbox_dispatcher
         .ensure_schema()
         .await
         .context("ensure indicator bundle outbox schema")?;
     let snapshot_fanout_projector = SnapshotFanoutProjector::new(
-        ctx.db_pool.clone(),
+        publish_db_pool,
         ctx.mq_publish_channel.clone(),
         publisher.clone(),
         ctx.config.indicator.symbol.clone(),

@@ -180,7 +180,7 @@ impl Dispatcher {
         let live_messages = if mode.publish_outputs() {
             let indicators_json_value = Value::Object(indicators_json.clone());
             let mut messages = Vec::with_capacity(1);
-            messages.push(self.publisher.build_minute_bundle_message(
+            messages.push(self.publisher.build_minute_bundle_outbox_message(
                 ctx.ts_bucket,
                 &ctx.symbol,
                 &indicators_json_value,
