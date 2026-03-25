@@ -34,8 +34,8 @@ pub fn spawn_consumers(
     handles
 }
 
-/// Outer retry loop: reconnect the AMQP channel whenever the broker closes it
-/// (e.g. due to a missed heartbeat during a long recompute cycle).
+/// Outer retry loop: reconnect the AMQP session whenever the broker closes the
+/// channel or the underlying connection enters an error state.
 /// Exits only when the downstream mpsc channel is closed (main task exiting).
 async fn run_single_consumer(
     ctx: Arc<AppContext>,
@@ -97,7 +97,7 @@ async fn run_consumer_session(
     non_trade_tx: &mpsc::Sender<EngineEvent>,
     metrics: &Arc<AppMetrics>,
 ) -> ConsumerExit {
-    let channel = match ctx.mq_connection.create_channel().await {
+    let channel = match ctx.mq.create_channel().await {
         Ok(ch) => ch,
         Err(err) => return ConsumerExit::SetupError(anyhow::Error::from(err)),
     };

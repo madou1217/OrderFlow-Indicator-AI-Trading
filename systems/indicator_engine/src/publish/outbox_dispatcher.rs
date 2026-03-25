@@ -1,3 +1,4 @@
+use crate::app::bootstrap::AmqpConnectionManager;
 use crate::publish::ind_publisher::IndPublisher;
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
@@ -12,6 +13,7 @@ use serde_json::{Map, Value};
 use sqlx::postgres::PgListener;
 use sqlx::{FromRow, PgPool};
 use std::io::Read;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::Instant;
 use tracing::{error, info, warn};
@@ -31,7 +33,7 @@ const OUTBOX_MAX_BATCHES_PER_WAKE: usize = 32;
 #[derive(Clone)]
 pub struct OutboxDispatcher {
     pool: PgPool,
-    channel: Channel,
+    mq: Arc<AmqpConnectionManager>,
     exchange_name: String,
     publisher: IndPublisher,
 }
@@ -39,13 +41,13 @@ pub struct OutboxDispatcher {
 impl OutboxDispatcher {
     pub fn new(
         pool: PgPool,
-        channel: Channel,
+        mq: Arc<AmqpConnectionManager>,
         exchange_name: String,
         publisher: IndPublisher,
     ) -> Self {
         Self {
             pool,
-            channel,
+            mq,
             exchange_name,
             publisher,
         }
@@ -143,6 +145,11 @@ impl OutboxDispatcher {
             return Ok(0);
         }
         let mut sent_ids: Vec<i64> = Vec::with_capacity(rows.len());
+        let channel = self
+            .mq
+            .create_confirm_channel()
+            .await
+            .context("acquire indicator publish channel for outbox batch")?;
 
         let publish_started_at = Instant::now();
         for row in rows {
@@ -151,7 +158,7 @@ impl OutboxDispatcher {
                 .await
                 .with_context(|| format!("build bundle payload outbox_id={}", row.outbox_id))?;
             match publish_amqp_message(
-                &self.channel,
+                &channel,
                 &row.exchange_name,
                 &row.routing_key,
                 row.message_id,

@@ -1,10 +1,12 @@
+use crate::app::bootstrap::AmqpConnectionManager;
 use crate::publish::ind_publisher::IndPublisher;
 use crate::publish::outbox_dispatcher::publish_amqp_message;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use lapin::{publisher_confirm::Confirmation, Channel};
+use lapin::publisher_confirm::Confirmation;
 use serde_json::Value;
 use sqlx::{FromRow, PgPool};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::{interval, Instant, MissedTickBehavior};
 use tracing::{info, warn};
@@ -16,16 +18,21 @@ const SNAPSHOT_FANOUT_WARN_MS: u128 = 2_000;
 #[derive(Clone)]
 pub struct SnapshotFanoutProjector {
     pool: PgPool,
-    channel: Channel,
+    mq: Arc<AmqpConnectionManager>,
     publisher: IndPublisher,
     symbol: String,
 }
 
 impl SnapshotFanoutProjector {
-    pub fn new(pool: PgPool, channel: Channel, publisher: IndPublisher, symbol: String) -> Self {
+    pub fn new(
+        pool: PgPool,
+        mq: Arc<AmqpConnectionManager>,
+        publisher: IndPublisher,
+        symbol: String,
+    ) -> Self {
         Self {
             pool,
-            channel,
+            mq,
             publisher,
             symbol,
         }
@@ -162,6 +169,11 @@ impl SnapshotFanoutProjector {
             return Ok(0);
         }
 
+        let channel = self
+            .mq
+            .create_confirm_channel()
+            .await
+            .context("acquire indicator publish channel for snapshot fanout")?;
         for row in &rows {
             let message = self.publisher.build_snapshot_message_from_parts(
                 row.ts_snapshot,
@@ -171,7 +183,7 @@ impl SnapshotFanoutProjector {
                 &row.payload_json,
             )?;
             match publish_amqp_message(
-                &self.channel,
+                &channel,
                 &message.exchange_name,
                 &message.routing_key,
                 message.message_id,

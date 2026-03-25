@@ -16,7 +16,8 @@ use sqlx::{
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::info;
+use tokio::sync::Mutex;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 const CONFIG_PATH: &str = "config/config.yaml";
@@ -729,10 +730,100 @@ fn default_slow_sql_threshold_ms() -> u64 {
 pub struct AppContext {
     pub config: Arc<RootConfig>,
     pub db_pool: PgPool,
-    pub mq_connection: Arc<Connection>,
-    pub mq_publish_channel: Channel,
+    pub mq: Arc<AmqpConnectionManager>,
     pub indicator_queues: Vec<String>,
     pub producer_instance_id: String,
+}
+
+#[derive(Clone)]
+pub struct AmqpConnectionManager {
+    uri: Arc<String>,
+    connection: Arc<Mutex<Arc<Connection>>>,
+}
+
+impl AmqpConnectionManager {
+    pub async fn connect(uri: String) -> Result<Self> {
+        let connection = Arc::new(connect_rabbitmq(&uri).await?);
+        Ok(Self {
+            uri: Arc::new(uri),
+            connection: Arc::new(Mutex::new(connection)),
+        })
+    }
+
+    pub async fn create_channel(&self) -> Result<Channel> {
+        self.create_channel_inner(false).await
+    }
+
+    pub async fn create_confirm_channel(&self) -> Result<Channel> {
+        self.create_channel_inner(true).await
+    }
+
+    async fn create_channel_inner(&self, confirm: bool) -> Result<Channel> {
+        let connection = self.ensure_connection().await?;
+        match connection.create_channel().await {
+            Ok(channel) => {
+                if confirm {
+                    channel
+                        .confirm_select(ConfirmSelectOptions::default())
+                        .await
+                        .context("enable publisher confirms for indicator publish channel")?;
+                }
+                Ok(channel)
+            }
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    confirm,
+                    "amqp create_channel failed, recreating connection"
+                );
+                let connection = self.force_reconnect().await?;
+                let channel = connection
+                    .create_channel()
+                    .await
+                    .context("create AMQP channel after reconnect")?;
+                if confirm {
+                    channel
+                        .confirm_select(ConfirmSelectOptions::default())
+                        .await
+                        .context(
+                            "enable publisher confirms for indicator publish channel after reconnect",
+                        )?;
+                }
+                Ok(channel)
+            }
+        }
+    }
+
+    async fn ensure_connection(&self) -> Result<Arc<Connection>> {
+        let current = {
+            let guard = self.connection.lock().await;
+            guard.clone()
+        };
+        if current.status().connected() {
+            return Ok(current);
+        }
+        self.force_reconnect().await
+    }
+
+    async fn force_reconnect(&self) -> Result<Arc<Connection>> {
+        let mut guard = self.connection.lock().await;
+        if guard.status().connected() {
+            return Ok(guard.clone());
+        }
+
+        let previous_state = guard.status().state();
+        warn!(
+            state = ?previous_state,
+            "amqp connection not connected, establishing a new connection"
+        );
+        let connection = Arc::new(
+            connect_rabbitmq(self.uri.as_str())
+                .await
+                .context("reconnect rabbitmq")?,
+        );
+        *guard = connection.clone();
+        Ok(connection)
+    }
 }
 
 pub async fn bootstrap() -> Result<AppContext> {
@@ -800,24 +891,10 @@ pub async fn bootstrap() -> Result<AppContext> {
 
     let db_pool = build_db_pool(&config).await?;
 
-    let mq_connection = Connection::connect(&config.mq.amqp_uri(), ConnectionProperties::default())
-        .await
-        .context("connect rabbitmq")?;
+    let mq = Arc::new(AmqpConnectionManager::connect(config.mq.amqp_uri()).await?);
 
-    let topology_channel = mq_connection
-        .create_channel()
-        .await
-        .context("create topology channel")?;
+    let topology_channel = mq.create_channel().await.context("create topology channel")?;
     declare_topology(&topology_channel, &config.mq).await?;
-
-    let mq_publish_channel = mq_connection
-        .create_channel()
-        .await
-        .context("create indicator publish channel")?;
-    mq_publish_channel
-        .confirm_select(ConfirmSelectOptions::default())
-        .await
-        .context("enable publisher confirms for indicator publish channel")?;
 
     let indicator_queue_cfgs = collect_indicator_queue_configs(&config)?;
 
@@ -844,11 +921,20 @@ pub async fn bootstrap() -> Result<AppContext> {
     Ok(AppContext {
         config,
         db_pool,
-        mq_connection: Arc::new(mq_connection),
-        mq_publish_channel,
+        mq,
         indicator_queues,
         producer_instance_id,
     })
+}
+
+async fn connect_rabbitmq(uri: &str) -> Result<Connection> {
+    let connection = Connection::connect(uri, ConnectionProperties::default())
+        .await
+        .context("connect rabbitmq")?;
+    connection.on_error(|err| {
+        warn!(error = %err, "amqp connection entered error state");
+    });
+    Ok(connection)
 }
 
 fn collect_indicator_queue_configs(config: &RootConfig) -> Result<Vec<(String, MqQueueConfig)>> {

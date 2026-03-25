@@ -302,7 +302,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
     let publish_db_pool = build_publish_db_pool(&ctx.config).await?;
     let outbox_dispatcher = OutboxDispatcher::new(
         publish_db_pool.clone(),
-        ctx.mq_publish_channel.clone(),
+        ctx.mq.clone(),
         ctx.config.mq.exchanges.ind.name.clone(),
         publisher.clone(),
     );
@@ -312,7 +312,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
         .context("ensure indicator bundle outbox schema")?;
     let snapshot_fanout_projector = SnapshotFanoutProjector::new(
         publish_db_pool,
-        ctx.mq_publish_channel.clone(),
+        ctx.mq.clone(),
         publisher.clone(),
         ctx.config.indicator.symbol.clone(),
     );
