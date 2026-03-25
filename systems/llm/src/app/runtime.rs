@@ -38,7 +38,6 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use tokio::sync::Mutex;
 use tokio::time::{sleep_until, Duration, Instant, Sleep};
@@ -270,7 +269,6 @@ pub async fn run(ctx: AppContext) -> Result<()> {
     let mut last_invoked_ts_bucket: Option<DateTime<Utc>> = None;
     let runtime_lifecycle_state = Arc::new(Mutex::new(RuntimeLifecycleStore::default()));
     restore_last_management_reasons_from_journal(&runtime_lifecycle_state).await?;
-    let invoke_inflight = Arc::new(AtomicBool::new(false));
     let invoke_throttle = Arc::new(Mutex::new(InvokeThrottleState::default()));
     let active_provider = ctx.config.active_default_model();
     let schedule_minutes = effective_schedule_minutes(&ctx.config, &active_provider);
@@ -306,7 +304,6 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                     &ctx,
                     &pending_invoke_bundle,
                     &mut last_invoked_ts_bucket,
-                    &invoke_inflight,
                     &invoke_throttle,
                     &runtime_lifecycle_state,
                     min_invoke_interval,
@@ -3044,7 +3041,6 @@ fn queue_latest_bundle_invoke(
     ctx: &AppContext,
     latest_bundle: &Option<LatestBundle>,
     last_invoked_ts_bucket: &mut Option<DateTime<Utc>>,
-    invoke_inflight: &Arc<AtomicBool>,
     invoke_throttle: &Arc<Mutex<InvokeThrottleState>>,
     runtime_lifecycle_state: &Arc<Mutex<RuntimeLifecycleStore>>,
     min_invoke_interval: Duration,
@@ -3079,25 +3075,12 @@ fn queue_latest_bundle_invoke(
         );
         return;
     }
-    if invoke_inflight
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
-        debug!(
-            ts_bucket = %bundle.raw.ts_bucket,
-            trigger = trigger,
-            "llm invoke skipped: previous invocation still in flight"
-        );
-        return;
-    }
-
     *last_invoked_ts_bucket = Some(bundle.raw.ts_bucket);
     let config = Arc::clone(&ctx.config);
     let db_pool = ctx.db_pool.clone();
     let http_client = ctx.http_client.clone();
     let loopback_http_client = ctx.loopback_http_client.clone();
     let print_response = ctx.config.llm.print_response;
-    let invoke_inflight = Arc::clone(invoke_inflight);
     let invoke_throttle = Arc::clone(invoke_throttle);
     let runtime_lifecycle_state = Arc::clone(runtime_lifecycle_state);
     let trigger = Arc::<str>::from(trigger.to_string());
@@ -3143,7 +3126,6 @@ fn queue_latest_bundle_invoke(
                 "llm invoke skipped: min_invoke_interval throttle active"
             );
         }
-        invoke_inflight.store(false, Ordering::Release);
     });
 }
 

@@ -3911,13 +3911,12 @@ mod tests {
     use super::{
         build_backfill_sql, find_long_null_price_run, handle_ingest_event,
         hydrate_futures_orderbook_heatmaps_for_range_with_fetch, live_tail_reconcile_start_ts,
-        LIVE_CANONICAL_TAIL_RECONCILE_LOOKBACK_MINUTES,
         minute_exclusive_upper_bound, minute_history_is_strictly_contiguous,
         replay_heatmap_hydration_batch_end, shutdown_ready_through_candidate,
         snapshot_has_required_history, snapshot_null_price_run_reaches_recent_tail,
         LiveCanonicalRepairController, FUNDING_BACKFILL_WINDOW_SQL, LIQ_BACKFILL_WINDOW_SQL,
-        ORDERBOOK_BACKFILL_WINDOW_SQL_SCALAR, ORDERBOOK_BACKFILL_WINDOW_SQL_WITH_HEATMAP,
-        TRADE_BACKFILL_WINDOW_SQL,
+        LIVE_CANONICAL_TAIL_RECONCILE_LOOKBACK_MINUTES, ORDERBOOK_BACKFILL_WINDOW_SQL_SCALAR,
+        ORDERBOOK_BACKFILL_WINDOW_SQL_WITH_HEATMAP, TRADE_BACKFILL_WINDOW_SQL,
     };
     use crate::ingest::decoder::{
         AggHeatmapLevel, AggOrderbook1mEvent, EngineEvent, MarketKind, MdData, TradeEvent,

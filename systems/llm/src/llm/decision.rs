@@ -126,6 +126,7 @@ pub fn validate_model_output(
 }
 
 pub fn trade_intent_from_value(value: &Value) -> Result<TradeIntent> {
+    validate_edge_assessment(value)?;
     validate_trade_quality(value)?;
 
     let decision_raw = value
@@ -149,13 +150,13 @@ pub fn trade_intent_from_value(value: &Value) -> Result<TradeIntent> {
         .ok_or_else(|| anyhow!("reason must be non-empty"))?
         .to_string();
 
-    let entry_price = find_f64(value, &["params.entry", "entry_price"]);
-    let take_profit = find_f64(value, &["params.tp", "tp"]);
-    let stop_loss = find_f64(value, &["params.sl", "sl"]);
-    let leverage = find_f64(value, &["params.leverage", "leverage"]);
-    let model_risk_reward_ratio = find_f64(value, &["params.rr", "risk_reward_ratio"]);
-    let horizon = find_str(value, &["params.horizon", "holding_period"]).map(str::to_string);
-    let swing_logic = find_str(value, &["params.swing_logic"]).map(str::to_string);
+    let entry_price = find_f64(value, &["plan.entry"]);
+    let take_profit = find_f64(value, &["plan.take_profit"]);
+    let stop_loss = find_f64(value, &["plan.stop_loss"]);
+    let leverage = find_f64(value, &["plan.leverage"]);
+    let model_risk_reward_ratio = find_f64(value, &["plan.rr"]);
+    let horizon = find_str(value, &["plan.horizon"]).map(str::to_string);
+    let swing_logic = find_str(value, &["plan.swing_logic"]).map(str::to_string);
 
     match decision {
         TradeDecision::NoTrade => Ok(TradeIntent {
@@ -219,6 +220,43 @@ pub fn trade_intent_from_value(value: &Value) -> Result<TradeIntent> {
             })
         }
     }
+}
+
+fn validate_edge_assessment(value: &Value) -> Result<()> {
+    let edge_assessment = value
+        .get("edge_assessment")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow!("edge_assessment must be an object"))?;
+
+    validate_enum_field(edge_assessment, "side", &["LONG", "SHORT", "NONE"])?;
+
+    edge_assessment
+        .get("edge_exists_now")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| anyhow!("edge_exists_now must be a boolean"))?;
+
+    validate_enum_field(
+        edge_assessment,
+        "edge_quality",
+        &["strong", "moderate", "weak"],
+    )?;
+    validate_enum_field(
+        edge_assessment,
+        "location_quality",
+        &["strong", "moderate", "weak"],
+    )?;
+    validate_enum_field(
+        edge_assessment,
+        "path_quality",
+        &["clean", "contested", "poor"],
+    )?;
+
+    edge_assessment
+        .get("why_no_trade_now")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("why_no_trade_now must be an array"))?;
+
+    Ok(())
 }
 
 fn validate_trade_quality(value: &Value) -> Result<()> {
@@ -630,6 +668,14 @@ mod tests {
     #[test]
     fn trade_intent_accepts_range_horizon_text() {
         let value = json!({
+            "edge_assessment": {
+                "side": "LONG",
+                "edge_exists_now": true,
+                "edge_quality": "strong",
+                "location_quality": "strong",
+                "path_quality": "clean",
+                "why_no_trade_now": []
+            },
             "decision": "LONG",
             "reason": "range horizon text should not block execution",
             "trade_quality": {
@@ -639,10 +685,10 @@ mod tests {
                 "stopout_risk_before_resolution": "low",
                 "reward_to_risk_sufficiency": "ample"
             },
-            "params": {
+            "plan": {
                 "entry": 2018.33,
-                "tp": 2054.96,
-                "sl": 2015.12,
+                "take_profit": 2054.96,
+                "stop_loss": 2015.12,
                 "leverage": 2,
                 "rr": 11.41,
                 "horizon": "2-5d"
@@ -657,6 +703,14 @@ mod tests {
     #[test]
     fn trade_intent_accepts_free_form_horizon_text() {
         let value = json!({
+            "edge_assessment": {
+                "side": "LONG",
+                "edge_exists_now": true,
+                "edge_quality": "moderate",
+                "location_quality": "moderate",
+                "path_quality": "clean",
+                "why_no_trade_now": []
+            },
             "decision": "LONG",
             "reason": "free-form horizon text should be preserved",
             "trade_quality": {
@@ -666,10 +720,10 @@ mod tests {
                 "stopout_risk_before_resolution": "medium",
                 "reward_to_risk_sufficiency": "adequate"
             },
-            "params": {
+            "plan": {
                 "entry": 2018.33,
-                "tp": 2054.96,
-                "sl": 2015.12,
+                "take_profit": 2054.96,
+                "stop_loss": 2015.12,
                 "leverage": 2,
                 "rr": 11.41,
                 "horizon": "next week"
@@ -683,6 +737,14 @@ mod tests {
     #[test]
     fn trade_intent_derives_rr_when_model_omits_it() {
         let value = json!({
+            "edge_assessment": {
+                "side": "LONG",
+                "edge_exists_now": true,
+                "edge_quality": "moderate",
+                "location_quality": "moderate",
+                "path_quality": "contested",
+                "why_no_trade_now": []
+            },
             "decision": "LONG",
             "reason": "schema-compliant entry without rr should still parse",
             "trade_quality": {
@@ -692,10 +754,10 @@ mod tests {
                 "stopout_risk_before_resolution": "medium",
                 "reward_to_risk_sufficiency": "adequate"
             },
-            "params": {
+            "plan": {
                 "entry": 2000.0,
-                "tp": 2040.0,
-                "sl": 1980.0,
+                "take_profit": 2040.0,
+                "stop_loss": 1980.0,
                 "leverage": 3,
                 "horizon": "4h"
             }
@@ -708,12 +770,20 @@ mod tests {
     #[test]
     fn trade_intent_requires_trade_quality() {
         let value = json!({
+            "edge_assessment": {
+                "side": "LONG",
+                "edge_exists_now": true,
+                "edge_quality": "strong",
+                "location_quality": "strong",
+                "path_quality": "clean",
+                "why_no_trade_now": []
+            },
             "decision": "LONG",
             "reason": "missing trade quality should fail",
-            "params": {
+            "plan": {
                 "entry": 2000.0,
-                "tp": 2040.0,
-                "sl": 1980.0,
+                "take_profit": 2040.0,
+                "stop_loss": 1980.0,
                 "leverage": 3,
                 "horizon": "4h"
             }
@@ -721,6 +791,31 @@ mod tests {
 
         let err = trade_intent_from_value(&value).expect_err("trade quality should be required");
         assert!(err.to_string().contains("trade_quality"));
+    }
+
+    #[test]
+    fn trade_intent_requires_edge_assessment() {
+        let value = json!({
+            "decision": "LONG",
+            "reason": "missing edge assessment should fail",
+            "trade_quality": {
+                "thesis_clarity": "strong",
+                "execution_quality": "strong",
+                "path_to_target_quality": "clean",
+                "stopout_risk_before_resolution": "low",
+                "reward_to_risk_sufficiency": "ample"
+            },
+            "plan": {
+                "entry": 2000.0,
+                "take_profit": 2040.0,
+                "stop_loss": 1980.0,
+                "leverage": 3,
+                "horizon": "4h"
+            }
+        });
+
+        let err = trade_intent_from_value(&value).expect_err("edge assessment should be required");
+        assert!(err.to_string().contains("edge_assessment"));
     }
 
     #[test]

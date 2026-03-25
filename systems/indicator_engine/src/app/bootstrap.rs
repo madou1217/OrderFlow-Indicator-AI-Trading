@@ -893,7 +893,10 @@ pub async fn bootstrap() -> Result<AppContext> {
 
     let mq = Arc::new(AmqpConnectionManager::connect(config.mq.amqp_uri()).await?);
 
-    let topology_channel = mq.create_channel().await.context("create topology channel")?;
+    let topology_channel = mq
+        .create_channel()
+        .await
+        .context("create topology channel")?;
     declare_topology(&topology_channel, &config.mq).await?;
 
     let indicator_queue_cfgs = collect_indicator_queue_configs(&config)?;

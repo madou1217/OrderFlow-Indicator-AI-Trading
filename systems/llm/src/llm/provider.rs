@@ -482,8 +482,8 @@ fn parse_entry_scan_output(provider: &str, raw_text: &str) -> Result<Value, Prov
 
 fn validate_scan_output(value: &Value) -> Result<()> {
     if let Some(schema_version) = value.get("schema_version").and_then(Value::as_str) {
-        if schema_version == "scan_v1_8_2" {
-            return validate_scan_output_v1_8_2(value);
+        if schema_version == "scan_v1_8_4" {
+            return validate_scan_output_v1_8_4(value);
         }
         if schema_version == "scan_v1_7" {
             return validate_scan_output_v1_7(value);
@@ -709,14 +709,14 @@ fn validate_scan_output_v1_7(value: &Value) -> Result<()> {
     Ok(())
 }
 
-fn validate_scan_output_v1_8_2(value: &Value) -> Result<()> {
+fn validate_scan_output_v1_8_4(value: &Value) -> Result<()> {
     let schema_version = value
         .get("schema_version")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("scan schema_version is missing"))?;
-    if schema_version != "scan_v1_8_2" {
+    if schema_version != "scan_v1_8_4" {
         return Err(anyhow!(
-            "scan schema_version must be scan_v1_8_2, got {}",
+            "scan schema_version must be scan_v1_8_4, got {}",
             schema_version
         ));
     }
@@ -736,7 +736,7 @@ fn validate_scan_output_v1_8_2(value: &Value) -> Result<()> {
 
     expect_object(value, "/timeframes")?;
     for tf in ["15m", "4h", "1d"] {
-        validate_scan_output_v1_7_timeframe(value, tf)?;
+        validate_scan_output_timeframe(value, tf, false)?;
     }
 
     expect_enum(
@@ -821,6 +821,10 @@ fn validate_scan_output_v1_8_2(value: &Value) -> Result<()> {
 }
 
 fn validate_scan_output_v1_7_timeframe(value: &Value, tf: &str) -> Result<()> {
+    validate_scan_output_timeframe(value, tf, true)
+}
+
+fn validate_scan_output_timeframe(value: &Value, tf: &str, include_path_map: bool) -> Result<()> {
     let base = format!("/timeframes/{tf}");
     expect_enum(
         value,
@@ -918,10 +922,12 @@ fn validate_scan_output_v1_7_timeframe(value: &Value, tf: &str) -> Result<()> {
     validate_optional_price_zone(value, &format!("{base}/structure_map/dominant_supply_zone"))?;
     validate_key_levels_with_max(value, &format!("{base}/structure_map/key_levels"), 6)?;
     expect_number_or_null(value, &format!("{base}/structure_map/invalidation_level"))?;
-    for side in ["upside", "downside"] {
-        let path_base = format!("{base}/structure_map/path_map/{side}");
-        validate_level_reference(value, &format!("{path_base}/first_objective_ref"))?;
-        validate_level_reference(value, &format!("{path_base}/first_barrier_ref"))?;
+    if include_path_map {
+        for side in ["upside", "downside"] {
+            let path_base = format!("{base}/structure_map/path_map/{side}");
+            validate_level_reference(value, &format!("{path_base}/first_objective_ref"))?;
+            validate_level_reference(value, &format!("{path_base}/first_barrier_ref"))?;
+        }
     }
 
     expect_enum(
@@ -2143,7 +2149,7 @@ fn qwen_output_contract(
 ) -> String {
     if matches!(entry_stage, prompt::EntryPromptStage::Scan) {
         if is_medium_large(prompt_template) {
-            "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- No extra top-level keys.\n- Top-level keys must be `schema_version`, `meta`, `timeframes`, and `cross_timeframe_map`.\n- `schema_version` must be `scan_v1_8_2`.\n- `timeframes` must contain `15m`, `4h`, and `1d`.\n- Each timeframe must include `state`, `flow_map`, `structure_map`, and `validation`.\n- `cross_timeframe_map` must include `ownership_map`, `relationship_map`, `cross_market_snapshot`, and `cross_timeframe_structure`.\n".to_string()
+            "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- No extra top-level keys.\n- Top-level keys must be `schema_version`, `meta`, `timeframes`, and `cross_timeframe_map`.\n- `schema_version` must be `scan_v1_8_4`.\n- `timeframes` must contain `15m`, `4h`, and `1d`.\n- Each timeframe must include `state`, `flow_map`, `structure_map`, and `validation`.\n- `cross_timeframe_map` must include `ownership_map`, `relationship_map`, `cross_market_snapshot`, and `cross_timeframe_structure`.\n".to_string()
         } else {
             "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- No extra top-level keys.\n- Top-level keys must be `15m`, `4h`, `1d`, and `scan_audit`.\n- Each timeframe key must include `trend`, `signal_agreement`, `range`, `supporting_signals`, `conflicting_signals`, `opportunity`, and `risk`.\n- `scan_audit` must include `15m`, `4h`, and `1d`, and each audit object must include `direction_basis`, `recent_closed_bars_align_with_trend`, `cvd_slope_aligns_with_trend`, `current_partial_bar_aligns_with_trend`, `invalidation_level`, and `range_width_vs_atr`.\n".to_string()
         }
@@ -2152,7 +2158,7 @@ fn qwen_output_contract(
     } else if management_mode {
         "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- Top-level keys must appear in this order: `management_context`, `decision`, `params`, and `reason`. `analysis` may be present as an extra object.\n- `reason` must be a non-empty top-level string.\n- `management_context` must include `direction_state`, `near_term_risk_15m`, `sl_survival_risk`, `tp_state`, and `key_condition`.\n- Allowed decisions: HOLD, REDUCE, CLOSE, ADJUST, ADD.\n- `params` must always be present.\n- For HOLD: keep `params` present; action fields may be null.\n- For CLOSE: set `params.close_price` to a number or null.\n- For REDUCE or ADD: set `params.qty_ratio` to a number 0-1.\n- For ADJUST: set `params.adjust_fields` (array: [\"tp\"], [\"sl\"], or [\"tp\",\"sl\"]), and corresponding values: `new_tp`/`new_sl`.\n".to_string()
     } else {
-        "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- Keep `reason` as a top-level string. Do not place `reason` inside `analysis`.\n- Top-level keys must appear in this order: `trade_quality`, `decision`, `params`, and `reason`. `analysis` and `self_check` may be present as extra objects.\n- `trade_quality` must include `thesis_clarity`, `execution_quality`, `path_to_target_quality`, `stopout_risk_before_resolution`, and `reward_to_risk_sufficiency`.\n- Allowed entry decisions: LONG, SHORT, NO_TRADE. Never use HOLD in entry mode.\n- For LONG or SHORT, params must include `entry`, `tp`, `sl`, `leverage`, and `horizon`.\n- For NO_TRADE, set `params.entry`, `params.tp`, `params.sl`, `params.leverage`, and `params.horizon` to null.\n".to_string()
+        "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- Keep `reason` as a top-level string.\n- Top-level keys must appear in this order: `edge_assessment`, `trade_quality`, `decision`, `plan`, and `reason`.\n- `edge_assessment` must include `side`, `edge_exists_now`, `edge_quality`, `location_quality`, `path_quality`, and `why_no_trade_now`.\n- `trade_quality` must include `thesis_clarity`, `execution_quality`, `path_to_target_quality`, `stopout_risk_before_resolution`, and `reward_to_risk_sufficiency`.\n- Allowed entry decisions: LONG, SHORT, NO_TRADE. Never use HOLD in entry mode.\n- For LONG or SHORT, `plan` must include `entry`, `take_profit`, `stop_loss`, `leverage`, and `horizon`.\n- For NO_TRADE, set `plan.entry`, `plan.take_profit`, `plan.stop_loss`, `plan.leverage`, and `plan.horizon` to null.\n".to_string()
     }
 }
 
@@ -2464,6 +2470,46 @@ fn trade_quality_schema_openai() -> Value {
     })
 }
 
+fn edge_assessment_schema_openai() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "side",
+            "edge_exists_now",
+            "edge_quality",
+            "location_quality",
+            "path_quality",
+            "why_no_trade_now"
+        ],
+        "properties": {
+            "side": {
+                "type": "string",
+                "enum": ["LONG", "SHORT", "NONE"]
+            },
+            "edge_exists_now": {
+                "type": "boolean"
+            },
+            "edge_quality": {
+                "type": "string",
+                "enum": ["strong", "moderate", "weak"]
+            },
+            "location_quality": {
+                "type": "string",
+                "enum": ["strong", "moderate", "weak"]
+            },
+            "path_quality": {
+                "type": "string",
+                "enum": ["clean", "contested", "poor"]
+            },
+            "why_no_trade_now": {
+                "type": "array",
+                "items": { "type": "string" }
+            }
+        }
+    })
+}
+
 fn trade_quality_schema_gemini() -> Value {
     json!({
         "type": "OBJECT",
@@ -2496,6 +2542,74 @@ fn trade_quality_schema_gemini() -> Value {
             "stopout_risk_before_resolution",
             "reward_to_risk_sufficiency"
         ]
+    })
+}
+
+fn edge_assessment_schema_gemini() -> Value {
+    json!({
+        "type": "OBJECT",
+        "properties": {
+            "side": {
+                "type": "STRING",
+                "enum": ["LONG", "SHORT", "NONE"]
+            },
+            "edge_exists_now": {
+                "type": "BOOLEAN"
+            },
+            "edge_quality": {
+                "type": "STRING",
+                "enum": ["strong", "moderate", "weak"]
+            },
+            "location_quality": {
+                "type": "STRING",
+                "enum": ["strong", "moderate", "weak"]
+            },
+            "path_quality": {
+                "type": "STRING",
+                "enum": ["clean", "contested", "poor"]
+            },
+            "why_no_trade_now": {
+                "type": "ARRAY",
+                "items": { "type": "STRING" }
+            }
+        },
+        "required": [
+            "side",
+            "edge_exists_now",
+            "edge_quality",
+            "location_quality",
+            "path_quality",
+            "why_no_trade_now"
+        ]
+    })
+}
+
+fn entry_plan_schema_openai(additional_properties: bool) -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": additional_properties,
+        "required": ["entry", "take_profit", "stop_loss", "leverage", "horizon"],
+        "properties": {
+            "entry": {"type": ["number", "null"]},
+            "take_profit": {"type": ["number", "null"]},
+            "stop_loss": {"type": ["number", "null"]},
+            "leverage": {"type": ["number", "null"]},
+            "horizon": {"type": ["string", "null"]}
+        }
+    })
+}
+
+fn entry_plan_schema_gemini() -> Value {
+    json!({
+        "type": "OBJECT",
+        "properties": {
+            "entry": { "type": "NUMBER", "nullable": true },
+            "take_profit": { "type": "NUMBER", "nullable": true },
+            "stop_loss": { "type": "NUMBER", "nullable": true },
+            "leverage": { "type": "NUMBER", "nullable": true },
+            "horizon": { "type": "STRING", "nullable": true }
+        },
+        "required": ["entry", "take_profit", "stop_loss", "leverage", "horizon"]
     })
 }
 
@@ -2649,28 +2763,18 @@ fn qwen_entry_response_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": true,
-        "required": ["trade_quality", "decision", "params", "reason"],
+        "required": ["edge_assessment", "trade_quality", "decision", "plan", "reason"],
         "properties": {
+            "edge_assessment": edge_assessment_schema_openai(),
             "trade_quality": trade_quality_schema_openai(),
             "decision": {
                 "type": "string",
                 "enum": ["LONG", "SHORT", "NO_TRADE"]
             },
-            "params": {
-                "type": "object",
-                "additionalProperties": true
-            },
+            "plan": entry_plan_schema_openai(true),
             "reason": {
                 "type": "string",
                 "minLength": 1
-            },
-            "analysis": {
-                "type": ["object", "null"],
-                "additionalProperties": true
-            },
-            "self_check": {
-                "type": ["object", "null"],
-                "additionalProperties": true
             }
         }
     })
@@ -2694,25 +2798,15 @@ fn custom_llm_entry_response_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["trade_quality", "decision", "params", "reason"],
+        "required": ["edge_assessment", "trade_quality", "decision", "plan", "reason"],
         "properties": {
+            "edge_assessment": edge_assessment_schema_openai(),
             "trade_quality": trade_quality_schema_openai(),
             "decision": {
                 "type": "string",
                 "enum": ["LONG", "SHORT", "NO_TRADE"]
             },
-            "params": {
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["entry", "tp", "sl", "leverage", "horizon"],
-                "properties": {
-                    "entry": {"type": ["number", "null"]},
-                    "tp": {"type": ["number", "null"]},
-                    "sl": {"type": ["number", "null"]},
-                    "leverage": {"type": ["number", "null"]},
-                    "horizon": {"type": ["string", "null"]}
-                }
-            },
+            "plan": entry_plan_schema_openai(false),
             "reason": {
                 "type": "string",
                 "minLength": 1
@@ -3236,34 +3330,15 @@ fn grok_entry_response_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["analysis", "trade_quality", "decision", "params", "reason"],
+        "required": ["edge_assessment", "trade_quality", "decision", "plan", "reason"],
         "properties": {
-            "analysis": {
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["market_thesis", "trade_logic"],
-                "properties": {
-                    "market_thesis": { "type": "string" },
-                    "trade_logic": { "type": "string" }
-                }
-            },
+            "edge_assessment": edge_assessment_schema_openai(),
             "trade_quality": trade_quality_schema_openai(),
             "decision": {
                 "type": "string",
                 "enum": ["LONG", "SHORT", "NO_TRADE"]
             },
-            "params": {
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["entry", "tp", "sl", "leverage", "horizon"],
-                "properties": {
-                    "entry": { "type": ["number", "null"] },
-                    "tp": { "type": ["number", "null"] },
-                    "sl": { "type": ["number", "null"] },
-                    "leverage": { "type": ["number", "null"] },
-                    "horizon": { "type": ["string", "null"] }
-                }
-            },
+            "plan": entry_plan_schema_openai(false),
             "reason": { "type": "string" }
         }
     })
@@ -4005,6 +4080,78 @@ fn scan_v1_8_2_set_schema_descriptions(schema: &mut Value) {
     }
 }
 
+fn remove_required_entry(schema: &mut Value, path: &str, target: &str) {
+    if let Some(required) = schema.pointer_mut(path).and_then(Value::as_array_mut) {
+        required.retain(|item| item.as_str() != Some(target));
+    }
+}
+
+fn strip_scan_path_map(schema: &mut Value) {
+    for tf in ["15m", "4h", "1d"] {
+        let structure_props_path =
+            format!("/properties/timeframes/properties/{tf}/properties/structure_map/properties");
+        if let Some(properties) = schema
+            .pointer_mut(&structure_props_path)
+            .and_then(Value::as_object_mut)
+        {
+            properties.remove("path_map");
+        }
+        let required_path =
+            format!("/properties/timeframes/properties/{tf}/properties/structure_map/required");
+        remove_required_entry(schema, &required_path, "path_map");
+    }
+}
+
+fn scan_v1_8_4_set_schema_descriptions(schema: &mut Value) {
+    if let Some(version) = schema.pointer_mut("/properties/schema_version/enum/0") {
+        *version = json!("scan_v1_8_4");
+    }
+
+    for tf in ["15m", "4h", "1d"] {
+        let tf_base = format!("/properties/timeframes/properties/{tf}/properties");
+
+        if let Some(slot) = schema.pointer_mut(&format!(
+            "{tf_base}/structure_map/properties/active_range/description"
+        )) {
+            *slot = json!(
+                "The main live bracket currently containing the auction and organizing acceptance, rejection, and rotation on this timeframe."
+            );
+        }
+
+        if let Some(slot) = schema.pointer_mut(&format!(
+            "{tf_base}/state/properties/range_state/description"
+        )) {
+            *slot = json!(
+                "Describe how price is interacting with the current active_range. testing_range_high/low should reflect real interaction with the range edge, not merely upper-half or lower-half location."
+            );
+        }
+
+        if let Some(slot) = schema.pointer_mut(&format!(
+            "{tf_base}/state/properties/sponsorship_state/description"
+        )) {
+            *slot = json!(
+                "Describe whether observed flow is being accepted and structurally carried by price on this timeframe, and how clean or fragile that sponsorship currently is."
+            );
+        }
+
+        if let Some(slot) = schema.pointer_mut(&format!(
+            "{tf_base}/flow_map/properties/trapped_side/description"
+        )) {
+            *slot = json!(
+                "Use trapped_side when one side has already lost the structural position it depended on and the market is showing failed acceptance, failed continuation, or growing forced-exit risk."
+            );
+        }
+
+        if let Some(slot) = schema.pointer_mut(&format!(
+            "{tf_base}/validation/properties/conflicting_facts/description"
+        )) {
+            *slot = json!(
+                "Material disagreements that make the current read less clean. Use this for meaningful PVS/TPO disagreement, spot/futures divergence, or flow-versus-price acceptance conflict when relevant."
+            );
+        }
+    }
+}
+
 fn scan_v1_8_2_schema_openai() -> Value {
     let mut schema = scan_v1_7_schema_openai();
     scan_v1_8_2_set_schema_descriptions(&mut schema);
@@ -4017,6 +4164,13 @@ fn scan_v1_8_2_schema_openai() -> Value {
             scan_v1_8_2_cross_market_snapshot_schema_openai(),
         );
     }
+    schema
+}
+
+fn scan_v1_8_4_schema_openai() -> Value {
+    let mut schema = scan_v1_8_2_schema_openai();
+    strip_scan_path_map(&mut schema);
+    scan_v1_8_4_set_schema_descriptions(&mut schema);
     schema
 }
 
@@ -4378,40 +4532,28 @@ fn scan_v1_8_2_schema_gemini() -> Value {
     schema
 }
 
+fn scan_v1_8_4_schema_gemini() -> Value {
+    let mut schema = scan_v1_8_2_schema_gemini();
+    strip_scan_path_map(&mut schema);
+    scan_v1_8_4_set_schema_descriptions(&mut schema);
+    schema
+}
+
 fn ml_grok_entry_scan_schema() -> Value {
-    scan_v1_8_2_schema_openai()
+    scan_v1_8_4_schema_openai()
 }
 
 fn ml_grok_entry_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["trade_quality", "decision", "params", "reason", "analysis"],
+        "required": ["edge_assessment", "trade_quality", "decision", "plan", "reason"],
         "properties": {
+            "edge_assessment": edge_assessment_schema_openai(),
             "trade_quality": trade_quality_schema_openai(),
             "decision": { "type": "string", "enum": ["LONG", "SHORT", "NO_TRADE"] },
-            "params": {
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["entry", "tp", "sl", "leverage", "horizon"],
-                "properties": {
-                    "entry": { "type": ["number", "null"] },
-                    "tp": { "type": ["number", "null"] },
-                    "sl": { "type": ["number", "null"] },
-                    "leverage": { "type": ["number", "null"] },
-                    "horizon": { "type": ["string", "null"] }
-                }
-            },
-            "reason": { "type": "string" },
-            "analysis": {
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["market_thesis", "trade_logic"],
-                "properties": {
-                    "market_thesis": { "type": "string" },
-                    "trade_logic": { "type": "string" }
-                }
-            }
+            "plan": entry_plan_schema_openai(false),
+            "reason": { "type": "string" }
         }
     })
 }
@@ -4432,37 +4574,20 @@ fn ml_grok_management_schema() -> Value {
 }
 
 fn ml_gemini_entry_scan_schema() -> Value {
-    scan_v1_8_2_schema_gemini()
+    scan_v1_8_4_schema_gemini()
 }
 
 fn ml_gemini_entry_schema() -> Value {
     json!({
         "type": "OBJECT",
         "properties": {
+            "edge_assessment": edge_assessment_schema_gemini(),
             "trade_quality": trade_quality_schema_gemini(),
             "decision": { "type": "STRING", "enum": ["LONG", "SHORT", "NO_TRADE"] },
-            "params": {
-                "type": "OBJECT",
-                "properties": {
-                    "entry": { "type": "NUMBER", "nullable": true },
-                    "tp": { "type": "NUMBER", "nullable": true },
-                    "sl": { "type": "NUMBER", "nullable": true },
-                    "leverage": { "type": "NUMBER", "nullable": true },
-                    "horizon": { "type": "STRING", "nullable": true }
-                },
-                "required": ["entry", "tp", "sl", "leverage", "horizon"]
-            },
-            "reason": { "type": "STRING" },
-            "analysis": {
-                "type": "OBJECT",
-                "properties": {
-                    "market_thesis": { "type": "STRING" },
-                    "trade_logic": { "type": "STRING" }
-                },
-                "required": ["market_thesis", "trade_logic"]
-            }
+            "plan": entry_plan_schema_gemini(),
+            "reason": { "type": "STRING" }
         },
-        "required": ["trade_quality", "decision", "params", "reason", "analysis"]
+        "required": ["edge_assessment", "trade_quality", "decision", "plan", "reason"]
     })
 }
 
@@ -4490,20 +4615,20 @@ fn ml_gemini_management_schema() -> Value {
 }
 
 fn ml_qwen_entry_scan_schema() -> Value {
-    scan_v1_8_2_schema_openai()
+    scan_v1_8_4_schema_openai()
 }
 
 fn ml_qwen_entry_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": true,
-        "required": ["trade_quality", "decision", "params", "reason"],
+        "required": ["edge_assessment", "trade_quality", "decision", "plan", "reason"],
         "properties": {
+            "edge_assessment": edge_assessment_schema_openai(),
             "trade_quality": trade_quality_schema_openai(),
             "decision": { "type": "string", "enum": ["LONG", "SHORT", "NO_TRADE"] },
-            "params": { "type": "object", "additionalProperties": true },
-            "reason": { "type": "string", "minLength": 1 },
-            "analysis": { "type": ["object", "null"], "additionalProperties": true }
+            "plan": entry_plan_schema_openai(true),
+            "reason": { "type": "string", "minLength": 1 }
         }
     })
 }
@@ -4525,29 +4650,19 @@ fn ml_qwen_management_schema() -> Value {
 }
 
 fn ml_custom_llm_entry_scan_schema() -> Value {
-    scan_v1_8_2_schema_openai()
+    scan_v1_8_4_schema_openai()
 }
 
 fn ml_custom_llm_entry_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["trade_quality", "decision", "params", "reason"],
+        "required": ["edge_assessment", "trade_quality", "decision", "plan", "reason"],
         "properties": {
+            "edge_assessment": edge_assessment_schema_openai(),
             "trade_quality": trade_quality_schema_openai(),
             "decision": { "type": "string", "enum": ["LONG", "SHORT", "NO_TRADE"] },
-            "params": {
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["entry", "tp", "sl", "leverage", "horizon"],
-                "properties": {
-                    "entry": { "type": ["number", "null"] },
-                    "tp": { "type": ["number", "null"] },
-                    "sl": { "type": ["number", "null"] },
-                    "leverage": { "type": ["number", "null"] },
-                    "horizon": { "type": ["string", "null"] }
-                }
-            },
+            "plan": entry_plan_schema_openai(false),
             "reason": { "type": "string", "minLength": 1 }
         }
     })
@@ -4613,33 +4728,16 @@ fn gemini_entry_response_schema() -> Value {
     json!({
         "type": "OBJECT",
         "properties": {
+            "edge_assessment": edge_assessment_schema_gemini(),
             "trade_quality": trade_quality_schema_gemini(),
             "decision": {
                 "type": "STRING",
                 "enum": ["LONG", "SHORT", "NO_TRADE"]
             },
-            "params": {
-                "type": "OBJECT",
-                "properties": {
-                    "entry": { "type": "NUMBER", "nullable": true },
-                    "tp": { "type": "NUMBER", "nullable": true },
-                    "sl": { "type": "NUMBER", "nullable": true },
-                    "leverage": { "type": "NUMBER", "nullable": true },
-                    "horizon": { "type": "STRING", "nullable": true }
-                },
-                "required": ["entry", "tp", "sl", "leverage", "horizon"]
-            },
-            "reason": { "type": "STRING" },
-            "analysis": {
-                "type": "OBJECT",
-                "properties": {
-                    "market_thesis": { "type": "STRING" },
-                    "trade_logic": { "type": "STRING" }
-                },
-                "required": ["market_thesis", "trade_logic"]
-            }
+            "plan": entry_plan_schema_gemini(),
+            "reason": { "type": "STRING" }
         },
-        "required": ["trade_quality", "decision", "params", "reason", "analysis"]
+        "required": ["edge_assessment", "trade_quality", "decision", "plan", "reason"]
     })
 }
 
@@ -5357,7 +5455,7 @@ mod tests {
 
     fn sample_stage_1_scan() -> Value {
         json!({
-            "schema_version": "scan_v1_8_2",
+            "schema_version": "scan_v1_8_4",
             "meta": {
                 "symbol": "TESTUSDT",
                 "scan_ts_bucket": "2026-03-18T07:00:00+00:00"
@@ -5393,17 +5491,7 @@ mod tests {
                             {"price": 1994.0, "type": "support", "reason": "15m local floor"},
                             {"price": 2018.0, "type": "resistance", "reason": "15m local cap"}
                         ],
-                        "invalidation_level": 1994.0,
-                        "path_map": {
-                            "upside": {
-                                "first_objective_ref": {"ref_kind": "active_range_high", "price": 2018.0, "label": "15m range high"},
-                                "first_barrier_ref": {"ref_kind": "supply_zone_edge", "price": 2018.0, "label": "15m supply high"}
-                            },
-                            "downside": {
-                                "first_objective_ref": {"ref_kind": "active_range_low", "price": 1994.0, "label": "15m range low"},
-                                "first_barrier_ref": {"ref_kind": "demand_zone_edge", "price": 1994.0, "label": "15m demand low"}
-                            }
-                        }
+                        "invalidation_level": 1994.0
                     },
                     "validation": {
                         "read_basis": "closed_bar_continuation",
@@ -5445,17 +5533,7 @@ mod tests {
                             {"price": 1988.0, "type": "support", "reason": "4h defended support"},
                             {"price": 2035.0, "type": "resistance", "reason": "4h upper cap"}
                         ],
-                        "invalidation_level": 1988.0,
-                        "path_map": {
-                            "upside": {
-                                "first_objective_ref": {"ref_kind": "active_range_high", "price": 2035.0, "label": "4h range high"},
-                                "first_barrier_ref": {"ref_kind": "supply_zone_edge", "price": 2035.0, "label": "4h supply high"}
-                            },
-                            "downside": {
-                                "first_objective_ref": {"ref_kind": "active_range_low", "price": 1988.0, "label": "4h range low"},
-                                "first_barrier_ref": {"ref_kind": "demand_zone_edge", "price": 1988.0, "label": "4h demand low"}
-                            }
-                        }
+                        "invalidation_level": 1988.0
                     },
                     "validation": {
                         "read_basis": "mixed",
@@ -5497,17 +5575,7 @@ mod tests {
                             {"price": 1960.0, "type": "support", "reason": "daily lower support"},
                             {"price": 2050.0, "type": "resistance", "reason": "daily upper resistance"}
                         ],
-                        "invalidation_level": null,
-                        "path_map": {
-                            "upside": {
-                                "first_objective_ref": {"ref_kind": "active_range_high", "price": 2050.0, "label": "1d range high"},
-                                "first_barrier_ref": {"ref_kind": "supply_zone_edge", "price": 2050.0, "label": "1d supply high"}
-                            },
-                            "downside": {
-                                "first_objective_ref": {"ref_kind": "active_range_low", "price": 1960.0, "label": "1d range low"},
-                                "first_barrier_ref": {"ref_kind": "demand_zone_edge", "price": 1960.0, "label": "1d demand low"}
-                            }
-                        }
+                        "invalidation_level": null
                     },
                     "validation": {
                         "read_basis": "structural_inference",
@@ -5888,7 +5956,7 @@ mod tests {
     fn normalize_qwen_shape_lifts_analysis_reason_to_top_level() {
         let value = json!({
             "decision": "NO_TRADE",
-            "params": {"entry": null, "tp": null, "sl": null, "rr": null, "horizon": null},
+            "plan": {"entry": null, "take_profit": null, "stop_loss": null, "rr": null, "horizon": null},
             "analysis": {
                 "reason": "wait for cleaner setup",
                 "v_calculation": "bars=[0:1.0]; sorted=[1.0]; median=1.0"
@@ -5905,7 +5973,7 @@ mod tests {
     fn normalize_qwen_shape_maps_hold_to_no_trade_in_entry_mode() {
         let value = json!({
             "decision": "HOLD",
-            "params": {"entry": null, "tp": null, "sl": null, "rr": null, "horizon": null},
+            "plan": {"entry": null, "take_profit": null, "stop_loss": null, "rr": null, "horizon": null},
             "analysis": {"reason": "no setup"}
         });
         let normalized = super::normalize_qwen_decision_shape(value, false, false);
@@ -5935,7 +6003,7 @@ mod tests {
     fn custom_llm_shape_uses_same_reason_lift_as_qwen() {
         let value = json!({
             "decision": "NO_TRADE",
-            "params": {"entry": null, "tp": null, "sl": null, "rr": null, "horizon": null},
+            "plan": {"entry": null, "take_profit": null, "stop_loss": null, "rr": null, "horizon": null},
             "analysis": {"reason": "wait for cleaner setup"}
         });
         let normalized =
@@ -6075,7 +6143,13 @@ mod tests {
         );
         assert_eq!(
             schema
-                .pointer("/properties/params/additionalProperties")
+                .pointer("/properties/plan/additionalProperties")
+                .and_then(|v| v.as_bool()),
+            Some(false)
+        );
+        assert_eq!(
+            schema
+                .pointer("/properties/edge_assessment/additionalProperties")
                 .and_then(|v| v.as_bool()),
             Some(false)
         );
@@ -6093,7 +6167,13 @@ mod tests {
                     .iter()
                     .map(|v| v.as_str().unwrap_or_default())
                     .collect::<Vec<_>>()
-                    == vec!["trade_quality", "decision", "params", "reason"]
+                    == vec![
+                        "edge_assessment",
+                        "trade_quality",
+                        "decision",
+                        "plan",
+                        "reason",
+                    ]
             })
             .unwrap_or(false));
     }
@@ -6202,7 +6282,7 @@ mod tests {
                     schema
                         .pointer("/properties/schema_version/enum/0")
                         .and_then(|v| v.as_str()),
-                    Some("scan_v1_8_2")
+                    Some("scan_v1_8_4")
                 );
                 assert_eq!(
                     schema
@@ -6236,6 +6316,9 @@ mod tests {
                         .and_then(|v| v.as_bool()),
                     Some(false)
                 );
+                assert!(schema
+                    .pointer("/properties/timeframes/properties/15m/properties/structure_map/properties/path_map")
+                    .is_none());
             } else {
                 assert_eq!(
                     schema
@@ -6290,11 +6373,12 @@ mod tests {
             if prompt_template == "medium_large_opportunity" {
                 assert!(contract
                     .contains("`schema_version`, `meta`, `timeframes`, and `cross_timeframe_map`"));
-                assert!(contract.contains("`scan_v1_8_2`"));
+                assert!(contract.contains("`scan_v1_8_4`"));
                 assert!(contract.contains("`state`, `flow_map`, `structure_map`, and `validation`"));
                 assert!(contract.contains(
                     "`ownership_map`, `relationship_map`, `cross_market_snapshot`, and `cross_timeframe_structure`"
                 ));
+                assert!(!contract.contains("path_map"));
                 assert!(!contract.contains("scan_audit"));
                 assert!(!contract.contains("supporting_signals"));
             } else {
@@ -6310,20 +6394,27 @@ mod tests {
     }
 
     #[test]
-    fn qwen_entry_output_contract_mentions_trade_quality() {
+    fn qwen_entry_output_contract_mentions_edge_assessment_and_trade_quality() {
         let contract = super::qwen_output_contract(
             false,
             false,
             super::prompt::EntryPromptStage::Finalize,
             "medium_large_opportunity",
         );
+        assert!(contract.contains("edge_assessment"));
+        assert!(contract
+            .contains("`edge_assessment`, `trade_quality`, `decision`, `plan`, and `reason`"));
+        assert!(contract.contains("edge_exists_now"));
+        assert!(contract.contains("location_quality"));
+        assert!(contract.contains("why_no_trade_now"));
         assert!(contract.contains("trade_quality"));
-        assert!(contract.contains("`trade_quality`, `decision`, `params`, and `reason`"));
         assert!(contract.contains("thesis_clarity"));
         assert!(contract.contains("execution_quality"));
         assert!(contract.contains("path_to_target_quality"));
         assert!(contract.contains("stopout_risk_before_resolution"));
         assert!(contract.contains("reward_to_risk_sufficiency"));
+        assert!(contract.contains("take_profit"));
+        assert!(contract.contains("stop_loss"));
     }
 
     #[test]
