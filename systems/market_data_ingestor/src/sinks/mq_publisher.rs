@@ -244,7 +244,7 @@ impl MqPublisher {
         // any burst or broker load.  A successful basic_publish means the
         // broker received the AMQP frame; loss is only possible if the broker
         // crashes before flushing, which the outbox relay covers on restart.
-        let _confirm = channel
+        let _confirm = match channel
             .basic_publish(
                 &record.exchange_name,
                 &event.routing_key,
@@ -253,7 +253,16 @@ impl MqPublisher {
                 properties,
             )
             .await
-            .with_context(|| format!("publish to routing_key={} failed", event.routing_key))?;
+        {
+            Ok(confirm) => confirm,
+            Err(err) => {
+                self.mq
+                    .mark_connection_stale("direct mq basic_publish failed");
+                return Err(err).with_context(|| {
+                    format!("publish to routing_key={} failed", event.routing_key)
+                });
+            }
+        };
         // _confirm (PublisherConfirm) is intentionally dropped; lapin discards
         // the incoming ACK internally when no one is awaiting it.
 

@@ -7,16 +7,20 @@ use crate::sinks::{
     outbox_dispatcher::OutboxDispatcher, outbox_writer::OutboxWriter, parquet_sink::ParquetSink,
 };
 use crate::state::{backfill_scheduler, depth_rebuilder};
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use futures_util::StreamExt;
 use lapin::{
     options::{BasicAckOptions, BasicConsumeOptions, BasicQosOptions},
     types::FieldTable,
 };
+use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
 
 const OUTBOX_DISPATCH_WORKERS: usize = 3;
+const SELFCHECK_CONSUMER_RECONNECT_BACKOFF_SECS: u64 = 5;
 
 pub async fn run(ctx: AppContext) -> Result<()> {
     let ctx = Arc::new(ctx);
@@ -48,13 +52,17 @@ pub async fn run(ctx: AppContext) -> Result<()> {
         },
     ));
 
-    let mut handles = vec![];
-    handles.push(tokio::spawn(run_selfcheck_consumer(ctx.clone())));
-    handles.push(tokio::spawn(heartbeat::run_heartbeat_loop(
-        ctx.clone(),
-        ops_writer.clone(),
-        metrics.clone(),
-    )));
+    let mut tasks = JoinSet::new();
+    spawn_critical_task(
+        &mut tasks,
+        "selfcheck mq consumer",
+        run_selfcheck_consumer(ctx.clone()),
+    );
+    spawn_critical_task(
+        &mut tasks,
+        "ops heartbeat loop",
+        heartbeat::run_heartbeat_loop(ctx.clone(), ops_writer.clone(), metrics.clone()),
+    );
     // Give each outbox dispatcher its own AMQP channel so that a channel error or
     // backpressure on one worker cannot affect the others, and concurrent basic_publish
     // calls are fully serialized per channel rather than competing on a shared one.
@@ -64,7 +72,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
             ctx.mq.clone(),
             ctx.config.mq.exchanges.md_live.name.clone(),
         );
-        handles.push(tokio::spawn(async move {
+        spawn_critical_task(&mut tasks, "outbox dispatcher worker", async move {
             let perform_housekeeping = worker_id == 0;
             info!(
                 worker_id = worker_id,
@@ -75,40 +83,54 @@ pub async fn run(ctx: AppContext) -> Result<()> {
             outbox_dispatcher
                 .run_loop_worker(perform_housekeeping)
                 .await
-        }));
+        });
     }
 
-    handles.push(tokio::spawn(spot_pipeline::run(
-        ctx.clone(),
-        rest_client.clone(),
-        publisher.clone(),
-        outbox_writer.clone(),
-        db_writer.clone(),
-        ops_writer.clone(),
-        metrics.clone(),
-    )));
+    spawn_critical_task(
+        &mut tasks,
+        "spot pipeline",
+        spot_pipeline::run(
+            ctx.clone(),
+            rest_client.clone(),
+            publisher.clone(),
+            outbox_writer.clone(),
+            db_writer.clone(),
+            ops_writer.clone(),
+            metrics.clone(),
+        ),
+    );
 
-    handles.push(tokio::spawn(futures_pipeline::run(
-        ctx.clone(),
-        rest_client.clone(),
-        publisher.clone(),
-        outbox_writer.clone(),
-        db_writer.clone(),
-        ops_writer.clone(),
-        metrics.clone(),
-    )));
+    spawn_critical_task(
+        &mut tasks,
+        "futures pipeline",
+        futures_pipeline::run(
+            ctx.clone(),
+            rest_client.clone(),
+            publisher.clone(),
+            outbox_writer.clone(),
+            db_writer.clone(),
+            ops_writer.clone(),
+            metrics.clone(),
+        ),
+    );
 
-    handles.push(tokio::spawn(depth_rebuilder::run_depth_snapshot_loop(
-        ctx.clone(),
-        rest_client.clone(),
-        db_writer.clone(),
-        ops_writer.clone(),
-        publisher.clone(),
-        outbox_writer.clone(),
-        metrics.clone(),
-    )));
+    spawn_critical_task(
+        &mut tasks,
+        "depth snapshot rebuilder",
+        depth_rebuilder::run_depth_snapshot_loop(
+            ctx.clone(),
+            rest_client.clone(),
+            db_writer.clone(),
+            ops_writer.clone(),
+            publisher.clone(),
+            outbox_writer.clone(),
+            metrics.clone(),
+        ),
+    );
 
-    handles.push(tokio::spawn(
+    spawn_critical_task(
+        &mut tasks,
+        "funding rate backfill loop",
         backfill_scheduler::run_funding_rate_backfill_loop(
             ctx.clone(),
             rest_client,
@@ -118,19 +140,80 @@ pub async fn run(ctx: AppContext) -> Result<()> {
             outbox_writer,
             metrics,
         ),
-    ));
+    );
 
     info!("market_data_ingestor started; press Ctrl+C to stop");
-    tokio::signal::ctrl_c().await?;
+    let mut shutdown_signal = std::pin::pin!(wait_for_shutdown_signal());
+    loop {
+        tokio::select! {
+            signal = &mut shutdown_signal => {
+                let signal = signal?;
+                info!(signal = signal, "shutdown signal received, stopping tasks");
+                break;
+            }
+            task_result = tasks.join_next() => {
+                let Some(task_result) = task_result else {
+                    return Err(anyhow!("all critical tasks exited unexpectedly"));
+                };
+                let (task_name, result) = match task_result {
+                    Ok(result) => result,
+                    Err(err) => {
+                        tasks.abort_all();
+                        return Err(anyhow!("critical task join failed: {}", err));
+                    }
+                };
 
-    info!("shutdown signal received, stopping tasks");
-    for handle in handles {
-        handle.abort();
+                tasks.abort_all();
+                return match result {
+                    Ok(()) => Err(anyhow!("critical task exited unexpectedly: {}", task_name)),
+                    Err(err) => Err(err.context(format!("critical task {task_name} failed"))),
+                };
+            }
+        }
     }
+
+    tasks.abort_all();
+    while let Some(result) = tasks.join_next().await {
+        if let Err(err) = result {
+            if !err.is_cancelled() {
+                warn!(error = %err, "critical task join failed during shutdown");
+            }
+        }
+    }
+
     Ok(())
 }
 
 async fn run_selfcheck_consumer(ctx: Arc<AppContext>) -> Result<()> {
+    loop {
+        match run_selfcheck_consumer_session(ctx.clone()).await {
+            Ok(()) => {
+                ctx.mq
+                    .mark_connection_stale("selfcheck consumer stream ended");
+                warn!(
+                    backoff_secs = SELFCHECK_CONSUMER_RECONNECT_BACKOFF_SECS,
+                    "selfcheck mq consumer stream ended, recreating"
+                );
+            }
+            Err(err) => {
+                ctx.mq
+                    .mark_connection_stale("selfcheck consumer session failed");
+                warn!(
+                    error = %err,
+                    backoff_secs = SELFCHECK_CONSUMER_RECONNECT_BACKOFF_SECS,
+                    "selfcheck mq consumer failed, reconnecting"
+                );
+            }
+        }
+
+        tokio::time::sleep(Duration::from_secs(
+            SELFCHECK_CONSUMER_RECONNECT_BACKOFF_SECS,
+        ))
+        .await;
+    }
+}
+
+async fn run_selfcheck_consumer_session(ctx: Arc<AppContext>) -> Result<()> {
     let channel = ctx
         .mq
         .create_channel()
@@ -169,14 +252,50 @@ async fn run_selfcheck_consumer(ctx: Arc<AppContext>) -> Result<()> {
                 }
 
                 if let Err(err) = delivery.ack(BasicAckOptions::default()).await {
+                    ctx.mq.mark_connection_stale("selfcheck ack failed");
                     error!(error = %err, "selfcheck ack failed");
+                    return Err(err).context("ack selfcheck message");
                 }
             }
             Err(err) => {
+                ctx.mq
+                    .mark_connection_stale("selfcheck consumer delivery error");
                 error!(error = %err, "selfcheck consumer error");
+                return Err(err).context("receive selfcheck delivery");
             }
         }
     }
 
     Ok(())
+}
+
+fn spawn_critical_task<F>(
+    tasks: &mut JoinSet<(&'static str, Result<()>)>,
+    name: &'static str,
+    future: F,
+) where
+    F: Future<Output = Result<()>> + Send + 'static,
+{
+    tasks.spawn(async move { (name, future.await) });
+}
+
+async fn wait_for_shutdown_signal() -> Result<&'static str> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+
+        let mut sigterm = signal(SignalKind::terminate()).context("register SIGTERM handler")?;
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => Ok("SIGINT"),
+            _ = sigterm.recv() => Ok("SIGTERM"),
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c()
+            .await
+            .context("wait for shutdown signal")?;
+        Ok("SIGINT")
+    }
 }

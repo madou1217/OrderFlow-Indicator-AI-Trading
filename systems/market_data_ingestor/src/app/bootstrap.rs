@@ -1,5 +1,5 @@
 use crate::app::config::{load_config, MqConfig, ResolvedDatabaseConfig, RootConfig};
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use lapin::{
     options::{
         ConfirmSelectOptions, ExchangeDeclareOptions, QueueBindOptions, QueueDeclareOptions,
@@ -11,6 +11,7 @@ use lapin::{
 use reqwest::Client;
 use sqlx::{postgres::PgPoolOptions, PgPool};
 use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -36,15 +37,23 @@ pub struct AppContext {
 #[derive(Clone)]
 pub struct AmqpConnectionManager {
     uri: Arc<String>,
+    topology: Arc<MqConfig>,
     connection: Arc<Mutex<Arc<Connection>>>,
+    reconnect_requested: Arc<AtomicBool>,
 }
 
 impl AmqpConnectionManager {
-    pub async fn connect(uri: String) -> Result<Self> {
+    pub async fn connect(uri: String, topology: MqConfig) -> Result<Self> {
+        let topology = Arc::new(topology);
+        let reconnect_requested = Arc::new(AtomicBool::new(false));
         let connection = Arc::new(connect_rabbitmq(&uri).await?);
+        observe_connection_errors(connection.as_ref(), reconnect_requested.clone());
+        ensure_topology(&connection, topology.as_ref()).await?;
         Ok(Self {
             uri: Arc::new(uri),
+            topology,
             connection: Arc::new(Mutex::new(connection)),
+            reconnect_requested,
         })
     }
 
@@ -56,38 +65,66 @@ impl AmqpConnectionManager {
         self.create_channel_inner(true).await
     }
 
+    pub fn mark_connection_stale(&self, reason: &str) {
+        let already_requested = self.reconnect_requested.swap(true, Ordering::AcqRel);
+        if !already_requested {
+            warn!(
+                reason = reason,
+                "amqp connection marked stale; reconnect required"
+            );
+        }
+    }
+
     async fn create_channel_inner(&self, confirm: bool) -> Result<Channel> {
-        let connection = self.ensure_connection().await?;
-        match connection.create_channel().await {
-            Ok(channel) => {
-                if confirm {
-                    channel
-                        .confirm_select(ConfirmSelectOptions::default())
-                        .await
-                        .context("enable publisher confirms for mq publish channel")?;
+        let mut last_err = None;
+        for attempt in 0..2 {
+            let connection = if attempt == 0 {
+                self.ensure_connection().await?
+            } else {
+                self.replace_connection("retry channel setup on fresh connection")
+                    .await?
+            };
+
+            match connection.create_channel().await {
+                Ok(channel) => {
+                    if confirm {
+                        if let Err(err) = channel
+                            .confirm_select(ConfirmSelectOptions::default())
+                            .await
+                        {
+                            self.mark_connection_stale(
+                                "publisher confirm setup failed on mq channel",
+                            );
+                            warn!(
+                                error = %err,
+                                confirm,
+                                attempt = attempt + 1,
+                                "amqp confirm_select failed"
+                            );
+                            last_err = Some(
+                                anyhow!(err)
+                                    .context("enable publisher confirms for mq publish channel"),
+                            );
+                            continue;
+                        }
+                    }
+                    self.reconnect_requested.store(false, Ordering::Release);
+                    return Ok(channel);
                 }
-                Ok(channel)
-            }
-            Err(err) => {
-                warn!(
-                    error = %err,
-                    confirm,
-                    "amqp create_channel failed, recreating connection"
-                );
-                let connection = self.force_reconnect().await?;
-                let channel = connection
-                    .create_channel()
-                    .await
-                    .context("create AMQP channel after reconnect")?;
-                if confirm {
-                    channel
-                        .confirm_select(ConfirmSelectOptions::default())
-                        .await
-                        .context("enable publisher confirms for mq publish channel after reconnect")?;
+                Err(err) => {
+                    self.mark_connection_stale("create_channel failed on mq connection");
+                    warn!(
+                        error = %err,
+                        confirm,
+                        attempt = attempt + 1,
+                        "amqp create_channel failed"
+                    );
+                    last_err = Some(anyhow!(err).context("create AMQP channel"));
                 }
-                Ok(channel)
             }
         }
+
+        Err(last_err.unwrap_or_else(|| anyhow!("create AMQP channel failed after reconnect")))
     }
 
     async fn ensure_connection(&self) -> Result<Arc<Connection>> {
@@ -95,29 +132,32 @@ impl AmqpConnectionManager {
             let guard = self.connection.lock().await;
             guard.clone()
         };
-        if current.status().connected() {
+        if current.status().connected() && !self.reconnect_requested.load(Ordering::Acquire) {
             return Ok(current);
         }
-        self.force_reconnect().await
+        self.replace_connection("ensure connection requested reconnect")
+            .await
     }
 
-    async fn force_reconnect(&self) -> Result<Arc<Connection>> {
+    async fn replace_connection(&self, reason: &str) -> Result<Arc<Connection>> {
         let mut guard = self.connection.lock().await;
-        if guard.status().connected() {
-            return Ok(guard.clone());
-        }
-
         let previous_state = guard.status().state();
         warn!(
             state = ?previous_state,
-            "amqp connection not connected, establishing a new connection"
+            reason = reason,
+            "establishing a fresh amqp connection"
         );
         let connection = Arc::new(
             connect_rabbitmq(self.uri.as_str())
                 .await
                 .context("reconnect rabbitmq")?,
         );
+        observe_connection_errors(connection.as_ref(), self.reconnect_requested.clone());
+        ensure_topology(&connection, self.topology.as_ref())
+            .await
+            .context("redeclare rabbitmq topology after reconnect")?;
         *guard = connection.clone();
+        self.reconnect_requested.store(false, Ordering::Release);
         Ok(connection)
     }
 }
@@ -139,11 +179,13 @@ pub async fn bootstrap() -> Result<AppContext> {
         info!("md/ops database endpoints are identical; creating dedicated pools to reduce contention");
     }
     let ops_db_pool = build_db_pool("ops", &ops_db_cfg).await?;
-    let mq = Arc::new(AmqpConnectionManager::connect(config.mq.amqp_uri()).await?);
-
-    let topology_channel = mq.create_channel().await.context("create topology channel")?;
-    declare_topology(&topology_channel, &config.mq).await?;
+    let mq =
+        Arc::new(AmqpConnectionManager::connect(config.mq.amqp_uri(), config.mq.clone()).await?);
     if config.mq.purge_startup_queues {
+        let topology_channel = mq
+            .create_channel()
+            .await
+            .context("create topology channel")?;
         purge_startup_queues(&topology_channel, &config.mq).await?;
     } else {
         info!("startup queue purge disabled (mq.purge_startup_queues=false)");
@@ -212,10 +254,22 @@ async fn connect_rabbitmq(uri: &str) -> Result<Connection> {
     let connection = Connection::connect(uri, ConnectionProperties::default())
         .await
         .context("connect rabbitmq")?;
-    connection.on_error(|err| {
+    Ok(connection)
+}
+
+fn observe_connection_errors(connection: &Connection, reconnect_requested: Arc<AtomicBool>) {
+    connection.on_error(move |err| {
+        reconnect_requested.store(true, Ordering::Release);
         warn!(error = %err, "amqp connection entered error state");
     });
-    Ok(connection)
+}
+
+async fn ensure_topology(connection: &Connection, mq: &MqConfig) -> Result<()> {
+    let channel = connection
+        .create_channel()
+        .await
+        .context("create topology channel on amqp connection")?;
+    declare_topology(&channel, mq).await
 }
 
 async fn build_db_pool(role: &'static str, config: &ResolvedDatabaseConfig) -> Result<PgPool> {

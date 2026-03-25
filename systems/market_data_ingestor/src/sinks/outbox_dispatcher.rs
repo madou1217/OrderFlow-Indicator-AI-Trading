@@ -146,6 +146,7 @@ impl OutboxDispatcher {
                     pending_confirms.push((row.bucket_date, row.outbox_id, confirm));
                 }
                 Err(err) => {
+                    self.mq.mark_connection_stale("outbox publish_row failed");
                     error!(error = %err, outbox_id = row.outbox_id, "outbox publish failed");
                     self.mark_failed(row.bucket_date, row.outbox_id, err.to_string())
                         .await?;
@@ -157,6 +158,8 @@ impl OutboxDispatcher {
             let confirmation = match confirm.await.context("wait publisher confirm") {
                 Ok(c) => c,
                 Err(err) => {
+                    self.mq
+                        .mark_connection_stale("outbox publisher confirm wait failed");
                     error!(error = %err, outbox_id, "outbox publisher confirm failed");
                     self.mark_failed(bucket_date, outbox_id, err.to_string())
                         .await?;
@@ -167,6 +170,8 @@ impl OutboxDispatcher {
             match confirmation {
                 Confirmation::Ack(_) => sent_keys.push((bucket_date, outbox_id)),
                 Confirmation::Nack(returned) => {
+                    self.mq
+                        .mark_connection_stale("outbox publish received broker nack");
                     let err_text = format!(
                         "broker nack for outbox_id={} returned={}",
                         outbox_id,
@@ -176,6 +181,8 @@ impl OutboxDispatcher {
                     self.mark_failed(bucket_date, outbox_id, err_text).await?;
                 }
                 Confirmation::NotRequested => {
+                    self.mq
+                        .mark_connection_stale("publisher confirm missing on outbox channel");
                     let err_text = "publisher confirm not requested on channel".to_string();
                     error!(outbox_id, "outbox publish confirmation missing");
                     self.mark_failed(bucket_date, outbox_id, err_text).await?;
@@ -366,7 +373,7 @@ impl OutboxDispatcher {
             .with_headers(headers)
             .with_message_id(ShortString::from(row.message_id.to_string()));
 
-        let confirm = channel
+        let confirm = match channel
             .basic_publish(
                 &row.exchange_name,
                 &row.routing_key,
@@ -375,12 +382,18 @@ impl OutboxDispatcher {
                 properties,
             )
             .await
-            .with_context(|| {
-                format!(
-                    "basic_publish exchange={} routing_key={}",
-                    row.exchange_name, row.routing_key
-                )
-            })?;
+        {
+            Ok(confirm) => confirm,
+            Err(err) => {
+                self.mq.mark_connection_stale("outbox basic_publish failed");
+                return Err(err).with_context(|| {
+                    format!(
+                        "basic_publish exchange={} routing_key={}",
+                        row.exchange_name, row.routing_key
+                    )
+                });
+            }
+        };
 
         Ok(confirm)
     }
