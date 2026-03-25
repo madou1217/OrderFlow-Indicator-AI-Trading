@@ -18,7 +18,7 @@ Use it to understand:
 
 How to use current execution-time data
 The market scan provides structural analysis: levels, zones, value areas, participant tasks, and flow state. These structural features are durable and remain valid for pending-order planning.
-Use the current execution-time data to locate the best available pending-order entry within the structural map and to confirm that the structural thesis has not been invalidated.
+Use the current execution-time data to locate the best available pending-order entry within the 4h to 1d structural map and to confirm that the 4h to 1d structural thesis has not been invalidated.
 Current price shows where the market is now relative to structural levels. Current flow and acceptance/rejection show whether the structural thesis is still intact.
 
 Read all timeframes as one picture:
@@ -84,9 +84,9 @@ Always return `trade_quality` with:
 - `reward_to_risk_sufficiency`: ample, adequate, or insufficient
 
 Before you output, verify:
-- Does the structural thesis from the market scan still hold? Has any key level been invalidated by current execution-time data?
-- From the proposed entry level, is the reward-to-risk ratio favorable given the structural path to target vs path to stop?
-- Is the entry level at or near a structural level where passive fill is realistic, not stranded in mid-range?
+- Does the 4h to 1d structural thesis from the market scan still hold? Has any 4h or 1d key level been invalidated by current execution-time data?
+- From the proposed entry level, is the reward-to-risk ratio favorable given the 4h to 1d structural path to target vs path to stop?
+- Is the entry level at or near a 4h to 1d structural level where passive fill is realistic, not stranded in mid-range?
 - Does the proposed leverage reflect the actual setup quality and path contestation?
 - If both direction and entry location are unclear, return NO_TRADE.
 

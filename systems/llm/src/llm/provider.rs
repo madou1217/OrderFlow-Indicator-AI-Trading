@@ -1374,6 +1374,8 @@ async fn invoke_one_model_scan_stage(
                     ));
                     let entry_stage_trace = trace.output_entry_stage_trace();
                     let entry_stage_prompt_inputs = trace.output_entry_stage_prompt_inputs();
+                    let shadow_error =
+                        format!("{:#}", failure.error.context("market scan stage failed"));
                     ModelCallOutput {
                         model_name,
                         provider,
@@ -1388,10 +1390,7 @@ async fn invoke_one_model_scan_stage(
                         validation_warning: None,
                         entry_stage_trace,
                         entry_stage_prompt_inputs,
-                        error: Some(format!(
-                            "{:#}",
-                            failure.error.context("market scan stage failed")
-                        )),
+                        error: Some(shadow_error),
                     }
                 }
             }
@@ -1400,6 +1399,7 @@ async fn invoke_one_model_scan_stage(
             let ProviderFailure { error, trace } = failure;
             let entry_stage_trace = trace.output_entry_stage_trace();
             let entry_stage_prompt_inputs = trace.output_entry_stage_prompt_inputs();
+            let shadow_error = format!("{:#}", error);
             ModelCallOutput {
                 model_name,
                 provider,
@@ -1414,7 +1414,7 @@ async fn invoke_one_model_scan_stage(
                 validation_warning: None,
                 entry_stage_trace,
                 entry_stage_prompt_inputs,
-                error: Some(format!("{:#}", error)),
+                error: Some(shadow_error),
             }
         }
     }
