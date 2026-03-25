@@ -13,7 +13,8 @@ use sqlx::{postgres::PgPoolOptions, PgPool};
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::info;
+use tokio::sync::Mutex;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 const CONFIG_PATH: &str = "config/config.yaml";
@@ -24,14 +25,101 @@ pub struct AppContext {
     pub config: Arc<RootConfig>,
     pub md_db_pool: PgPool,
     pub ops_db_pool: PgPool,
-    pub mq_connection: Arc<Connection>,
-    pub mq_publish_channel: Channel,
-    pub mq_consume_channel: Channel,
+    pub mq: Arc<AmqpConnectionManager>,
     pub http_client: Client,
     pub rest_proxy_url: Option<String>,
     pub ws_proxy_url: Option<String>,
     pub producer_instance_id: String,
     pub selfcheck_queue: String,
+}
+
+#[derive(Clone)]
+pub struct AmqpConnectionManager {
+    uri: Arc<String>,
+    connection: Arc<Mutex<Arc<Connection>>>,
+}
+
+impl AmqpConnectionManager {
+    pub async fn connect(uri: String) -> Result<Self> {
+        let connection = Arc::new(connect_rabbitmq(&uri).await?);
+        Ok(Self {
+            uri: Arc::new(uri),
+            connection: Arc::new(Mutex::new(connection)),
+        })
+    }
+
+    pub async fn create_channel(&self) -> Result<Channel> {
+        self.create_channel_inner(false).await
+    }
+
+    pub async fn create_confirm_channel(&self) -> Result<Channel> {
+        self.create_channel_inner(true).await
+    }
+
+    async fn create_channel_inner(&self, confirm: bool) -> Result<Channel> {
+        let connection = self.ensure_connection().await?;
+        match connection.create_channel().await {
+            Ok(channel) => {
+                if confirm {
+                    channel
+                        .confirm_select(ConfirmSelectOptions::default())
+                        .await
+                        .context("enable publisher confirms for mq publish channel")?;
+                }
+                Ok(channel)
+            }
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    confirm,
+                    "amqp create_channel failed, recreating connection"
+                );
+                let connection = self.force_reconnect().await?;
+                let channel = connection
+                    .create_channel()
+                    .await
+                    .context("create AMQP channel after reconnect")?;
+                if confirm {
+                    channel
+                        .confirm_select(ConfirmSelectOptions::default())
+                        .await
+                        .context("enable publisher confirms for mq publish channel after reconnect")?;
+                }
+                Ok(channel)
+            }
+        }
+    }
+
+    async fn ensure_connection(&self) -> Result<Arc<Connection>> {
+        let current = {
+            let guard = self.connection.lock().await;
+            guard.clone()
+        };
+        if current.status().connected() {
+            return Ok(current);
+        }
+        self.force_reconnect().await
+    }
+
+    async fn force_reconnect(&self) -> Result<Arc<Connection>> {
+        let mut guard = self.connection.lock().await;
+        if guard.status().connected() {
+            return Ok(guard.clone());
+        }
+
+        let previous_state = guard.status().state();
+        warn!(
+            state = ?previous_state,
+            "amqp connection not connected, establishing a new connection"
+        );
+        let connection = Arc::new(
+            connect_rabbitmq(self.uri.as_str())
+                .await
+                .context("reconnect rabbitmq")?,
+        );
+        *guard = connection.clone();
+        Ok(connection)
+    }
 }
 
 pub async fn bootstrap() -> Result<AppContext> {
@@ -51,36 +139,15 @@ pub async fn bootstrap() -> Result<AppContext> {
         info!("md/ops database endpoints are identical; creating dedicated pools to reduce contention");
     }
     let ops_db_pool = build_db_pool("ops", &ops_db_cfg).await?;
-    let mq_connection = Arc::new(
-        Connection::connect(&config.mq.amqp_uri(), ConnectionProperties::default())
-            .await
-            .context("connect rabbitmq")?,
-    );
+    let mq = Arc::new(AmqpConnectionManager::connect(config.mq.amqp_uri()).await?);
 
-    let topology_channel = mq_connection
-        .create_channel()
-        .await
-        .context("create topology channel")?;
+    let topology_channel = mq.create_channel().await.context("create topology channel")?;
     declare_topology(&topology_channel, &config.mq).await?;
     if config.mq.purge_startup_queues {
         purge_startup_queues(&topology_channel, &config.mq).await?;
     } else {
         info!("startup queue purge disabled (mq.purge_startup_queues=false)");
     }
-
-    let mq_publish_channel = mq_connection
-        .create_channel()
-        .await
-        .context("create mq publish channel")?;
-    mq_publish_channel
-        .confirm_select(ConfirmSelectOptions::default())
-        .await
-        .context("enable publisher confirms for mq publish channel")?;
-
-    let mq_consume_channel = mq_connection
-        .create_channel()
-        .await
-        .context("create mq consume channel")?;
 
     let rest_proxy_url = config.network.effective_rest_proxy_url();
     let ws_proxy_url = config.network.effective_ws_proxy_url();
@@ -132,15 +199,23 @@ pub async fn bootstrap() -> Result<AppContext> {
         config,
         md_db_pool,
         ops_db_pool,
-        mq_connection,
-        mq_publish_channel,
-        mq_consume_channel,
+        mq,
         http_client,
         rest_proxy_url,
         ws_proxy_url,
         producer_instance_id,
         selfcheck_queue: INGESTOR_SELFCHECK_QUEUE.to_string(),
     })
+}
+
+async fn connect_rabbitmq(uri: &str) -> Result<Connection> {
+    let connection = Connection::connect(uri, ConnectionProperties::default())
+        .await
+        .context("connect rabbitmq")?;
+    connection.on_error(|err| {
+        warn!(error = %err, "amqp connection entered error state");
+    });
+    Ok(connection)
 }
 
 async fn build_db_pool(role: &'static str, config: &ResolvedDatabaseConfig) -> Result<PgPool> {

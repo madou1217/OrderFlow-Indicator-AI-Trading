@@ -10,7 +10,7 @@ use crate::state::{backfill_scheduler, depth_rebuilder};
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use lapin::{
-    options::{BasicAckOptions, BasicConsumeOptions, BasicQosOptions, ConfirmSelectOptions},
+    options::{BasicAckOptions, BasicConsumeOptions, BasicQosOptions},
     types::FieldTable,
 };
 use std::sync::Arc;
@@ -22,7 +22,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
     let ctx = Arc::new(ctx);
 
     let publisher = Arc::new(MqPublisher::new(
-        ctx.mq_publish_channel.clone(),
+        ctx.mq.clone(),
         ctx.config.mq.exchanges.md_live.name.clone(),
         ctx.config.mq.exchanges.md_replay.name.clone(),
         ctx.producer_instance_id.clone(),
@@ -59,21 +59,9 @@ pub async fn run(ctx: AppContext) -> Result<()> {
     // backpressure on one worker cannot affect the others, and concurrent basic_publish
     // calls are fully serialized per channel rather than competing on a shared one.
     for worker_id in 0..OUTBOX_DISPATCH_WORKERS {
-        let worker_channel = ctx.mq_connection.create_channel().await.with_context(|| {
-            format!("create outbox dispatcher channel for worker {}", worker_id)
-        })?;
-        worker_channel
-            .confirm_select(ConfirmSelectOptions::default())
-            .await
-            .with_context(|| {
-                format!(
-                    "enable publisher confirms for outbox dispatcher worker {}",
-                    worker_id
-                )
-            })?;
         let outbox_dispatcher = OutboxDispatcher::new(
             ctx.ops_db_pool.clone(),
-            worker_channel,
+            ctx.mq.clone(),
             ctx.config.mq.exchanges.md_live.name.clone(),
         );
         handles.push(tokio::spawn(async move {
@@ -143,7 +131,11 @@ pub async fn run(ctx: AppContext) -> Result<()> {
 }
 
 async fn run_selfcheck_consumer(ctx: Arc<AppContext>) -> Result<()> {
-    let channel = ctx.mq_consume_channel.clone();
+    let channel = ctx
+        .mq
+        .create_channel()
+        .await
+        .context("create selfcheck mq consume channel")?;
 
     channel.basic_qos(200, BasicQosOptions::default()).await?;
 

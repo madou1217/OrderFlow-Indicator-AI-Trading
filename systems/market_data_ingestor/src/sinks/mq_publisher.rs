@@ -1,10 +1,11 @@
+use crate::app::bootstrap::AmqpConnectionManager;
 use crate::normalize::NormalizedMdEvent;
 use anyhow::{Context, Result};
 use chrono::Utc;
 use lapin::{
     options::BasicPublishOptions,
     types::{AMQPValue, FieldTable, LongString, ShortString},
-    BasicProperties, Channel,
+    BasicProperties,
 };
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -29,7 +30,7 @@ pub struct OutboxRecord {
 
 #[derive(Clone)]
 pub struct MqPublisher {
-    channel: Channel,
+    mq: Arc<AmqpConnectionManager>,
     live_exchange_name: String,
     replay_exchange_name: String,
     producer_instance_id: String,
@@ -40,13 +41,13 @@ pub struct MqPublisher {
 
 impl MqPublisher {
     pub fn new(
-        channel: Channel,
+        mq: Arc<AmqpConnectionManager>,
         live_exchange_name: String,
         replay_exchange_name: String,
         producer_instance_id: String,
     ) -> Self {
         Self {
-            channel,
+            mq,
             live_exchange_name,
             replay_exchange_name,
             producer_instance_id,
@@ -230,6 +231,11 @@ impl MqPublisher {
             .with_delivery_mode(2)
             .with_headers(headers)
             .with_message_id(ShortString::from(record.message_id.to_string()));
+        let channel = self
+            .mq
+            .create_channel()
+            .await
+            .context("acquire mq publish channel")?;
 
         // Fire-and-forget: await only the frame-send (TCP write), not the
         // broker ACK.  The outbox pattern (DB-backed) provides guaranteed
@@ -238,8 +244,7 @@ impl MqPublisher {
         // any burst or broker load.  A successful basic_publish means the
         // broker received the AMQP frame; loss is only possible if the broker
         // crashes before flushing, which the outbox relay covers on restart.
-        let _confirm = self
-            .channel
+        let _confirm = channel
             .basic_publish(
                 &record.exchange_name,
                 &event.routing_key,

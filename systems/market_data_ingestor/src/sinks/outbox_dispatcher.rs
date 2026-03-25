@@ -1,3 +1,4 @@
+use crate::app::bootstrap::AmqpConnectionManager;
 use anyhow::{anyhow, Context, Result};
 use chrono::{NaiveDate, Utc};
 use lapin::{
@@ -10,6 +11,7 @@ use serde_json::Value;
 use sqlx::postgres::PgListener;
 use sqlx::{FromRow, PgPool};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::Instant;
 use tracing::{error, info, warn};
@@ -29,15 +31,15 @@ const OUTBOX_BACKLOG_TOP_KEYS: usize = 8;
 #[derive(Clone)]
 pub struct OutboxDispatcher {
     pool: PgPool,
-    channel: Channel,
+    mq: Arc<AmqpConnectionManager>,
     live_exchange_name: String,
 }
 
 impl OutboxDispatcher {
-    pub fn new(pool: PgPool, channel: Channel, live_exchange_name: String) -> Self {
+    pub fn new(pool: PgPool, mq: Arc<AmqpConnectionManager>, live_exchange_name: String) -> Self {
         Self {
             pool,
-            channel,
+            mq,
             live_exchange_name,
         }
     }
@@ -124,6 +126,11 @@ impl OutboxDispatcher {
             Vec::with_capacity(rows.len());
         let mut max_outbox_age_secs: i64 = 0;
         let mut backlog_by_key: HashMap<(String, String), OutboxBacklogStat> = HashMap::new();
+        let channel = self
+            .mq
+            .create_confirm_channel()
+            .await
+            .context("acquire outbox dispatcher publish channel")?;
 
         for row in rows {
             let outbox_age_secs = (Utc::now() - row.created_at).num_seconds();
@@ -134,7 +141,7 @@ impl OutboxDispatcher {
             bucket.count = bucket.count.saturating_add(1);
             bucket.max_outbox_age_secs = bucket.max_outbox_age_secs.max(outbox_age_secs);
 
-            match self.publish_row(&row).await {
+            match self.publish_row(&channel, &row).await {
                 Ok(confirm) => {
                     pending_confirms.push((row.bucket_date, row.outbox_id, confirm));
                 }
@@ -349,7 +356,7 @@ impl OutboxDispatcher {
             .context(context_text)
     }
 
-    async fn publish_row(&self, row: &OutboxRow) -> Result<PublisherConfirm> {
+    async fn publish_row(&self, channel: &Channel, row: &OutboxRow) -> Result<PublisherConfirm> {
         let payload = serde_json::to_vec(&row.payload_json).context("serialize outbox payload")?;
         let headers = json_to_field_table(&row.headers_json).context("build amqp headers")?;
 
@@ -359,8 +366,7 @@ impl OutboxDispatcher {
             .with_headers(headers)
             .with_message_id(ShortString::from(row.message_id.to_string()));
 
-        let confirm = self
-            .channel
+        let confirm = channel
             .basic_publish(
                 &row.exchange_name,
                 &row.routing_key,
