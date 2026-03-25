@@ -104,97 +104,84 @@ fn build_finalize_focus(prior_scan: &Value) -> Value {
         "scan_schema_version": prior_scan
             .get("schema_version")
             .and_then(Value::as_str)
-            .unwrap_or("legacy"),
-        // Keep the legacy trend-style fields for compatibility with existing stage-2 prompt input.
-        "scan_15m_trend": legacy_scan_trend_label(prior_scan, "15m"),
-        "scan_4h_trend": legacy_scan_trend_label(prior_scan, "4h"),
-        "scan_1d_trend": legacy_scan_trend_label(prior_scan, "1d"),
+            .unwrap_or("unknown"),
+        "scan_15m_trend": scan_trend_label(prior_scan, "15m"),
+        "scan_4h_trend": scan_trend_label(prior_scan, "4h"),
+        "scan_1d_trend": scan_trend_label(prior_scan, "1d"),
         "scan_15m_control_side": scan_timeframe_state(prior_scan, "15m", "control_side"),
         "scan_15m_control_clarity": scan_timeframe_state(prior_scan, "15m", "control_clarity"),
         "scan_15m_sponsorship_state": scan_timeframe_state(prior_scan, "15m", "sponsorship_state"),
+        "scan_15m_value_location": scan_timeframe_state(prior_scan, "15m", "value_location"),
+        "scan_15m_range_state": scan_timeframe_state(prior_scan, "15m", "range_state"),
         "scan_4h_control_side": scan_timeframe_state(prior_scan, "4h", "control_side"),
         "scan_4h_control_clarity": scan_timeframe_state(prior_scan, "4h", "control_clarity"),
         "scan_4h_sponsorship_state": scan_timeframe_state(prior_scan, "4h", "sponsorship_state"),
+        "scan_4h_value_location": scan_timeframe_state(prior_scan, "4h", "value_location"),
+        "scan_4h_range_state": scan_timeframe_state(prior_scan, "4h", "range_state"),
         "scan_1d_control_side": scan_timeframe_state(prior_scan, "1d", "control_side"),
         "scan_1d_control_clarity": scan_timeframe_state(prior_scan, "1d", "control_clarity"),
         "scan_1d_sponsorship_state": scan_timeframe_state(prior_scan, "1d", "sponsorship_state"),
-        "broader_regime_owner": prior_scan
-            .pointer("/cross_timeframe_map/ownership_map/broader_regime_owner")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown"),
-        "active_swing_owner": prior_scan
-            .pointer("/cross_timeframe_map/ownership_map/active_swing_owner")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown"),
-        "immediate_owner": prior_scan
-            .pointer("/cross_timeframe_map/ownership_map/immediate_owner")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown"),
-        "relationship_15m_vs_4h": prior_scan
-            .pointer("/cross_timeframe_map/relationship_map/15m_vs_4h/control_relation")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown"),
-        "relationship_4h_vs_1d": prior_scan
-            .pointer("/cross_timeframe_map/relationship_map/4h_vs_1d/control_relation")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown"),
-        "relationship_15m_vs_1d": prior_scan
-            .pointer("/cross_timeframe_map/relationship_map/15m_vs_1d/control_relation")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown"),
-        "cross_market_spot_premium_state": prior_scan
-            .pointer("/cross_timeframe_map/cross_market_snapshot/spot_premium_state")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown"),
+        "scan_1d_value_location": scan_timeframe_state(prior_scan, "1d", "value_location"),
+        "scan_1d_range_state": scan_timeframe_state(prior_scan, "1d", "range_state"),
+        "cross_market_spot_premium_state": derive_spot_premium_state_label(prior_scan),
         "cross_market_flow_driver": prior_scan
-            .pointer("/cross_timeframe_map/cross_market_snapshot/flow_driver")
+            .pointer("/cross_timeframe_parse/cross_market_parse/flow_driver")
             .and_then(Value::as_str)
             .unwrap_or("unknown"),
         "cross_market_latest_4h_delta_relation": prior_scan
-            .pointer("/cross_timeframe_map/cross_market_snapshot/latest_4h_delta_relation")
+            .pointer("/cross_timeframe_parse/cross_market_parse/latest_4h_delta_relation")
             .and_then(Value::as_str)
             .unwrap_or("unknown"),
         "cross_market_spot_vs_futures_gap_pct": prior_scan
-            .pointer("/cross_timeframe_map/cross_market_snapshot/spot_vs_futures_gap_pct")
+            .pointer("/cross_timeframe_parse/cross_market_parse/spot_vs_futures_gap_pct")
             .cloned()
             .unwrap_or(Value::Null),
         "main_tension": prior_scan
-            .pointer("/cross_timeframe_map/cross_timeframe_structure/main_tension")
+            .pointer("/cross_timeframe_parse/main_tension")
             .and_then(Value::as_str)
             .unwrap_or("unknown"),
         "main_unresolved_factors": prior_scan
-            .pointer("/cross_timeframe_map/cross_timeframe_structure/main_unresolved_factors")
+            .pointer("/cross_timeframe_parse/unresolved_factors")
             .cloned()
             .unwrap_or_else(|| Value::Array(vec![])),
     })
 }
 
 fn scan_timeframe_state<'a>(prior_scan: &'a Value, tf: &str, field: &str) -> &'a str {
+    let pointer = match field {
+        "control_side" => format!("/timeframes/{tf}/state_parse/control_read/side"),
+        "control_clarity" => format!("/timeframes/{tf}/state_parse/control_read/clarity"),
+        "sponsorship_state" => format!("/timeframes/{tf}/state_parse/sponsorship_state"),
+        "value_location" => format!("/timeframes/{tf}/state_parse/value_read/combined"),
+        "range_state" => format!("/timeframes/{tf}/state_parse/range_state"),
+        _ => return "unknown",
+    };
+
     prior_scan
-        .pointer(&format!("/timeframes/{tf}/state/{field}"))
+        .pointer(&pointer)
         .and_then(Value::as_str)
         .unwrap_or("unknown")
 }
 
-fn legacy_scan_trend_label(prior_scan: &Value, tf: &str) -> &'static str {
-    if let Some(legacy) = prior_scan
-        .pointer(&format!("/{tf}/trend"))
-        .and_then(Value::as_str)
-    {
-        return match legacy {
-            "Bullish" => "Bullish",
-            "Bearish" => "Bearish",
-            "Sideways" => "Sideways",
-            _ => "unknown",
-        };
-    }
-
+fn scan_trend_label(prior_scan: &Value, tf: &str) -> &'static str {
     match scan_timeframe_state(prior_scan, tf, "control_side") {
         "buyers" => "Bullish",
         "sellers" => "Bearish",
         "balanced" => "Sideways",
         "unclear" => "unknown",
         _ => "unknown",
+    }
+}
+
+fn derive_spot_premium_state_label(prior_scan: &Value) -> &'static str {
+    match prior_scan
+        .pointer("/cross_timeframe_parse/cross_market_parse/spot_vs_futures_gap_pct")
+        .and_then(Value::as_f64)
+    {
+        Some(gap_pct) if gap_pct > 0.05 => "spot_premium",
+        Some(gap_pct) if gap_pct < -0.05 => "futures_premium",
+        Some(_) => "near_flat",
+        None => "unknown",
     }
 }
 

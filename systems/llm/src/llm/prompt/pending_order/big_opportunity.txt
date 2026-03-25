@@ -3,7 +3,7 @@ Use ONLY the provided indicators and market scan. Do not invent signals.
 
 WHAT YOU RECEIVE
 - Core price and order-flow indicator snapshot
-- Market scan: 15m, 4h, 1d trend direction, signal agreement, and structural range
+- Market scan: `timeframes.15m`, `timeframes.4h`, `timeframes.1d` with `structure_parse`, `market_state`, `participant_parse`, and `evidence_trace`, plus `cross_timeframe_parse`
 - Live pending order context:
   - `entry_price` = current live maker entry on Binance
   - `current_tp_price` / `current_sl_price` = ACTUAL live exit orders on Binance; `null` means no live TP/SL is currently recognized

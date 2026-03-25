@@ -11,7 +11,7 @@ How to use the market scan
 Treat the market scan as the objective multi-timeframe market map already built from Stage 1.
 Use it to understand:
 - control, clarity, sponsorship, and value state on 15m, 4h, and 1d
-- who is acting aggressively, absorbing, or trapped
+- who is acting aggressively, who is absorbing, and which participant objectives are being accepted, blocked, failing, or remain unresolved
 - where supply, demand, invalidation, and structural levels are concentrated
 - how the timeframes relate to each other
 - what the main unresolved cross-timeframe tension still is
