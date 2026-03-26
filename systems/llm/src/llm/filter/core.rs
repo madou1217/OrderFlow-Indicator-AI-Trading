@@ -105,14 +105,8 @@ fn build_finalize_focus(prior_scan: &Value) -> Value {
             .get("schema_version")
             .and_then(Value::as_str)
             .unwrap_or("unknown"),
-        "scan_15m_trend": scan_trend_label(prior_scan, "15m"),
         "scan_4h_trend": scan_trend_label(prior_scan, "4h"),
         "scan_1d_trend": scan_trend_label(prior_scan, "1d"),
-        "scan_15m_control_side": scan_timeframe_state(prior_scan, "15m", "control_side"),
-        "scan_15m_control_clarity": scan_timeframe_state(prior_scan, "15m", "control_clarity"),
-        "scan_15m_sponsorship_state": scan_timeframe_state(prior_scan, "15m", "sponsorship_state"),
-        "scan_15m_value_location": scan_timeframe_state(prior_scan, "15m", "value_location"),
-        "scan_15m_range_state": scan_timeframe_state(prior_scan, "15m", "range_state"),
         "scan_4h_control_side": scan_timeframe_state(prior_scan, "4h", "control_side"),
         "scan_4h_control_clarity": scan_timeframe_state(prior_scan, "4h", "control_clarity"),
         "scan_4h_sponsorship_state": scan_timeframe_state(prior_scan, "4h", "sponsorship_state"),
@@ -123,6 +117,34 @@ fn build_finalize_focus(prior_scan: &Value) -> Value {
         "scan_1d_sponsorship_state": scan_timeframe_state(prior_scan, "1d", "sponsorship_state"),
         "scan_1d_value_location": scan_timeframe_state(prior_scan, "1d", "value_location"),
         "scan_1d_range_state": scan_timeframe_state(prior_scan, "1d", "range_state"),
+        "execution_15m_micro_auction_state": prior_scan
+            .pointer("/execution_context_15m/micro_auction_state")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown"),
+        "execution_15m_nearest_support": prior_scan
+            .pointer("/execution_context_15m/nearest_executable_support")
+            .cloned()
+            .unwrap_or(Value::Null),
+        "execution_15m_nearest_resistance": prior_scan
+            .pointer("/execution_context_15m/nearest_executable_resistance")
+            .cloned()
+            .unwrap_or(Value::Null),
+        "execution_15m_entry_sweep_risk": prior_scan
+            .pointer("/execution_context_15m/entry_sweep_risk_15m")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown"),
+        "execution_15m_micro_invalidation_risk": prior_scan
+            .pointer("/execution_context_15m/micro_invalidation_risk")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown"),
+        "execution_15m_note": prior_scan
+            .pointer("/execution_context_15m/execution_note")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown"),
+        "execution_alignment_15m": prior_scan
+            .pointer("/cross_timeframe_parse/execution_alignment_15m")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown"),
         "cross_market_spot_premium_state": derive_spot_premium_state_label(prior_scan),
         "cross_market_flow_driver": prior_scan
             .pointer("/cross_timeframe_parse/cross_market_parse/flow_driver")

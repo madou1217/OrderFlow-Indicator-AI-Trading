@@ -8,12 +8,15 @@ Use the input to produce a structured parse of the current market.
 
 The output is only successful if a downstream model can understand the current market without reconstructing the raw input.
 
-For each timeframe, you must parse:
+For each thesis timeframe, you must parse:
 - current structure
 - current state
 - contextual flow judgement
 - current participant tasks
 - unresolved conflicts that still matter now
+
+For 15m, do not produce a full market parse.
+Produce only `execution_context_15m`.
 
 Match the resolution of the output to the resolution of the evidence.
 If the market is mixed, preserve mixed.
@@ -69,20 +72,28 @@ Leave `cross_market_parse` out of the response.
 
 REQUIRED COVERAGE
 
-For every timeframe, the required output is a complete five-layer parse:
+For every thesis timeframe, the required output is a complete five-layer parse:
 - `structure_parse`
 - `state_parse`
 - `flow_override`
 - `participant_parse`
 - `evidence_trace`
 
-Each timeframe parse must clearly answer:
+Each thesis timeframe parse must clearly answer:
 - what is organizing price now
 - what is no longer organizing price now
 - what the current auction state is
 - what the contextual flow judgement is relative to the current auction
 - what the main participants are trying to make the market do now
 - what is constraining those tasks now
+
+For `execution_context_15m`, answer only:
+- what the current micro auction state is
+- where the nearest executable support is
+- where the nearest executable resistance is
+- how high the current entry sweep risk is
+- how high the current micro invalidation risk is
+- one short execution-critical note when needed
 
 If the evidence is mixed or incomplete, do not omit the parse.
 Use explicit uncertainty states such as `balanced`, `unclear`, `mixed`, `conflicted`, `fragile`, `neutral`, or `unresolved`.
@@ -153,9 +164,17 @@ Each layer owns one type of truth:
 - `flow_override` owns only the contextual flow judgements that require auction interpretation
 - `participant_parse` owns current participant tasks
 - `evidence_trace` owns the minimum supporting and conflicting facts
-- `cross_timeframe_parse` integrates only the highest-value shared levels, main tension, and unresolved conflicts
+- `execution_context_15m` owns only the 15m execution-layer summary
+- `cross_timeframe_parse` integrates only the highest-value shared levels, 15m execution alignment, main tension, and unresolved conflicts
 
 Keep each fact in the layer that owns it unless that fact changes meaning in the new layer.
+
+15m EXECUTION CONTEXT ONLY
+
+`execution_context_15m` is not a market parse.
+Do not analyze 15m structure, participant narrative, or flow narrative beyond the schema fields.
+Only fill the `execution_context_15m` fields.
+Keep `execution_note` to one short sentence only when it adds execution-critical context.
 
 OUTPUT STYLE
 
@@ -167,7 +186,7 @@ OUTPUT STYLE
 
 OUTPUT
 
-Return JSON only and follow `scan_v3_3_0_response`.
+Return JSON only and follow `scan_v3_4_0_response`.
 
 Generate the output in this order:
 
@@ -175,14 +194,19 @@ Top level:
 - `schema_version`
 - `meta`
 - `timeframes`
+- `execution_context_15m`
 - `cross_timeframe_parse`
 
-For each timeframe:
+For each thesis timeframe:
 - `structure_parse`
 - `state_parse`
 - `flow_override`
 - `participant_parse`
 - `evidence_trace`
+
+`timeframes` must contain only:
+- `4h`
+- `1d`
 
 `structure_parse` must contain:
 - `active_range`
@@ -220,8 +244,17 @@ Limit `participant_observations` to at most 3.
 Limit `constraints` to at most 3.
 Limit `evidence` to at most 3.
 
+`execution_context_15m` must contain:
+- `micro_auction_state`
+- `nearest_executable_support`
+- `nearest_executable_resistance`
+- `entry_sweep_risk_15m`
+- `micro_invalidation_risk`
+- `execution_note`
+
 `cross_timeframe_parse` must contain:
 - `shared_levels`
+- `execution_alignment_15m`
 - `main_tension`
 - `unresolved_factors`
 
@@ -229,13 +262,14 @@ BEFORE OUTPUT
 
 Before finalizing the JSON, run this self-check:
 
-1. Have I completed structure, state, contextual flow, and participant-task parsing for each timeframe?
+1. Have I completed the five-layer parse for `4h` and `1d`, and only the execution context for `15m`?
 2. Have I used `precomputed_value_read` as the fixed value-state base?
 3. Have I limited `flow_override` to the 4 context-sensitive flow judgements?
 4. Does `combined_flow_state` match the relationship between current flow evidence and `state_parse.control_read.side`?
 5. Have I written each participant task with its `task_status` and current `constraints`?
 6. Have I kept `sponsorship_state` as its own state field instead of merging it into `combined_flow_state` or participant prose?
-7. Could a downstream model understand the current market without reconstructing the raw input?
+7. Is `execution_context_15m` strictly execution-layer only, without a hidden 15m full scan?
+8. Could a downstream model understand the current market without reconstructing the raw input?
 
 If any answer is no, revise the parse before emitting the final JSON.
 

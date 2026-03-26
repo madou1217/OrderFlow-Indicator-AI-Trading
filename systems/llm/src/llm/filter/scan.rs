@@ -22,7 +22,7 @@ const ORDERBOOK_CLUSTER_MID_PER_SIDE: usize = 1;
 const ORDERBOOK_CLUSTER_DEEP_PER_SIDE: usize = 1;
 const PVS_PEAK_MIN_PERCENTILE: f64 = 0.90;
 const PVS_PEAK_NEIGHBOR_STEPS: usize = 2;
-const PATH_15M_DETAIL_BARS: usize = 12;
+const PATH_15M_DETAIL_BARS: usize = 6;
 const PATH_4H_CONTEXT_BARS: usize = 8;
 const PATH_1D_BACKGROUND_BARS: usize = 10;
 const BRACKET_BOARD_LIMIT: usize = 8;
@@ -156,7 +156,7 @@ fn build_scan_root(root: &Value) -> Value {
 
     result.insert(
         "version".to_string(),
-        Value::String("scan_v6_3".to_string()),
+        Value::String("scan_v6_4".to_string()),
     );
     if let Some(symbol) = root.get("symbol") {
         result.insert("symbol".to_string(), symbol.clone());
@@ -6072,7 +6072,7 @@ mod tests {
 
         assert_eq!(
             value.pointer("/version").and_then(Value::as_str),
-            Some("scan_v6_3")
+            Some("scan_v6_4")
         );
         assert_eq!(
             value.pointer("/current_price").and_then(Value::as_f64),
@@ -6084,6 +6084,11 @@ mod tests {
         assert!(value
             .pointer("/path_newest_to_oldest/latest_15m_detail/bars_newest_to_oldest/0")
             .is_some());
+        assert!(value
+            .pointer("/path_newest_to_oldest/latest_15m_detail/bars_newest_to_oldest")
+            .and_then(Value::as_array)
+            .map(|bars| bars.len() <= 6)
+            .unwrap_or(false));
         assert!(value
             .pointer("/events_newest_to_oldest/latest_24h_detail/0")
             .is_some());

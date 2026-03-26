@@ -17,8 +17,8 @@ use uuid::Uuid;
 
 const CLAUDE_EXTENDED_CACHE_TTL_BETA: &str = "extended-cache-ttl-2025-04-11";
 const CLAUDE_DECISION_TOOL_NAME: &str = "emit_decision";
-const FULL_SCAN_SCHEMA_VERSION: &str = "scan_v3_3_0";
-const SCAN_RESPONSE_SCHEMA_VERSION: &str = "scan_v3_3_0_response";
+const FULL_SCAN_SCHEMA_VERSION: &str = "scan_v3_4_0";
+const SCAN_RESPONSE_SCHEMA_VERSION: &str = "scan_v3_4_0_response";
 #[derive(Debug, Clone, Serialize)]
 pub struct ModelInvocationInput {
     pub symbol: String,
@@ -285,18 +285,39 @@ fn build_entry_finalize_trace_event(
             "entry"
         },
         "latency_ms": latency_ms,
-        "scan_15m_trend": scan_trace_trend_value(prior_scan, "15m"),
         "scan_4h_trend": scan_trace_trend_value(prior_scan, "4h"),
         "scan_1d_trend": scan_trace_trend_value(prior_scan, "1d"),
-        "scan_15m_control_side": scan_trace_state_value(prior_scan, "15m", "control_side"),
         "scan_4h_control_side": scan_trace_state_value(prior_scan, "4h", "control_side"),
         "scan_1d_control_side": scan_trace_state_value(prior_scan, "1d", "control_side"),
-        "scan_15m_control_clarity": scan_trace_state_value(prior_scan, "15m", "control_clarity"),
         "scan_4h_control_clarity": scan_trace_state_value(prior_scan, "4h", "control_clarity"),
         "scan_1d_control_clarity": scan_trace_state_value(prior_scan, "1d", "control_clarity"),
-        "scan_15m_sponsorship_state": scan_trace_state_value(prior_scan, "15m", "sponsorship_state"),
         "scan_4h_sponsorship_state": scan_trace_state_value(prior_scan, "4h", "sponsorship_state"),
         "scan_1d_sponsorship_state": scan_trace_state_value(prior_scan, "1d", "sponsorship_state"),
+        "execution_15m_micro_auction_state": scan_trace_execution_context_value(
+            prior_scan,
+            "micro_auction_state",
+        ),
+        "execution_15m_nearest_support": scan_trace_execution_context_value(
+            prior_scan,
+            "nearest_executable_support",
+        ),
+        "execution_15m_nearest_resistance": scan_trace_execution_context_value(
+            prior_scan,
+            "nearest_executable_resistance",
+        ),
+        "execution_15m_entry_sweep_risk": scan_trace_execution_context_value(
+            prior_scan,
+            "entry_sweep_risk_15m",
+        ),
+        "execution_15m_micro_invalidation_risk": scan_trace_execution_context_value(
+            prior_scan,
+            "micro_invalidation_risk",
+        ),
+        "execution_15m_note": scan_trace_execution_context_value(prior_scan, "execution_note"),
+        "execution_alignment_15m": prior_scan
+            .pointer("/cross_timeframe_parse/execution_alignment_15m")
+            .cloned()
+            .unwrap_or(Value::Null),
         "cross_market_spot_premium_state": derived_spot_premium_state_value(prior_scan),
         "cross_market_flow_driver": prior_scan
             .pointer("/cross_timeframe_parse/cross_market_parse/flow_driver")
@@ -358,6 +379,13 @@ fn scan_trace_state_value(prior_scan: &Value, tf: &str, field: &str) -> Value {
     };
 
     prior_scan.pointer(&pointer).cloned().unwrap_or(Value::Null)
+}
+
+fn scan_trace_execution_context_value(prior_scan: &Value, field: &str) -> Value {
+    prior_scan
+        .pointer(&format!("/execution_context_15m/{field}"))
+        .cloned()
+        .unwrap_or(Value::Null)
 }
 
 fn is_entry_mode(input: &ModelInvocationInput) -> bool {
@@ -527,7 +555,7 @@ fn validate_scan_output(value: &Value) -> Result<()> {
         ));
     }
 
-    validate_scan_output_v3_3_0(value)
+    validate_scan_output_v3_4_0(value)
 }
 
 fn validate_scan_model_response(value: &Value) -> Result<()> {
@@ -543,10 +571,10 @@ fn validate_scan_model_response(value: &Value) -> Result<()> {
         ));
     }
 
-    validate_scan_model_response_v3_3_0(value)
+    validate_scan_model_response_v3_4_0(value)
 }
 
-fn validate_scan_model_response_v3_3_0(value: &Value) -> Result<()> {
+fn validate_scan_model_response_v3_4_0(value: &Value) -> Result<()> {
     for legacy_path in ["/15m", "/4h", "/1d", "/cross_timeframe_map", "/scan_audit"] {
         reject_present(value, legacy_path)?;
     }
@@ -565,22 +593,29 @@ fn validate_scan_model_response_v3_3_0(value: &Value) -> Result<()> {
         .map_err(|_| anyhow!("scan response meta.scan_ts_bucket must be RFC3339 date-time"))?;
 
     expect_object(value, "/timeframes")?;
-    for tf in ["15m", "4h", "1d"] {
-        validate_scan_response_v3_3_0_timeframe(value, tf)?;
+    reject_present(value, "/timeframes/15m")?;
+    for tf in ["4h", "1d"] {
+        validate_scan_response_v3_4_0_timeframe(value, tf)?;
     }
+    validate_execution_context_15m(value)?;
 
     reject_present(value, "/cross_timeframe_parse/relationship_facts")?;
     reject_present(value, "/cross_timeframe_parse/shared_structure")?;
     reject_present(value, "/cross_timeframe_parse/cross_market_parse")?;
 
     validate_key_levels_with_max(value, "/cross_timeframe_parse/shared_levels", 6)?;
+    expect_enum(
+        value,
+        "/cross_timeframe_parse/execution_alignment_15m",
+        &["supports", "degrades", "blocks", "conflicted", "unclear"],
+    )?;
     expect_string(value, "/cross_timeframe_parse/main_tension")?;
     validate_string_array_with_max(value, "/cross_timeframe_parse/unresolved_factors", 4)?;
 
     Ok(())
 }
 
-fn validate_scan_output_v3_3_0(value: &Value) -> Result<()> {
+fn validate_scan_output_v3_4_0(value: &Value) -> Result<()> {
     for legacy_path in ["/15m", "/4h", "/1d", "/cross_timeframe_map", "/scan_audit"] {
         reject_present(value, legacy_path)?;
     }
@@ -599,9 +634,11 @@ fn validate_scan_output_v3_3_0(value: &Value) -> Result<()> {
         .map_err(|_| anyhow!("scan meta.scan_ts_bucket must be RFC3339 date-time"))?;
 
     expect_object(value, "/timeframes")?;
-    for tf in ["15m", "4h", "1d"] {
-        validate_scan_output_v3_3_0_timeframe(value, tf)?;
+    reject_present(value, "/timeframes/15m")?;
+    for tf in ["4h", "1d"] {
+        validate_scan_output_v3_4_0_timeframe(value, tf)?;
     }
+    validate_execution_context_15m(value)?;
 
     reject_present(value, "/cross_timeframe_parse/relationship_facts")?;
     reject_present(value, "/cross_timeframe_parse/shared_structure")?;
@@ -626,6 +663,11 @@ fn validate_scan_output_v3_3_0(value: &Value) -> Result<()> {
     )?;
 
     validate_key_levels_with_max(value, "/cross_timeframe_parse/shared_levels", 6)?;
+    expect_enum(
+        value,
+        "/cross_timeframe_parse/execution_alignment_15m",
+        &["supports", "degrades", "blocks", "conflicted", "unclear"],
+    )?;
 
     expect_string(value, "/cross_timeframe_parse/main_tension")?;
     validate_string_array_with_max(value, "/cross_timeframe_parse/unresolved_factors", 4)?;
@@ -633,7 +675,39 @@ fn validate_scan_output_v3_3_0(value: &Value) -> Result<()> {
     Ok(())
 }
 
-fn validate_scan_output_v3_3_0_timeframe(value: &Value, tf: &str) -> Result<()> {
+fn validate_execution_context_15m(value: &Value) -> Result<()> {
+    expect_enum(
+        value,
+        "/execution_context_15m/micro_auction_state",
+        &[
+            "acceptance",
+            "rejection",
+            "reentry",
+            "balance",
+            "expansion",
+            "unresolved",
+        ],
+    )?;
+    validate_price_zone(value, "/execution_context_15m/nearest_executable_support")?;
+    validate_price_zone(
+        value,
+        "/execution_context_15m/nearest_executable_resistance",
+    )?;
+    expect_enum(
+        value,
+        "/execution_context_15m/entry_sweep_risk_15m",
+        &["low", "medium", "high"],
+    )?;
+    expect_enum(
+        value,
+        "/execution_context_15m/micro_invalidation_risk",
+        &["low", "medium", "high"],
+    )?;
+    expect_string(value, "/execution_context_15m/execution_note")?;
+    Ok(())
+}
+
+fn validate_scan_output_v3_4_0_timeframe(value: &Value, tf: &str) -> Result<()> {
     let base = format!("/timeframes/{tf}");
 
     expect_number(value, &format!("{base}/structure_parse/active_range/low"))?;
@@ -916,7 +990,7 @@ fn validate_scan_output_v3_3_0_timeframe(value: &Value, tf: &str) -> Result<()> 
     Ok(())
 }
 
-fn validate_scan_response_v3_3_0_timeframe(value: &Value, tf: &str) -> Result<()> {
+fn validate_scan_response_v3_4_0_timeframe(value: &Value, tf: &str) -> Result<()> {
     let base = format!("/timeframes/{tf}");
 
     expect_number(value, &format!("{base}/structure_parse/active_range/low"))?;
@@ -1156,7 +1230,7 @@ fn merge_scan_model_response(prompt_input: &Value, response: &Value) -> Result<V
         Value::String(FULL_SCAN_SCHEMA_VERSION.to_string()),
     );
 
-    for tf in ["15m", "4h", "1d"] {
+    for tf in ["4h", "1d"] {
         let value_read = prompt_input
             .pointer(&format!("/now/precomputed_value_read/{tf}"))
             .cloned()
@@ -1348,6 +1422,18 @@ fn validate_optional_price_zone(value: &Value, path: &str) -> Result<()> {
             Ok(())
         }
         _ => Err(anyhow!("scan {} must be an object or null", path)),
+    }
+}
+
+fn validate_price_zone(value: &Value, path: &str) -> Result<()> {
+    match value.pointer(path) {
+        Some(Value::Object(_)) => {
+            expect_number(value, &format!("{path}/low"))?;
+            expect_number(value, &format!("{path}/high"))?;
+            expect_string(value, &format!("{path}/reason"))?;
+            Ok(())
+        }
+        _ => Err(anyhow!("scan {} must be an object", path)),
     }
 }
 
@@ -2443,7 +2529,7 @@ fn qwen_output_contract(
 ) -> String {
     if matches!(entry_stage, prompt::EntryPromptStage::Scan) {
         format!(
-            "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- No extra top-level keys.\n- Top-level keys must be `schema_version`, `meta`, `timeframes`, and `cross_timeframe_parse`.\n- `schema_version` must be `{}`.\n- `timeframes` must contain `15m`, `4h`, and `1d`.\n- Each timeframe must include `structure_parse`, `state_parse`, `flow_override`, `participant_parse`, and `evidence_trace`.\n- `cross_timeframe_parse` must include `shared_levels`, `main_tension`, and `unresolved_factors`.\n",
+            "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- No extra top-level keys.\n- Top-level keys must be `schema_version`, `meta`, `timeframes`, `execution_context_15m`, and `cross_timeframe_parse`.\n- `schema_version` must be `{}`.\n- `timeframes` must contain `4h` and `1d` only.\n- Each timeframe must include `structure_parse`, `state_parse`, `flow_override`, `participant_parse`, and `evidence_trace`.\n- `execution_context_15m` must include `micro_auction_state`, `nearest_executable_support`, `nearest_executable_resistance`, `entry_sweep_risk_15m`, `micro_invalidation_risk`, and `execution_note`.\n- `cross_timeframe_parse` must include `shared_levels`, `execution_alignment_15m`, `main_tension`, and `unresolved_factors`.\n",
             SCAN_RESPONSE_SCHEMA_VERSION
         )
     } else if pending_order_mode {
@@ -4119,6 +4205,38 @@ fn scan_v3_3_0_participant_parse_schema_openai() -> Value {
     })
 }
 
+fn scan_v3_4_0_execution_context_15m_schema_openai() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "micro_auction_state",
+            "nearest_executable_support",
+            "nearest_executable_resistance",
+            "entry_sweep_risk_15m",
+            "micro_invalidation_risk",
+            "execution_note"
+        ],
+        "properties": {
+            "micro_auction_state": {
+                "type": "string",
+                "enum": ["acceptance", "rejection", "reentry", "balance", "expansion", "unresolved"]
+            },
+            "nearest_executable_support": scan_v1_7_price_zone_schema_openai(),
+            "nearest_executable_resistance": scan_v1_7_price_zone_schema_openai(),
+            "entry_sweep_risk_15m": {
+                "type": "string",
+                "enum": ["low", "medium", "high"]
+            },
+            "micro_invalidation_risk": {
+                "type": "string",
+                "enum": ["low", "medium", "high"]
+            },
+            "execution_note": { "type": "string" }
+        }
+    })
+}
+
 fn scan_v3_3_0_response_timeframe_schema_openai() -> Value {
     json!({
         "type": "object",
@@ -4138,7 +4256,7 @@ fn scan_v3_3_0_response_schema_openai() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["schema_version", "meta", "timeframes", "cross_timeframe_parse"],
+        "required": ["schema_version", "meta", "timeframes", "execution_context_15m", "cross_timeframe_parse"],
         "properties": {
             "schema_version": { "type": "string", "enum": [SCAN_RESPONSE_SCHEMA_VERSION] },
             "meta": {
@@ -4153,22 +4271,26 @@ fn scan_v3_3_0_response_schema_openai() -> Value {
             "timeframes": {
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["15m", "4h", "1d"],
+                "required": ["4h", "1d"],
                 "properties": {
-                    "15m": scan_v3_3_0_response_timeframe_schema_openai(),
                     "4h": scan_v3_3_0_response_timeframe_schema_openai(),
                     "1d": scan_v3_3_0_response_timeframe_schema_openai()
                 }
             },
+            "execution_context_15m": scan_v3_4_0_execution_context_15m_schema_openai(),
             "cross_timeframe_parse": {
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["shared_levels", "main_tension", "unresolved_factors"],
+                "required": ["shared_levels", "execution_alignment_15m", "main_tension", "unresolved_factors"],
                 "properties": {
                     "shared_levels": {
                         "type": "array",
                         "maxItems": 6,
                         "items": scan_v1_7_key_level_schema_openai()
+                    },
+                    "execution_alignment_15m": {
+                        "type": "string",
+                        "enum": ["supports", "degrades", "blocks", "conflicted", "unclear"]
                     },
                     "main_tension": { "type": "string" },
                     "unresolved_factors": {
@@ -4305,6 +4427,37 @@ fn scan_v3_3_0_participant_parse_schema_gemini() -> Value {
     })
 }
 
+fn scan_v3_4_0_execution_context_15m_schema_gemini() -> Value {
+    json!({
+        "type": "OBJECT",
+        "properties": {
+            "micro_auction_state": {
+                "type": "STRING",
+                "enum": ["acceptance", "rejection", "reentry", "balance", "expansion", "unresolved"]
+            },
+            "nearest_executable_support": scan_v1_7_price_zone_schema_gemini(),
+            "nearest_executable_resistance": scan_v1_7_price_zone_schema_gemini(),
+            "entry_sweep_risk_15m": {
+                "type": "STRING",
+                "enum": ["low", "medium", "high"]
+            },
+            "micro_invalidation_risk": {
+                "type": "STRING",
+                "enum": ["low", "medium", "high"]
+            },
+            "execution_note": { "type": "STRING" }
+        },
+        "required": [
+            "micro_auction_state",
+            "nearest_executable_support",
+            "nearest_executable_resistance",
+            "entry_sweep_risk_15m",
+            "micro_invalidation_risk",
+            "execution_note"
+        ]
+    })
+}
+
 fn scan_v3_3_0_response_timeframe_schema_gemini() -> Value {
     json!({
         "type": "OBJECT",
@@ -4335,12 +4488,12 @@ fn scan_v3_3_0_response_schema_gemini() -> Value {
             "timeframes": {
                 "type": "OBJECT",
                 "properties": {
-                    "15m": scan_v3_3_0_response_timeframe_schema_gemini(),
                     "4h": scan_v3_3_0_response_timeframe_schema_gemini(),
                     "1d": scan_v3_3_0_response_timeframe_schema_gemini()
                 },
-                "required": ["15m", "4h", "1d"]
+                "required": ["4h", "1d"]
             },
+            "execution_context_15m": scan_v3_4_0_execution_context_15m_schema_gemini(),
             "cross_timeframe_parse": {
                 "type": "OBJECT",
                 "properties": {
@@ -4349,6 +4502,10 @@ fn scan_v3_3_0_response_schema_gemini() -> Value {
                         "maxItems": 6,
                         "items": scan_v1_7_key_level_schema_gemini()
                     },
+                    "execution_alignment_15m": {
+                        "type": "STRING",
+                        "enum": ["supports", "degrades", "blocks", "conflicted", "unclear"]
+                    },
                     "main_tension": { "type": "STRING" },
                     "unresolved_factors": {
                         "type": "ARRAY",
@@ -4356,10 +4513,10 @@ fn scan_v3_3_0_response_schema_gemini() -> Value {
                         "items": { "type": "STRING" }
                     }
                 },
-                "required": ["shared_levels", "main_tension", "unresolved_factors"]
+                "required": ["shared_levels", "execution_alignment_15m", "main_tension", "unresolved_factors"]
             }
         },
-        "required": ["schema_version", "meta", "timeframes", "cross_timeframe_parse"]
+        "required": ["schema_version", "meta", "timeframes", "execution_context_15m", "cross_timeframe_parse"]
     })
 }
 
@@ -5242,104 +5399,12 @@ mod tests {
 
     fn sample_stage_1_scan() -> Value {
         json!({
-            "schema_version": "scan_v3_3_0",
+            "schema_version": "scan_v3_4_0",
             "meta": {
                 "symbol": "TESTUSDT",
                 "scan_ts_bucket": "2026-03-18T07:00:00+00:00"
             },
             "timeframes": {
-                "15m": {
-                    "structure_parse": {
-                        "active_range": {"low": 1994.0, "high": 2018.0},
-                        "range_width_vs_atr": "normal",
-                        "dominant_demand_zone": {"low": 1994.0, "high": 1998.0, "reason": "local bid defense"},
-                        "dominant_supply_zone": {"low": 2015.0, "high": 2018.0, "reason": "nearby offer cap"},
-                        "key_levels": [
-                            {"price": 1994.0, "type": "support", "reason": "15m local floor"},
-                            {"price": 2018.0, "type": "resistance", "reason": "15m local cap"}
-                        ],
-                        "invalidation_level": 1994.0,
-                        "structure_lifecycle": {
-                            "structures": [
-                                {
-                                    "structure_id": "15m_active_range",
-                                    "structure_kind": "active_range",
-                                    "status": "active",
-                                    "price_low": 1994.0,
-                                    "price_high": 2018.0,
-                                    "reason": "current auction is still rotating inside this 15m bracket"
-                                },
-                                {
-                                    "structure_id": "15m_upper_acceptance",
-                                    "structure_kind": "acceptance_attempt",
-                                    "status": "failing",
-                                    "price_low": 2015.0,
-                                    "price_high": 2018.0,
-                                    "reason": "buyers are pressing the upper edge but supply is still capping follow-through"
-                                }
-                            ]
-                        }
-                    },
-                    "state_parse": {
-                        "value_read": {
-                            "pvs": "inside_value",
-                            "tpo": "inside_value",
-                            "combined": "inside_value"
-                        },
-                        "range_state": "testing_range_high",
-                        "auction_state": "acceptance_attempt",
-                        "control_read": {
-                            "side": "buyers",
-                            "clarity": "mixed"
-                        },
-                        "sponsorship_state": "active"
-                    },
-                    "flow_parse": {
-                        "delta_read": {
-                            "futures": "buying",
-                            "spot": "buying",
-                            "relation": "aligned"
-                        },
-                        "cvd_read": {
-                            "state": "rising",
-                            "alignment_vs_price": "supports"
-                        },
-                        "whale_read": {
-                            "state": "buyers",
-                            "spot_vs_futures_relation": "aligned"
-                        },
-                        "orderbook_read": {
-                            "pressure_side": "sell",
-                            "near_price_constraint": "offers_above"
-                        },
-                        "combined_flow_state": "supportive"
-                    },
-                    "participant_parse": {
-                        "participant_observations": [
-                            {
-                                "participant_role": "initiative_flow",
-                                "current_task": "push acceptance through local resistance",
-                                "task_status": "blocked",
-                                "constraints": ["nearby offer cap", "local resistance still intact"],
-                                "evidence": ["positive cvd", "range high is being tested"],
-                                "confidence": "medium"
-                            },
-                            {
-                                "participant_role": "passive_liquidity",
-                                "current_task": "block clean acceptance above 2018",
-                                "task_status": "accepted",
-                                "constraints": ["buyers are still testing the upper edge"],
-                                "evidence": ["nearby offer cap", "rejection at local cap"],
-                                "confidence": "medium"
-                            }
-                        ]
-                    },
-                    "evidence_trace": {
-                        "supporting_facts": ["15m ema bull", "cvd bullish"],
-                        "conflicting_facts": ["absorption bearish"],
-                        "fragility_summary": "15m upside is active but still pressing into nearby supply."
-                    }
-                },
                 "4h": {
                     "structure_parse": {
                         "active_range": {"low": 1988.0, "high": 2035.0},
@@ -5509,17 +5574,34 @@ mod tests {
                     }
                 }
             },
+            "execution_context_15m": {
+                "micro_auction_state": "reentry",
+                "nearest_executable_support": {
+                    "low": 1994.0,
+                    "high": 1998.0,
+                    "reason": "local bid defense under the execution range"
+                },
+                "nearest_executable_resistance": {
+                    "low": 2015.0,
+                    "high": 2018.0,
+                    "reason": "nearby offer cap above current trade"
+                },
+                "entry_sweep_risk_15m": "medium",
+                "micro_invalidation_risk": "medium",
+                "execution_note": "15m is still tradable, but nearby offers can sweep weak entries."
+            },
             "cross_timeframe_parse": {
                 "shared_levels": [
                     {"price": 1988.0, "type": "support", "reason": "shared 4h support"},
                     {"price": 2035.0, "type": "resistance", "reason": "shared 4h resistance"}
                 ],
+                "execution_alignment_15m": "conflicted",
                 "cross_market_parse": {
                     "spot_vs_futures_gap_pct": 0.05,
                     "flow_driver": "balanced",
                     "latest_4h_delta_relation": "aligned"
                 },
-                "main_tension": "15m and 4h buyers are pressing higher while the 1d backdrop remains only partially sponsored.",
+                "main_tension": "4h buyers are pressing higher while the 1d backdrop remains only partially sponsored and 15m execution is still contested.",
                 "unresolved_factors": [
                         "daily sponsorship is unresolved",
                         "4h flow is constructive but not fully clean"
@@ -5568,9 +5650,9 @@ mod tests {
         let mut response = sample_stage_1_scan();
         *response
             .pointer_mut("/schema_version")
-            .expect("schema_version should exist") = json!("scan_v3_3_0_response");
+            .expect("schema_version should exist") = json!("scan_v3_4_0_response");
 
-        for tf in ["15m", "4h", "1d"] {
+        for tf in ["4h", "1d"] {
             let flow_parse = response
                 .pointer(&format!("/timeframes/{tf}/flow_parse"))
                 .cloned()
@@ -5620,12 +5702,10 @@ mod tests {
     fn sample_stage_1_scan_with_supporting_indicator_refs() -> Value {
         let mut scan = sample_stage_1_scan();
         *scan
-            .pointer_mut("/timeframes/15m/participant_parse/participant_observations/0/evidence")
-            .expect("15m evidence should exist") = json!([
-            "orderbook_depth still shows sellers leaning above price",
-            "buying_exhaustion capped the last lift",
-            "absorption remains active near local supply"
-        ]);
+            .pointer_mut("/execution_context_15m/execution_note")
+            .expect("execution_note should exist") = json!(
+            "orderbook_depth still shows sellers leaning above price; buying_exhaustion and absorption still define the local sweep risk."
+        );
         *scan
             .pointer_mut("/timeframes/4h/evidence_trace/supporting_facts")
             .expect("4h supporting_facts should exist") = json!([
@@ -5646,8 +5726,8 @@ mod tests {
     fn sample_stage_1_scan_with_htf_target_refs() -> Value {
         let mut scan = sample_stage_1_scan();
         *scan
-            .pointer_mut("/timeframes/15m/structure_parse/dominant_demand_zone/reason")
-            .expect("15m dominant_demand_zone reason should exist") =
+            .pointer_mut("/execution_context_15m/nearest_executable_support/reason")
+            .expect("nearest_executable_support reason should exist") =
             json!("defense is anchored near price_volume_structure.payload.val");
         *scan.pointer_mut("/timeframes/1d/participant_parse/participant_observations/0/current_task")
             .expect("1d current_task should exist") = json!(
@@ -6309,7 +6389,7 @@ mod tests {
                 schema
                     .pointer("/properties/schema_version/enum/0")
                     .and_then(|v| v.as_str()),
-                Some("scan_v3_3_0_response"),
+                Some("scan_v3_4_0_response"),
                 "schema_version should be reduced response for {prompt_template}"
             );
             assert_eq!(
@@ -6321,14 +6401,13 @@ mod tests {
             );
             assert_eq!(
                 schema
-                    .pointer("/properties/timeframes/properties/15m/additionalProperties")
+                    .pointer("/properties/timeframes/properties/4h/additionalProperties")
                     .and_then(|v| v.as_bool()),
-                Some(false),
-                "15m should be strict for {prompt_template}"
+                Some(false)
             );
             assert_eq!(
                 schema
-                    .pointer("/properties/timeframes/properties/15m/properties/participant_parse/additionalProperties")
+                    .pointer("/properties/timeframes/properties/4h/properties/participant_parse/additionalProperties")
                     .and_then(|v| v.as_bool()),
                 Some(false),
                 "participant_parse should be strict for {prompt_template}"
@@ -6341,30 +6420,34 @@ mod tests {
                 "cross_timeframe_parse should be strict for {prompt_template}"
             );
             assert!(schema
-                .pointer("/properties/timeframes/properties/15m/properties/flow_map")
+                .pointer("/properties/timeframes/properties/15m")
                 .is_none());
             assert!(schema
-                .pointer(
-                    "/properties/timeframes/properties/15m/properties/participant_parse/properties/aggressive_side"
-                )
-                .is_none());
-            assert!(schema
-                .pointer("/properties/timeframes/properties/15m/properties/state_parse")
+                .pointer("/properties/execution_context_15m")
                 .is_some());
             assert!(schema
-                .pointer("/properties/timeframes/properties/15m/properties/flow_override")
+                .pointer("/properties/execution_context_15m/properties/micro_auction_state")
                 .is_some());
             assert!(schema
-                .pointer("/properties/timeframes/properties/15m/properties/flow_parse")
+                .pointer("/properties/timeframes/properties/4h/properties/participant_parse/properties/aggressive_side")
                 .is_none());
             assert!(schema
-                .pointer("/properties/timeframes/properties/15m/properties/state_parse/properties/value_read")
+                .pointer("/properties/timeframes/properties/4h/properties/state_parse")
+                .is_some());
+            assert!(schema
+                .pointer("/properties/timeframes/properties/4h/properties/flow_override")
+                .is_some());
+            assert!(schema
+                .pointer("/properties/timeframes/properties/4h/properties/flow_parse")
                 .is_none());
             assert!(schema
-                .pointer("/properties/timeframes/properties/15m/properties/market_state")
+                .pointer("/properties/timeframes/properties/4h/properties/state_parse/properties/value_read")
                 .is_none());
             assert!(schema
-                .pointer("/properties/timeframes/properties/15m/properties/evidence_trace")
+                .pointer("/properties/timeframes/properties/4h/properties/market_state")
+                .is_none());
+            assert!(schema
+                .pointer("/properties/timeframes/properties/4h/properties/evidence_trace")
                 .is_some());
             assert!(schema
                 .pointer("/properties/cross_timeframe_parse/properties/cross_market_parse")
@@ -6380,6 +6463,9 @@ mod tests {
             assert!(schema
                 .pointer("/properties/cross_timeframe_parse/properties/shared_levels")
                 .is_some());
+            assert!(schema
+                .pointer("/properties/cross_timeframe_parse/properties/execution_alignment_15m")
+                .is_some());
             assert!(schema.pointer("/properties/cross_timeframe_map").is_none());
         }
     }
@@ -6394,13 +6480,16 @@ mod tests {
                 prompt_template,
             );
             assert!(contract
-                .contains("`schema_version`, `meta`, `timeframes`, and `cross_timeframe_parse`"));
-            assert!(contract.contains("`scan_v3_3_0_response`"));
+                .contains("`schema_version`, `meta`, `timeframes`, `execution_context_15m`, and `cross_timeframe_parse`"));
+            assert!(contract.contains("`scan_v3_4_0_response`"));
             assert!(contract.contains(
                 "`structure_parse`, `state_parse`, `flow_override`, `participant_parse`, and `evidence_trace`"
             ));
             assert!(contract.contains(
-                "`shared_levels`, `main_tension`, and `unresolved_factors`"
+                "`micro_auction_state`, `nearest_executable_support`, `nearest_executable_resistance`, `entry_sweep_risk_15m`, `micro_invalidation_risk`, and `execution_note`"
+            ));
+            assert!(contract.contains(
+                "`shared_levels`, `execution_alignment_15m`, `main_tension`, and `unresolved_factors`"
             ));
             assert!(!contract.contains("flow_map"));
             assert!(!contract.contains("cross_timeframe_map"));
@@ -6502,10 +6591,6 @@ mod tests {
 
         let event = super::build_entry_finalize_trace_event(&input, &scan, Some(123));
         assert_eq!(
-            event.get("scan_15m_trend").and_then(Value::as_str),
-            Some("Bullish")
-        );
-        assert_eq!(
             event.get("scan_4h_trend").and_then(Value::as_str),
             Some("Bullish")
         );
@@ -6528,6 +6613,18 @@ mod tests {
         );
         assert_eq!(
             event
+                .get("execution_15m_micro_auction_state")
+                .and_then(Value::as_str),
+            Some("reentry")
+        );
+        assert_eq!(
+            event
+                .get("execution_alignment_15m")
+                .and_then(Value::as_str),
+            Some("conflicted")
+        );
+        assert_eq!(
+            event
                 .get("cross_market_spot_premium_state")
                 .and_then(Value::as_str),
             Some("near_flat")
@@ -6535,7 +6632,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_entry_scan_output_accepts_scan_v3_3_0_response_and_merges_full_scan() {
+    fn parse_entry_scan_output_accepts_scan_v3_4_0_response_and_merges_full_scan() {
         let raw_text =
             serde_json::to_string(&sample_stage_1_scan_response()).expect("serialize scan");
         let prompt_input = sample_stage_1_scan_prompt_input();
@@ -6544,13 +6641,13 @@ mod tests {
 
         assert_eq!(
             parsed.get("schema_version").and_then(Value::as_str),
-            Some("scan_v3_3_0")
+            Some("scan_v3_4_0")
         );
         assert_eq!(
             parsed
-                .pointer("/timeframes/15m/state_parse/control_read/side")
+                .pointer("/execution_context_15m/micro_auction_state")
                 .and_then(Value::as_str),
-            Some("buyers")
+            Some("reentry")
         );
         assert!(parsed
             .pointer("/cross_timeframe_parse/main_tension")
@@ -6562,7 +6659,7 @@ mod tests {
     fn parse_entry_scan_output_rejects_removed_v2_0_0_fields() {
         let mut legacy_mix = sample_stage_1_scan_response();
         *legacy_mix
-            .pointer_mut("/timeframes/15m/participant_parse")
+            .pointer_mut("/timeframes/4h/participant_parse")
             .expect("participant_parse should exist") = json!({
             "aggressive_side": "buyers",
             "participant_observations": [
@@ -6585,7 +6682,7 @@ mod tests {
         assert!(error
             .error
             .to_string()
-            .contains("/timeframes/15m/participant_parse/aggressive_side"));
+            .contains("/timeframes/4h/participant_parse/aggressive_side"));
     }
 
     #[test]
@@ -6594,11 +6691,11 @@ mod tests {
             serde_json::to_string(&sample_stage_1_scan_response()).expect("serialize scan");
         let mut prompt_input = sample_stage_1_scan_prompt_input();
         *prompt_input
-            .pointer_mut("/now/precomputed_value_read/15m/tpo")
-            .expect("15m tpo value read should exist") = json!("accepted_above");
+            .pointer_mut("/now/precomputed_value_read/4h/tpo")
+            .expect("4h tpo value read should exist") = json!("inside_value");
         *prompt_input
-            .pointer_mut("/now/precomputed_value_read/15m/combined")
-            .expect("15m combined value read should exist") = json!("inside_value");
+            .pointer_mut("/now/precomputed_value_read/4h/combined")
+            .expect("4h combined value read should exist") = json!("accepted_above");
 
         let error = super::parse_entry_scan_output("custom_llm", &response, &prompt_input)
             .expect_err("inconsistent combined value should be rejected");
@@ -6623,7 +6720,7 @@ mod tests {
         assert!(error
             .error
             .to_string()
-            .contains("scan response schema_version must be scan_v3_3_0_response"));
+            .contains("scan response schema_version must be scan_v3_4_0_response"));
     }
 
     #[test]
@@ -6656,7 +6753,7 @@ mod tests {
 
         assert!(error
             .to_string()
-            .contains("scan schema_version must be scan_v3_3_0"));
+            .contains("scan schema_version must be scan_v3_4_0"));
     }
 
     #[test]
@@ -6870,14 +6967,14 @@ mod tests {
             capture
                 .stage_1_setup_scan_json
                 .as_ref()
-                .and_then(|value| value.pointer("/timeframes/15m/structure_parse/active_range/low"))
+                .and_then(|value| value.pointer("/execution_context_15m/nearest_executable_support/low"))
                 .and_then(Value::as_f64),
             Some(1994.0)
         );
         assert!(capture
             .stage_1_setup_scan_json
             .as_ref()
-            .and_then(|value| value.pointer("/timeframes/15m/story"))
+            .and_then(|value| value.pointer("/execution_context_15m/story"))
             .is_none());
         assert!(capture
             .stage_1_setup_scan_json
@@ -6991,7 +7088,7 @@ mod tests {
         assert_eq!(value.as_object().map(|obj| obj.len()), Some(9));
         assert_eq!(
             value.get("version").and_then(Value::as_str),
-            Some("scan_v6_3")
+            Some("scan_v6_4")
         );
         assert!(value.pointer("/now").is_some());
         assert!(value
@@ -7170,7 +7267,7 @@ mod tests {
         assert!(capture
             .stage_1_setup_scan_json
             .as_ref()
-            .and_then(|value| value.pointer("/timeframes/15m/story"))
+            .and_then(|value| value.pointer("/execution_context_15m/story"))
             .is_none());
     }
 

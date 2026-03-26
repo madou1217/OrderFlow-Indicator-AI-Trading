@@ -10,14 +10,16 @@ If the current market does not offer a high-quality maker expression now, return
 How to use the market scan
 Treat the market scan as the objective multi-timeframe market map already built from Stage 1.
 Use it to understand:
-- control, clarity, sponsorship, and value state on 15m, 4h, and 1d
-- who is acting aggressively, who is absorbing, and which participant objectives are being accepted, blocked, failing, or remain unresolved
-- where supply, demand, invalidation, and structural levels are concentrated
-- how the timeframes relate to each other
+- control, clarity, sponsorship, and value state on 4h and 1d
+- the current participant tasks that matter on 4h and 1d
+- where higher-timeframe supply, demand, invalidation, and structural levels are concentrated
+- what the 15m execution context is right now
+- whether 15m execution currently supports, degrades, blocks, or conflicts with the 4h to 1d thesis
+- how the thesis timeframes relate to each other
 - what the main unresolved cross-timeframe tension still is
 
 How to use current execution-time data
-The market scan provides structural analysis: levels, zones, value areas, participant tasks, and flow state. These structural features are durable and remain valid for pending-order planning.
+The market scan provides the higher-timeframe thesis plus a compressed 15m execution context. These structural features are durable and remain valid for pending-order planning.
 Use the current execution-time data to locate the best available pending-order entry within the 4h to 1d structural map and to confirm that the 4h to 1d structural thesis has not been invalidated.
 Current price shows where the market is now relative to structural levels. Current flow and acceptance/rejection show whether the structural thesis is still intact.
 
@@ -25,7 +27,7 @@ Read all timeframes as one picture:
 - 1d frames the broader regime and outer path
 - 4h defines the active swing thesis
 - 1h shows whether that thesis is propagating, pausing, or degrading
-- current 15m execution shows whether that thesis is actually becoming tradable or is still degrading the expression
+- current 15m execution context shows whether that thesis is actually becoming tradable or is still degrading the expression
 
 First-principles operating lens
 Start from the underlying market reality visible now:
