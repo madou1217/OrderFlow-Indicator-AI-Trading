@@ -122,6 +122,16 @@ v1.1 分成 3 层：
 - `live_refs` 只放少量最关键的实时引用值，不复制完整大对象
 - `freshness` 告诉模型这份数据相对 `Stage 1` 新了多久
 
+其中 `since_stage1_increment` 除了 flow 增量外，还要显式表达：
+
+- **scan 后新出现的 event indicators**
+
+否则会出现一个盲区：
+
+- `Stage 1 scan` 当时没有 absorption / initiation / exhaustion
+- 但 `Stage 2 bundle` 已经包含了新确认的 event
+- 模型虽然能看到这个 event 存在，却不知道它是 **scan 之后才出现的新增信息**
+
 ### Layer C: runtime 新增 `pre_execution_freshness_recheck`
 
 在模型已经给出可执行决策，但真正落交易动作之前：
@@ -314,7 +324,23 @@ v1.1 改成：
     "delta_spot_sum": -180.3,
     "volume_fut_sum": 8200.0,
     "max_abs_1m_delta_fut": 540.1,
-    "dominant_flow": "selling"
+    "dominant_flow": "selling",
+    "new_events_since_scan": [
+      {
+        "type": "absorption",
+        "direction": "bullish",
+        "price": 2159.18,
+        "minutes_ago": 4,
+        "confirm_ts": "2026-03-26T03:35:00Z"
+      },
+      {
+        "type": "initiation",
+        "direction": "bearish",
+        "price": 2171.05,
+        "minutes_ago": 2,
+        "confirm_ts": "2026-03-26T03:37:00Z"
+      }
+    ]
   },
 
   "live_refs": {
@@ -354,7 +380,58 @@ v1.1 改成：
 
 在交易决策上不是一回事。
 
-### 5.4 `live_refs` 的意义
+同理，模型看到：
+
+- 当前 prompt 里有一个 `absorption`
+
+和看到：
+
+- **这个 absorption 是 `Stage 1 scan` 之后新确认的**
+
+也不是一回事。
+
+对于 `entry / pending`，这类“scan 后新出现的 absorption / initiation / exhaustion”
+往往有非常高的交易价值。
+
+### 5.4 `new_events_since_scan` 的构建方式
+
+v1.1 的最小实现建议直接读取：
+
+- `indicators.events_summary.payload.most_recent_absorption`
+- `indicators.events_summary.payload.most_recent_initiation`
+- `indicators.events_summary.payload.most_recent_buying_exhaustion`
+- `indicators.events_summary.payload.most_recent_selling_exhaustion`
+
+这些 summary 当前已经包含：
+
+- `confirm_ts`
+- `direction`
+- `type`
+- `price`
+- `minutes_ago`
+
+构建规则：
+
+1. 取上述每个 summary
+2. 若 `confirm_ts > stage1_scan_ts_bucket`，则视为 `scan` 后新出现
+3. 只保留满足条件的 event
+4. 统一写入 `since_stage1_increment.new_events_since_scan`
+
+这版实现的优点是：
+
+- 不需要再扫描完整 event arrays
+- 复用现有 `events_summary`
+- 增量极小，通常 0~3 个事件
+
+这版实现的边界是：
+
+- 它最多只能捕捉“每个事件家族当前最新的那个 post-scan event”
+- 如果 scan 后同一事件家族连续确认了多个事件，v1.1 只会保留最新一个
+
+如果后续需要完整覆盖“同一类型 scan 后连续出现多个事件”的情况，
+再在 v1.2 升级为直接读取原始 event indicator 的 `recent_7d.events`。
+
+### 5.5 `live_refs` 的意义
 
 `live_refs` 不是新指标，
 只是从已有的 live/rolling 指标里抽取最关键的几个字段，供模型快速定位：
@@ -371,24 +448,27 @@ v1.1 改成：
 - 不让 prompt 因为重复大对象变得更噪
 - 让模型更容易把“新增的 CVD partial 视角”和当前 orderbook / footprint 合起来看
 
-### 5.5 不同 mode 的保留策略
+### 5.6 不同 mode 的保留策略
 
 #### Entry
 
 - 完整保留 `15m.recent_series`
 - 保留 `4h / 1d` 汇总
 - 完整保留 `since_stage1_increment`
+- 完整保留 `new_events_since_scan`
 
 #### Pending
 
 - 与 `Entry` 基本一致
 - 因为 pending 是否撤单 / 改价，非常依赖最近几分钟是否已经翻向
+- 也非常依赖 scan 后是否新出现 `absorption / initiation / exhaustion`
 
 #### Management
 
 - 不保留 `15m.recent_series`
 - 只保留 `15m` 摘要
 - `4h / 1d` 只保留汇总和 `vs_last_closed_bar`
+- `new_events_since_scan` 只保留最近 1~2 个最相关事件即可
 
 这样可以降低 management prompt 的 token 噪音，
 同时仍然保留 “4h / 1d 延续是否被破坏，15m 是否出现近端风险”。
@@ -554,6 +634,7 @@ acceleration, or invalidation inside the unfinished 15m / 4h / 1d bar?
 
 - 在 `core.rs` 的 Stage 2 root builder 中插入顶层 `realtime_flow_context`
 - `core_shared.rs` 新增 `build_realtime_flow_context()`
+- `build_realtime_flow_context()` 直接复用 `filtered_indicators["events_summary"]` 构建 `new_events_since_scan`
 - `core_entry / pending / management` 只负责 mode-specific 裁剪
 
 ### 8.3 provider
@@ -659,6 +740,8 @@ acceleration, or invalidation inside the unfinished 15m / 4h / 1d bar?
 - `rtf_15m_regime`
 - `rtf_15m_direction_consistent`
 - `rtf_since_stage1_delta_fut_sum`
+- `rtf_new_events_since_scan_count`
+- `rtf_new_events_since_scan_types`
 - `rtf_recheck_triggered`
 - `rtf_recheck_vetoed`
 - `rtf_recheck_result`
