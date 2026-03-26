@@ -38,6 +38,8 @@ pub async fn run_heartbeat_loop(ctx: Arc<AppContext>, metrics: Arc<AppMetrics>) 
             optional_ts_from_ms(snapshot.latest_contiguous_complete_minute_ts_ms);
         let dirty_recompute_from_ts = optional_ts_from_ms(snapshot.dirty_recompute_from_ts_ms);
         let dirty_recompute_end_ts = optional_ts_from_ms(snapshot.dirty_recompute_end_ts_ms);
+        let oi_ratio_patch_from_ts = optional_ts_from_ms(snapshot.oi_ratio_patch_from_ts_ms);
+        let oi_ratio_patch_end_ts = optional_ts_from_ms(snapshot.oi_ratio_patch_end_ts_ms);
         let frontier_trade_futures_ts = optional_ts_from_ms(snapshot.frontier_trade_futures_ts_ms);
         let frontier_trade_spot_ts = optional_ts_from_ms(snapshot.frontier_trade_spot_ts_ms);
         let frontier_orderbook_futures_ts =
@@ -51,6 +53,12 @@ pub async fn run_heartbeat_loop(ctx: Arc<AppContext>, metrics: Arc<AppMetrics>) 
             optional_ts_from_ms(snapshot.event_writer_last_failure_ts_ms);
 
         let event_lag_ms = last_event_ts.map(|ts| (Utc::now() - ts).num_milliseconds());
+        let oi_ratio_patch_backlog_minutes = match (oi_ratio_patch_from_ts, oi_ratio_patch_end_ts) {
+            (Some(from_ts), Some(end_ts)) if end_ts >= from_ts => {
+                Some((end_ts - from_ts).num_minutes() + 1)
+            }
+            _ => None,
+        };
         let total_errors = snapshot.db_errors + snapshot.mq_errors + snapshot.decode_errors;
         let error_rate = if snapshot.processed_events > 0 {
             Some(total_errors as f64 / snapshot.processed_events as f64)
@@ -68,6 +76,13 @@ pub async fn run_heartbeat_loop(ctx: Arc<AppContext>, metrics: Arc<AppMetrics>) 
             "latest_contiguous_complete_minute_ts": latest_contiguous_complete_minute_ts.map(|ts| ts.to_rfc3339()),
             "dirty_recompute_from_ts": dirty_recompute_from_ts.map(|ts| ts.to_rfc3339()),
             "dirty_recompute_end_ts": dirty_recompute_end_ts.map(|ts| ts.to_rfc3339()),
+            "oi_ratio_patch_from_ts": oi_ratio_patch_from_ts.map(|ts| ts.to_rfc3339()),
+            "oi_ratio_patch_end_ts": oi_ratio_patch_end_ts.map(|ts| ts.to_rfc3339()),
+            "live_ready_to_bundle_ms": snapshot.live_ready_to_bundle_ms,
+            "indicator_oi_ratio_patch_backlog_minutes": oi_ratio_patch_backlog_minutes,
+            "indicator_oi_ratio_patch_windows_total": snapshot.oi_ratio_patch_windows_total,
+            "indicator_oi_ratio_patch_republish_total": snapshot.oi_ratio_patch_republish_total,
+            "indicator_oi_ratio_patch_total_ms": snapshot.oi_ratio_patch_total_ms,
             "event_lag_ms": event_lag_ms,
             "queue_lag": snapshot.queue_lag,
             "trade_channel_len": snapshot.trade_channel_len,

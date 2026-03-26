@@ -42,6 +42,7 @@ pub struct Dispatcher {
     flow_indicators: Vec<Arc<dyn Indicator>>,
     deriv_indicators: Vec<Arc<dyn Indicator>>,
     orderbook_indicators: Vec<Arc<dyn Indicator>>,
+    oi_ratio_patch_indicators: Vec<Arc<dyn Indicator>>,
     feature_writer: FeatureWriter,
     snapshot_writer: SnapshotWriter,
     level_writer: LevelWriter,
@@ -73,6 +74,7 @@ impl Dispatcher {
         let mut flow_indicators = Vec::new();
         let mut deriv_indicators = Vec::new();
         let mut orderbook_indicators = Vec::new();
+        let mut oi_ratio_patch_indicators = Vec::new();
         for indicator in indicators {
             match indicator.code() {
                 "price_volume_structure"
@@ -89,6 +91,9 @@ impl Dispatcher {
                 | "ema_trend_regime"
                 | "fvg" => flow_indicators.push(indicator),
                 "liquidation_density" | "funding_rate" | "open_interest" | "long_short_ratios" => {
+                    if matches!(indicator.code(), "open_interest" | "long_short_ratios") {
+                        oi_ratio_patch_indicators.push(indicator.clone());
+                    }
                     deriv_indicators.push(indicator)
                 }
                 _ => orderbook_indicators.push(indicator),
@@ -99,6 +104,7 @@ impl Dispatcher {
             flow_indicators,
             deriv_indicators,
             orderbook_indicators,
+            oi_ratio_patch_indicators,
             feature_writer,
             snapshot_writer,
             level_writer,
@@ -346,6 +352,55 @@ impl Dispatcher {
         self.snapshot_writer
             .rewind_persisted_tail(symbol, repair_start_ts, exchange_name)
             .await
+    }
+
+    pub async fn process_oi_ratio_patch_window(
+        &self,
+        ctx: Arc<IndicatorContext>,
+    ) -> Result<Vec<IndicatorSnapshotRow>> {
+        let started_at = Instant::now();
+        let output = evaluate_indicator_group(self.oi_ratio_patch_indicators.clone(), ctx.as_ref());
+        let mut snapshots = output.snapshots;
+        snapshots.sort_by(|a, b| {
+            a.indicator_code.cmp(b.indicator_code).then_with(|| {
+                snapshot_window_rank(a.window_code).cmp(&snapshot_window_rank(b.window_code))
+            })
+        });
+
+        self.snapshot_writer
+            .write_snapshots(ctx.ts_bucket, &ctx.symbol, &snapshots)
+            .await?;
+        self.feature_writer.write_oi_ratio_only(&ctx).await?;
+
+        let (indicators_json, indicator_count) = self
+            .snapshot_writer
+            .load_minute_bundle_indicators_json(&ctx.symbol, ctx.ts_bucket)
+            .await?;
+        let repair_message = self
+            .publisher
+            .build_minute_bundle_outbox_message_with_extra_headers(
+                ctx.ts_bucket,
+                &ctx.symbol,
+                &indicators_json,
+                indicator_count,
+                Some(json!({
+                    "repair_reason": "oi_ratio_patch",
+                    "repair_scope": "indicator_subset",
+                })),
+            )?;
+        self.snapshot_writer
+            .enqueue_bundle_repairs(&[repair_message])
+            .await?;
+
+        debug!(
+            ts_bucket = %ctx.ts_bucket,
+            symbol = %ctx.symbol,
+            snapshot_count = snapshots.len(),
+            total_ms = started_at.elapsed().as_millis(),
+            "oi_ratio patch window processed"
+        );
+
+        Ok(snapshots)
     }
 }
 

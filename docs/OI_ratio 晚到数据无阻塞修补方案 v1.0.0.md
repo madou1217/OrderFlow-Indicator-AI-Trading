@@ -364,7 +364,7 @@ patch 处理范围：
 
 对每个 minute：
 
-1. 基于当前 runtime state 构造该 minute 的 `IndicatorContext`
+1. **只读方式**构造该 minute 的 `IndicatorContext`（见下方关键约束）
 2. 只运行：
    - `open_interest`
    - `long_short_ratios`
@@ -379,6 +379,60 @@ patch 处理范围：
    - `divergence`
    - 各类 event 表
 
+### 关键约束：patch 不能复用 `finalize_minute()` 路径
+
+当前 `finalize_minute()` 不是只读操作。它会推进 StateStore 的内部状态：
+
+- 将 minute 数据 push 进 `history_futures` / `history_spot`
+- 推进 CVD 累计值（`cvd_futures` / `cvd_spot`）
+- 推进 VPIN rolling state（`vpin_futures` / `vpin_spot`）
+- 推进 `last_finalized_minute` 指针
+
+如果专项 patch 对已经 finalized 的 minute 再次调用 `finalize_minute()`，会：
+
+- 向 history 重复 push 已有分钟 → 破坏 rolling window 指标的历史序列
+- CVD / VPIN 累计值被二次叠加 → 后续所有 live minute 的 CVD / VPIN 全部漂掉
+- `last_finalized_minute` 可能被错误回退
+
+因此，专项 patch 必须用**只读方式**构建 `IndicatorContext`：
+
+- 不能复用 `finalize_minute()` / `recompute_dirty_finalized_minutes()` 这类有副作用路径
+- 需要基于 finalized history、canonical minute inputs、funding/mark timeline，**只读重建**目标 minute 的 `WindowBundle`
+- 在这个只读 `WindowBundle` 上，仅替换其中的 `OiRatioWindowView` 部分（调用 `build_oi_ratio_view_for_minute(ts_bucket)` 取最新视图）
+- 再用修正后的 `WindowBundle -> IndicatorContext`
+- **不修改** StateStore 的任何可变状态
+
+推荐实现方式：新增一个专用方法，例如：
+
+```rust
+fn build_patch_bundle_for_minute(&self, ts_bucket: DateTime<Utc>) -> WindowBundle
+```
+
+语义：
+
+- 与 `build_window_bundle(...)` 的输出形状一致
+- 但只能读取 finalized history / canonical inputs / funding-mark timeline
+- 不能推进任何 rolling state，也不能改写 `last_finalized_minute`
+- 在此基础上，再通过 `IndicatorContext::from_bundle(...)` 构建 patch 专用 context
+
+### 实现前提必须写清楚
+
+当前代码**没有**持久化 finalized `WindowBundle`。
+
+因此这里不能假设：
+
+- “直接查出旧 `WindowBundle` 再改一改”
+
+真正可行的实现只有两种：
+
+1. 新增一个**只读 historical bundle builder**
+2. 或者新增一个 finalized bundle cache，再在 patch 时读取它
+
+在这版代码结构下，推荐第 1 种，因为：
+
+- 不会额外引入一套 bundle 存储一致性问题
+- 仍然能保持 patch 对 StateStore 无副作用
+
 ### 为什么可行
 
 因为 snapshot 现在本来就是按：
@@ -390,7 +444,9 @@ patch 处理范围：
 这意味着：
 
 - 只修补两类 indicator 的 snapshot 行
-- 在数据模型上是完全成立的
+- 在数据模型上是成立的
+
+而 `i25` / `i26` 的计算虽然不需要重新 finalize 全部历史，但它们仍然读取 `IndicatorContext`，所以 patch 路径必须先解决“如何只读重建该 minute 的 bundle/context”，不能直接跳过这一步。
 
 ---
 
@@ -447,20 +503,19 @@ patch 处理范围：
 
 OI / ratio patch 不应阻塞 live 主路径。
 
-推荐优先级：
+唯一安全的优先级是：
 
-1. 先处理当前 tick 的 live ready minute
-2. 再在剩余 budget 内处理 `oi_ratio_patch`
-
-即：
-
-- `dirty_recompute` 仍然高优先级
-- `oi_ratio_patch` 为低优先级、可分批 drain
+1. 先处理 `dirty_recompute`
+2. 再处理当前 tick 的 live ready minute
+3. 最后在剩余 budget 内处理 `oi_ratio_patch`
 
 原因：
 
 - `dirty_recompute` 代表 canonical 1m truth 变化，影响更广
-- `oi_ratio_patch` 只影响 `i25 / i26`
+- 当前 runtime 之所以先 drain `dirty_recompute`，是为了避免 rolling history 指标看到临时 tail gap
+- `oi_ratio_patch` 只影响 `i25 / i26`，因此必须排在 live 主路径之后
+
+这里不应保留“先 live 再 dirty 也可以”的说法，因为那会破坏现有 canonical dirty 的准确性假设。
 
 ### 推荐批次控制
 
@@ -560,19 +615,17 @@ OI / ratio patch 不应阻塞 live 主路径。
 
 - `process_pending_oi_ratio_patch(...)`
 
-处理顺序建议：
+处理顺序必须固定为：
 
-1. 先 live ready minute
-2. 再 dirty recompute
-3. 再 oi_ratio patch
+1. `dirty_recompute`
+2. `live ready minute`
+3. `oi_ratio_patch`
 
-或者：
+其中：
 
-1. dirty recompute
-2. live ready minute
-3. oi_ratio patch
-
-二者都可以，但**oi_ratio patch 必须在 live 主路径之后**。
+- `dirty_recompute` 继续沿用现有 accuracy-first 语义
+- `oi_ratio_patch` 明确排在 live 主路径之后
+- 不再保留“live 在 dirty 前面也可以”的口径
 
 ## 8.3 `indicator_engine/src/runtime/dispatcher.rs`
 
@@ -608,6 +661,20 @@ OI / ratio patch 不应阻塞 live 主路径。
 
 - 定点 upsert 两类 indicator 的 snapshot
 - 定点为某个 minute 重新 enqueue minute bundle
+
+这里要显式补一条实现约束：
+
+- **不能**复用 `advance_progress_with_outbox(...)`
+
+原因：
+
+- 这个 API 会推进 `feat.indicator_progress`
+- patch 处理的是旧 minute
+- 如果复用它，progress 指针会被旧 minute 错写
+
+因此需要新增一个 enqueue-only / payload-cache-upsert-only 的专用路径，例如：
+
+- `enqueue_bundle_repair_without_progress(...)`
 
 明确不应复用当前 overlap repair 的“整段 delete tail 再重建”策略，因为那会重新引入全局阻塞。
 

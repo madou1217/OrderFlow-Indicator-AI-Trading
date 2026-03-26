@@ -16,6 +16,12 @@ pub struct AppMetrics {
     latest_contiguous_complete_minute_ts_ms: AtomicI64,
     dirty_recompute_from_ts_ms: AtomicI64,
     dirty_recompute_end_ts_ms: AtomicI64,
+    oi_ratio_patch_from_ts_ms: AtomicI64,
+    oi_ratio_patch_end_ts_ms: AtomicI64,
+    live_ready_to_bundle_ms: AtomicI64,
+    oi_ratio_patch_windows_total: AtomicU64,
+    oi_ratio_patch_republish_total: AtomicU64,
+    oi_ratio_patch_total_ms: AtomicU64,
     trade_channel_len: AtomicI64,
     non_trade_channel_len: AtomicI64,
     frontier_trade_futures_ts_ms: AtomicI64,
@@ -45,6 +51,12 @@ pub struct MetricsSnapshot {
     pub latest_contiguous_complete_minute_ts_ms: i64,
     pub dirty_recompute_from_ts_ms: i64,
     pub dirty_recompute_end_ts_ms: i64,
+    pub oi_ratio_patch_from_ts_ms: i64,
+    pub oi_ratio_patch_end_ts_ms: i64,
+    pub live_ready_to_bundle_ms: i64,
+    pub oi_ratio_patch_windows_total: u64,
+    pub oi_ratio_patch_republish_total: u64,
+    pub oi_ratio_patch_total_ms: u64,
     pub trade_channel_len: i64,
     pub non_trade_channel_len: i64,
     pub frontier_trade_futures_ts_ms: i64,
@@ -121,6 +133,38 @@ impl AppMetrics {
             .store(dirty_recompute_end_ts_ms.unwrap_or(0), Ordering::Relaxed);
     }
 
+    pub fn set_oi_ratio_patch_bounds(
+        &self,
+        oi_ratio_patch_from_ts_ms: Option<i64>,
+        oi_ratio_patch_end_ts_ms: Option<i64>,
+    ) {
+        self.oi_ratio_patch_from_ts_ms
+            .store(oi_ratio_patch_from_ts_ms.unwrap_or(0), Ordering::Relaxed);
+        self.oi_ratio_patch_end_ts_ms
+            .store(oi_ratio_patch_end_ts_ms.unwrap_or(0), Ordering::Relaxed);
+    }
+
+    pub fn set_live_ready_to_bundle_ms(&self, live_ready_to_bundle_ms: u128) {
+        self.live_ready_to_bundle_ms.store(
+            i64::try_from(live_ready_to_bundle_ms).unwrap_or(i64::MAX),
+            Ordering::Relaxed,
+        );
+    }
+
+    pub fn record_oi_ratio_patch_batch(&self, windows_processed: usize, elapsed_ms: u128) {
+        self.oi_ratio_patch_windows_total
+            .fetch_add(windows_processed as u64, Ordering::Relaxed);
+        self.oi_ratio_patch_total_ms.fetch_add(
+            u64::try_from(elapsed_ms).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+    }
+
+    pub fn record_oi_ratio_patch_republish(&self, repair_count: usize) {
+        self.oi_ratio_patch_republish_total
+            .fetch_add(repair_count as u64, Ordering::Relaxed);
+    }
+
     pub fn set_channel_lengths(&self, trade_channel_len: usize, non_trade_channel_len: usize) {
         self.trade_channel_len
             .store(trade_channel_len as i64, Ordering::Relaxed);
@@ -184,6 +228,14 @@ impl AppMetrics {
                 .load(Ordering::Relaxed),
             dirty_recompute_from_ts_ms: self.dirty_recompute_from_ts_ms.load(Ordering::Relaxed),
             dirty_recompute_end_ts_ms: self.dirty_recompute_end_ts_ms.load(Ordering::Relaxed),
+            oi_ratio_patch_from_ts_ms: self.oi_ratio_patch_from_ts_ms.load(Ordering::Relaxed),
+            oi_ratio_patch_end_ts_ms: self.oi_ratio_patch_end_ts_ms.load(Ordering::Relaxed),
+            live_ready_to_bundle_ms: self.live_ready_to_bundle_ms.load(Ordering::Relaxed),
+            oi_ratio_patch_windows_total: self.oi_ratio_patch_windows_total.load(Ordering::Relaxed),
+            oi_ratio_patch_republish_total: self
+                .oi_ratio_patch_republish_total
+                .load(Ordering::Relaxed),
+            oi_ratio_patch_total_ms: self.oi_ratio_patch_total_ms.load(Ordering::Relaxed),
             trade_channel_len: self.trade_channel_len.load(Ordering::Relaxed),
             non_trade_channel_len: self.non_trade_channel_len.load(Ordering::Relaxed),
             frontier_trade_futures_ts_ms: self.frontier_trade_futures_ts_ms.load(Ordering::Relaxed),

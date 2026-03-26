@@ -33,7 +33,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::{interval, Instant, MissedTickBehavior};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 const STARTUP_BACKFILL_FALLBACK_LOOKBACK_MINUTES: i64 = 180;
@@ -46,6 +46,8 @@ const INGEST_NON_TRADE_CHANNEL_CAPACITY: usize = 100_000;
 const INGEST_DRAIN_PER_TICK_LIMIT: usize = 25_000;
 const DIRTY_RECOMPUTE_BATCH_SIZE: usize = 5;
 const DIRTY_RECOMPUTE_WINDOW_BUDGET_PER_TICK: usize = 50;
+const OI_RATIO_PATCH_BATCH_SIZE: usize = 6;
+const OI_RATIO_PATCH_WINDOW_BUDGET_PER_TICK: usize = 24;
 const PROCESS_READY_MINUTES_WARN_MS: u128 = 2_000;
 const STUCK_PROGRESS_IDLE_SECS: u64 = 60;
 const STUCK_WARN_INTERVAL_SECS: u64 = 60;
@@ -691,6 +693,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                                             first_bucket = ?stats.first_bucket,
                                             last_bucket = ?stats.last_bucket,
                                             dirty_recompute_pending = state_store.has_pending_dirty_recompute(),
+                                            oi_ratio_patch_pending = state_store.has_pending_oi_ratio_patch(),
                                             "live canonical tail reconcile ingested db truth"
                                         );
                                     }
@@ -737,9 +740,29 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                 );
 
                 let Some(_next_minute) = next_minute else {
+                    if state_store.has_pending_oi_ratio_patch() {
+                        process_pending_oi_ratio_patches(
+                            &dispatcher,
+                            &mut state_store,
+                            &runtime_options,
+                            &metrics,
+                        )
+                        .await
+                        .context("process oi_ratio patch minutes without live ready minute")?;
+                    }
                     continue;
                 };
                 let Some(ready_through_ts) = ready_through_ts else {
+                    if state_store.has_pending_oi_ratio_patch() {
+                        process_pending_oi_ratio_patches(
+                            &dispatcher,
+                            &mut state_store,
+                            &runtime_options,
+                            &metrics,
+                        )
+                        .await
+                        .context("process oi_ratio patch minutes while no live minute is ready")?;
+                    }
                     continue;
                 };
                 if let Err(err) = process_ready_minutes(
@@ -1027,6 +1050,7 @@ async fn shutdown_drain_and_persist(
         let last_persisted_after = ts_from_millis(metrics.snapshot().last_persisted_ts_ms);
         let next_minute_after = scheduler.next_minute_to_emit();
         let dirty_pending_after = state_store.has_pending_dirty_recompute();
+        let oi_ratio_patch_pending_after = state_store.has_pending_oi_ratio_patch();
 
         let processed_this_round = match (next_minute_before, next_minute_after) {
             (Some(before), Some(after)) if after > before => {
@@ -1053,6 +1077,7 @@ async fn shutdown_drain_and_persist(
                 shutdown_closed_minute = %shutdown_closed_minute,
                 last_persisted_ts = ?last_persisted_after,
                 dirty_recompute_pending = dirty_pending_after,
+                oi_ratio_patch_pending = oi_ratio_patch_pending_after,
                 elapsed_ms = started_at.elapsed().as_millis(),
                 "shutdown drain + persist reached a stable frontier"
             );
@@ -1690,6 +1715,10 @@ fn refresh_runtime_observability_metrics(
         ts_to_millis(frontier_snapshot.dirty_recompute_from_ts),
         ts_to_millis(frontier_snapshot.dirty_recompute_end_ts),
     );
+    metrics.set_oi_ratio_patch_bounds(
+        ts_to_millis(frontier_snapshot.oi_ratio_patch_from_ts),
+        ts_to_millis(frontier_snapshot.oi_ratio_patch_end_ts),
+    );
     metrics.set_channel_lengths(trade_channel_len, non_trade_channel_len);
     metrics.set_canonical_frontiers(
         ts_to_millis(frontier_snapshot.trade_futures_ts),
@@ -1778,6 +1807,8 @@ fn maybe_warn_runtime_stall(
         funding_futures_ts = ?frontier_snapshot.funding_futures_ts,
         dirty_recompute_from_ts = ?frontier_snapshot.dirty_recompute_from_ts,
         dirty_recompute_end_ts = ?frontier_snapshot.dirty_recompute_end_ts,
+        oi_ratio_patch_from_ts = ?frontier_snapshot.oi_ratio_patch_from_ts,
+        oi_ratio_patch_end_ts = ?frontier_snapshot.oi_ratio_patch_end_ts,
         last_finalized_minute_ts = ?frontier_snapshot.last_finalized_minute_ts,
         effective_history_floor_ts = ?frontier_snapshot.effective_history_floor_ts,
         next_minute_present = next_minute_presence.minute_present,
@@ -2143,9 +2174,14 @@ async fn process_ready_minutes(
         }
     }
 
+    let oi_ratio_patch_windows_processed =
+        process_pending_oi_ratio_patches(dispatcher, state_store, runtime_options, &metrics)
+            .await?;
+
     if let Some(last_bucket) = last_bucket {
         let first_bucket = first_bucket.unwrap_or(last_bucket);
         let elapsed_ms = batch_started_at.elapsed().as_millis();
+        metrics.set_live_ready_to_bundle_ms(elapsed_ms);
         if missing_union.is_empty() {
             info!(
                 ts_bucket_from = %first_bucket,
@@ -2153,6 +2189,7 @@ async fn process_ready_minutes(
                 processed_windows = windows_processed,
                 planned_ready_minutes = planned_ready_minutes,
                 dirty_windows_processed = dirty_windows_processed,
+                oi_ratio_patch_windows_processed = oi_ratio_patch_windows_processed,
                 dirty_pending_at_start = had_dirty_pending_at_start,
                 ready_through_ts = %ready_through_ts,
                 elapsed_ms = elapsed_ms,
@@ -2173,6 +2210,7 @@ async fn process_ready_minutes(
                 processed_windows = windows_processed,
                 planned_ready_minutes = planned_ready_minutes,
                 dirty_windows_processed = dirty_windows_processed,
+                oi_ratio_patch_windows_processed = oi_ratio_patch_windows_processed,
                 dirty_pending_at_start = had_dirty_pending_at_start,
                 ready_through_ts = %ready_through_ts,
                 elapsed_ms = elapsed_ms,
@@ -2186,6 +2224,59 @@ async fn process_ready_minutes(
     }
 
     Ok(())
+}
+
+async fn process_pending_oi_ratio_patches(
+    dispatcher: &Dispatcher,
+    state_store: &mut StateStore,
+    runtime_options: &IndicatorRuntimeOptions,
+    metrics: &Arc<AppMetrics>,
+) -> Result<usize> {
+    let mut processed = 0usize;
+    while processed < OI_RATIO_PATCH_WINDOW_BUDGET_PER_TICK {
+        let batch_started_at = Instant::now();
+        let batch_size = OI_RATIO_PATCH_BATCH_SIZE
+            .min(OI_RATIO_PATCH_WINDOW_BUDGET_PER_TICK.saturating_sub(processed));
+        let patch_range = state_store.pending_oi_ratio_patch_batch_range(batch_size);
+        if let Some((patch_from, patch_to)) = patch_range {
+            debug!(
+                patch_from = %patch_from,
+                patch_to = %patch_to,
+                "processing pending oi_ratio patch batch"
+            );
+        }
+        let patch_batch = state_store.take_oi_ratio_patch_batch(batch_size);
+        if patch_batch.is_empty() {
+            break;
+        }
+        let patch_batch_len = patch_batch.len();
+        processed += patch_batch_len;
+        for minute in patch_batch {
+            let bundle = state_store.build_oi_ratio_patch_bundle_for_minute(minute);
+            let ictx = Arc::new(IndicatorContext::from_bundle(
+                &bundle,
+                runtime_options,
+                KlineHistorySupplement::default(),
+            ));
+            dispatcher.process_oi_ratio_patch_window(ictx).await?;
+        }
+        let elapsed_ms = batch_started_at.elapsed().as_millis();
+        metrics.record_oi_ratio_patch_batch(patch_batch_len, elapsed_ms);
+        metrics.record_oi_ratio_patch_republish(patch_batch_len);
+        if let Some((patch_from, patch_to)) = patch_range {
+            debug!(
+                reason = "oi_ratio_patch",
+                from_ts = %patch_from,
+                to_ts = %patch_to,
+                windows_processed = patch_batch_len,
+                elapsed_ms = elapsed_ms,
+                batch_size = batch_size,
+                live_windows_skipped_due_to_budget = 0,
+                "oi_ratio patch batch processed"
+            );
+        }
+    }
+    Ok(processed)
 }
 
 fn replay_heatmap_hydration_batch_end(

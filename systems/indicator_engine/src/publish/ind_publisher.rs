@@ -138,16 +138,34 @@ impl IndPublisher {
         indicators_json: &Value,
         indicator_count: usize,
     ) -> Result<BundleOutboxMessage> {
+        self.build_minute_bundle_outbox_message_with_extra_headers(
+            ts_bucket,
+            symbol,
+            indicators_json,
+            indicator_count,
+            None,
+        )
+    }
+
+    pub fn build_minute_bundle_outbox_message_with_extra_headers(
+        &self,
+        ts_bucket: DateTime<Utc>,
+        symbol: &str,
+        indicators_json: &Value,
+        indicator_count: usize,
+        extra_headers: Option<Value>,
+    ) -> Result<BundleOutboxMessage> {
         let (routing_key, message_id, _trace_id, payload_json) =
             self.build_minute_bundle_payload(ts_bucket, symbol, indicators_json, indicator_count)?;
         let payload_bytes = gzip_json_bytes(&payload_json)?;
+        let headers_json = merge_headers(self.build_headers_json(), extra_headers);
 
         Ok(BundleOutboxMessage {
             exchange_name: self.exchange_name.clone(),
             routing_key,
             message_id,
             schema_version: INDICATOR_OUTBOX_SCHEMA_VERSION,
-            headers_json: self.build_headers_json(),
+            headers_json,
             symbol: symbol.to_uppercase(),
             ts_bucket,
             indicator_count: indicator_count as i32,
@@ -212,6 +230,19 @@ impl IndPublisher {
             "producer_instance_id": self.producer_instance_id,
         })
     }
+}
+
+fn merge_headers(base: Value, extra: Option<Value>) -> Value {
+    let mut out = match base {
+        Value::Object(map) => map,
+        _ => return base,
+    };
+    if let Some(Value::Object(extra_map)) = extra {
+        for (key, value) in extra_map {
+            out.insert(key, value);
+        }
+    }
+    Value::Object(out)
 }
 
 fn stable_uuid(scope: &str, identity: &str) -> Uuid {

@@ -14,6 +14,13 @@ pub struct SnapshotWriter {
     pool: PgPool,
 }
 
+#[derive(sqlx::FromRow)]
+struct SnapshotBundleRow {
+    indicator_code: String,
+    window_code: String,
+    payload_json: Value,
+}
+
 impl SnapshotWriter {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
@@ -169,6 +176,54 @@ impl SnapshotWriter {
             );
         }
         Ok(())
+    }
+
+    pub async fn enqueue_bundle_repairs(&self, messages: &[BundleOutboxMessage]) -> Result<()> {
+        if messages.is_empty() {
+            return Ok(());
+        }
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("begin indicator repair outbox tx")?;
+        enqueue_outbox_batch_in_tx(&mut tx, messages).await?;
+        tx.commit()
+            .await
+            .context("commit indicator repair outbox tx")?;
+        Ok(())
+    }
+
+    pub async fn load_minute_bundle_indicators_json(
+        &self,
+        symbol: &str,
+        ts_bucket: DateTime<Utc>,
+    ) -> Result<(Value, usize)> {
+        let rows: Vec<SnapshotBundleRow> = sqlx::query_as(
+            r#"
+            SELECT indicator_code, window_code, payload_json
+            FROM feat.indicator_snapshot
+            WHERE symbol = $1
+              AND ts_snapshot = $2
+            ORDER BY indicator_code
+            "#,
+        )
+        .bind(symbol.to_uppercase())
+        .bind(ts_bucket)
+        .fetch_all(&self.pool)
+        .await
+        .context("fetch snapshot rows for repair bundle rebuild")?;
+
+        if rows.is_empty() {
+            anyhow::bail!(
+                "no indicator_snapshot rows found for symbol={} ts_bucket={}",
+                symbol,
+                ts_bucket
+            );
+        }
+
+        let row_count = rows.len();
+        Ok((assemble_bundle_indicators_json(rows), row_count))
     }
 
     pub async fn rewind_progress(&self, symbol: &str, ts_bucket: DateTime<Utc>) -> Result<()> {
@@ -431,6 +486,19 @@ fn interval_text_by_window(window_code: &str) -> String {
         "1d" => "1 day".to_string(),
         "3d" => "3 days".to_string(),
         _ => "1 minute".to_string(),
+    }
+}
+
+fn snapshot_window_rank(window_code: &str) -> usize {
+    match window_code {
+        "5m" => 0,
+        "1m" => 1,
+        "15m" => 2,
+        "1h" => 3,
+        "4h" => 4,
+        "1d" => 5,
+        "3d" => 6,
+        _ => usize::MAX,
     }
 }
 
@@ -765,9 +833,30 @@ fn singularize_array_key(key: &str) -> &'static str {
     }
 }
 
+fn assemble_bundle_indicators_json(mut rows: Vec<SnapshotBundleRow>) -> Value {
+    rows.sort_by(|a, b| {
+        a.indicator_code.cmp(&b.indicator_code).then_with(|| {
+            snapshot_window_rank(&a.window_code).cmp(&snapshot_window_rank(&b.window_code))
+        })
+    });
+
+    let mut indicators = Map::new();
+    for row in &rows {
+        indicators
+            .entry(row.indicator_code.clone())
+            .or_insert_with(|| {
+                json!({
+                    "window_code": row.window_code,
+                    "payload": row.payload_json,
+                })
+            });
+    }
+    Value::Object(indicators)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::compact_snapshot_payload;
+    use super::{assemble_bundle_indicators_json, compact_snapshot_payload, SnapshotBundleRow};
     use serde_json::json;
 
     #[test]
@@ -899,5 +988,34 @@ mod tests {
         assert_eq!(compacted["tpo_single_print_zones_count"], json!(2));
         assert!(compacted.get("peak_levels").is_none());
         assert!(compacted.get("tpo_single_print_zones").is_none());
+    }
+
+    #[test]
+    fn repair_bundle_prefers_primary_window_rank_over_lexical_order() {
+        let indicators = assemble_bundle_indicators_json(vec![
+            SnapshotBundleRow {
+                indicator_code: "open_interest".to_string(),
+                window_code: "15m".to_string(),
+                payload_json: json!({"window":"15m"}),
+            },
+            SnapshotBundleRow {
+                indicator_code: "open_interest".to_string(),
+                window_code: "5m".to_string(),
+                payload_json: json!({"window":"5m"}),
+            },
+            SnapshotBundleRow {
+                indicator_code: "long_short_ratios".to_string(),
+                window_code: "1d".to_string(),
+                payload_json: json!({"window":"1d"}),
+            },
+            SnapshotBundleRow {
+                indicator_code: "long_short_ratios".to_string(),
+                window_code: "5m".to_string(),
+                payload_json: json!({"window":"5m"}),
+            },
+        ]);
+
+        assert_eq!(indicators["open_interest"]["window_code"], json!("5m"));
+        assert_eq!(indicators["long_short_ratios"]["window_code"], json!("5m"));
     }
 }

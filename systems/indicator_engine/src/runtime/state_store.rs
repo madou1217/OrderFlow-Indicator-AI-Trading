@@ -9,6 +9,7 @@ use crate::ingest::decoder::{
 };
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use tracing::debug;
 
 pub const HISTORY_LIMIT_MINUTES: usize = 60 * 24 * 9; // keep 9 days
 const PRICE_SCALE: f64 = 100.0; // 0.01 tick bin for level-based outputs
@@ -366,6 +367,8 @@ pub struct CanonicalFrontierSnapshot {
     pub effective_history_floor_ts: Option<DateTime<Utc>>,
     pub dirty_recompute_from_ts: Option<DateTime<Utc>>,
     pub dirty_recompute_end_ts: Option<DateTime<Utc>>,
+    pub oi_ratio_patch_from_ts: Option<DateTime<Utc>>,
+    pub oi_ratio_patch_end_ts: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1229,6 +1232,10 @@ pub struct StateStore {
     // dirty_recompute_from. Reset to false whenever dirty_from moves to an earlier
     // minute (requiring a fresh truncation).
     dirty_recompute_truncated: bool,
+    oi_ratio_patch_from: Option<DateTime<Utc>>,
+    oi_ratio_patch_end: Option<DateTime<Utc>>,
+    oi_ratio_patch_mark_total: u64,
+    oi_ratio_patch_extends_backward_total: u64,
     last_finalized_minute: Option<DateTime<Utc>>,
 }
 
@@ -1267,6 +1274,10 @@ impl StateStore {
             dirty_recompute_from: None,
             dirty_recompute_end: None,
             dirty_recompute_truncated: false,
+            oi_ratio_patch_from: None,
+            oi_ratio_patch_end: None,
+            oi_ratio_patch_mark_total: 0,
+            oi_ratio_patch_extends_backward_total: 0,
             last_finalized_minute: None,
         }
     }
@@ -1301,6 +1312,10 @@ impl StateStore {
         self.dirty_recompute_from = None;
         self.dirty_recompute_end = None;
         self.dirty_recompute_truncated = false;
+        self.oi_ratio_patch_from = None;
+        self.oi_ratio_patch_end = None;
+        self.oi_ratio_patch_mark_total = 0;
+        self.oi_ratio_patch_extends_backward_total = 0;
         self.last_finalized_minute = None;
     }
 
@@ -1312,6 +1327,11 @@ impl StateStore {
         self.dirty_recompute_from = None;
         self.dirty_recompute_end = None;
         self.dirty_recompute_truncated = false;
+    }
+
+    pub fn clear_oi_ratio_patch_state(&mut self) {
+        self.oi_ratio_patch_from = None;
+        self.oi_ratio_patch_end = None;
     }
 
     pub fn reset_for_new_continuous_segment(&mut self, start: DateTime<Utc>) {
@@ -1365,6 +1385,8 @@ impl StateStore {
             effective_history_floor_ts: self.effective_history_floor_ts,
             dirty_recompute_from_ts: self.dirty_recompute_from,
             dirty_recompute_end_ts: self.dirty_recompute_end,
+            oi_ratio_patch_from_ts: self.oi_ratio_patch_from,
+            oi_ratio_patch_end_ts: self.oi_ratio_patch_end,
             ..CanonicalFrontierSnapshot::default()
         };
 
@@ -1646,6 +1668,10 @@ impl StateStore {
         self.dirty_recompute_from.is_some()
     }
 
+    pub fn has_pending_oi_ratio_patch(&self) -> bool {
+        self.oi_ratio_patch_from.is_some()
+    }
+
     pub fn pending_dirty_recompute_batch_range(
         &self,
         max_batch: usize,
@@ -1660,6 +1686,52 @@ impl StateStore {
             start,
             end.min(start + Duration::minutes(batch_span_minutes)),
         ))
+    }
+
+    pub fn pending_oi_ratio_patch_batch_range(
+        &self,
+        max_batch: usize,
+    ) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+        let start = self.oi_ratio_patch_from?;
+        let end = self.oi_ratio_patch_end.or(self.last_finalized_minute)?;
+        if start > end {
+            return None;
+        }
+        let batch_span_minutes = i64::try_from(max_batch.saturating_sub(1)).unwrap_or(i64::MAX);
+        Some((
+            start,
+            end.min(start + Duration::minutes(batch_span_minutes)),
+        ))
+    }
+
+    pub fn take_oi_ratio_patch_batch(&mut self, max_batch: usize) -> Vec<DateTime<Utc>> {
+        let Some(start) = self.oi_ratio_patch_from else {
+            return Vec::new();
+        };
+        let Some(end) = self.oi_ratio_patch_end.or(self.last_finalized_minute) else {
+            self.clear_oi_ratio_patch_state();
+            return Vec::new();
+        };
+        if start > end {
+            self.clear_oi_ratio_patch_state();
+            return Vec::new();
+        }
+
+        let batch_span_minutes = i64::try_from(max_batch.saturating_sub(1)).unwrap_or(i64::MAX);
+        let batch_end = end.min(start + Duration::minutes(batch_span_minutes));
+        if batch_end >= end {
+            self.clear_oi_ratio_patch_state();
+        } else {
+            self.oi_ratio_patch_from = Some(batch_end + Duration::minutes(1));
+        }
+
+        let mut out = Vec::new();
+        let mut minute = start;
+        while minute <= batch_end {
+            out.push(minute);
+            minute += Duration::minutes(1);
+        }
+        out
     }
 
     pub fn has_unhydrated_futures_orderbook_heatmap_in_range(
@@ -1828,7 +1900,10 @@ impl StateStore {
             |item| item.ts_bucket,
         );
         if changed {
-            self.mark_dirty_recompute_if_finalized(open_interest_hist.ts_bucket);
+            self.mark_oi_ratio_patch_if_finalized(
+                open_interest_hist.ts_bucket,
+                "open_interest_hist_5m_changed",
+            );
         }
     }
 
@@ -1863,7 +1938,48 @@ impl StateStore {
             ),
         };
         if changed {
-            self.mark_dirty_recompute_if_finalized(long_short_ratio.ts_bucket);
+            self.mark_oi_ratio_patch_if_finalized(
+                long_short_ratio.ts_bucket,
+                "long_short_ratio_5m_changed",
+            );
+        }
+    }
+
+    fn mark_oi_ratio_patch_if_finalized(&mut self, ts_bucket: DateTime<Utc>, reason: &'static str) {
+        if self
+            .last_finalized_minute
+            .map(|last| ts_bucket <= last)
+            .unwrap_or(false)
+        {
+            let old_from = self.oi_ratio_patch_from;
+            let extends_backward = old_from.map(|prev| ts_bucket < prev).unwrap_or(true);
+            self.oi_ratio_patch_from = Some(
+                self.oi_ratio_patch_from
+                    .map(|prev| prev.min(ts_bucket))
+                    .unwrap_or(ts_bucket),
+            );
+            if let Some(last) = self.last_finalized_minute {
+                self.oi_ratio_patch_end = Some(
+                    self.oi_ratio_patch_end
+                        .map(|prev| prev.max(last))
+                        .unwrap_or(last),
+                );
+            }
+            self.oi_ratio_patch_mark_total += 1;
+            if extends_backward {
+                self.oi_ratio_patch_extends_backward_total += 1;
+            }
+            debug!(
+                oi_ratio_patch_mark_total = self.oi_ratio_patch_mark_total,
+                oi_ratio_patch_mark_minute = %ts_bucket,
+                oi_ratio_patch_mark_reason = reason,
+                oi_ratio_patch_extends_backward = extends_backward,
+                oi_ratio_patch_extends_backward_total = self.oi_ratio_patch_extends_backward_total,
+                oi_ratio_patch_from = ?self.oi_ratio_patch_from,
+                oi_ratio_patch_end = ?self.oi_ratio_patch_end,
+                last_finalized_minute = ?self.last_finalized_minute,
+                "oi_ratio patch minute marked"
+            );
         }
     }
 
@@ -2067,6 +2183,45 @@ impl StateStore {
         }
     }
 
+    pub fn build_oi_ratio_patch_bundle_for_minute(&self, ts_bucket: DateTime<Utc>) -> WindowBundle {
+        let as_of_ts = ts_bucket + Duration::minutes(1);
+        let oi_ratio_view = self.build_oi_ratio_view_for_minute(ts_bucket);
+        let futures = self
+            .history_row(MarketKind::Futures, ts_bucket)
+            .map(minute_window_from_history_row)
+            .unwrap_or_else(|| MinuteWindowData::empty(MarketKind::Futures, ts_bucket));
+        let spot = self
+            .history_row(MarketKind::Spot, ts_bucket)
+            .map(minute_window_from_history_row)
+            .unwrap_or_else(|| MinuteWindowData::empty(MarketKind::Spot, ts_bucket));
+        WindowBundle {
+            ts_bucket,
+            symbol: self.symbol.clone(),
+            futures,
+            spot,
+            history_futures: self.history_prefix(MarketKind::Futures, ts_bucket),
+            history_spot: self.history_prefix(MarketKind::Spot, ts_bucket),
+            trade_history_futures: self
+                .build_trade_history_with_canonical_backfill_until(MarketKind::Futures, ts_bucket),
+            trade_history_spot: self
+                .build_trade_history_with_canonical_backfill_until(MarketKind::Spot, ts_bucket),
+            latest_mark: self.latest_mark_as_of(as_of_ts),
+            latest_funding: self.latest_funding_as_of(as_of_ts),
+            funding_changes_in_window: self.funding_changes_between(ts_bucket, as_of_ts),
+            funding_points_in_window: self.funding_points_between(ts_bucket, as_of_ts),
+            mark_points_in_window: self.mark_points_between(ts_bucket, as_of_ts),
+            funding_changes_recent: self.funding_changes_until(as_of_ts),
+            funding_points_recent: self.funding_points_until(as_of_ts),
+            mark_points_recent: self.mark_points_until(as_of_ts),
+            latest_common_oi_ratio_bucket: oi_ratio_view.latest_common_bucket,
+            current_open_interest: oi_ratio_view.current_open_interest,
+            open_interest_hist_5m: oi_ratio_view.open_interest_hist_5m,
+            global_account_ratio_5m: oi_ratio_view.global_account_ratio_5m,
+            top_account_ratio_5m: oi_ratio_view.top_account_ratio_5m,
+            top_position_ratio_5m: oi_ratio_view.top_position_ratio_5m,
+        }
+    }
+
     fn build_oi_ratio_view_for_minute(&self, ts_bucket: DateTime<Utc>) -> OiRatioWindowView {
         let as_of_ts = ts_bucket + Duration::minutes(1);
         let current_open_interest = self
@@ -2139,6 +2294,26 @@ impl StateStore {
         &self,
         market: MarketKind,
     ) -> Vec<MinuteHistory> {
+        let up_to_ts = match market {
+            MarketKind::Futures => self.history_futures.back().map(|h| h.ts_bucket),
+            MarketKind::Spot => self.history_spot.back().map(|h| h.ts_bucket),
+        };
+        self.build_trade_history_with_canonical_backfill_until_opt(market, up_to_ts)
+    }
+
+    fn build_trade_history_with_canonical_backfill_until(
+        &self,
+        market: MarketKind,
+        up_to_ts: DateTime<Utc>,
+    ) -> Vec<MinuteHistory> {
+        self.build_trade_history_with_canonical_backfill_until_opt(market, Some(up_to_ts))
+    }
+
+    fn build_trade_history_with_canonical_backfill_until_opt(
+        &self,
+        market: MarketKind,
+        up_to_ts: Option<DateTime<Utc>>,
+    ) -> Vec<MinuteHistory> {
         let history = match market {
             MarketKind::Futures => &self.history_futures,
             MarketKind::Spot => &self.history_spot,
@@ -2146,7 +2321,11 @@ impl StateStore {
         let Some(mut minute) = history.front().map(|h| h.ts_bucket) else {
             return Vec::new();
         };
-        let Some(last_minute) = history.back().map(|h| h.ts_bucket) else {
+        let Some(last_minute) = history
+            .back()
+            .map(|h| h.ts_bucket)
+            .map(|last| up_to_ts.map(|bound| last.min(bound)).unwrap_or(last))
+        else {
             return Vec::new();
         };
 
@@ -2185,6 +2364,102 @@ impl StateStore {
         }
 
         out
+    }
+
+    fn history_row(&self, market: MarketKind, ts_bucket: DateTime<Utc>) -> Option<&MinuteHistory> {
+        let history = match market {
+            MarketKind::Futures => &self.history_futures,
+            MarketKind::Spot => &self.history_spot,
+        };
+        history.iter().find(|row| row.ts_bucket == ts_bucket)
+    }
+
+    fn history_prefix(&self, market: MarketKind, up_to_ts: DateTime<Utc>) -> Vec<MinuteHistory> {
+        let history = match market {
+            MarketKind::Futures => &self.history_futures,
+            MarketKind::Spot => &self.history_spot,
+        };
+        history
+            .iter()
+            .filter(|row| row.ts_bucket <= up_to_ts)
+            .cloned()
+            .collect()
+    }
+
+    fn latest_mark_as_of(&self, as_of_ts: DateTime<Utc>) -> Option<LatestMarkState> {
+        self.mark_timeline
+            .iter()
+            .rev()
+            .find(|point| point.ts <= as_of_ts)
+            .cloned()
+    }
+
+    fn latest_funding_as_of(&self, as_of_ts: DateTime<Utc>) -> Option<LatestFundingState> {
+        self.funding_timeline
+            .iter()
+            .rev()
+            .find(|point| point.ts <= as_of_ts)
+            .cloned()
+    }
+
+    fn funding_changes_between(
+        &self,
+        start_ts: DateTime<Utc>,
+        end_ts: DateTime<Utc>,
+    ) -> Vec<FundingChange> {
+        self.funding_changes
+            .iter()
+            .filter(|point| point.ts_change >= start_ts && point.ts_change < end_ts)
+            .cloned()
+            .collect()
+    }
+
+    fn funding_points_between(
+        &self,
+        start_ts: DateTime<Utc>,
+        end_ts: DateTime<Utc>,
+    ) -> Vec<LatestFundingState> {
+        self.funding_timeline
+            .iter()
+            .filter(|point| point.ts >= start_ts && point.ts < end_ts)
+            .cloned()
+            .collect()
+    }
+
+    fn mark_points_between(
+        &self,
+        start_ts: DateTime<Utc>,
+        end_ts: DateTime<Utc>,
+    ) -> Vec<LatestMarkState> {
+        self.mark_timeline
+            .iter()
+            .filter(|point| point.ts >= start_ts && point.ts < end_ts)
+            .cloned()
+            .collect()
+    }
+
+    fn funding_changes_until(&self, as_of_ts: DateTime<Utc>) -> Vec<FundingChange> {
+        self.funding_changes
+            .iter()
+            .filter(|point| point.ts_change <= as_of_ts)
+            .cloned()
+            .collect()
+    }
+
+    fn funding_points_until(&self, as_of_ts: DateTime<Utc>) -> Vec<LatestFundingState> {
+        self.funding_timeline
+            .iter()
+            .filter(|point| point.ts <= as_of_ts)
+            .cloned()
+            .collect()
+    }
+
+    fn mark_points_until(&self, as_of_ts: DateTime<Utc>) -> Vec<LatestMarkState> {
+        self.mark_timeline
+            .iter()
+            .filter(|point| point.ts <= as_of_ts)
+            .cloned()
+            .collect()
     }
 
     fn push_finalized_vpin_snapshot(&mut self, market: MarketKind, ts_bucket: DateTime<Utc>) {
@@ -2663,6 +2938,58 @@ fn build_trade_history_row_from_canonical(
     }
 }
 
+fn minute_window_from_history_row(row: &MinuteHistory) -> MinuteWindowData {
+    MinuteWindowData {
+        market: row.market,
+        ts_bucket: row.ts_bucket,
+        trade_count: 0,
+        buy_qty: row.buy_qty,
+        sell_qty: row.sell_qty,
+        total_qty: row.total_qty,
+        buy_notional: 0.0,
+        sell_notional: 0.0,
+        total_notional: row.total_notional,
+        delta: row.delta,
+        relative_delta: row.relative_delta,
+        first_price: row.open_price,
+        last_price: row.last_price.or(row.close_price),
+        high_price: row.high_price,
+        low_price: row.low_price,
+        profile: row.profile.clone(),
+        force_liq: row.force_liq.clone(),
+        heatmap: BTreeMap::new(),
+        depth_k: ORDERBOOK_TOPK,
+        spread_twa: row.spread_twa,
+        topk_depth_twa: row.topk_depth_twa,
+        obi_twa: row.obi_twa,
+        obi_l1_twa: row.obi_l1_twa,
+        obi_k_twa: row.obi_k_twa,
+        obi_k_dw_twa: row.obi_k_dw_twa,
+        obi_k_dw_close: row.obi_k_dw_close,
+        obi_k_dw_change: row.obi_k_dw_change,
+        obi_k_dw_adj_twa: row.obi_k_dw_adj_twa,
+        ofi: row.ofi,
+        bbo_updates: row.bbo_updates,
+        microprice_twa: row.microprice_twa,
+        microprice_classic_twa: row.microprice_classic_twa,
+        microprice_kappa_twa: row.microprice_kappa_twa,
+        microprice_adj_twa: row.microprice_adj_twa,
+        avwap: row.avwap_minute,
+        whale: WhaleStats {
+            trade_count: row.whale_trade_count,
+            buy_count: row.whale_buy_count,
+            sell_count: row.whale_sell_count,
+            notional_total: row.whale_notional_total,
+            notional_buy: row.whale_notional_buy,
+            notional_sell: row.whale_notional_sell,
+            qty_eth_total: row.whale_qty_eth_total,
+            qty_eth_buy: row.whale_qty_eth_buy,
+            qty_eth_sell: row.whale_qty_eth_sell,
+            max_single_notional: row.whale_max_single_notional,
+        },
+    }
+}
+
 fn collect_heatmap_levels(
     bids: &BTreeMap<i64, f64>,
     asks: &BTreeMap<i64, f64>,
@@ -2690,7 +3017,8 @@ mod tests {
     use crate::ingest::decoder::{
         AggFundingMark1mEvent, AggFundingPoint, AggHeatmapLevel, AggLiq1mEvent, AggLiqLevel,
         AggMarkPoint, AggOrderbook1mEvent, AggProfileLevel, AggTrade1mEvent, AggVpinSnapshot,
-        AggWhaleStats, BboEvent, EngineEvent, KlineEvent, MarketKind, MdData,
+        AggWhaleStats, BboEvent, EngineEvent, KlineEvent, LongShortRatio5mEvent,
+        LongShortRatioType, MarketKind, MdData, OpenInterestHist5mEvent,
     };
     use chrono::{Duration as ChronoDuration, TimeZone, Utc};
     use uuid::Uuid;
@@ -2762,6 +3090,55 @@ mod tests {
         event.market = MarketKind::Spot;
         event.routing_key = "md.agg.spot.trade.1m.testusdt".to_string();
         event
+    }
+
+    fn oi_hist_event(ts_bucket: chrono::DateTime<Utc>, oi_value: f64) -> EngineEvent {
+        EngineEvent {
+            schema_version: 1,
+            msg_type: "md.open_interest.hist.5m".to_string(),
+            message_id: Uuid::new_v4(),
+            trace_id: Uuid::new_v4(),
+            routing_key: "md.futures.open_interest.hist.5m.testusdt".to_string(),
+            market: MarketKind::Futures,
+            symbol: "TESTUSDT".to_string(),
+            source_kind: "test".to_string(),
+            backfill_in_progress: false,
+            event_ts: ts_bucket + ChronoDuration::minutes(5),
+            published_at: ts_bucket + ChronoDuration::minutes(5),
+            data: MdData::OpenInterestHist5m(OpenInterestHist5mEvent {
+                ts_bucket,
+                open_interest_contracts: oi_value / 100.0,
+                open_interest_value_usdt: oi_value,
+                reference_price: Some(2000.0),
+            }),
+        }
+    }
+
+    fn ratio_event(
+        ts_bucket: chrono::DateTime<Utc>,
+        ratio_type: LongShortRatioType,
+        value: f64,
+    ) -> EngineEvent {
+        EngineEvent {
+            schema_version: 1,
+            msg_type: "md.long_short_ratio.5m".to_string(),
+            message_id: Uuid::new_v4(),
+            trace_id: Uuid::new_v4(),
+            routing_key: "md.futures.long_short_ratio.5m.testusdt".to_string(),
+            market: MarketKind::Futures,
+            symbol: "TESTUSDT".to_string(),
+            source_kind: "test".to_string(),
+            backfill_in_progress: false,
+            event_ts: ts_bucket + ChronoDuration::minutes(5),
+            published_at: ts_bucket + ChronoDuration::minutes(5),
+            data: MdData::LongShortRatio5m(LongShortRatio5mEvent {
+                ts_bucket,
+                ratio_type,
+                long_short_ratio: value,
+                long_account_ratio: Some(0.6),
+                short_account_ratio: Some(0.4),
+            }),
+        }
     }
 
     fn agg_trade_event_with_profile(
@@ -3438,6 +3815,44 @@ mod tests {
 
         assert!(!store.has_pending_dirty_recompute());
         assert_eq!(store.last_finalized_minute(), None);
+    }
+
+    #[test]
+    fn late_oi_hist_marks_patch_not_global_dirty() {
+        let mut store = StateStore::new("TESTUSDT".to_string(), 1_000.0);
+        let ts = Utc.with_ymd_and_hms(2026, 3, 6, 9, 0, 0).single().unwrap();
+        store.finalize_minute(ts);
+
+        store.ingest(oi_hist_event(ts, 1_000_000.0));
+
+        assert!(store.has_pending_oi_ratio_patch());
+        assert!(!store.has_pending_dirty_recompute());
+        assert_eq!(store.pending_oi_ratio_patch_batch_range(10), Some((ts, ts)));
+    }
+
+    #[test]
+    fn late_ratio_marks_patch_not_global_dirty() {
+        let mut store = StateStore::new("TESTUSDT".to_string(), 1_000.0);
+        let ts = Utc.with_ymd_and_hms(2026, 3, 6, 9, 5, 0).single().unwrap();
+        store.finalize_minute(ts);
+
+        store.ingest(ratio_event(ts, LongShortRatioType::GlobalAccount, 1.2));
+
+        assert!(store.has_pending_oi_ratio_patch());
+        assert!(!store.has_pending_dirty_recompute());
+        assert_eq!(store.pending_oi_ratio_patch_batch_range(10), Some((ts, ts)));
+    }
+
+    #[test]
+    fn frontier_snapshot_exposes_oi_ratio_patch_bounds() {
+        let mut store = StateStore::new("TESTUSDT".to_string(), 1_000.0);
+        let ts = Utc.with_ymd_and_hms(2026, 3, 6, 9, 10, 0).single().unwrap();
+        store.finalize_minute(ts);
+        store.ingest(oi_hist_event(ts, 1_100_000.0));
+
+        let snapshot = store.canonical_frontier_snapshot();
+        assert_eq!(snapshot.oi_ratio_patch_from_ts, Some(ts));
+        assert_eq!(snapshot.oi_ratio_patch_end_ts, Some(ts));
     }
 
     #[test]

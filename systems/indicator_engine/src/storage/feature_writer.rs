@@ -123,6 +123,12 @@ impl FeatureWriter {
         Ok(())
     }
 
+    pub async fn write_oi_ratio_only(&self, ctx: &IndicatorContext) -> Result<()> {
+        self.insert_open_interest_feature_windows(ctx).await?;
+        self.insert_long_short_ratio_feature_windows(ctx).await?;
+        Ok(())
+    }
+
     async fn insert_trade_flow_for_market_window(
         &self,
         symbol: &str,
