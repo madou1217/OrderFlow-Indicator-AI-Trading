@@ -156,7 +156,7 @@ fn build_scan_root(root: &Value) -> Value {
 
     result.insert(
         "version".to_string(),
-        Value::String("scan_v6_2".to_string()),
+        Value::String("scan_v6_3".to_string()),
     );
     if let Some(symbol) = root.get("symbol") {
         result.insert("symbol".to_string(), symbol.clone());
@@ -206,10 +206,14 @@ fn build_now(
     kline_derived: &Value,
     raw_price_structures: &[Value],
 ) -> Value {
+    let price_anchor = build_price_anchor(source, current_price);
+    let value_state_board = build_value_state_board(source, current_price);
+    let precomputed_value_read = build_precomputed_value_read(&value_state_board);
     json!({
-        "price_anchor": build_price_anchor(source, current_price),
+        "price_anchor": price_anchor.clone(),
         "location_snapshot": build_location_snapshot(source, current_price),
-        "value_state_board": build_value_state_board(source, current_price),
+        "value_state_board": value_state_board.clone(),
+        "precomputed_value_read": precomputed_value_read,
         "momentum_snapshot": build_momentum_snapshot(source),
         "bracket_board": build_bracket_board(
             source,
@@ -222,7 +226,9 @@ fn build_now(
             raw_price_structures,
             current_price,
         ),
-        "current_flow_snapshot": build_current_flow_snapshot(source, current_price),
+        "precomputed_flow_base": build_precomputed_flow_base(source),
+        "flow_supporting_evidence": build_flow_supporting_evidence(source, current_price),
+        "precomputed_cross_market": build_precomputed_cross_market(source, &price_anchor),
         "current_volume_nodes": build_current_volume_nodes(source),
     })
 }
@@ -1068,36 +1074,450 @@ fn limit_values(mut values: Vec<Value>, limit: usize) -> Vec<Value> {
     values
 }
 
-fn build_current_flow_snapshot(source: &Map<String, Value>, current_price: Option<f64>) -> Value {
-    let cvd = extract_indicator_payload(source, "cvd_pack")
-        .map(|payload| {
-            json!({
-                "delta_fut": payload.get("delta_fut").and_then(Value::as_f64),
-                "delta_spot": payload.get("delta_spot").and_then(Value::as_f64),
-                "relative_delta_fut": payload.get("relative_delta_fut").and_then(Value::as_f64),
-                "relative_delta_spot": payload.get("relative_delta_spot").and_then(Value::as_f64),
-                "likely_driver": payload.get("likely_driver").and_then(Value::as_str),
-                "spot_flow_dominance": payload.get("spot_flow_dominance").cloned().unwrap_or(Value::Null),
-                "window_latest": build_cvd_latest_by_window(payload),
-            })
-        })
-        .unwrap_or(Value::Null);
-    let orderbook = extract_indicator_payload(source, "orderbook_depth")
-        .map(|payload| build_current_orderbook_snapshot(payload, current_price))
-        .unwrap_or(Value::Null);
-    let footprint = extract_indicator_payload(source, "footprint")
-        .map(|payload| filter_footprint_with_price(&Value::Object(payload.clone()), current_price))
-        .unwrap_or(Value::Null);
-    let whales = extract_indicator_payload(source, "whale_trades")
-        .map(|payload| filter_whale_trades(&Value::Object(payload.clone())))
-        .unwrap_or(Value::Null);
+fn build_precomputed_flow_base(source: &Map<String, Value>) -> Value {
+    let cvd_by_window = extract_indicator_payload(source, "cvd_pack")
+        .and_then(|payload| payload.get("by_window"))
+        .and_then(Value::as_object);
+    let whale_by_window = extract_indicator_payload(source, "whale_trades")
+        .and_then(|payload| payload.get("by_window"))
+        .and_then(Value::as_object);
+
+    let mut by_window = Map::new();
+    for tf in ["15m", "4h", "1d"] {
+        let cvd_window = cvd_by_window.and_then(|by_window| by_window.get(tf));
+        let whale_window = whale_by_window.and_then(|by_window| by_window.get(tf));
+        by_window.insert(
+            tf.to_string(),
+            build_precomputed_flow_base_for_window(cvd_window, whale_window),
+        );
+    }
+    Value::Object(by_window)
+}
+
+fn build_precomputed_flow_base_for_window(
+    cvd_window: Option<&Value>,
+    whale_window: Option<&Value>,
+) -> Value {
+    let latest_closed_delta_fut = cvd_window
+        .and_then(Value::as_object)
+        .and_then(|window| window.get("series"))
+        .and_then(Value::as_array)
+        .and_then(|series| series.last())
+        .and_then(|entry| entry.get("delta_fut"))
+        .and_then(Value::as_f64);
+    let latest_closed_delta_spot = cvd_window
+        .and_then(Value::as_object)
+        .and_then(|window| window.get("series"))
+        .and_then(Value::as_array)
+        .and_then(|series| series.last())
+        .and_then(|entry| entry.get("delta_spot"))
+        .and_then(Value::as_f64);
+    let cvd_slope = cvd_window
+        .and_then(Value::as_object)
+        .and_then(|window| window.get("series"))
+        .and_then(Value::as_array)
+        .and_then(|series| last_two_delta_fut_slope(series));
+    let fut_whale_delta = whale_window
+        .and_then(Value::as_object)
+        .and_then(|window| window.get("fut_whale_delta_notional"))
+        .and_then(Value::as_f64);
+    let spot_whale_delta = whale_window
+        .and_then(Value::as_object)
+        .and_then(|window| window.get("spot_whale_delta_notional"))
+        .and_then(Value::as_f64);
+
+    let futures_side = classify_signed_delta(latest_closed_delta_fut);
+    let spot_side = classify_signed_delta(latest_closed_delta_spot);
+    let delta_relation = classify_alignment_relation(latest_closed_delta_fut, latest_closed_delta_spot);
+    let cvd_state = classify_signed_cvd(cvd_slope);
+    let whale_state = classify_signed_whales(fut_whale_delta);
+    let whale_relation = classify_alignment_relation(fut_whale_delta, spot_whale_delta);
 
     json!({
-        "cvd": cvd,
-        "orderbook": orderbook,
-        "footprint": footprint,
-        "whales": whales,
+        "delta_read": {
+            "futures": futures_side,
+            "spot": spot_side,
+            "relation": delta_relation,
+        },
+        "cvd_read": {
+            "state": cvd_state,
+        },
+        "whale_read": {
+            "state": whale_state,
+            "spot_vs_futures_relation": whale_relation,
+        }
     })
+}
+
+fn build_flow_supporting_evidence(
+    source: &Map<String, Value>,
+    current_price: Option<f64>,
+) -> Value {
+    let filtered_orderbook = extract_indicator_payload(source, "orderbook_depth")
+        .map(|payload| build_current_orderbook_snapshot(payload, current_price))
+        .unwrap_or(Value::Null);
+    let filtered_footprint = extract_indicator_payload(source, "footprint")
+        .map(|payload| filter_footprint_with_price(&Value::Object(payload.clone()), current_price))
+        .unwrap_or(Value::Null);
+    let cvd_payload = extract_indicator_payload(source, "cvd_pack");
+    let whale_by_window = extract_indicator_payload(source, "whale_trades")
+        .and_then(|payload| payload.get("by_window"))
+        .and_then(Value::as_object);
+
+    let mut by_window = Map::new();
+    for tf in ["15m", "4h", "1d"] {
+        let cvd_window = cvd_payload
+            .and_then(|payload| payload.get("by_window"))
+            .and_then(Value::as_object)
+            .and_then(|by_window| by_window.get(tf));
+        let whale_window = whale_by_window.and_then(|by_window| by_window.get(tf));
+        let footprint_window = filtered_footprint
+            .pointer(&format!("/by_window/{tf}"));
+        let orderbook_window = if tf == "15m" {
+            filtered_orderbook.pointer("/current_window_15m")
+        } else {
+            None
+        };
+        let orderbook_root = match &filtered_orderbook {
+            Value::Null => None,
+            other => Some(other),
+        };
+        by_window.insert(
+            tf.to_string(),
+            build_flow_supporting_evidence_for_window(
+                cvd_payload,
+                cvd_window,
+                whale_window,
+                footprint_window,
+                orderbook_window,
+                orderbook_root,
+            ),
+        );
+    }
+    Value::Object(by_window)
+}
+
+fn build_flow_supporting_evidence_for_window(
+    cvd_payload: Option<&Map<String, Value>>,
+    cvd_window: Option<&Value>,
+    whale_window: Option<&Value>,
+    footprint_window: Option<&Value>,
+    orderbook_window: Option<&Value>,
+    orderbook_root: Option<&Value>,
+) -> Value {
+    let latest_closed_delta_fut = cvd_window
+        .and_then(Value::as_object)
+        .and_then(|window| window.get("series"))
+        .and_then(Value::as_array)
+        .and_then(|series| series.last())
+        .and_then(|entry| entry.get("delta_fut"))
+        .and_then(Value::as_f64)
+        .map(round2);
+    let latest_closed_delta_spot = cvd_window
+        .and_then(Value::as_object)
+        .and_then(|window| window.get("series"))
+        .and_then(Value::as_array)
+        .and_then(|series| series.last())
+        .and_then(|entry| entry.get("delta_spot"))
+        .and_then(Value::as_f64)
+        .map(round2);
+    let partial_window_delta_fut = footprint_window
+        .and_then(Value::as_object)
+        .and_then(|window| window.get("window_delta"))
+        .and_then(Value::as_f64)
+        .map(round2);
+    let partial_window_delta_spot = cvd_payload
+        .and_then(|payload| payload.get("delta_spot"))
+        .and_then(Value::as_f64)
+        .map(round2);
+    let partial_vs_closed_divergent =
+        signed_values_diverge(latest_closed_delta_fut, partial_window_delta_fut);
+    let cvd_slope = cvd_window
+        .and_then(Value::as_object)
+        .and_then(|window| window.get("series"))
+        .and_then(Value::as_array)
+        .and_then(|series| last_two_delta_fut_slope(series))
+        .map(round2);
+    let whale_delta_fut = whale_window
+        .and_then(Value::as_object)
+        .and_then(|window| window.get("fut_whale_delta_notional"))
+        .and_then(Value::as_f64)
+        .map(round2);
+    let whale_delta_spot = whale_window
+        .and_then(Value::as_object)
+        .and_then(|window| window.get("spot_whale_delta_notional"))
+        .and_then(Value::as_f64)
+        .map(round2);
+
+    let obi_close_fut = orderbook_window
+        .and_then(Value::as_object)
+        .and_then(|window| window.get("obi_fut"))
+        .and_then(Value::as_f64)
+        .or_else(|| {
+            orderbook_root
+                .and_then(|root| root.get("obi_fut"))
+                .and_then(Value::as_f64)
+        })
+        .map(round3);
+    let obi_direction = classify_orderbook_direction(obi_close_fut);
+    let ofi_close_fut = orderbook_window
+        .and_then(Value::as_object)
+        .and_then(|window| window.get("ofi_norm_fut"))
+        .and_then(Value::as_f64)
+        .or_else(|| {
+            orderbook_root
+                .and_then(|root| root.get("ofi_norm_fut"))
+                .and_then(Value::as_f64)
+        })
+        .map(round3);
+    let ofi_direction = classify_orderbook_direction(ofi_close_fut);
+
+    let nearest_ask_wall_price = orderbook_root
+        .and_then(|root| root.pointer("/liquidity_walls/ask_walls/0/price_level"))
+        .and_then(Value::as_f64)
+        .map(round2);
+    let nearest_bid_wall_price = orderbook_root
+        .and_then(|root| root.pointer("/liquidity_walls/bid_walls/0/price_level"))
+        .and_then(Value::as_f64)
+        .map(round2);
+
+    let nearest_sell_imb_prices = nearest_footprint_cluster_prices(footprint_window, "sell_imb_clusters");
+    let nearest_buy_imb_prices = nearest_footprint_cluster_prices(footprint_window, "buy_imb_clusters");
+
+    let stacked_sell_near_price = footprint_window
+        .and_then(Value::as_object)
+        .and_then(|window| window.get("stacked_sell"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let stacked_buy_near_price = footprint_window
+        .and_then(Value::as_object)
+        .and_then(|window| window.get("stacked_buy"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    json!({
+        "latest_closed_delta_fut": latest_closed_delta_fut,
+        "latest_closed_delta_spot": latest_closed_delta_spot,
+        "partial_window_delta_fut": partial_window_delta_fut,
+        "partial_window_delta_spot": partial_window_delta_spot,
+        "partial_vs_closed_divergent": partial_vs_closed_divergent,
+        "cvd_slope": cvd_slope,
+        "whale_delta_fut": whale_delta_fut,
+        "whale_delta_spot": whale_delta_spot,
+        "obi_close_fut": obi_close_fut,
+        "obi_direction": obi_direction,
+        "ofi_direction": ofi_direction,
+        "nearest_ask_wall_price": nearest_ask_wall_price,
+        "nearest_bid_wall_price": nearest_bid_wall_price,
+        "nearest_sell_imb_prices": nearest_sell_imb_prices,
+        "nearest_buy_imb_prices": nearest_buy_imb_prices,
+        "stacked_sell_near_price": stacked_sell_near_price,
+        "stacked_buy_near_price": stacked_buy_near_price,
+    })
+}
+
+fn build_precomputed_value_read(value_state_board: &[Value]) -> Value {
+    let mut by_window = Map::new();
+    for tf in ["15m", "4h", "1d"] {
+        let pvs = mapped_value_read_for_source(value_state_board, tf, "price_volume_structure");
+        let tpo = mapped_value_read_for_source(value_state_board, tf, "tpo_market_profile");
+        let combined = if pvs == tpo { pvs } else { "conflicted" };
+        by_window.insert(
+            tf.to_string(),
+            json!({
+                "pvs": pvs,
+                "tpo": tpo,
+                "combined": combined,
+            }),
+        );
+    }
+    Value::Object(by_window)
+}
+
+fn build_precomputed_cross_market(source: &Map<String, Value>, price_anchor: &Value) -> Value {
+    let futures_last_price = price_anchor
+        .get("futures_last_price")
+        .and_then(Value::as_f64);
+    let spot_proxy_price = price_anchor
+        .get("spot_proxy_price")
+        .and_then(Value::as_f64);
+    let spot_vs_futures_gap_pct = match (futures_last_price, spot_proxy_price) {
+        (Some(futures), Some(spot)) if spot.abs() > f64::EPSILON => {
+            Some(round2((futures - spot) / spot * 100.0))
+        }
+        _ => Some(0.0),
+    };
+
+    let flow_driver = extract_indicator_payload(source, "cvd_pack")
+        .and_then(|payload| payload.get("likely_driver"))
+        .and_then(Value::as_str)
+        .map(normalize_flow_driver_label)
+        .unwrap_or("unclear");
+
+    let latest_4h_delta_relation = extract_indicator_payload(source, "cvd_pack")
+        .and_then(|payload| payload.get("by_window"))
+        .and_then(Value::as_object)
+        .and_then(|by_window| by_window.get("4h"))
+        .and_then(Value::as_object)
+        .and_then(|window| window.get("series"))
+        .and_then(Value::as_array)
+        .and_then(|series| series.last())
+        .map(|entry| {
+            let delta_fut = entry.get("delta_fut").and_then(Value::as_f64);
+            let delta_spot = entry.get("delta_spot").and_then(Value::as_f64);
+            classify_delta_relation_for_cross_market(delta_fut, delta_spot)
+        })
+        .unwrap_or("flat_or_unclear");
+
+    json!({
+        "spot_vs_futures_gap_pct": spot_vs_futures_gap_pct.unwrap_or(0.0),
+        "flow_driver": flow_driver,
+        "latest_4h_delta_relation": latest_4h_delta_relation,
+    })
+}
+
+fn mapped_value_read_for_source(value_state_board: &[Value], tf: &str, source_name: &str) -> &'static str {
+    value_state_board
+        .iter()
+        .rev()
+        .filter_map(Value::as_object)
+        .find(|entry| {
+            entry.get("scope").and_then(Value::as_str) == Some(tf)
+                && entry.get("source").and_then(Value::as_str) == Some(source_name)
+        })
+        .and_then(|entry| entry.get("state").and_then(Value::as_str))
+        .map(map_value_state_to_scan_enum)
+        .unwrap_or("inside_value")
+}
+
+fn map_value_state_to_scan_enum(state: &str) -> &'static str {
+    match state {
+        "inside_value" | "reentered_value" => "inside_value",
+        "accepted_above" => "accepted_above",
+        "accepted_below" => "accepted_below",
+        "rejected_from_above" => "rejected_from_above",
+        "rejected_from_below" => "rejected_from_below",
+        "above_value" => "above_value",
+        "below_value" => "below_value",
+        _ => "inside_value",
+    }
+}
+
+fn last_two_delta_fut_slope(series: &[Value]) -> Option<f64> {
+    if series.len() < 2 {
+        return None;
+    }
+    let last = series.last()?.get("delta_fut").and_then(Value::as_f64)?;
+    let prev = series
+        .get(series.len().saturating_sub(2))?
+        .get("delta_fut")
+        .and_then(Value::as_f64)?;
+    Some(last - prev)
+}
+
+fn classify_signed_delta(value: Option<f64>) -> &'static str {
+    match value {
+        Some(v) if v > f64::EPSILON => "buying",
+        Some(v) if v < -f64::EPSILON => "selling",
+        Some(_) => "mixed",
+        None => "unclear",
+    }
+}
+
+fn classify_signed_whales(value: Option<f64>) -> &'static str {
+    match value {
+        Some(v) if v > f64::EPSILON => "buyers",
+        Some(v) if v < -f64::EPSILON => "sellers",
+        Some(_) => "mixed",
+        None => "unclear",
+    }
+}
+
+fn classify_signed_cvd(value: Option<f64>) -> &'static str {
+    match value {
+        Some(v) if v > f64::EPSILON => "rising",
+        Some(v) if v < -f64::EPSILON => "falling",
+        Some(_) => "flat",
+        None => "unclear",
+    }
+}
+
+fn classify_alignment_relation(left: Option<f64>, right: Option<f64>) -> &'static str {
+    match (left, right) {
+        (Some(left), Some(right)) if left.abs() > f64::EPSILON && right.abs() > f64::EPSILON => {
+            if left.signum() == right.signum() {
+                "aligned"
+            } else {
+                "divergent"
+            }
+        }
+        _ => "unclear",
+    }
+}
+
+fn classify_delta_relation_for_cross_market(left: Option<f64>, right: Option<f64>) -> &'static str {
+    match (left, right) {
+        (Some(left), Some(right)) if left.abs() > f64::EPSILON && right.abs() > f64::EPSILON => {
+            if left.signum() == right.signum() {
+                "aligned"
+            } else {
+                "divergent"
+            }
+        }
+        _ => "flat_or_unclear",
+    }
+}
+
+fn normalize_flow_driver_label(raw: &str) -> &'static str {
+    match raw {
+        "futures_led" => "futures_led",
+        "spot_led" => "spot_led",
+        "mixed" | "balanced" => "balanced",
+        _ => "unclear",
+    }
+}
+
+fn signed_values_diverge(closed: Option<f64>, partial: Option<f64>) -> bool {
+    match (closed, partial) {
+        (Some(closed), Some(partial))
+            if closed.abs() > f64::EPSILON && partial.abs() > f64::EPSILON =>
+        {
+            closed.signum() != partial.signum()
+        }
+        _ => false,
+    }
+}
+
+fn classify_orderbook_direction(value: Option<f64>) -> &'static str {
+    match value {
+        Some(v) if v > f64::EPSILON => "buy",
+        Some(v) if v < -f64::EPSILON => "sell",
+        Some(_) => "mixed",
+        None => "unclear",
+    }
+}
+
+fn nearest_footprint_cluster_prices(window: Option<&Value>, key: &str) -> Value {
+    let prices = window
+        .and_then(Value::as_object)
+        .and_then(|window| window.get(key))
+        .and_then(Value::as_object)
+        .map(|clusters| {
+            ["cross", "above", "below"]
+                .iter()
+                .filter_map(|bucket| clusters.get(*bucket).and_then(Value::as_array))
+                .flat_map(|items| items.iter())
+                .filter_map(|entry| {
+                    let low = entry.get("low").and_then(Value::as_f64);
+                    let high = entry.get("high").and_then(Value::as_f64);
+                    low.or(high).map(|price| round2(price))
+                })
+                .take(2)
+                .map(Value::from)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    Value::Array(prices)
 }
 
 fn build_momentum_snapshot(source: &Map<String, Value>) -> Value {
@@ -3793,7 +4213,7 @@ fn filter_cvd_pack(payload: &Value) -> Value {
 
     if let Some(by_window) = payload.get("by_window").and_then(Value::as_object) {
         let mut filtered_windows = Map::new();
-        for (window, limit) in [("15m", 12usize), ("4h", 8usize), ("1d", 5usize)] {
+        for (window, limit) in [("15m", 3usize), ("4h", 3usize), ("1d", 3usize)] {
             let Some(window_value) = by_window.get(window).and_then(Value::as_object) else {
                 continue;
             };
@@ -5652,7 +6072,7 @@ mod tests {
 
         assert_eq!(
             value.pointer("/version").and_then(Value::as_str),
-            Some("scan_v6_2")
+            Some("scan_v6_3")
         );
         assert_eq!(
             value.pointer("/current_price").and_then(Value::as_f64),
@@ -6127,18 +6547,14 @@ mod tests {
         });
         assert!(has_absorption_evidence);
 
-        assert_eq!(
-            value
-                .pointer("/now/current_flow_snapshot/footprint/by_window/15m/max_buy_stack_len")
-                .and_then(Value::as_u64),
-            Some(6)
-        );
-        assert_eq!(
-            value
-                .pointer("/now/current_flow_snapshot/footprint/by_window/15m/max_sell_stack_len")
-                .and_then(Value::as_u64),
-            Some(5)
-        );
+        assert!(value
+            .pointer("/now/flow_supporting_evidence/15m/stacked_buy_near_price")
+            .and_then(Value::as_bool)
+            .is_some());
+        assert!(value
+            .pointer("/now/flow_supporting_evidence/15m/stacked_sell_near_price")
+            .and_then(Value::as_bool)
+            .is_some());
     }
 
     #[test]
@@ -6601,7 +7017,7 @@ mod tests {
             .pointer("/raw_overflow/price_structures/0")
             .is_some());
         assert!(scan_value
-            .pointer("/now/current_flow_snapshot/footprint/by_window/15m/buy_stacks")
+            .pointer("/now/flow_supporting_evidence/15m/stacked_buy_near_price")
             .is_some());
         assert!(scan_value.pointer("/indicators").is_none());
         assert!(scan_value.pointer("/by_timeframe").is_none());

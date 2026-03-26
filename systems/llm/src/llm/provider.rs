@@ -17,6 +17,8 @@ use uuid::Uuid;
 
 const CLAUDE_EXTENDED_CACHE_TTL_BETA: &str = "extended-cache-ttl-2025-04-11";
 const CLAUDE_DECISION_TOOL_NAME: &str = "emit_decision";
+const FULL_SCAN_SCHEMA_VERSION: &str = "scan_v3_3_0";
+const SCAN_RESPONSE_SCHEMA_VERSION: &str = "scan_v3_3_0_response";
 #[derive(Debug, Clone, Serialize)]
 pub struct ModelInvocationInput {
     pub symbol: String,
@@ -235,6 +237,14 @@ impl ProviderTrace {
         } else {
             Some(self.entry_stage_prompt_inputs.clone())
         }
+    }
+
+    fn scan_prompt_input(&self) -> Option<&Value> {
+        self.entry_stage_prompt_inputs
+            .iter()
+            .rev()
+            .find(|capture| capture.stage == "scan")
+            .map(|capture| &capture.prompt_input)
     }
 }
 
@@ -490,12 +500,18 @@ fn serialize_entry_finalize_input_minified(
     filter::core::CoreFilter::serialize_finalize_input(input, prior_scan)
 }
 
-fn parse_entry_scan_output(provider: &str, raw_text: &str) -> Result<Value, ProviderFailure> {
+fn parse_entry_scan_output(
+    provider: &str,
+    raw_text: &str,
+    prompt_input: &Value,
+) -> Result<Value, ProviderFailure> {
     let value = parse_json_from_text(raw_text)
         .map(|value| normalize_provider_decision_shape(provider, value, false, false))
         .ok_or_else(|| provider_failure_plain(anyhow!("entry scan output is not valid JSON")))?;
-    validate_scan_output(&value).map_err(provider_failure_plain)?;
-    Ok(value)
+    validate_scan_model_response(&value).map_err(provider_failure_plain)?;
+    let merged = merge_scan_model_response(prompt_input, &value).map_err(provider_failure_plain)?;
+    validate_scan_output(&merged).map_err(provider_failure_plain)?;
+    Ok(merged)
 }
 
 fn validate_scan_output(value: &Value) -> Result<()> {
@@ -503,17 +519,68 @@ fn validate_scan_output(value: &Value) -> Result<()> {
         .get("schema_version")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("scan schema_version is missing"))?;
-    if schema_version != "scan_v2_1_0" {
+    if schema_version != FULL_SCAN_SCHEMA_VERSION {
         return Err(anyhow!(
-            "scan schema_version must be scan_v2_1_0, got {}",
+            "scan schema_version must be {}, got {}",
+            FULL_SCAN_SCHEMA_VERSION,
             schema_version
         ));
     }
 
-    validate_scan_output_v2_1_0(value)
+    validate_scan_output_v3_3_0(value)
 }
 
-fn validate_scan_output_v2_1_0(value: &Value) -> Result<()> {
+fn validate_scan_model_response(value: &Value) -> Result<()> {
+    let schema_version = value
+        .get("schema_version")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("scan response schema_version is missing"))?;
+    if schema_version != SCAN_RESPONSE_SCHEMA_VERSION {
+        return Err(anyhow!(
+            "scan response schema_version must be {}, got {}",
+            SCAN_RESPONSE_SCHEMA_VERSION,
+            schema_version
+        ));
+    }
+
+    validate_scan_model_response_v3_3_0(value)
+}
+
+fn validate_scan_model_response_v3_3_0(value: &Value) -> Result<()> {
+    for legacy_path in ["/15m", "/4h", "/1d", "/cross_timeframe_map", "/scan_audit"] {
+        reject_present(value, legacy_path)?;
+    }
+
+    let meta = expect_object(value, "/meta")?;
+    meta.get("symbol")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| anyhow!("scan response meta.symbol is missing"))?;
+    let scan_ts_bucket = meta
+        .get("scan_ts_bucket")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| anyhow!("scan response meta.scan_ts_bucket is missing"))?;
+    DateTime::parse_from_rfc3339(scan_ts_bucket)
+        .map_err(|_| anyhow!("scan response meta.scan_ts_bucket must be RFC3339 date-time"))?;
+
+    expect_object(value, "/timeframes")?;
+    for tf in ["15m", "4h", "1d"] {
+        validate_scan_response_v3_3_0_timeframe(value, tf)?;
+    }
+
+    reject_present(value, "/cross_timeframe_parse/relationship_facts")?;
+    reject_present(value, "/cross_timeframe_parse/shared_structure")?;
+    reject_present(value, "/cross_timeframe_parse/cross_market_parse")?;
+
+    validate_key_levels_with_max(value, "/cross_timeframe_parse/shared_levels", 6)?;
+    expect_string(value, "/cross_timeframe_parse/main_tension")?;
+    validate_string_array_with_max(value, "/cross_timeframe_parse/unresolved_factors", 4)?;
+
+    Ok(())
+}
+
+fn validate_scan_output_v3_3_0(value: &Value) -> Result<()> {
     for legacy_path in ["/15m", "/4h", "/1d", "/cross_timeframe_map", "/scan_audit"] {
         reject_present(value, legacy_path)?;
     }
@@ -533,7 +600,7 @@ fn validate_scan_output_v2_1_0(value: &Value) -> Result<()> {
 
     expect_object(value, "/timeframes")?;
     for tf in ["15m", "4h", "1d"] {
-        validate_scan_output_v2_timeframe(value, tf)?;
+        validate_scan_output_v3_3_0_timeframe(value, tf)?;
     }
 
     reject_present(value, "/cross_timeframe_parse/relationship_facts")?;
@@ -566,7 +633,7 @@ fn validate_scan_output_v2_1_0(value: &Value) -> Result<()> {
     Ok(())
 }
 
-fn validate_scan_output_v2_timeframe(value: &Value, tf: &str) -> Result<()> {
+fn validate_scan_output_v3_3_0_timeframe(value: &Value, tf: &str) -> Result<()> {
     let base = format!("/timeframes/{tf}");
 
     expect_number(value, &format!("{base}/structure_parse/active_range/low"))?;
@@ -782,6 +849,7 @@ fn validate_scan_output_v2_timeframe(value: &Value, tf: &str) -> Result<()> {
         format!("{base}/flow_map"),
         format!("{base}/structure_map"),
         format!("{base}/validation"),
+        format!("{base}/flow_override"),
         format!("{base}/participant_parse/aggressive_side"),
         format!("{base}/participant_parse/absorption_side"),
     ] {
@@ -848,6 +916,335 @@ fn validate_scan_output_v2_timeframe(value: &Value, tf: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_scan_response_v3_3_0_timeframe(value: &Value, tf: &str) -> Result<()> {
+    let base = format!("/timeframes/{tf}");
+
+    expect_number(value, &format!("{base}/structure_parse/active_range/low"))?;
+    expect_number(value, &format!("{base}/structure_parse/active_range/high"))?;
+    expect_enum(
+        value,
+        &format!("{base}/structure_parse/range_width_vs_atr"),
+        &["narrow", "normal", "wide"],
+    )?;
+    validate_optional_price_zone(
+        value,
+        &format!("{base}/structure_parse/dominant_demand_zone"),
+    )?;
+    validate_optional_price_zone(
+        value,
+        &format!("{base}/structure_parse/dominant_supply_zone"),
+    )?;
+    validate_key_levels_with_max(value, &format!("{base}/structure_parse/key_levels"), 6)?;
+    expect_number_or_null(value, &format!("{base}/structure_parse/invalidation_level"))?;
+
+    let structures = expect_array(
+        value,
+        &format!("{base}/structure_parse/structure_lifecycle/structures"),
+    )?;
+    ensure_max_items(
+        structures.len(),
+        &format!("{base}/structure_parse/structure_lifecycle/structures"),
+        8,
+    )?;
+    for (idx, _) in structures.iter().enumerate() {
+        let item_base = format!("{base}/structure_parse/structure_lifecycle/structures/{idx}");
+        expect_string(value, &format!("{item_base}/structure_id"))?;
+        expect_enum(
+            value,
+            &format!("{item_base}/structure_kind"),
+            &[
+                "active_range",
+                "value_area",
+                "demand_zone",
+                "supply_zone",
+                "imbalance_bracket",
+                "acceptance_attempt",
+                "rejection_band",
+            ],
+        )?;
+        expect_enum(
+            value,
+            &format!("{item_base}/status"),
+            &["active", "failing", "invalidated"],
+        )?;
+        expect_number(value, &format!("{item_base}/price_low"))?;
+        expect_number(value, &format!("{item_base}/price_high"))?;
+        expect_string(value, &format!("{item_base}/reason"))?;
+    }
+
+    reject_present(value, &format!("{base}/market_state"))?;
+    reject_present(value, &format!("{base}/state_parse/value_read"))?;
+    expect_enum(
+        value,
+        &format!("{base}/state_parse/range_state"),
+        &[
+            "inside_range",
+            "accepting_above_range",
+            "accepting_below_range",
+            "rejecting_above_range",
+            "rejecting_below_range",
+            "testing_range_high",
+            "testing_range_low",
+            "range_unresolved",
+        ],
+    )?;
+    expect_enum(
+        value,
+        &format!("{base}/state_parse/auction_state"),
+        &[
+            "balancing",
+            "reentry",
+            "acceptance_attempt",
+            "rejection_attempt",
+            "rejected_back_inside",
+            "auction_unresolved",
+        ],
+    )?;
+    expect_enum(
+        value,
+        &format!("{base}/state_parse/control_read/side"),
+        &["buyers", "sellers", "balanced", "unclear"],
+    )?;
+    expect_enum(
+        value,
+        &format!("{base}/state_parse/control_read/clarity"),
+        &["strong", "mixed", "conflicted"],
+    )?;
+    expect_enum(
+        value,
+        &format!("{base}/state_parse/sponsorship_state"),
+        &["active", "fragile", "fading", "absent", "unresolved"],
+    )?;
+
+    reject_present(value, &format!("{base}/flow_parse"))?;
+    expect_enum(
+        value,
+        &format!("{base}/flow_override/cvd_alignment_vs_price"),
+        &["supports", "lags", "opposes", "unclear"],
+    )?;
+    expect_enum(
+        value,
+        &format!("{base}/flow_override/orderbook_pressure_side"),
+        &["buy", "sell", "mixed", "unclear"],
+    )?;
+    expect_enum(
+        value,
+        &format!("{base}/flow_override/orderbook_near_price_constraint"),
+        &["offers_above", "bids_below", "two_sided", "none", "unclear"],
+    )?;
+    expect_enum(
+        value,
+        &format!("{base}/flow_override/combined_flow_state"),
+        &[
+            "supportive",
+            "constraining",
+            "conflicted",
+            "neutral",
+            "unclear",
+        ],
+    )?;
+
+    for legacy_path in [
+        format!("{base}/state"),
+        format!("{base}/flow_map"),
+        format!("{base}/structure_map"),
+        format!("{base}/validation"),
+        format!("{base}/participant_parse/aggressive_side"),
+        format!("{base}/participant_parse/absorption_side"),
+    ] {
+        reject_present(value, &legacy_path)?;
+    }
+    let observations = expect_array(
+        value,
+        &format!("{base}/participant_parse/participant_observations"),
+    )?;
+    ensure_max_items(
+        observations.len(),
+        &format!("{base}/participant_parse/participant_observations"),
+        3,
+    )?;
+    for (idx, _) in observations.iter().enumerate() {
+        let item_base = format!("{base}/participant_parse/participant_observations/{idx}");
+        expect_enum(
+            value,
+            &format!("{item_base}/participant_role"),
+            &[
+                "initiative_flow",
+                "passive_liquidity",
+                "higher_timeframe_sponsorship",
+                "responsive_crowd",
+            ],
+        )?;
+        reject_present(value, &format!("{item_base}/observed_behavior"))?;
+        reject_present(value, &format!("{item_base}/current_objective"))?;
+        reject_present(value, &format!("{item_base}/objective_status"))?;
+        expect_string(value, &format!("{item_base}/current_task"))?;
+        expect_enum(
+            value,
+            &format!("{item_base}/task_status"),
+            &["accepted", "blocked", "failing", "unresolved"],
+        )?;
+        validate_string_array_with_max(value, &format!("{item_base}/constraints"), 3)?;
+        validate_string_array_with_max(value, &format!("{item_base}/evidence"), 3)?;
+        expect_enum(
+            value,
+            &format!("{item_base}/confidence"),
+            &["high", "medium", "low"],
+        )?;
+    }
+
+    for removed_evidence_field in [
+        "read_basis",
+        "recent_closed_bars_align_with_read",
+        "cvd_slope_aligns_with_read",
+        "current_partial_bar_aligns_with_read",
+    ] {
+        reject_present(
+            value,
+            &format!("{base}/evidence_trace/{removed_evidence_field}"),
+        )?;
+    }
+    validate_string_array_with_max(value, &format!("{base}/evidence_trace/supporting_facts"), 4)?;
+    validate_string_array_with_max(
+        value,
+        &format!("{base}/evidence_trace/conflicting_facts"),
+        4,
+    )?;
+    expect_string(value, &format!("{base}/evidence_trace/fragility_summary"))?;
+
+    Ok(())
+}
+
+fn merge_scan_model_response(prompt_input: &Value, response: &Value) -> Result<Value> {
+    let prompt_symbol = prompt_input
+        .get("symbol")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("scan prompt input symbol is missing"))?;
+    let prompt_ts_bucket = prompt_input
+        .get("ts_bucket")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("scan prompt input ts_bucket is missing"))?;
+    let response_symbol = response
+        .pointer("/meta/symbol")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("scan response meta.symbol is missing"))?;
+    let response_ts_bucket = response
+        .pointer("/meta/scan_ts_bucket")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("scan response meta.scan_ts_bucket is missing"))?;
+    if prompt_symbol != response_symbol {
+        return Err(anyhow!(
+            "scan response meta.symbol {} does not match prompt input symbol {}",
+            response_symbol,
+            prompt_symbol
+        ));
+    }
+    if prompt_ts_bucket != response_ts_bucket {
+        return Err(anyhow!(
+            "scan response meta.scan_ts_bucket {} does not match prompt input ts_bucket {}",
+            response_ts_bucket,
+            prompt_ts_bucket
+        ));
+    }
+
+    let mut merged = response.clone();
+    let merged_obj = merged
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("scan response must be an object"))?;
+    merged_obj.insert(
+        "schema_version".to_string(),
+        Value::String(FULL_SCAN_SCHEMA_VERSION.to_string()),
+    );
+
+    for tf in ["15m", "4h", "1d"] {
+        let value_read = prompt_input
+            .pointer(&format!("/now/precomputed_value_read/{tf}"))
+            .cloned()
+            .ok_or_else(|| anyhow!("scan prompt input missing /now/precomputed_value_read/{tf}"))?;
+        let flow_base = prompt_input
+            .pointer(&format!("/now/precomputed_flow_base/{tf}"))
+            .cloned()
+            .ok_or_else(|| anyhow!("scan prompt input missing /now/precomputed_flow_base/{tf}"))?;
+        let flow_override = merged
+            .pointer(&format!("/timeframes/{tf}/flow_override"))
+            .cloned()
+            .ok_or_else(|| anyhow!("scan response missing /timeframes/{tf}/flow_override"))?;
+
+        let state_parse = merged
+            .pointer_mut(&format!("/timeframes/{tf}/state_parse"))
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| anyhow!("scan response missing /timeframes/{tf}/state_parse"))?;
+        state_parse.insert("value_read".to_string(), value_read);
+
+        let timeframe = merged
+            .pointer_mut(&format!("/timeframes/{tf}"))
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| anyhow!("scan response missing /timeframes/{tf}"))?;
+        timeframe.insert(
+            "flow_parse".to_string(),
+            merge_flow_parse_from_base_and_override(&flow_base, &flow_override)?,
+        );
+        timeframe.remove("flow_override");
+    }
+
+    let cross_market_parse = prompt_input
+        .pointer("/now/precomputed_cross_market")
+        .cloned()
+        .ok_or_else(|| anyhow!("scan prompt input missing /now/precomputed_cross_market"))?;
+    let cross_timeframe = merged
+        .pointer_mut("/cross_timeframe_parse")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| anyhow!("scan response missing /cross_timeframe_parse"))?;
+    cross_timeframe.insert("cross_market_parse".to_string(), cross_market_parse);
+
+    Ok(merged)
+}
+
+fn merge_flow_parse_from_base_and_override(flow_base: &Value, flow_override: &Value) -> Result<Value> {
+    let delta_read = flow_base
+        .get("delta_read")
+        .cloned()
+        .ok_or_else(|| anyhow!("precomputed_flow_base.delta_read is missing"))?;
+    let cvd_state = flow_base
+        .pointer("/cvd_read/state")
+        .cloned()
+        .ok_or_else(|| anyhow!("precomputed_flow_base.cvd_read.state is missing"))?;
+    let whale_read = flow_base
+        .get("whale_read")
+        .cloned()
+        .ok_or_else(|| anyhow!("precomputed_flow_base.whale_read is missing"))?;
+    let cvd_alignment_vs_price = flow_override
+        .get("cvd_alignment_vs_price")
+        .cloned()
+        .ok_or_else(|| anyhow!("flow_override.cvd_alignment_vs_price is missing"))?;
+    let orderbook_pressure_side = flow_override
+        .get("orderbook_pressure_side")
+        .cloned()
+        .ok_or_else(|| anyhow!("flow_override.orderbook_pressure_side is missing"))?;
+    let orderbook_near_price_constraint = flow_override
+        .get("orderbook_near_price_constraint")
+        .cloned()
+        .ok_or_else(|| anyhow!("flow_override.orderbook_near_price_constraint is missing"))?;
+    let combined_flow_state = flow_override
+        .get("combined_flow_state")
+        .cloned()
+        .ok_or_else(|| anyhow!("flow_override.combined_flow_state is missing"))?;
+
+    Ok(json!({
+        "delta_read": delta_read,
+        "cvd_read": {
+            "state": cvd_state,
+            "alignment_vs_price": cvd_alignment_vs_price,
+        },
+        "whale_read": whale_read,
+        "orderbook_read": {
+            "pressure_side": orderbook_pressure_side,
+            "near_price_constraint": orderbook_near_price_constraint,
+        },
+        "combined_flow_state": combined_flow_state,
+    }))
+}
+
 fn expect_object<'a>(value: &'a Value, path: &str) -> Result<&'a Map<String, Value>> {
     value
         .pointer(path)
@@ -857,7 +1254,7 @@ fn expect_object<'a>(value: &'a Value, path: &str) -> Result<&'a Map<String, Val
 
 fn reject_present(value: &Value, path: &str) -> Result<()> {
     if value.pointer(path).is_some() {
-        Err(anyhow!("scan {} is not allowed in scan_v2_1_0", path))
+        Err(anyhow!("scan {} is not allowed", path))
     } else {
         Ok(())
     }
@@ -1338,7 +1735,14 @@ async fn invoke_one_model_scan_stage(
                 mut trace,
             } = success;
             let scan_latency_ms = elapsed_ms_u64(started);
-            match parse_entry_scan_output(&provider, &raw_text) {
+            let scan_prompt_input = trace
+                .scan_prompt_input()
+                .cloned()
+                .ok_or_else(|| anyhow!("scan stage missing captured prompt input"));
+            match scan_prompt_input
+                .map_err(provider_failure_plain)
+                .and_then(|prompt_input| parse_entry_scan_output(&provider, &raw_text, &prompt_input))
+            {
                 Ok(scan_value) => {
                     trace.push_entry_stage_event(build_entry_scan_trace_event(
                         &provider,
@@ -2038,7 +2442,10 @@ fn qwen_output_contract(
     _prompt_template: &str,
 ) -> String {
     if matches!(entry_stage, prompt::EntryPromptStage::Scan) {
-        "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- No extra top-level keys.\n- Top-level keys must be `schema_version`, `meta`, `timeframes`, and `cross_timeframe_parse`.\n- `schema_version` must be `scan_v2_1_0`.\n- `timeframes` must contain `15m`, `4h`, and `1d`.\n- Each timeframe must include `structure_parse`, `state_parse`, `flow_parse`, `participant_parse`, and `evidence_trace`.\n- `cross_timeframe_parse` must include `shared_levels`, `cross_market_parse`, `main_tension`, and `unresolved_factors`.\n".to_string()
+        format!(
+            "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- No extra top-level keys.\n- Top-level keys must be `schema_version`, `meta`, `timeframes`, and `cross_timeframe_parse`.\n- `schema_version` must be `{}`.\n- `timeframes` must contain `15m`, `4h`, and `1d`.\n- Each timeframe must include `structure_parse`, `state_parse`, `flow_override`, `participant_parse`, and `evidence_trace`.\n- `cross_timeframe_parse` must include `shared_levels`, `main_tension`, and `unresolved_factors`.\n",
+            SCAN_RESPONSE_SCHEMA_VERSION
+        )
     } else if pending_order_mode {
         "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- Top-level keys must appear in this order: `pending_context`, `params`, and `reason`. `analysis` and `self_check` may be present as extra objects.\n- `reason` must be a non-empty top-level string. Do not place `reason` inside `analysis`.\n- `pending_context` must include `preferred_direction`, `entry_state`, `entry_sweep_risk_15m`, `thesis_freshness`, `tp_state`, and `key_condition`.\n- `params` must contain exactly: `entry`, `tp`, `sl`, `leverage` — each a number or null.\n- Set all params to null if there is no valid setup.\n".to_string()
     } else if management_mode {
@@ -3480,25 +3887,6 @@ fn scan_v2_0_1_evidence_trace_schema_openai() -> Value {
     })
 }
 
-fn scan_v2_0_1_cross_market_parse_schema_openai() -> Value {
-    json!({
-        "type": "object",
-        "additionalProperties": false,
-        "required": ["spot_vs_futures_gap_pct", "flow_driver", "latest_4h_delta_relation"],
-        "properties": {
-            "spot_vs_futures_gap_pct": { "type": "number" },
-            "flow_driver": {
-                "type": "string",
-                "enum": ["futures_led", "spot_led", "balanced", "unclear"]
-            },
-            "latest_4h_delta_relation": {
-                "type": "string",
-                "enum": ["aligned", "divergent", "flat_or_unclear"]
-            }
-        }
-    })
-}
-
 fn scan_v2_0_1_structure_lifecycle_entry_schema_gemini() -> Value {
     json!({
         "type": "OBJECT",
@@ -3590,78 +3978,12 @@ fn scan_v2_0_1_evidence_trace_schema_gemini() -> Value {
     })
 }
 
-fn scan_v2_0_1_cross_market_parse_schema_gemini() -> Value {
-    json!({
-        "type": "OBJECT",
-        "properties": {
-            "spot_vs_futures_gap_pct": { "type": "NUMBER" },
-            "flow_driver": {
-                "type": "STRING",
-                "enum": ["futures_led", "spot_led", "balanced", "unclear"]
-            },
-            "latest_4h_delta_relation": {
-                "type": "STRING",
-                "enum": ["aligned", "divergent", "flat_or_unclear"]
-            }
-        },
-        "required": ["spot_vs_futures_gap_pct", "flow_driver", "latest_4h_delta_relation"]
-    })
-}
-
-fn scan_v2_1_0_value_read_schema_openai() -> Value {
+fn scan_v3_3_0_response_state_parse_schema_openai() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["pvs", "tpo", "combined"],
+        "required": ["range_state", "auction_state", "control_read", "sponsorship_state"],
         "properties": {
-            "pvs": {
-                "type": "string",
-                "enum": [
-                    "above_value",
-                    "below_value",
-                    "inside_value",
-                    "accepted_above",
-                    "accepted_below",
-                    "rejected_from_above",
-                    "rejected_from_below"
-                ]
-            },
-            "tpo": {
-                "type": "string",
-                "enum": [
-                    "above_value",
-                    "below_value",
-                    "inside_value",
-                    "accepted_above",
-                    "accepted_below",
-                    "rejected_from_above",
-                    "rejected_from_below"
-                ]
-            },
-            "combined": {
-                "type": "string",
-                "enum": [
-                    "above_value",
-                    "below_value",
-                    "inside_value",
-                    "accepted_above",
-                    "accepted_below",
-                    "rejected_from_above",
-                    "rejected_from_below",
-                    "conflicted"
-                ]
-            }
-        }
-    })
-}
-
-fn scan_v2_1_0_state_parse_schema_openai() -> Value {
-    json!({
-        "type": "object",
-        "additionalProperties": false,
-        "required": ["value_read", "range_state", "auction_state", "control_read", "sponsorship_state"],
-        "properties": {
-            "value_read": scan_v2_1_0_value_read_schema_openai(),
             "range_state": {
                 "type": "string",
                 "enum": [
@@ -3709,51 +4031,28 @@ fn scan_v2_1_0_state_parse_schema_openai() -> Value {
     })
 }
 
-fn scan_v2_1_0_flow_parse_schema_openai() -> Value {
+fn scan_v3_3_0_flow_override_schema_openai() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["delta_read", "cvd_read", "whale_read", "orderbook_read", "combined_flow_state"],
+        "required": [
+            "cvd_alignment_vs_price",
+            "orderbook_pressure_side",
+            "orderbook_near_price_constraint",
+            "combined_flow_state"
+        ],
         "properties": {
-            "delta_read": {
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["futures", "spot", "relation"],
-                "properties": {
-                    "futures": { "type": "string", "enum": ["buying", "selling", "mixed", "unclear"] },
-                    "spot": { "type": "string", "enum": ["buying", "selling", "mixed", "unclear"] },
-                    "relation": { "type": "string", "enum": ["aligned", "divergent", "unclear"] }
-                }
+            "cvd_alignment_vs_price": {
+                "type": "string",
+                "enum": ["supports", "lags", "opposes", "unclear"]
             },
-            "cvd_read": {
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["state", "alignment_vs_price"],
-                "properties": {
-                    "state": { "type": "string", "enum": ["rising", "falling", "flat", "unclear"] },
-                    "alignment_vs_price": { "type": "string", "enum": ["supports", "lags", "opposes", "unclear"] }
-                }
+            "orderbook_pressure_side": {
+                "type": "string",
+                "enum": ["buy", "sell", "mixed", "unclear"]
             },
-            "whale_read": {
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["state", "spot_vs_futures_relation"],
-                "properties": {
-                    "state": { "type": "string", "enum": ["buyers", "sellers", "mixed", "unclear"] },
-                    "spot_vs_futures_relation": { "type": "string", "enum": ["aligned", "divergent", "unclear"] }
-                }
-            },
-            "orderbook_read": {
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["pressure_side", "near_price_constraint"],
-                "properties": {
-                    "pressure_side": { "type": "string", "enum": ["buy", "sell", "mixed", "unclear"] },
-                    "near_price_constraint": {
-                        "type": "string",
-                        "enum": ["offers_above", "bids_below", "two_sided", "none", "unclear"]
-                    }
-                }
+            "orderbook_near_price_constraint": {
+                "type": "string",
+                "enum": ["offers_above", "bids_below", "two_sided", "none", "unclear"]
             },
             "combined_flow_state": {
                 "type": "string",
@@ -3763,7 +4062,7 @@ fn scan_v2_1_0_flow_parse_schema_openai() -> Value {
     })
 }
 
-fn scan_v2_1_0_participant_observation_schema_openai() -> Value {
+fn scan_v3_3_0_participant_observation_schema_openai() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
@@ -3805,7 +4104,7 @@ fn scan_v2_1_0_participant_observation_schema_openai() -> Value {
     })
 }
 
-fn scan_v2_1_0_participant_parse_schema_openai() -> Value {
+fn scan_v3_3_0_participant_parse_schema_openai() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
@@ -3814,34 +4113,34 @@ fn scan_v2_1_0_participant_parse_schema_openai() -> Value {
             "participant_observations": {
                 "type": "array",
                 "maxItems": 3,
-                "items": scan_v2_1_0_participant_observation_schema_openai()
+                "items": scan_v3_3_0_participant_observation_schema_openai()
             }
         }
     })
 }
 
-fn scan_v2_1_0_timeframe_schema_openai() -> Value {
+fn scan_v3_3_0_response_timeframe_schema_openai() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["structure_parse", "state_parse", "flow_parse", "participant_parse", "evidence_trace"],
+        "required": ["structure_parse", "state_parse", "flow_override", "participant_parse", "evidence_trace"],
         "properties": {
             "structure_parse": scan_v2_0_1_structure_parse_schema_openai(),
-            "state_parse": scan_v2_1_0_state_parse_schema_openai(),
-            "flow_parse": scan_v2_1_0_flow_parse_schema_openai(),
-            "participant_parse": scan_v2_1_0_participant_parse_schema_openai(),
+            "state_parse": scan_v3_3_0_response_state_parse_schema_openai(),
+            "flow_override": scan_v3_3_0_flow_override_schema_openai(),
+            "participant_parse": scan_v3_3_0_participant_parse_schema_openai(),
             "evidence_trace": scan_v2_0_1_evidence_trace_schema_openai()
         }
     })
 }
 
-fn scan_v2_1_0_schema_openai() -> Value {
+fn scan_v3_3_0_response_schema_openai() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
         "required": ["schema_version", "meta", "timeframes", "cross_timeframe_parse"],
         "properties": {
-            "schema_version": { "type": "string", "enum": ["scan_v2_1_0"] },
+            "schema_version": { "type": "string", "enum": [SCAN_RESPONSE_SCHEMA_VERSION] },
             "meta": {
                 "type": "object",
                 "additionalProperties": false,
@@ -3856,22 +4155,21 @@ fn scan_v2_1_0_schema_openai() -> Value {
                 "additionalProperties": false,
                 "required": ["15m", "4h", "1d"],
                 "properties": {
-                    "15m": scan_v2_1_0_timeframe_schema_openai(),
-                    "4h": scan_v2_1_0_timeframe_schema_openai(),
-                    "1d": scan_v2_1_0_timeframe_schema_openai()
+                    "15m": scan_v3_3_0_response_timeframe_schema_openai(),
+                    "4h": scan_v3_3_0_response_timeframe_schema_openai(),
+                    "1d": scan_v3_3_0_response_timeframe_schema_openai()
                 }
             },
             "cross_timeframe_parse": {
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["shared_levels", "cross_market_parse", "main_tension", "unresolved_factors"],
+                "required": ["shared_levels", "main_tension", "unresolved_factors"],
                 "properties": {
                     "shared_levels": {
                         "type": "array",
                         "maxItems": 6,
                         "items": scan_v1_7_key_level_schema_openai()
                     },
-                    "cross_market_parse": scan_v2_0_1_cross_market_parse_schema_openai(),
                     "main_tension": { "type": "string" },
                     "unresolved_factors": {
                         "type": "array",
@@ -3884,57 +4182,10 @@ fn scan_v2_1_0_schema_openai() -> Value {
     })
 }
 
-fn scan_v2_1_0_value_read_schema_gemini() -> Value {
+fn scan_v3_3_0_response_state_parse_schema_gemini() -> Value {
     json!({
         "type": "OBJECT",
         "properties": {
-            "pvs": {
-                "type": "STRING",
-                "enum": [
-                    "above_value",
-                    "below_value",
-                    "inside_value",
-                    "accepted_above",
-                    "accepted_below",
-                    "rejected_from_above",
-                    "rejected_from_below"
-                ]
-            },
-            "tpo": {
-                "type": "STRING",
-                "enum": [
-                    "above_value",
-                    "below_value",
-                    "inside_value",
-                    "accepted_above",
-                    "accepted_below",
-                    "rejected_from_above",
-                    "rejected_from_below"
-                ]
-            },
-            "combined": {
-                "type": "STRING",
-                "enum": [
-                    "above_value",
-                    "below_value",
-                    "inside_value",
-                    "accepted_above",
-                    "accepted_below",
-                    "rejected_from_above",
-                    "rejected_from_below",
-                    "conflicted"
-                ]
-            }
-        },
-        "required": ["pvs", "tpo", "combined"]
-    })
-}
-
-fn scan_v2_1_0_state_parse_schema_gemini() -> Value {
-    json!({
-        "type": "OBJECT",
-        "properties": {
-            "value_read": scan_v2_1_0_value_read_schema_gemini(),
             "range_state": {
                 "type": "STRING",
                 "enum": [
@@ -3972,60 +4223,41 @@ fn scan_v2_1_0_state_parse_schema_gemini() -> Value {
                 "enum": ["active", "fragile", "fading", "absent", "unresolved"]
             }
         },
-        "required": ["value_read", "range_state", "auction_state", "control_read", "sponsorship_state"]
+        "required": ["range_state", "auction_state", "control_read", "sponsorship_state"]
     })
 }
 
-fn scan_v2_1_0_flow_parse_schema_gemini() -> Value {
+fn scan_v3_3_0_flow_override_schema_gemini() -> Value {
     json!({
         "type": "OBJECT",
         "properties": {
-            "delta_read": {
-                "type": "OBJECT",
-                "properties": {
-                    "futures": { "type": "STRING", "enum": ["buying", "selling", "mixed", "unclear"] },
-                    "spot": { "type": "STRING", "enum": ["buying", "selling", "mixed", "unclear"] },
-                    "relation": { "type": "STRING", "enum": ["aligned", "divergent", "unclear"] }
-                },
-                "required": ["futures", "spot", "relation"]
+            "cvd_alignment_vs_price": {
+                "type": "STRING",
+                "enum": ["supports", "lags", "opposes", "unclear"]
             },
-            "cvd_read": {
-                "type": "OBJECT",
-                "properties": {
-                    "state": { "type": "STRING", "enum": ["rising", "falling", "flat", "unclear"] },
-                    "alignment_vs_price": { "type": "STRING", "enum": ["supports", "lags", "opposes", "unclear"] }
-                },
-                "required": ["state", "alignment_vs_price"]
+            "orderbook_pressure_side": {
+                "type": "STRING",
+                "enum": ["buy", "sell", "mixed", "unclear"]
             },
-            "whale_read": {
-                "type": "OBJECT",
-                "properties": {
-                    "state": { "type": "STRING", "enum": ["buyers", "sellers", "mixed", "unclear"] },
-                    "spot_vs_futures_relation": { "type": "STRING", "enum": ["aligned", "divergent", "unclear"] }
-                },
-                "required": ["state", "spot_vs_futures_relation"]
-            },
-            "orderbook_read": {
-                "type": "OBJECT",
-                "properties": {
-                    "pressure_side": { "type": "STRING", "enum": ["buy", "sell", "mixed", "unclear"] },
-                    "near_price_constraint": {
-                        "type": "STRING",
-                        "enum": ["offers_above", "bids_below", "two_sided", "none", "unclear"]
-                    }
-                },
-                "required": ["pressure_side", "near_price_constraint"]
+            "orderbook_near_price_constraint": {
+                "type": "STRING",
+                "enum": ["offers_above", "bids_below", "two_sided", "none", "unclear"]
             },
             "combined_flow_state": {
                 "type": "STRING",
                 "enum": ["supportive", "constraining", "conflicted", "neutral", "unclear"]
             }
         },
-        "required": ["delta_read", "cvd_read", "whale_read", "orderbook_read", "combined_flow_state"]
+        "required": [
+            "cvd_alignment_vs_price",
+            "orderbook_pressure_side",
+            "orderbook_near_price_constraint",
+            "combined_flow_state"
+        ]
     })
 }
 
-fn scan_v2_1_0_participant_observation_schema_gemini() -> Value {
+fn scan_v3_3_0_participant_observation_schema_gemini() -> Value {
     json!({
         "type": "OBJECT",
         "properties": {
@@ -4059,39 +4291,39 @@ fn scan_v2_1_0_participant_observation_schema_gemini() -> Value {
     })
 }
 
-fn scan_v2_1_0_participant_parse_schema_gemini() -> Value {
+fn scan_v3_3_0_participant_parse_schema_gemini() -> Value {
     json!({
         "type": "OBJECT",
         "properties": {
             "participant_observations": {
                 "type": "ARRAY",
                 "maxItems": 3,
-                "items": scan_v2_1_0_participant_observation_schema_gemini()
+                "items": scan_v3_3_0_participant_observation_schema_gemini()
             }
         },
         "required": ["participant_observations"]
     })
 }
 
-fn scan_v2_1_0_timeframe_schema_gemini() -> Value {
+fn scan_v3_3_0_response_timeframe_schema_gemini() -> Value {
     json!({
         "type": "OBJECT",
         "properties": {
             "structure_parse": scan_v2_0_1_structure_parse_schema_gemini(),
-            "state_parse": scan_v2_1_0_state_parse_schema_gemini(),
-            "flow_parse": scan_v2_1_0_flow_parse_schema_gemini(),
-            "participant_parse": scan_v2_1_0_participant_parse_schema_gemini(),
+            "state_parse": scan_v3_3_0_response_state_parse_schema_gemini(),
+            "flow_override": scan_v3_3_0_flow_override_schema_gemini(),
+            "participant_parse": scan_v3_3_0_participant_parse_schema_gemini(),
             "evidence_trace": scan_v2_0_1_evidence_trace_schema_gemini()
         },
-        "required": ["structure_parse", "state_parse", "flow_parse", "participant_parse", "evidence_trace"]
+        "required": ["structure_parse", "state_parse", "flow_override", "participant_parse", "evidence_trace"]
     })
 }
 
-fn scan_v2_1_0_schema_gemini() -> Value {
+fn scan_v3_3_0_response_schema_gemini() -> Value {
     json!({
         "type": "OBJECT",
         "properties": {
-            "schema_version": { "type": "STRING", "enum": ["scan_v2_1_0"] },
+            "schema_version": { "type": "STRING", "enum": [SCAN_RESPONSE_SCHEMA_VERSION] },
             "meta": {
                 "type": "OBJECT",
                 "properties": {
@@ -4103,9 +4335,9 @@ fn scan_v2_1_0_schema_gemini() -> Value {
             "timeframes": {
                 "type": "OBJECT",
                 "properties": {
-                    "15m": scan_v2_1_0_timeframe_schema_gemini(),
-                    "4h": scan_v2_1_0_timeframe_schema_gemini(),
-                    "1d": scan_v2_1_0_timeframe_schema_gemini()
+                    "15m": scan_v3_3_0_response_timeframe_schema_gemini(),
+                    "4h": scan_v3_3_0_response_timeframe_schema_gemini(),
+                    "1d": scan_v3_3_0_response_timeframe_schema_gemini()
                 },
                 "required": ["15m", "4h", "1d"]
             },
@@ -4117,7 +4349,6 @@ fn scan_v2_1_0_schema_gemini() -> Value {
                         "maxItems": 6,
                         "items": scan_v1_7_key_level_schema_gemini()
                     },
-                    "cross_market_parse": scan_v2_0_1_cross_market_parse_schema_gemini(),
                     "main_tension": { "type": "STRING" },
                     "unresolved_factors": {
                         "type": "ARRAY",
@@ -4125,7 +4356,7 @@ fn scan_v2_1_0_schema_gemini() -> Value {
                         "items": { "type": "STRING" }
                     }
                 },
-                "required": ["shared_levels", "cross_market_parse", "main_tension", "unresolved_factors"]
+                "required": ["shared_levels", "main_tension", "unresolved_factors"]
             }
         },
         "required": ["schema_version", "meta", "timeframes", "cross_timeframe_parse"]
@@ -4133,7 +4364,7 @@ fn scan_v2_1_0_schema_gemini() -> Value {
 }
 
 fn ml_grok_entry_scan_schema() -> Value {
-    scan_v2_1_0_schema_openai()
+    scan_v3_3_0_response_schema_openai()
 }
 
 fn ml_grok_entry_schema() -> Value {
@@ -4167,7 +4398,7 @@ fn ml_grok_management_schema() -> Value {
 }
 
 fn ml_gemini_entry_scan_schema() -> Value {
-    scan_v2_1_0_schema_gemini()
+    scan_v3_3_0_response_schema_gemini()
 }
 
 fn ml_gemini_entry_schema() -> Value {
@@ -4208,7 +4439,7 @@ fn ml_gemini_management_schema() -> Value {
 }
 
 fn ml_qwen_entry_scan_schema() -> Value {
-    scan_v2_1_0_schema_openai()
+    scan_v3_3_0_response_schema_openai()
 }
 
 fn ml_qwen_entry_schema() -> Value {
@@ -4243,7 +4474,7 @@ fn ml_qwen_management_schema() -> Value {
 }
 
 fn ml_custom_llm_entry_scan_schema() -> Value {
-    scan_v2_1_0_schema_openai()
+    scan_v3_3_0_response_schema_openai()
 }
 
 fn ml_custom_llm_entry_schema() -> Value {
@@ -5011,7 +5242,7 @@ mod tests {
 
     fn sample_stage_1_scan() -> Value {
         json!({
-            "schema_version": "scan_v2_1_0",
+            "schema_version": "scan_v3_3_0",
             "meta": {
                 "symbol": "TESTUSDT",
                 "scan_ts_bucket": "2026-03-18T07:00:00+00:00"
@@ -5295,6 +5526,95 @@ mod tests {
                 ]
             }
         })
+    }
+
+    fn sample_stage_1_scan_prompt_input() -> Value {
+        json!({
+            "symbol": "TESTUSDT",
+            "ts_bucket": "2026-03-18T07:00:00+00:00",
+            "now": {
+                "precomputed_value_read": {
+                    "15m": {"pvs": "inside_value", "tpo": "inside_value", "combined": "inside_value"},
+                    "4h": {"pvs": "accepted_above", "tpo": "accepted_above", "combined": "accepted_above"},
+                    "1d": {"pvs": "inside_value", "tpo": "inside_value", "combined": "inside_value"}
+                },
+                "precomputed_flow_base": {
+                    "15m": {
+                        "delta_read": {"futures": "buying", "spot": "buying", "relation": "aligned"},
+                        "cvd_read": {"state": "rising"},
+                        "whale_read": {"state": "buyers", "spot_vs_futures_relation": "aligned"}
+                    },
+                    "4h": {
+                        "delta_read": {"futures": "buying", "spot": "mixed", "relation": "divergent"},
+                        "cvd_read": {"state": "rising"},
+                        "whale_read": {"state": "buyers", "spot_vs_futures_relation": "divergent"}
+                    },
+                    "1d": {
+                        "delta_read": {"futures": "mixed", "spot": "mixed", "relation": "unclear"},
+                        "cvd_read": {"state": "flat"},
+                        "whale_read": {"state": "mixed", "spot_vs_futures_relation": "unclear"}
+                    }
+                },
+                "precomputed_cross_market": {
+                    "spot_vs_futures_gap_pct": 0.05,
+                    "flow_driver": "balanced",
+                    "latest_4h_delta_relation": "aligned"
+                }
+            }
+        })
+    }
+
+    fn sample_stage_1_scan_response() -> Value {
+        let mut response = sample_stage_1_scan();
+        *response
+            .pointer_mut("/schema_version")
+            .expect("schema_version should exist") = json!("scan_v3_3_0_response");
+
+        for tf in ["15m", "4h", "1d"] {
+            let flow_parse = response
+                .pointer(&format!("/timeframes/{tf}/flow_parse"))
+                .cloned()
+                .expect("full flow_parse should exist");
+            let flow_override = json!({
+                "cvd_alignment_vs_price": flow_parse
+                    .pointer("/cvd_read/alignment_vs_price")
+                    .cloned()
+                    .expect("cvd alignment should exist"),
+                "orderbook_pressure_side": flow_parse
+                    .pointer("/orderbook_read/pressure_side")
+                    .cloned()
+                    .expect("orderbook pressure should exist"),
+                "orderbook_near_price_constraint": flow_parse
+                    .pointer("/orderbook_read/near_price_constraint")
+                    .cloned()
+                    .expect("orderbook constraint should exist"),
+                "combined_flow_state": flow_parse
+                    .get("combined_flow_state")
+                    .cloned()
+                    .expect("combined flow state should exist"),
+            });
+
+            let timeframe = response
+                .pointer_mut(&format!("/timeframes/{tf}"))
+                .and_then(Value::as_object_mut)
+                .expect("timeframe should exist");
+            timeframe.remove("flow_parse");
+            timeframe.insert("flow_override".to_string(), flow_override);
+
+            let state_parse = response
+                .pointer_mut(&format!("/timeframes/{tf}/state_parse"))
+                .and_then(Value::as_object_mut)
+                .expect("state_parse should exist");
+            state_parse.remove("value_read");
+        }
+
+        response
+            .pointer_mut("/cross_timeframe_parse")
+            .and_then(Value::as_object_mut)
+            .expect("cross_timeframe_parse should exist")
+            .remove("cross_market_parse");
+
+        response
     }
 
     fn sample_stage_1_scan_with_supporting_indicator_refs() -> Value {
@@ -5989,8 +6309,8 @@ mod tests {
                 schema
                     .pointer("/properties/schema_version/enum/0")
                     .and_then(|v| v.as_str()),
-                Some("scan_v2_1_0"),
-                "schema_version should be v2 for {prompt_template}"
+                Some("scan_v3_3_0_response"),
+                "schema_version should be reduced response for {prompt_template}"
             );
             assert_eq!(
                 schema
@@ -6020,15 +6340,6 @@ mod tests {
                 Some(false),
                 "cross_timeframe_parse should be strict for {prompt_template}"
             );
-            assert_eq!(
-                schema
-                    .pointer(
-                        "/properties/cross_timeframe_parse/properties/cross_market_parse/additionalProperties"
-                    )
-                    .and_then(|v| v.as_bool()),
-                Some(false),
-                "cross_market_parse should be strict for {prompt_template}"
-            );
             assert!(schema
                 .pointer("/properties/timeframes/properties/15m/properties/flow_map")
                 .is_none());
@@ -6041,8 +6352,14 @@ mod tests {
                 .pointer("/properties/timeframes/properties/15m/properties/state_parse")
                 .is_some());
             assert!(schema
-                .pointer("/properties/timeframes/properties/15m/properties/flow_parse")
+                .pointer("/properties/timeframes/properties/15m/properties/flow_override")
                 .is_some());
+            assert!(schema
+                .pointer("/properties/timeframes/properties/15m/properties/flow_parse")
+                .is_none());
+            assert!(schema
+                .pointer("/properties/timeframes/properties/15m/properties/state_parse/properties/value_read")
+                .is_none());
             assert!(schema
                 .pointer("/properties/timeframes/properties/15m/properties/market_state")
                 .is_none());
@@ -6050,9 +6367,7 @@ mod tests {
                 .pointer("/properties/timeframes/properties/15m/properties/evidence_trace")
                 .is_some());
             assert!(schema
-                .pointer(
-                    "/properties/cross_timeframe_parse/properties/cross_market_parse/properties/spot_premium_state"
-                )
+                .pointer("/properties/cross_timeframe_parse/properties/cross_market_parse")
                 .is_none());
             assert!(schema
                 .pointer(
@@ -6080,12 +6395,12 @@ mod tests {
             );
             assert!(contract
                 .contains("`schema_version`, `meta`, `timeframes`, and `cross_timeframe_parse`"));
-            assert!(contract.contains("`scan_v2_1_0`"));
+            assert!(contract.contains("`scan_v3_3_0_response`"));
             assert!(contract.contains(
-                "`structure_parse`, `state_parse`, `flow_parse`, `participant_parse`, and `evidence_trace`"
+                "`structure_parse`, `state_parse`, `flow_override`, `participant_parse`, and `evidence_trace`"
             ));
             assert!(contract.contains(
-                "`shared_levels`, `cross_market_parse`, `main_tension`, and `unresolved_factors`"
+                "`shared_levels`, `main_tension`, and `unresolved_factors`"
             ));
             assert!(!contract.contains("flow_map"));
             assert!(!contract.contains("cross_timeframe_map"));
@@ -6220,14 +6535,16 @@ mod tests {
     }
 
     #[test]
-    fn parse_entry_scan_output_accepts_scan_v2_1_0() {
-        let raw_text = serde_json::to_string(&sample_stage_1_scan()).expect("serialize scan");
-        let parsed =
-            super::parse_entry_scan_output("custom_llm", &raw_text).expect("parse scan output");
+    fn parse_entry_scan_output_accepts_scan_v3_3_0_response_and_merges_full_scan() {
+        let raw_text =
+            serde_json::to_string(&sample_stage_1_scan_response()).expect("serialize scan");
+        let prompt_input = sample_stage_1_scan_prompt_input();
+        let parsed = super::parse_entry_scan_output("custom_llm", &raw_text, &prompt_input)
+            .expect("parse scan output");
 
         assert_eq!(
             parsed.get("schema_version").and_then(Value::as_str),
-            Some("scan_v2_1_0")
+            Some("scan_v3_3_0")
         );
         assert_eq!(
             parsed
@@ -6243,7 +6560,7 @@ mod tests {
 
     #[test]
     fn parse_entry_scan_output_rejects_removed_v2_0_0_fields() {
-        let mut legacy_mix = sample_stage_1_scan();
+        let mut legacy_mix = sample_stage_1_scan_response();
         *legacy_mix
             .pointer_mut("/timeframes/15m/participant_parse")
             .expect("participant_parse should exist") = json!({
@@ -6261,7 +6578,8 @@ mod tests {
         });
 
         let raw_text = serde_json::to_string(&legacy_mix).expect("serialize mixed scan");
-        let error = super::parse_entry_scan_output("custom_llm", &raw_text)
+        let prompt_input = sample_stage_1_scan_prompt_input();
+        let error = super::parse_entry_scan_output("custom_llm", &raw_text, &prompt_input)
             .expect_err("removed legacy field should be rejected");
 
         assert!(error
@@ -6271,17 +6589,18 @@ mod tests {
     }
 
     #[test]
-    fn parse_entry_scan_output_rejects_inconsistent_value_read_combined() {
-        let mut invalid = sample_stage_1_scan();
-        *invalid
-            .pointer_mut("/timeframes/15m/state_parse/value_read/tpo")
+    fn parse_entry_scan_output_rejects_inconsistent_precomputed_value_read_combined() {
+        let response =
+            serde_json::to_string(&sample_stage_1_scan_response()).expect("serialize scan");
+        let mut prompt_input = sample_stage_1_scan_prompt_input();
+        *prompt_input
+            .pointer_mut("/now/precomputed_value_read/15m/tpo")
             .expect("15m tpo value read should exist") = json!("accepted_above");
-        *invalid
-            .pointer_mut("/timeframes/15m/state_parse/value_read/combined")
+        *prompt_input
+            .pointer_mut("/now/precomputed_value_read/15m/combined")
             .expect("15m combined value read should exist") = json!("inside_value");
 
-        let raw_text = serde_json::to_string(&invalid).expect("serialize invalid scan");
-        let error = super::parse_entry_scan_output("custom_llm", &raw_text)
+        let error = super::parse_entry_scan_output("custom_llm", &response, &prompt_input)
             .expect_err("inconsistent combined value should be rejected");
 
         assert!(error
@@ -6292,18 +6611,19 @@ mod tests {
 
     #[test]
     fn parse_entry_scan_output_rejects_old_scan_schema_version() {
-        let mut legacy = sample_stage_1_scan();
+        let mut legacy = sample_stage_1_scan_response();
         *legacy
             .pointer_mut("/schema_version")
-            .expect("schema_version should exist") = json!("scan_v1_8_4");
+            .expect("schema_version should exist") = json!("scan_v2_1_0");
         let raw_text = serde_json::to_string(&legacy).expect("serialize legacy scan");
-        let error = super::parse_entry_scan_output("custom_llm", &raw_text)
+        let prompt_input = sample_stage_1_scan_prompt_input();
+        let error = super::parse_entry_scan_output("custom_llm", &raw_text, &prompt_input)
             .expect_err("old schema_version should be rejected");
 
         assert!(error
             .error
             .to_string()
-            .contains("scan schema_version must be scan_v2_1_0"));
+            .contains("scan response schema_version must be scan_v3_3_0_response"));
     }
 
     #[test]
@@ -6336,7 +6656,7 @@ mod tests {
 
         assert!(error
             .to_string()
-            .contains("scan schema_version must be scan_v2_1_0"));
+            .contains("scan schema_version must be scan_v3_3_0"));
     }
 
     #[test]
@@ -6671,7 +6991,7 @@ mod tests {
         assert_eq!(value.as_object().map(|obj| obj.len()), Some(9));
         assert_eq!(
             value.get("version").and_then(Value::as_str),
-            Some("scan_v6_2")
+            Some("scan_v6_3")
         );
         assert!(value.pointer("/now").is_some());
         assert!(value
