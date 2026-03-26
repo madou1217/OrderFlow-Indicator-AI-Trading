@@ -20,11 +20,13 @@
 
 - 保留 `v3.3.0` 的 deterministic 预计算
 - 保留 `v3.4.0` 的 `15m execution_context`
-- **重做 `4h / 1d structure_parse`**
+- **重做 `4h / 1d` 的主输出层**
+- **精简 participant_parse，用内联价格替代 zone_id 引用**
+- **删除 `key_levels`，ladder 是唯一结构层级输出**
 
 这里要明确一件事：
 
-- **`v4.0.0` 不建立在“去掉 15m 完整解析就足以修复 `4h / 1d` 价格带过窄”这个假设上。**
+- **`v4.0.0` 不建立在"去掉 15m 完整解析就足以修复 `4h / 1d` 价格带过窄"这个假设上。**
 
 去掉 `15m` full scan 只会：
 
@@ -37,13 +39,19 @@
 
 真正的根因修复是：
 
-- **把 `4h / 1d structure_parse` 从“单层 dominant zone 摘要”重做成“可交易的结构层级地图”。**
+- **把 `4h / 1d` 的主输出从"单层 dominant zone 摘要"重做成"可交易的结构层级地图"。**
 
-目标不是再优化“当前组织区”的表达，而是让 `stage1` 真正输出：
+目标不是再优化"当前组织区"的表达，而是让 `stage1` 真正输出：
 
 - `4h / 1d` 的关键价格带层级
 - `4h / 1d` 的当前市场结构
 - `4h / 1d` 的主要参与者正在守哪里、打哪里、盯哪里
+
+这里的"关键价格带层级"要进一步定义清楚：
+
+- 以 `4h / 1d` 决策真正会用到的主要价格带为主
+- 相邻价格带的间隔要足够大，避免把 near-price 噪音塞满 ladder
+- 每个 thesis timeframe 只保留最重要的价格带，总数控制在 **最多 6 条**
 
 ---
 
@@ -55,13 +63,26 @@
 - 不为了减少模型思考时长而降低输出质量
 - 不用考虑工作量
 
-因此，本版不是为了“简化 schema 让模型更快”。
+因此，本版不是为了"简化 schema 让模型更快"。
 
 本版是为了：
 
 - **让 `stage1` 终于输出 `stage2` 真正需要的市场地图**
 
 只有在这个前提下，任何输入/输出优化才有意义。
+
+同时，本版遵守一条实现原则：
+
+- **模型的 token 应花在"选对价格层级"上，不是花在"填分类枚举"上**
+
+因此，schema 的每个字段都必须直接服务于 stage2 交易决策。
+如果一个字段的信息可以从其他字段推导出来，或者只增加分类开销而不增加决策信息量，就不应存在。
+
+对应到 `4h / 1d` 的主输出层上，这意味着：
+
+- 输出应优先保留主要价格带本身
+- 每条价格带都应具有明确的交易决策意义
+- 不为历史叙事、重复分类、近端噪音保留字段空间
 
 ---
 
@@ -77,8 +98,8 @@
 
 关键点：
 
-- `stage1` 不是只回答“当前最近哪里在起作用”
-- `stage1` 也不是只回答“当前 market state 是什么”
+- `stage1` 不是只回答"当前最近哪里在起作用"
+- `stage1` 也不是只回答"当前 market state 是什么"
 - `stage1` 必须回答：
   - `4h / 1d` 当前市场由哪些关键结构组成
   - 这些结构在价格上分别在哪里
@@ -115,13 +136,13 @@
 
 ## 3. 第一性原理下，当前设计哪里错了
 
-当前 `stage1 scan` 的错误，不是“价格算错了”这么简单。
+当前 `stage1 scan` 的错误，不是"价格算错了"这么简单。
 
 根本问题是：
 
-- **它把 `4h / 1d` 市场分析压缩成了“当前最近主组织区摘要”**
+- **它把 `4h / 1d` 市场分析压缩成了"当前最近主组织区摘要"**
 
-这会带来 4 个直接后果。
+这会带来 7 个直接后果。
 
 ## 3.1 只输出最近一层，不输出结构层级
 
@@ -144,9 +165,23 @@
 - 更外层 thesis invalidation 在哪
 - 更外层 thesis objective 在哪
 
-这不是“表达不够好”，而是**结构不够表达**。
+这不是"表达不够好"，而是**结构不够表达**。
 
-## 3.5 `15m` anchoring 只是放大器，不是根因
+## 3.2 `key_levels` 被近价格锚定吞噬
+
+当前 `key_levels` 最多 6 个，本来应该覆盖整个 thesis 范围。
+
+但实际日志表明：
+
+- 4h 的 6 个 key_levels 全部挤在 $13 范围内（2133-2147）
+- 1d 的 6 个 key_levels 只有 1 个在远端（2102），其余 5 个挤在 $15 内
+
+原因：`dominant_demand_zone / dominant_supply_zone` 锚定了模型对"当前重要区域"的理解，`key_levels` 自然围绕这两个 zone 展开，而不是按 thesis 范围展开。
+
+`key_levels` 不是独立的层级地图——它是 dominant zone 的附属品。
+只要 dominant zone 锚定在近端，key_levels 也必然聚集在近端。
+
+## 3.3 `15m` anchoring 只是放大器，不是根因
 
 移除 `15m` 完整解析是对的，因为它能减轻一部分近价格锚定。
 
@@ -163,10 +198,10 @@
 
 所以：
 
-- **`v4.0.0` 的主要修复不是“拿掉 15m”**
-- **而是“把 `4h / 1d` 的主输出改成 ladder-first 的结构地图”**
+- **`v4.0.0` 的主要修复不是"拿掉 15m"**
+- **而是"把 `4h / 1d` 的主输出改成 ladder-first 的结构地图"**
 
-## 3.2 “active now” 被错误实现成“只保留当前最近一层”
+## 3.4 "active now" 被错误实现成"只保留当前最近一层"
 
 从第一性原理看，`active now` 的真正含义应该是：
 
@@ -185,7 +220,7 @@
 
 有决策意义，就仍然是 active 的一部分。
 
-## 3.3 失效区域和角色翻转区域没有被正确处理
+## 3.5 失效区域和角色翻转区域没有被正确处理
 
 当前设计把 `structure_lifecycle` 做成了：
 
@@ -206,15 +241,29 @@
 因此：
 
 - **完全失效且不再影响当前 auction 的区域，不应留在主输出里**
-- **失效后已经翻转成当前 supply / demand 的区域，应保留，但要以“当前角色”表达**
+- **失效后已经翻转成当前 supply / demand 的区域，应保留，但要以"当前角色"表达**
 
 例如：
 
-- 原来的 reclaim band 失败后，如果现在成了 overhead supply  
-  那它不应该再以“旧 reclaim attempt”身份保留，  
-  而应该以“当前压力带”身份保留。
+- 原来的 reclaim band 失败后，如果现在成了 overhead supply
+  那它不应该再以"旧 reclaim attempt"身份保留，
+  而应该以"当前压力带"身份保留。
 
-## 3.4 `stage2` 会天然被近端结构绑架
+## 3.6 `structure_lifecycle` 是最大的 token 浪费
+
+v3.4.0 日志显示 `structure_lifecycle` 在 4h 和 1d 各产生 5 个 structure，共占 57+ 行字段。
+
+这些结构绝大多数是历史叙事：
+
+- 某个 acceptance_attempt 正在 failing
+- 某个 value_area 仍然 active
+- 某个 demand_zone 正在被 test
+
+这些信息对 stage2 的直接交易决策贡献极低——stage2 需要的是"哪些价格还能用"，不是"哪些结构曾经有过什么生命周期"。
+
+这些 token 完全应该花在 ladder 的价格层级选择上。
+
+## 3.7 `stage2` 会天然被近端结构绑架
 
 如果 `stage1` 只给最近一层，`stage2` 虽然理论上还能看 raw 输入，
 但在实践里会天然被：
@@ -228,7 +277,7 @@
 这会导致：
 
 - `entry`、`tp`、`sl` 都偏近端
-- `4h / 1d` 交易被缩成一笔“当前附近的结构表达”
+- `4h / 1d` 交易被缩成一笔"当前附近的结构表达"
 
 这不是 `stage2` 的错，而是 `stage1` 地图不完整。
 
@@ -246,21 +295,24 @@
 
 ## 4.2 删除什么
 
-从 `4h / 1d structure_parse` 中删除：
+从 `4h / 1d` 的主输出层中删除：
 
-- `dominant_demand_zone`
-- `dominant_supply_zone`
-- `invalidation_level`
-- `structure_lifecycle`
+- `dominant_demand_zone` — 被 `support_ladder[0]` 替代
+- `dominant_supply_zone` — 被 `resistance_ladder[0]` 替代
+- `invalidation_level` — 被 support/resistance ladder 最远层替代
+- `structure_lifecycle` — 完全删除，历史叙事，token 浪费
+- `key_levels` — 被 ladders 完全替代
+- `range_width_vs_atr` — 可由 `active_range` 和 stage2 已有 ATR 数据自行判断
 
-原因不是这些字段完全没价值，
-而是它们会把市场压成：
+### 为什么删除 `key_levels`
 
-- 单层 dominant zone
-- 单个 invalidation scalar
-- 一组 lifecycle commentary
+有了 `support_ladder` + `resistance_ladder`（共最多 6 条主要价格带），`key_levels` 变成冗余：
 
-这三者都不适合直接服务 `stage2` 交易决策。
+- 如果同时保留 `key_levels` 和 ladders，模型会把重要信息分散到两处，导致两边都不完整
+- POC 等单点 level 可以作为 zone（`low ≈ high`）放入 ladder
+- `cross_timeframe_parse.shared_levels` 已经承担跨时间框架关键点位的角色
+
+一个输出里不应该有两个竞争性的"关键价格"字段。ladder 是唯一的结构层级输出。
 
 ## 4.3 用什么替代
 
@@ -268,13 +320,12 @@
 
 - `support_ladder`
 - `resistance_ladder`
-- `current_structure_zone`
-- `key_levels`
+- `active_range`
 
 一句话说：
 
-- **从“单层 dominant zone”切换为“可交易的结构层级地图”**
-- **其中 `support_ladder / resistance_ladder` 是主输出，`current_structure_zone` 只是当前位置标签**
+- **从"单层 dominant zone + key_levels 补充"切换为"价格带地图优先的主输出层"**
+- **`support_ladder / resistance_ladder` 是主输出，`active_range` 只负责描述当前 containing bracket**
 
 ---
 
@@ -301,11 +352,11 @@
 
 ---
 
-## 6. 如果给价格带，要不要给“全量”
+## 6. 如果给价格带，要不要给"全量"
 
-这个问题要分清两种“全量”。
+这个问题要分清两种"全量"。
 
-## 6.1 不该给的“全量”
+## 6.1 不该给的"全量"
 
 不该给：
 
@@ -316,7 +367,7 @@
 
 这不是市场解析，只是把候选池倒给 `stage2`。
 
-## 6.2 应该给的“全量”
+## 6.2 应该给的"全量"
 
 应该给的是：
 
@@ -340,8 +391,16 @@
 
 这里要再强调一次：
 
-- `stage1` 不能停在“当前最近正在组织价格的一层”
+- `stage1` 不能停在"当前最近正在组织价格的一层"
 - 必须把直到 thesis objective / thesis invalidation 为止、仍然影响交易决策的层级都交给 `stage2`
+
+同时，这个完整层级不是"越多越好"。
+
+它应该满足：
+
+- 只保留主要价格带
+- 价格带之间有足够的层级间隔
+- 每个 thesis timeframe 的价格带总数最多 6 条
 
 ---
 
@@ -351,13 +410,12 @@
 
 新的 `structure_parse` 不再回答：
 
-- “当前最 dominant 的 demand / supply 是哪一层”
+- "当前最 dominant 的 demand / supply 是哪一层"
 
 而要回答：
 
-- 上方从近到远的重要阻力层级是谁
 - 下方从近到远的重要支撑层级是谁
-- 当前价格正处于哪一层主结构里
+- 上方从近到远的重要阻力层级是谁
 - 哪些层级是当前 thesis 的真正决策边界
 
 ## 7.2 推荐 schema
@@ -365,90 +423,137 @@
 ```json
 "structure_parse": {
   "active_range": {
-    "low": 2143.52,
-    "high": 2164.48
+    "low": 2102.0,
+    "high": 2185.2
   },
-  "range_width_vs_atr": "narrow|normal|wide",
   "support_ladder": [
     {
-      "zone_id": "1d_support_1",
-      "low": 2142.15,
-      "high": 2147.96,
-      "importance": "immediate|next|outer",
-      "structural_role": "value_edge|imbalance_support|demand_flip|swing_support|balance_low|liquidity_cluster",
-      "status": "active|testing|failing|flipped",
-      "reason": "string"
+      "low": 2136.16,
+      "high": 2137.66,
+      "role": "value_edge",
+      "reason": "4h sigma2 floor and daily TPO lower value edge cluster"
+    },
+    {
+      "low": 2133.81,
+      "high": 2133.81,
+      "role": "liquidity_cluster",
+      "reason": "nearest bid wall below the 4h bracket floor"
+    },
+    {
+      "low": 2102.0,
+      "high": 2102.0,
+      "role": "swing_low",
+      "reason": "daily swing low, thesis invalidation if lost"
     }
   ],
   "resistance_ladder": [
     {
-      "zone_id": "1d_resistance_1",
-      "low": 2160.06,
-      "high": 2164.48,
-      "importance": "immediate|next|outer",
-      "structural_role": "value_edge|reclaim_band|supply_flip|swing_resistance|balance_high|liquidity_cluster",
-      "status": "active|testing|failing|flipped",
-      "reason": "string"
-    }
-  ],
-  "current_structure_zone": {
-    "zone_id": "1d_current_balance_2143_2164",
-    "low": 2143.52,
-    "high": 2164.48,
-    "zone_role": "balance|reclaim_band|rejection_band|value_area|imbalance_bracket|swing_boundary",
-    "status": "active|testing|failing|flipped",
-    "reason": "string"
-  },
-  "key_levels": [
+      "low": 2145.36,
+      "high": 2147.16,
+      "role": "value_edge",
+      "reason": "ask wall and 4h lower value edges cap reentry"
+    },
     {
-      "price": 2151.49,
-      "type": "pivot|value_edge|imbalance_edge|liquidity_wall|swing_level",
-      "reason": "string"
+      "low": 2158.83,
+      "high": 2164.26,
+      "role": "reclaim_band",
+      "reason": "daily PVS lower value overlaps upper TPO band, failed reclaim"
+    },
+    {
+      "low": 2185.2,
+      "high": 2185.2,
+      "role": "swing_high",
+      "reason": "upper daily PVS value and prior rejection ceiling"
     }
   ]
 }
 ```
 
-## 7.3 为什么这样更对
+### 7.2.1 zone 字段设计原则
+
+每个 zone 只有 4 个字段：`low`、`high`、`role`、`reason`。
+
+**不设 `zone_id`**：LLM 维护一致 ID 极其不可靠。如果 `participant_parse` 引用 `"1d_support_1"`，模型很容易在 ladder 里写成 `"1d_support_s1"` 或别的名字，导致 validation 失败或引用断裂。
+
+**不设 `importance` 枚举**：层级重要性隐含在排序里——第一个 zone 就是 immediate，最后一个就是 outer。额外的枚举只增加分类 token 开销。
+
+**不设 `status` 枚举**：如果一个 zone 还在 ladder 里，它就是 active 的。如果它正在 testing 或 failing，写在 `reason` 里。已经完全失效的 zone 不应出现在 ladder 中。
+
+这样做的直接好处：模型在每个 zone 上只花 4 个字段的 token，而不是 7 个。省下来的 token 用在"选对价格层级"上，而不是"填分类枚举"上。
+
+### 7.2.2 价格带数量原则
+
+每个 thesis timeframe 的 ladder 输出，目标是：
+
+- **support_ladder + resistance_ladder 合计最多 6 条价格带**
+
+这 6 条不是固定地平均分配给上下两侧。
+
+而是按当前 thesis 路径决定：
+
+- 哪一侧承担更多决策层级，就给哪一侧更多价格带
+- 另一侧只保留仍然影响 `entry / sl / tp` 的主要带
+
+一句话说：
+
+- **数量服从 thesis 决策路径，不服从平均分配**
+
+### 7.2.3 `role` 枚举
+
+```
+value_edge | imbalance_support | imbalance_resistance |
+demand_flip | supply_flip |
+swing_low | swing_high |
+balance_boundary | liquidity_cluster |
+reclaim_band | rejection_band
+```
+
+`role` 的职责是标注这个 zone 的结构角色，不是它的状态。
+
+### 7.2.4 单点 level 的处理
+
+POC、sigma 线、pivot 等单点 level：用 `low ≈ high` 的 zone 表示。
+
+例如：
+
+```json
+{
+  "low": 2151.49,
+  "high": 2151.49,
+  "role": "balance_boundary",
+  "reason": "daily TPO POC balance pivot"
+}
+```
+
+不需要额外的 `key_levels` 字段来容纳单点 level。
+
+## 7.3 为什么不保留 `current_structure_zone`
+
+初版方案包含了 `current_structure_zone` 作为"当前位置标签"。
+
+不再保留，原因：
+
+- **`active_range` 已经描述了包含当前价格的主区间**
+- **`support_ladder[0]` 和 `resistance_ladder[0]` 的间距就是当前价格所在的局部结构**
+- 额外输出一个 zone object 不增加信息量，只增加 token 开销
+- 更关键的是：如果 `current_structure_zone` 存在，模型有退化到"围绕 current zone 展开分析"的风险，重蹈 `dominant_zone` 的覆辙
+
+`active_range` + ladders 已经完整描述了"当前价格在结构中的位置"。
+
+## 7.4 为什么这样更对
 
 这组字段能明确分开：
 
-- 下方层级
-- 上方层级
-- 当前所在主结构区
+- 下方层级（从近到远）
+- 上方层级（从近到远）
 
-这样 `stage2` 才能区分：
+这样 `stage2` 才能直接读到：
 
 - 下一层支撑
 - 更远层目标
 - 更外层失效
-- 当前局部表达
-
-## 7.4 `current_structure_zone` 的真正定位
-
-`current_structure_zone` 不是新的中心字段。
-
-它的职责只有一个：
-
-- 告诉 `stage2` 当前价格现在位于哪一层主结构里
-
-它不负责替代：
-
-- 下方支撑层级
-- 上方阻力层级
-- thesis invalidation / objective 的外层边界
-
-所以在 `v4.0.0` 里：
-
-- **`support_ladder / resistance_ladder` 才是 `structure_parse` 的主输出**
-- **`current_structure_zone` 只是辅助定位字段**
-
-如果没有 ladders，只有 `current_structure_zone`，
-那系统就会退化回：
-
-- “当前组织区摘要”
-
-这正是本版要避免的。
+- 上方第一层阻力
+- 更远层 thesis objective
 
 ---
 
@@ -473,33 +578,43 @@
 
 ## 8.3 数量要求
 
-推荐：
+- 每个 thesis timeframe 的 ladder 总数：max 6 条主要价格带
 
-- `support_ladder`: 默认 3 层，必要时允许到 4 层
-- `resistance_ladder`: 默认 3 层，必要时允许到 4 层
+如果当前 thesis 路径只需要 4-5 条主要价格带，可以少于 6。
 
-这 3 层分别对应：
-
-- `immediate`
-- `next`
-- `outer`
-
-如果数据里不存在更外层有效结构，可以少于 3。
-
-但如果存在，就不能偷懒只写 1 层。
+如果当前 thesis 路径需要 6 条以内的完整层级，输出应覆盖到完整层级。
 
 这里的关键不是固定数量本身，
 而是：
 
 - **不能因为当前 schema 的近端偏置或低 item 限制，省略仍然影响 thesis 的下一层/外层结构**
 
-因此：
+## 8.4 thesis 边界覆盖要求
 
-- `key_levels` 可以继续是补充字段
-- 但 `support_ladder / resistance_ladder` 必须承担完整层级地图的职责
-- 不能把结构深度继续压回 `key_levels` 的 item 限制里
+这是价格带地图完整性的核心要求：
 
-## 8.4 已失效区域如何处理
+- `support_ladder` 的最外层应覆盖 thesis invalidation 区域
+- `resistance_ladder` 的最外层应覆盖 thesis objective 区域（或更远的结构天花板）
+- 中间价格带应覆盖从当前价到 thesis 边界之间仍然影响决策的主要层级
+
+这层要求的作用不是给模型加额外规则，
+而是明确我们真正需要什么：
+
+- 一张从当前价延伸到 thesis 边界的完整价格带地图
+
+## 8.5 1d 与 4h 的分辨率区分
+
+- 1d ladder 必须反映 1d 分辨率的结构，不是 4h 分辨率
+- 如果 1d 和 4h 的 ladder 几乎一样宽（如 v3.4.0 日志中 1d active_range $27 vs 4h $28），说明 1d 没有给出应有的结构深度
+
+Prompt 中应明确写：
+
+```
+A 1d ladder expresses 1d-resolution structure, with wider spacing and higher-level bands than the 4h ladder.
+The 4h ladder expresses the nearer thesis structure inside that broader 1d map.
+```
+
+## 8.6 已失效区域如何处理
 
 规则很明确：
 
@@ -508,12 +623,12 @@
 
 所以：
 
-- “旧角色”不保留
-- “当前角色”保留
+- "旧角色"不保留
+- "当前角色"保留
 
 ---
 
-## 9. 参与者解析也必须绑定到价格带
+## 9. 参与者解析必须绑定到价格
 
 如果 `stage1` 的任务之一是解析主要参与者的目的和行为，
 那 `participant_parse` 不能只写抽象任务。
@@ -536,40 +651,57 @@
 - `stop_loss`
 - `take_profit`
 
-## 9.2 推荐改法
+## 9.2 为什么不用 zone_id 引用
+
+初版方案使用 `defended_zone_ids` / `attacked_zone_ids` / `next_target_zone_ids` 引用 ladder 中的 zone_id。
+
+这个方向是对的——participant 必须绑定到具体价格。但 zone_id 引用有两个致命问题：
+
+1. **LLM 生成 ID 不一致**：模型在 ladder 里写 `"1d_support_1"`，在 participant 里引用 `"1d_support_s1"` 或 `"1d_sup_1"`。这不是偶尔发生，是常态。
+2. **Validation 复杂度爆炸**：需要交叉验证 participant 里引用的每个 zone_id 确实存在于 ladder 中。
+
+## 9.3 推荐改法：内联 `target_zone`
+
+用 optional 的内联价格 zone 替代 zone_id 引用：
 
 ```json
 "participant_observations": [
   {
-    "participant_role": "higher_timeframe_sponsorship|passive_liquidity|responsive_crowd|initiative_flow",
-    "current_task": "string",
-    "task_status": "accepted|blocked|failing|unresolved",
-    "defended_zone_ids": ["1d_support_1"],
-    "attacked_zone_ids": ["1d_resistance_1"],
-    "next_target_zone_ids": ["1d_support_2"],
-    "constraints": ["string"],
-    "evidence": ["string"],
-    "confidence": "low|medium|high"
+    "participant_role": "initiative_flow",
+    "current_task": "Keep rejection below 4h value 2146-2147",
+    "task_status": "accepted",
+    "target_zone": {"low": 2133.81, "high": 2136.16},
+    "constraints": ["2136.16 floor is still holding", "buy-side OB pressure present"],
+    "evidence": ["4h combined value read is rejected_from_below", "whale flow seller-aligned"],
+    "confidence": "high"
   }
 ]
 ```
 
-这样 `participant_parse` 就会回答：
+**`target_zone`**（optional，可为 null）：这个 participant 正在推价格去的地方。
 
-- 谁在守哪一层
-- 谁在打哪一层
-- 如果打穿/守住，下一层会是谁
+- 对于 initiative sellers：target_zone 是下方的 breakdown 目标
+- 对于 passive liquidity defenders：target_zone 是 null（他们在防守，不在推价格）
+- 对于 higher_timeframe_sponsorship：target_zone 是他们试图 reclaim 的区域
 
-这比单纯写行为 prose 更适合 `stage2` 直接消费。
+`defended` 和 `attacked` 的价格已经隐含在 `current_task` 文本里（例如 "Keep rejection below 2146-2147"）。
+只有 `target_zone` 需要显式结构化，因为它直接影响 stage2 的 TP 选择。
+
+这样做：
+
+- 不需要 zone_id
+- 不需要交叉验证
+- participant 的目标价格仍然是结构化的
+- stage2 可以直接读取 target_zone 来辅助 TP 决策
 
 ---
 
-## 10. `state_parse` 和 `flow_parse` 仍然保留
+## 10. `state_parse` 和 `flow_override` 仍然保留
 
 本版不推翻：
 
 - `state_parse`
-- `flow_parse`
+- `flow_override`（模型只输出 4 个 context-sensitive 字段）
 - `participant_parse`
 - `evidence_trace`
 
@@ -582,6 +714,13 @@
 因为当前最根本的问题不在 flow，而在：
 
 - `4h / 1d` 的结构地图没有被完整表达出来
+
+## 10.1 `evidence_trace` 收紧
+
+将 `supporting_facts` 和 `conflicting_facts` 从 max 4 降到 max 3。
+
+加上 `fragility_summary`，这层已经够了。
+省下的 token 用在 ladder 上。
 
 ---
 
@@ -613,41 +752,38 @@
 
 真正的主要手段仍然是：
 
-- `4h / 1d` 改成 ladder-first 的结构地图
+- `4h / 1d` 改成 ladder-only 的结构地图
 
 ---
 
 ## 12. 对 prompt 的要求
 
-## 12.1 不再让模型输出单层 dominant zone
+## 12.1 prompt 的核心需求定义
 
-prompt 不应再要求：
+prompt 应把 `4h / 1d` 的主要任务定义成：
 
-- `dominant_demand_zone`
-- `dominant_supply_zone`
+- 输出可直接用于 `4h-1d` 交易决策的主要价格带地图
+- 用 `support_ladder / resistance_ladder` 承载完整结构层级
+- 让价格带从当前价一直延伸到 thesis 边界
+- 让每条价格带都直接服务 `entry / sl / tp` 判断
 
-而应要求：
-
-- `support_ladder`
-- `resistance_ladder`
-- `current_structure_zone`
-
-## 12.2 新的 prompt 要求
+## 12.2 ladder 覆盖需求
 
 应明确写：
 
 ```text
-For 4h and 1d, do not stop at the nearest active zone.
-Return the operative structural ladder needed for a 4h to 1d trade decision.
+THESIS PRICE-BAND MAP
+
+For 4h and 1d, return the operative structural ladder needed for a 4h to 1d trade decision.
 
 For each thesis timeframe:
-- identify the immediate support and resistance layers
-- identify the next support and resistance layers when they still matter for the thesis
-- identify the outer support or resistance layer when it defines the thesis objective or invalidation
-- identify the current structure zone only as the current location label, not as a substitute for the ladder
-
-Do not include invalidated zones that no longer affect the current auction.
-If a formerly invalidated zone now acts as live supply or demand, include it by its current role.
+- begin each ladder with the nearest still-relevant major structural zone
+- extend support_ladder to the thesis invalidation boundary
+- extend resistance_ladder to the thesis objective or outer structural ceiling
+- include the intermediate major zones that still shape the thesis path
+- keep the ladder focused on major price bands with meaningful spacing
+- let the 1d ladder express 1d-resolution structure, not a narrow copy of the 4h ladder
+- represent former zones by their current live role when they still shape the auction
 ```
 
 ## 12.3 参与者 prompt 要求
@@ -655,9 +791,12 @@ If a formerly invalidated zone now acts as live supply or demand, include it by 
 应明确写：
 
 ```text
+PARTICIPANT TASKS
+
 Anchor participant tasks to the structural ladders.
-State which zones are being defended, attacked, or targeted next.
-Do not describe participant behavior without linking it to the current price-band map.
+State which price levels are being defended, attacked, or targeted next directly in current_task.
+Use target_zone to explicitly mark the structured price target when a participant is pushing price toward a specific zone.
+Describe participant behavior through the current price-band map so a downstream model can directly use it for trading decisions.
 ```
 
 ---
@@ -668,37 +807,81 @@ Do not describe participant behavior without linking it to the current price-ban
 
 从 `4h / 1d structure_parse` 删除：
 
-- `dominant_demand_zone`
-- `dominant_supply_zone`
-- `invalidation_level`
-- `structure_lifecycle`
+| 字段 | 替代方 |
+|------|--------|
+| `dominant_demand_zone` | `support_ladder[0]` |
+| `dominant_supply_zone` | `resistance_ladder[0]` |
+| `invalidation_level` | support/resistance ladder 最远层 |
+| `structure_lifecycle` | 完全删除，ladder 已覆盖 active 结构 |
+| `key_levels` | ladder zones 完全替代 |
 
 ## 13.2 新增
 
-新增：
-
-- `support_ladder`
-- `resistance_ladder`
-- `current_structure_zone`
-
-并把 `participant_parse` 扩成 zone-linked 版本。
+| 字段 | 说明 |
+|------|------|
+| `support_ladder` | 与 `resistance_ladder` 合计最多 6 条主要价格带，从近到远 |
+| `resistance_ladder` | 与 `support_ladder` 合计最多 6 条主要价格带，从近到远 |
+| `target_zone` (participant) | optional，标注参与者推价目标 |
 
 ## 13.3 保留
 
 保留：
 
 - `active_range`
-- `range_width_vs_atr`
-- `key_levels`
-- `state_parse`
-- `flow_parse`
-- `evidence_trace`
-- `execution_context_15m`
-- `cross_timeframe_parse`
+- `state_parse`（不变）
+- `flow_override`（不变）
+- `participant_parse`（加 `target_zone`）
+- `evidence_trace`（收紧到 max 3）
+- `execution_context_15m`（不变）
+- `cross_timeframe_parse`（不变）
 
 ---
 
-## 14. 对 Stage2 的意义
+## 14. 完整 per-timeframe schema 总览
+
+```
+structure_parse:
+  active_range: {low, high}
+  support_ladder: [                                与 resistance_ladder 合计 max 6, 从近到远
+    {low, high, role, reason}
+  ]
+  resistance_ladder: [                             与 support_ladder 合计 max 6, 从近到远
+    {low, high, role, reason}
+  ]
+
+state_parse:                                       (不变)
+  value_read: {pvs, tpo, combined}                 (precomputed merge)
+  range_state: enum
+  auction_state: enum
+  control_read: {side, clarity}
+  sponsorship_state: enum
+
+flow_override:                                     (不变，模型只输出这 4 个)
+  cvd_alignment_vs_price: enum
+  orderbook_pressure_side: enum
+  orderbook_near_price_constraint: enum
+  combined_flow_state: enum
+
+participant_parse:
+  participant_observations: [                       max 3
+    participant_role: enum
+    current_task: string
+    task_status: enum
+    target_zone: {low, high} | null                新增，optional
+    constraints: [string]                           max 3
+    evidence: [string]                              max 3
+    confidence: enum
+  ]
+
+evidence_trace:
+  supporting_facts: [string]                        max 3 (原 4→3)
+  conflicting_facts: [string]                       max 3 (原 4→3)
+  fragility_summary: string
+```
+
+---
+
+## 15. 对 Stage2 的意义
 
 按这个设计，`stage2` 将不再只看到：
 
@@ -706,18 +889,18 @@ Do not describe participant behavior without linking it to the current price-ban
 
 而会看到：
 
-- 当前结构层
-- 下一层支撑/压力
-- 外层 thesis 失效/目标层
-- 哪个 participant 在守哪一层、打哪一层
+- 下方从近到远的支撑层级
+- 上方从近到远的阻力层级
+- 最远层 = thesis 边界
+- 哪个 participant 正在推价格去哪里（target_zone）
 
 这会直接改善：
 
-- `direction` 的判断
-- `entry` 选择
-- `stop_loss` 放置
-- `take_profit` 选择
-- `leverage` 的风险定级
+- `direction` 的判断：ladder 的深度和 participant task 方向提供 thesis 方向性
+- `entry` 选择：support/resistance_ladder[0] 是最近执行区
+- `stop_loss` 放置：ladder 的外层提供结构化的 SL 参考
+- `take_profit` 选择：participant 的 target_zone + 对侧 ladder 提供 TP 候选
+- `leverage` 的风险定级：ladder 的深度（从近到远有多少层）反映路径拥挤度
 
 一句话说：
 
@@ -725,9 +908,32 @@ Do not describe participant behavior without linking it to the current price-ban
 
 ---
 
-## 15. 风险与边界
+## 16. Prompt self-check 更新
 
-## 15.1 本版不做的事
+```text
+BEFORE OUTPUT
+
+Before finalizing the JSON, run this self-check:
+
+1. Does each ladder span from the nearest active zone to the thesis boundary, not just the immediate neighborhood?
+2. Is the last zone in support_ladder the thesis invalidation boundary?
+3. Is the last zone in resistance_ladder the thesis objective or outer structural ceiling?
+4. Does the 1d ladder reflect 1d-resolution structure, not just a copy of the 4h ladder?
+5. Have I used `precomputed_value_read` as the fixed value-state base?
+6. Have I limited `flow_override` to the 4 context-sensitive flow judgements?
+7. Does `combined_flow_state` match the relationship between current flow evidence and `state_parse.control_read.side`?
+8. Have I anchored each participant task to specific price levels from the ladders?
+9. Is `execution_context_15m` a pure execution-layer summary that only contributes entry-quality context?
+10. Could a downstream model understand the current market and make a 4h-1d trade decision without reconstructing the raw input?
+
+If any answer is no, revise the parse before emitting the final JSON.
+```
+
+---
+
+## 17. 风险与边界
+
+## 17.1 本版不做的事
 
 本版不做：
 
@@ -740,22 +946,40 @@ Do not describe participant behavior without linking it to the current price-ban
 
 - **先把 `stage1` 的 4h/1d 市场分析职责做对**
 
-## 15.2 本版最大的收益
+## 17.2 本版最大的收益
 
 本版最大的收益不是 token 节省。
 
 而是：
 
-- `stage1` 不再输出一张“当前组织区摘要”
-- 而是输出一张“可供交易的结构层级地图”
+- `stage1` 不再输出一张"当前组织区摘要"
+- 而是输出一张"可供交易的结构层级地图"
 
 这才符合：
 
 - `stage1 scan = 解析市场 + 解析主要参与者目的和行为`
 
+## 17.3 Token 预算变化
+
+虽然 token 节省不是目标，但本版的 token 变化是正向的：
+
+| 删除 | 估算节省 |
+|------|---------|
+| `structure_lifecycle` (2 tf × ~5 structures × ~6 fields) | ~60 行 |
+| `key_levels` (2 tf × ~6 levels × 3 fields) | ~36 行 |
+| `dominant_demand_zone` + `dominant_supply_zone` | ~12 行 |
+| `invalidation_level` | ~2 行 |
+
+| 新增 | 估算开销 |
+|------|---------|
+| `support_ladder` + `resistance_ladder` (2 tf × ~6 zones × 4 fields) | ~48 行 |
+| `target_zone` (2 tf × ~3 participants × 1 zone) | ~6 行 |
+
+净变化：约 -56 行。节省的 token 被重新分配到"选对价格层级"上。
+
 ---
 
-## 16. 最终结论
+## 18. 最终结论
 
 按第一性原理重做之后，结论非常明确：
 
@@ -765,12 +989,14 @@ Do not describe participant behavior without linking it to the current price-ban
 
 因此：
 
-- 当前 `v3.x` 的单层 `dominant zone` 设计不够
+- 当前 `v3.x` 的单层 `dominant zone` + `key_levels` 设计不够
 - `4h / 1d structure_parse` 必须升级成：
-  - `current_structure_zone`
   - `support_ladder`
   - `resistance_ladder`
-  - zone-linked `participant_parse`
+  - 两条 ladder 合计最多 6 条主要价格带，并覆盖从当前价到 thesis 边界的完整决策层级
+  - 内联 `target_zone` 的 `participant_parse`
+- 删除 `dominant_demand_zone`、`dominant_supply_zone`、`invalidation_level`、`structure_lifecycle`、`key_levels`
+- 不设 `zone_id`、`importance`、`status` 枚举——模型的 token 花在选价格，不是填分类
 
 这版的核心不是让模型更快，
 而是让 `stage1` 第一次真正完成它应该完成的事：
