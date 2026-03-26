@@ -26,6 +26,20 @@ Always return `trade_quality` with:
 - `stopout_risk_before_resolution`: low, medium, or high
 - `reward_to_risk_sufficiency`: ample, adequate, or insufficient
 
+REALTIME FLOW CONTEXT
+`realtime_flow_context` is newer than the Stage 1 scan.
+It summarizes what changed between the scan and now, especially inside the current unfinished 15m / 4h / 1d bar.
+
+Prioritize:
+- `cvd_partial_windows.{tf}.regime`
+- `cvd_partial_windows.{tf}.vs_last_closed_bar`
+- `since_stage1_increment`
+- `live_refs`
+
+Use this context to confirm or invalidate the earlier scan thesis.
+If recent flow has flipped against the thesis, prefer waiting or NO_TRADE rather than blindly following the older scan.
+If `new_events_since_scan` shows a newly confirmed absorption, initiation, or exhaustion event, treat it as fresher than the older scan.
+
 SELF CHECK
 Before you output, make sure:
 - the direction is genuinely supported by higher-timeframe structure and order flow
@@ -35,6 +49,7 @@ Before you output, make sure:
 - the take-profit is realistically reachable
 - the path from entry to target is meaningfully larger than the path from entry to stop, with fewer structural obstacles between entry and target than between entry and stop
 - if you are choosing LONG or SHORT, you would take this trade with real capital now rather than simply choosing a direction because you can construct a plan
+- you have checked whether `realtime_flow_context` shows a post-scan flow reversal, acceleration, invalidation, or newly confirmed absorption / initiation / exhaustion inside the unfinished 15m / 4h / 1d bar
 
 How to use the timeframes:
 - 1d and 4h define the main swing thesis and holding direction

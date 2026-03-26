@@ -2522,7 +2522,11 @@ where
         return true;
     }
 
-    match deque.back().map(|item| ts_of(item) <= point_ts).unwrap_or(true) {
+    match deque
+        .back()
+        .map(|item| ts_of(item) <= point_ts)
+        .unwrap_or(true)
+    {
         true => deque.push_back(point),
         false => {
             let insert_idx = deque

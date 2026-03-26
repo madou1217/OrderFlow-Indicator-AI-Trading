@@ -10,6 +10,20 @@ GOAL
 Choose the action that maximizes expected value from now for this unfilled pending trade idea,
 while controlling entry sweep risk, stale-entry risk, and thesis-failure risk.
 
+REALTIME FLOW CONTEXT
+`realtime_flow_context` is newer than the Stage 1 scan.
+It summarizes what changed between the scan and now, especially inside the current unfinished 15m / 4h / 1d bar.
+
+Prioritize:
+- `cvd_partial_windows.{tf}.regime`
+- `cvd_partial_windows.{tf}.vs_last_closed_bar`
+- `since_stage1_increment`
+- `live_refs`
+
+Use this context to confirm or invalidate the earlier scan thesis.
+If recent flow has flipped against the pending direction, prefer canceling, repricing, waiting, or declaring the setup obsolete rather than blindly following the older scan.
+If `new_events_since_scan` shows a newly confirmed absorption, initiation, or exhaustion event, treat it as fresher than the older scan.
+
 BEFORE YOU OUTPUT
 1. From now, does this unfilled trade idea still offer real 4h to 1d edge?
 2. Is the current pending direction still the best expression of the trade idea from now, or does the current data support a better action that would satisfy the GOAL more effectively?
@@ -17,6 +31,7 @@ BEFORE YOU OUTPUT
 4. Is the current candidate entry likely to be swept by 15m noise before the thesis has enough time to resolve?
 5. Does the current TP still represent the best objective for this pending idea?
 6. If canceling, repricing, or waiting would better satisfy the GOAL, why?
+7. Have you checked whether `realtime_flow_context` shows a post-scan flow reversal, acceleration, invalidation, or newly confirmed absorption / initiation / exhaustion inside the unfinished 15m / 4h / 1d bar?
 
 If you see no valid setup → return all null params.
 If any level raises doubt, revise before outputting.

@@ -1,6 +1,7 @@
-use super::{core_entry, core_management, core_pending};
+use super::{core_entry, core_management, core_pending, core_shared};
 use crate::llm::{prompt, provider::ModelInvocationInput};
 use anyhow::{anyhow, Context, Result};
+use chrono::{DateTime, Utc};
 use serde_json::{json, Map, Value};
 
 pub(crate) struct CoreFilter;
@@ -34,6 +35,18 @@ impl CoreMode {
             Self::Pending => "pending_core",
         }
     }
+
+    fn include_realtime_15m_series(self) -> bool {
+        !matches!(self, Self::Management)
+    }
+
+    fn max_realtime_new_events(self) -> usize {
+        if matches!(self, Self::Management) {
+            2
+        } else {
+            6
+        }
+    }
 }
 
 impl CoreFilter {
@@ -41,19 +54,24 @@ impl CoreFilter {
         let mut root =
             serde_json::to_value(input).context("serialize core invocation input value")?;
         super::TempIndicatorInputOptimizer::round_derived_fields(&mut root);
-        Ok(build_core_root(&root, CoreMode::from_input(input)))
+        Ok(build_core_root(&root, CoreMode::from_input(input), None))
     }
 
     pub(crate) fn build_finalize_value(
         input: &ModelInvocationInput,
         prior_scan: &Value,
     ) -> Result<Value> {
-        let mut value = Self::build_value(input)?;
+        let mut root =
+            serde_json::to_value(input).context("serialize core invocation input value")?;
+        super::TempIndicatorInputOptimizer::round_derived_fields(&mut root);
+        let mut value = build_core_root(&root, CoreMode::from_input(input), Some(prior_scan));
         if let Some(root) = value.as_object_mut() {
-            root.insert(
-                "finalize_focus".to_string(),
-                build_finalize_focus(prior_scan),
-            );
+            if matches!(CoreMode::from_input(input), CoreMode::Entry) {
+                root.insert(
+                    "finalize_focus".to_string(),
+                    build_finalize_focus(prior_scan),
+                );
+            }
         }
         Ok(value)
     }
@@ -80,11 +98,9 @@ impl CoreFilter {
         entry_stage: prompt::EntryPromptStage,
         prior_scan: Option<&Value>,
     ) -> Result<String> {
-        if matches!(CoreMode::from_input(input), CoreMode::Entry)
-            && matches!(entry_stage, prompt::EntryPromptStage::Finalize)
-        {
+        if matches!(entry_stage, prompt::EntryPromptStage::Finalize) {
             let scan =
-                prior_scan.ok_or_else(|| anyhow!("missing prior scan for entry finalize"))?;
+                prior_scan.ok_or_else(|| anyhow!("missing prior scan for finalize stage"))?;
             return Self::serialize_finalize_input(input, scan);
         }
 
@@ -207,7 +223,7 @@ fn derive_spot_premium_state_label(prior_scan: &Value) -> &'static str {
     }
 }
 
-fn build_core_root(root: &Value, mode: CoreMode) -> Value {
+fn build_core_root(root: &Value, mode: CoreMode, prior_scan: Option<&Value>) -> Value {
     let mut result = Map::new();
     if let Some(symbol) = root.get("symbol") {
         result.insert("symbol".to_string(), symbol.clone());
@@ -235,7 +251,26 @@ fn build_core_root(root: &Value, mode: CoreMode) -> Value {
             ),
         })
         .unwrap_or_default();
+
+    let realtime_flow_context =
+        root.get("indicators")
+            .and_then(Value::as_object)
+            .and_then(|source| {
+                prior_scan.and_then(|scan| {
+                    core_shared::build_realtime_flow_context(
+                        source,
+                        &filtered_indicators,
+                        current_ts_bucket(root),
+                        stage1_scan_ts_bucket(scan),
+                        mode.include_realtime_15m_series(),
+                        mode.max_realtime_new_events(),
+                    )
+                })
+            });
     result.insert("indicators".to_string(), Value::Object(filtered_indicators));
+    if let Some(realtime_flow_context) = realtime_flow_context {
+        result.insert("realtime_flow_context".to_string(), realtime_flow_context);
+    }
 
     if !matches!(mode, CoreMode::Entry) {
         if let Some(trading_state) = root
@@ -276,6 +311,35 @@ fn build_core_root(root: &Value, mode: CoreMode) -> Value {
     }
 
     Value::Object(result)
+}
+
+fn current_ts_bucket(root: &Value) -> Option<DateTime<Utc>> {
+    root.get("ts_bucket")
+        .and_then(Value::as_str)
+        .and_then(parse_rfc3339_utc)
+}
+
+fn stage1_scan_ts_bucket(prior_scan: &Value) -> Option<DateTime<Utc>> {
+    prior_scan
+        .get("stage_1_scan_ts_bucket")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            prior_scan
+                .get("stage1_scan_ts_bucket")
+                .and_then(Value::as_str)
+        })
+        .or_else(|| {
+            prior_scan
+                .pointer("/meta/scan_ts_bucket")
+                .and_then(Value::as_str)
+        })
+        .and_then(parse_rfc3339_utc)
+}
+
+fn parse_rfc3339_utc(raw: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(raw)
+        .ok()
+        .map(|value| value.with_timezone(&Utc))
 }
 
 fn strip_position_entry_reason(value: &mut Value) {
@@ -1123,6 +1187,190 @@ mod tests {
             .collect()
     }
 
+    fn sample_partial_window_15m() -> Value {
+        let start = DateTime::parse_from_rfc3339("2026-03-18T07:00:00Z")
+            .expect("parse partial window start")
+            .with_timezone(&Utc);
+        let fut_deltas = [
+            120.0, 105.0, 95.0, 80.0, 60.0, -20.0, -45.0, -70.0, -95.0, -110.0,
+        ];
+        let spot_deltas = [18.0, 14.0, 12.0, 10.0, 6.0, -4.0, -8.0, -10.0, -12.0, -16.0];
+        let volumes = [
+            900.0, 880.0, 860.0, 840.0, 820.0, 810.0, 800.0, 790.0, 780.0, 770.0,
+        ];
+        let mut cum_delta_fut = 0.0;
+        let mut cum_delta_spot = 0.0;
+        let mut cum_volume_fut = 0.0;
+        let mut recent_series = Vec::new();
+
+        for idx in 0..fut_deltas.len() {
+            let ts = start + Duration::minutes(idx as i64);
+            cum_delta_fut += fut_deltas[idx];
+            cum_delta_spot += spot_deltas[idx];
+            cum_volume_fut += volumes[idx];
+            recent_series.push(json!({
+                "ts": ts.to_rfc3339_opts(SecondsFormat::Secs, true),
+                "delta_fut": fut_deltas[idx],
+                "delta_spot": spot_deltas[idx],
+                "volume_fut": volumes[idx],
+                "cum_delta_fut": cum_delta_fut,
+                "cum_delta_spot": cum_delta_spot
+            }));
+        }
+
+        json!({
+            "window_start": start.to_rfc3339_opts(SecondsFormat::Secs, true),
+            "window_end": (start + Duration::minutes(15)).to_rfc3339_opts(SecondsFormat::Secs, true),
+            "last_minute_ts": (start + Duration::minutes(9)).to_rfc3339_opts(SecondsFormat::Secs, true),
+            "minutes_elapsed": 10,
+            "minutes_total": 15,
+            "progress_pct": 66.67,
+            "cum_delta_fut": cum_delta_fut,
+            "cum_delta_spot": cum_delta_spot,
+            "cum_volume_fut": cum_volume_fut,
+            "recent_3m_delta_fut": -275.0,
+            "recent_5m_delta_fut": -340.0,
+            "recent_15m_delta_fut": cum_delta_fut,
+            "recent_5m_delta_spot": -50.0,
+            "slope_recent_5m_fut": -68.0,
+            "slope_prev_5m_fut": 92.0,
+            "slope_change_ratio": -0.74,
+            "regime": "reversal_to_selling",
+            "recent_series": recent_series
+        })
+    }
+
+    fn sample_signal_event(
+        confirm_ts: &str,
+        indicator_code: &str,
+        direction: &str,
+        price: f64,
+    ) -> Value {
+        json!({
+            "event_id": format!("{indicator_code}-{confirm_ts}"),
+            "indicator_code": indicator_code,
+            "start_ts": confirm_ts,
+            "end_ts": confirm_ts,
+            "event_start_ts": confirm_ts,
+            "event_end_ts": confirm_ts,
+            "event_available_ts": confirm_ts,
+            "confirm_ts": confirm_ts,
+            "direction": direction,
+            "pivot_price": price,
+            "price_high": price + 1.0,
+            "price_low": price - 1.0,
+            "score": 0.81,
+            "score_base": 0.7,
+            "strength_score_xmk": 0.73,
+            "trigger_side": if direction == "bullish" { "buy" } else { "sell" },
+            "type": indicator_code,
+            "delta_sum": 120.0,
+            "reject_ratio": 0.55,
+            "stacked_buy_imbalance": direction == "bullish",
+            "stacked_sell_imbalance": direction == "bearish",
+            "key_distance_ticks": 3,
+            "spot_flow_confirm_score": 0.7,
+            "spot_whale_confirm_score": 0.65,
+            "spot_rdelta_1m_mean": 12.0,
+            "spot_cvd_1m_change": 18.0
+        })
+    }
+
+    fn attach_realtime_flow_inputs(indicators: &mut Value) {
+        indicators
+            .get_mut("cvd_pack")
+            .and_then(Value::as_object_mut)
+            .and_then(|indicator| indicator.get_mut("payload"))
+            .and_then(Value::as_object_mut)
+            .expect("cvd_pack payload")
+            .insert(
+                "partial_window".to_string(),
+                json!({
+                    "15m": sample_partial_window_15m(),
+                    "4h": {
+                        "window_start": "2026-03-18T04:00:00Z",
+                        "window_end": "2026-03-18T08:00:00Z",
+                        "last_minute_ts": "2026-03-18T07:09:00Z",
+                        "minutes_elapsed": 190,
+                        "minutes_total": 240,
+                        "progress_pct": 79.17,
+                        "cum_delta_fut": -420.0,
+                        "cum_delta_spot": -120.0,
+                        "cum_volume_fut": 18200.0,
+                        "recent_3m_delta_fut": -75.0,
+                        "recent_5m_delta_fut": -110.0,
+                        "recent_15m_delta_fut": -240.0,
+                        "slope_recent_5m_fut": -22.0,
+                        "slope_prev_5m_fut": 16.0,
+                        "slope_change_ratio": -1.38,
+                        "regime": "reversal_to_selling",
+                        "recent_series": []
+                    },
+                    "1d": {
+                        "window_start": "2026-03-18T00:00:00Z",
+                        "window_end": "2026-03-19T00:00:00Z",
+                        "last_minute_ts": "2026-03-18T07:09:00Z",
+                        "minutes_elapsed": 430,
+                        "minutes_total": 1440,
+                        "progress_pct": 29.86,
+                        "cum_delta_fut": 310.0,
+                        "cum_delta_spot": 95.0,
+                        "cum_volume_fut": 48100.0,
+                        "recent_3m_delta_fut": -28.0,
+                        "recent_5m_delta_fut": -35.0,
+                        "recent_15m_delta_fut": 40.0,
+                        "slope_recent_5m_fut": -7.0,
+                        "slope_prev_5m_fut": 11.0,
+                        "slope_change_ratio": -0.64,
+                        "regime": "steady",
+                        "recent_series": []
+                    }
+                }),
+            );
+
+        let orderbook_payload = indicators
+            .get_mut("orderbook_depth")
+            .and_then(Value::as_object_mut)
+            .and_then(|indicator| indicator.get_mut("payload"))
+            .and_then(Value::as_object_mut)
+            .expect("orderbook payload");
+        orderbook_payload.insert("ofi_norm_fut".to_string(), json!(-1.29));
+        orderbook_payload.insert("obi_k_dw_close_fut".to_string(), json!(-0.863));
+        orderbook_payload.insert("exec_confirm_fut".to_string(), json!(false));
+        orderbook_payload.insert("spot_confirm".to_string(), json!(false));
+
+        indicators
+            .get_mut("absorption")
+            .and_then(Value::as_object_mut)
+            .and_then(|indicator| indicator.get_mut("payload"))
+            .and_then(Value::as_object_mut)
+            .and_then(|payload| payload.get_mut("recent_7d"))
+            .and_then(Value::as_object_mut)
+            .expect("absorption recent_7d")
+            .insert(
+                "events".to_string(),
+                json!([
+                    sample_signal_event("2026-03-18T07:05:00Z", "absorption", "bullish", 2159.18),
+                    sample_signal_event("2026-03-18T06:52:00Z", "absorption", "bearish", 2168.4)
+                ]),
+            );
+        indicators
+            .get_mut("initiation")
+            .and_then(Value::as_object_mut)
+            .and_then(|indicator| indicator.get_mut("payload"))
+            .and_then(Value::as_object_mut)
+            .and_then(|payload| payload.get_mut("recent_7d"))
+            .and_then(Value::as_object_mut)
+            .expect("initiation recent_7d")
+            .insert(
+                "events".to_string(),
+                json!([
+                    sample_signal_event("2026-03-18T07:07:00Z", "initiation", "bearish", 2171.05),
+                    sample_signal_event("2026-03-18T06:49:00Z", "initiation", "bullish", 2153.2)
+                ]),
+            );
+    }
+
     fn sample_time_strings(start: &str, step_minutes: i64, count: usize) -> Vec<String> {
         let start = DateTime::parse_from_rfc3339(start)
             .expect("parse sample start ts")
@@ -1770,6 +2018,93 @@ mod tests {
                 )
                 .and_then(Value::as_i64),
             Some(77)
+        );
+    }
+
+    #[test]
+    fn entry_finalize_includes_realtime_flow_context() {
+        let mut indicators = build_sample_indicators();
+        attach_realtime_flow_inputs(&mut indicators);
+        let ts_bucket = DateTime::parse_from_rfc3339("2026-03-18T07:09:00Z")
+            .expect("parse ts bucket")
+            .with_timezone(&Utc);
+        let input = sample_input_at(indicators, false, false, ts_bucket);
+        let prior_scan = json!({
+            "schema_version": "scan_v4_0_0",
+            "stage_1_scan_ts_bucket": "2026-03-18T07:00:00+00:00"
+        });
+
+        let value =
+            CoreFilter::build_finalize_value(&input, &prior_scan).expect("build finalize value");
+
+        assert!(value.pointer("/finalize_focus").is_some());
+        assert_eq!(
+            value
+                .pointer("/realtime_flow_context/cvd_partial_windows/15m/regime")
+                .and_then(Value::as_str),
+            Some("reversal_to_selling")
+        );
+        assert_eq!(
+            value
+                .pointer("/realtime_flow_context/cvd_partial_windows/15m/recent_series")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(10)
+        );
+        assert_eq!(
+            value
+                .pointer("/realtime_flow_context/live_refs/orderbook_ofi_norm_fut")
+                .and_then(Value::as_f64),
+            Some(-1.29)
+        );
+        assert_eq!(
+            value
+                .pointer("/realtime_flow_context/live_refs/orderbook_exec_confirm_fut")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            value
+                .pointer("/realtime_flow_context/since_stage1_increment/new_events_since_scan")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(2)
+        );
+        assert_eq!(
+            value
+                .pointer("/realtime_flow_context/since_stage1_increment/dominant_flow")
+                .and_then(Value::as_str),
+            Some("balanced")
+        );
+    }
+
+    #[test]
+    fn management_finalize_uses_realtime_summary_without_finalize_focus() {
+        let mut indicators = build_sample_indicators();
+        attach_realtime_flow_inputs(&mut indicators);
+        let ts_bucket = DateTime::parse_from_rfc3339("2026-03-18T07:09:00Z")
+            .expect("parse ts bucket")
+            .with_timezone(&Utc);
+        let input = sample_input_at(indicators, true, false, ts_bucket);
+        let prior_scan = json!({
+            "schema_version": "scan_v4_0_0",
+            "stage_1_scan_ts_bucket": "2026-03-18T07:00:00+00:00"
+        });
+
+        let value = CoreFilter::build_finalize_value(&input, &prior_scan)
+            .expect("build management finalize value");
+
+        assert!(value.pointer("/finalize_focus").is_none());
+        assert!(value.pointer("/realtime_flow_context").is_some());
+        assert!(value
+            .pointer("/realtime_flow_context/cvd_partial_windows/15m/recent_series")
+            .is_none());
+        assert_eq!(
+            value
+                .pointer("/realtime_flow_context/since_stage1_increment/new_events_since_scan")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(2)
         );
     }
 

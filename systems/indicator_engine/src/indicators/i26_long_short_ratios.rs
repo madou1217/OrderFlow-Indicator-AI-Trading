@@ -67,7 +67,10 @@ impl Indicator for I26LongShortRatios {
         let view = build_long_short_ratio_view(ctx);
         let mut by_window = Map::new();
         for metrics in &view.by_window {
-            by_window.insert(metrics.window_label.to_string(), long_short_window_json(metrics));
+            by_window.insert(
+                metrics.window_label.to_string(),
+                long_short_window_json(metrics),
+            );
         }
         let mut snapshot_rows = Vec::new();
         for metrics in &view.by_window {
@@ -120,7 +123,9 @@ pub fn build_long_short_ratio_view(ctx: &IndicatorContext) -> LongShortRatioIndi
     let latest = aligned.last();
     let by_window = LONG_SHORT_WINDOWS
         .into_iter()
-        .map(|(label, minutes, samples)| compute_long_short_window(&aligned, label, minutes, samples))
+        .map(|(label, minutes, samples)| {
+            compute_long_short_window(&aligned, label, minutes, samples)
+        })
         .collect::<Vec<_>>();
 
     LongShortRatioIndicatorView {
@@ -167,9 +172,8 @@ fn compute_long_short_window(
 
     let account_crowding_gap = end.top_account - end.global_account;
     let position_crowding_gap = end.top_position - end.global_account;
-    let crowding_stretch = account_crowding_gap.abs()
-        + position_crowding_gap.abs()
-        + (end.global_account - 1.0).abs();
+    let crowding_stretch =
+        account_crowding_gap.abs() + position_crowding_gap.abs() + (end.global_account - 1.0).abs();
     let global_ratio_change = Some(end.global_account - start.global_account);
     let top_account_ratio_change = Some(end.top_account - start.top_account);
     let top_position_ratio_change = Some(end.top_position - start.top_position);

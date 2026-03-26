@@ -478,8 +478,8 @@ impl BinanceRestClient {
                     }
 
                     let class = classify_status(status);
-                    let backoff = retry_after_duration(&resp)
-                        .unwrap_or_else(|| self.retry_backoff(attempt));
+                    let backoff =
+                        retry_after_duration(&resp).unwrap_or_else(|| self.retry_backoff(attempt));
                     warn!(
                         op = op_name,
                         url = url,
@@ -569,7 +569,9 @@ impl BinanceRestClient {
             .with_context(|| format!("{op_name} bad status symbol={symbol} period={period}"))?
             .json::<Vec<BinanceLongShortRatioRecord>>()
             .await
-            .with_context(|| format!("decode long short ratio series symbol={symbol} period={period}"))
+            .with_context(|| {
+                format!("decode long short ratio series symbol={symbol} period={period}")
+            })
     }
 }
 

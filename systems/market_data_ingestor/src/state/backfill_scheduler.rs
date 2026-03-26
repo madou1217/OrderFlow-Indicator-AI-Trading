@@ -172,12 +172,12 @@ pub async fn run_open_interest_ratio_loop(
     let mut last_current_oi_ts = load_latest_open_interest_current_ts(&ctx.md_db_pool, &symbol)
         .await
         .unwrap_or(None);
-    let mut last_common_bucket =
-        load_latest_common_oi_ratio_bucket(&ctx.md_db_pool, &symbol).await.unwrap_or(None);
+    let mut last_common_bucket = load_latest_common_oi_ratio_bucket(&ctx.md_db_pool, &symbol)
+        .await
+        .unwrap_or(None);
     let mut current_ticker = interval(Duration::from_secs(OPEN_INTEREST_CURRENT_INTERVAL_SECS));
     current_ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    let mut structure_ticker =
-        interval(Duration::from_secs(OI_RATIO_STRUCTURE_POLL_INTERVAL_SECS));
+    let mut structure_ticker = interval(Duration::from_secs(OI_RATIO_STRUCTURE_POLL_INTERVAL_SECS));
     structure_ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
     if let Err(err) = backfill_recent_oi_ratio_history(
@@ -526,7 +526,10 @@ async fn handle_oi_ratio_live_bucket(
     let Some(target_bucket) = boundary_bucket.checked_sub_signed(ChronoDuration::minutes(5)) else {
         return;
     };
-    if last_common_bucket.map(|ts| ts >= target_bucket).unwrap_or(false) {
+    if last_common_bucket
+        .map(|ts| ts >= target_bucket)
+        .unwrap_or(false)
+    {
         return;
     }
 
@@ -602,15 +605,10 @@ async fn backfill_recent_oi_ratio_history(
     let end_ms = end.timestamp_millis();
 
     let oi_hist = fetch_open_interest_hist_range(rest_client, symbol, start_ms, end_ms).await?;
-    let global_ratio = fetch_ratio_range(
-        rest_client,
-        symbol,
-        "global_account",
-        start_ms,
-        end_ms,
-    )
-    .await?;
-    let top_account = fetch_ratio_range(rest_client, symbol, "top_account", start_ms, end_ms).await?;
+    let global_ratio =
+        fetch_ratio_range(rest_client, symbol, "global_account", start_ms, end_ms).await?;
+    let top_account =
+        fetch_ratio_range(rest_client, symbol, "top_account", start_ms, end_ms).await?;
     let top_position =
         fetch_ratio_range(rest_client, symbol, "top_position", start_ms, end_ms).await?;
 
@@ -661,13 +659,7 @@ async fn fetch_open_interest_hist_range(
     let mut out = BTreeMap::<i64, BinanceOpenInterestHistRecord>::new();
     while cursor_end >= start_time_ms {
         let batch = rest_client
-            .fetch_open_interest_hist(
-                symbol,
-                "5m",
-                None,
-                Some(cursor_end),
-                OI_RATIO_FETCH_LIMIT,
-            )
+            .fetch_open_interest_hist(symbol, "5m", None, Some(cursor_end), OI_RATIO_FETCH_LIMIT)
             .await?;
         if batch.is_empty() {
             break;
@@ -822,10 +814,22 @@ fn live_bucket_set_from_target(
     target_ms: i64,
 ) -> Option<RatioBucketSet> {
     Some(RatioBucketSet {
-        oi_hist: oi_hist.iter().find(|row| row.timestamp == target_ms)?.clone(),
-        global_account: global_ratio.iter().find(|row| row.timestamp == target_ms)?.clone(),
-        top_account: top_account.iter().find(|row| row.timestamp == target_ms)?.clone(),
-        top_position: top_position.iter().find(|row| row.timestamp == target_ms)?.clone(),
+        oi_hist: oi_hist
+            .iter()
+            .find(|row| row.timestamp == target_ms)?
+            .clone(),
+        global_account: global_ratio
+            .iter()
+            .find(|row| row.timestamp == target_ms)?
+            .clone(),
+        top_account: top_account
+            .iter()
+            .find(|row| row.timestamp == target_ms)?
+            .clone(),
+        top_position: top_position
+            .iter()
+            .find(|row| row.timestamp == target_ms)?
+            .clone(),
     })
 }
 
@@ -879,7 +883,10 @@ fn align_ratio_buckets(
                     oi_hist: oi_by_ts.get(&ts).expect("oi ts").clone(),
                     global_account: global_by_ts.get(&ts).expect("global ts").clone(),
                     top_account: top_account_by_ts.get(&ts).expect("top_account ts").clone(),
-                    top_position: top_position_by_ts.get(&ts).expect("top_position ts").clone(),
+                    top_position: top_position_by_ts
+                        .get(&ts)
+                        .expect("top_position ts")
+                        .clone(),
                 },
             )
         })
@@ -966,7 +973,9 @@ async fn load_latest_open_interest_current_ts(
     .bind(symbol)
     .fetch_one(pool)
     .await?;
-    Ok(row.try_get::<Option<f64>, _>("ts_ms")?.map(|value| value as i64))
+    Ok(row
+        .try_get::<Option<f64>, _>("ts_ms")?
+        .map(|value| value as i64))
 }
 
 async fn load_latest_common_oi_ratio_bucket(
@@ -1046,8 +1055,15 @@ async fn persist_scheduler_event(
         event.msg_type.as_str(),
         "md.open_interest_current" | "md.open_interest_hist_5m" | "md.long_short_ratio_5m"
     ) {
-        persist_async::persist_event(event, db_writer, publisher, outbox_writer, ops_writer, metrics)
-            .await
+        persist_async::persist_event(
+            event,
+            db_writer,
+            publisher,
+            outbox_writer,
+            ops_writer,
+            metrics,
+        )
+        .await
     } else {
         warn!(
             market = event.market,

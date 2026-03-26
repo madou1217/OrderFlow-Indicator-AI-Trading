@@ -55,15 +55,16 @@ pub fn normalize_hist_5m_rest(
         .sum_open_interest
         .parse::<f64>()
         .with_context(|| format!("parse sum open interest {}", record.sum_open_interest))?;
-    let open_interest_value_usdt = record
-        .sum_open_interest_value
-        .parse::<f64>()
-        .with_context(|| {
-            format!(
-                "parse sum open interest value {}",
-                record.sum_open_interest_value
-            )
-        })?;
+    let open_interest_value_usdt =
+        record
+            .sum_open_interest_value
+            .parse::<f64>()
+            .with_context(|| {
+                format!(
+                    "parse sum open interest value {}",
+                    record.sum_open_interest_value
+                )
+            })?;
     let reference_price = if open_interest_contracts.abs() > f64::EPSILON {
         Some(open_interest_value_usdt / open_interest_contracts)
     } else {

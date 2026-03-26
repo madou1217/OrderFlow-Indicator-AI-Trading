@@ -17,7 +17,7 @@ use std::time::Instant;
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
-const PROCESS_WINDOW_WARN_MS: u128 = 2_000;
+const PROCESS_WINDOW_WARN_MS: u128 = 5_000;
 const PROCESS_WINDOW_STAGE_WARN_MS: u128 = 1_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,10 +88,9 @@ impl Dispatcher {
                 | "high_volume_pulse"
                 | "ema_trend_regime"
                 | "fvg" => flow_indicators.push(indicator),
-                "liquidation_density"
-                | "funding_rate"
-                | "open_interest"
-                | "long_short_ratios" => deriv_indicators.push(indicator),
+                "liquidation_density" | "funding_rate" | "open_interest" | "long_short_ratios" => {
+                    deriv_indicators.push(indicator)
+                }
                 _ => orderbook_indicators.push(indicator),
             }
         }
@@ -170,9 +169,9 @@ impl Dispatcher {
             &mut liq_rows,
         );
         snapshots.sort_by(|a, b| {
-            a.indicator_code
-                .cmp(b.indicator_code)
-                .then_with(|| snapshot_window_rank(a.window_code).cmp(&snapshot_window_rank(b.window_code)))
+            a.indicator_code.cmp(b.indicator_code).then_with(|| {
+                snapshot_window_rank(a.window_code).cmp(&snapshot_window_rank(b.window_code))
+            })
         });
 
         let mut indicators_json = Map::new();

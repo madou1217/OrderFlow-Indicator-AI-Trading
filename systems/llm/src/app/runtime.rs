@@ -30,7 +30,7 @@ use lapin::{
 };
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use sqlx::{PgPool, Row};
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -52,6 +52,8 @@ const MANAGEMENT_REDUCTION_LEVEL_THRESHOLD: f64 = 0.5;
 const KLINE_DB_BACKFILL_INTERVALS: [(&str, i64); 2] = [("4h", 240), ("1d", 1440)];
 const KLINE_RANGE_CACHE_TTL_MINUTES: i64 = 30;
 const KLINE_RANGE_CACHE_MAX_SERIES: usize = 8;
+const ENTRY_RECHECK_MIN_BUNDLE_UPDATE_MINUTES: i64 = 2;
+const ENTRY_RECHECK_VETO_THRESHOLD: usize = 2;
 
 #[derive(Debug, Default)]
 struct InvokeThrottleState {
@@ -219,6 +221,20 @@ struct LatestBundle {
     indicators: Value,
     missing_indicator_codes: Vec<String>,
     received_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+struct EntryFreshnessRecheckSnapshot {
+    latest_bundle_ts_bucket: DateTime<Utc>,
+    latest_bundle_age_secs: i64,
+    bundle_update_minutes: i64,
+    realtime_flow_context: Value,
+}
+
+#[derive(Debug, Clone)]
+struct EntryFreshnessRecheckEvaluation {
+    result: &'static str,
+    rules_hit: Vec<&'static str>,
 }
 
 pub async fn run(ctx: AppContext) -> Result<()> {
@@ -3498,6 +3514,11 @@ async fn invoke_bundle_models(
             return;
         }
     };
+    let stage2_realtime_flow_context = build_runtime_realtime_flow_context_for_input(
+        &stage2_prepared.input,
+        stage1_bundle.raw.ts_bucket,
+    );
+    let stage2_rtf_rollout_fields = build_rtf_rollout_fields(stage2_realtime_flow_context.as_ref());
     println!(
         "LLM_INVOKE_CONTEXT ts_bucket={} trigger={} symbol={} stage=stage2_core management_mode={} pending_order_mode={} context_state={} active_position_count={} open_order_count={} default_model={} prompt_template={} last_management_reason={}",
         stage2_prepared.bundle.raw.ts_bucket,
@@ -3522,7 +3543,7 @@ async fn invoke_bundle_models(
             .iter()
             .map(|p| p.unrealized_pnl)
             .sum();
-        let event = json!({
+        let mut event = json!({
             "event_type": "llm_invoke_context",
             "event_ts": Utc::now().to_rfc3339(),
             "ts_bucket": stage2_prepared.bundle.raw.ts_bucket.to_rfc3339(),
@@ -3541,6 +3562,11 @@ async fn invoke_bundle_models(
             "available_balance": state.available_balance,
             "total_unrealized_pnl": total_unrealized_pnl,
         });
+        if let Some(object) = event.as_object_mut() {
+            for (key, value) in stage2_rtf_rollout_fields.clone() {
+                object.insert(key, value);
+            }
+        }
         if let Err(err) = append_journal_event(event) {
             warn!(error = %err, "append llm_invoke_context journal failed");
         }
@@ -3661,6 +3687,52 @@ async fn invoke_bundle_models(
             );
         }
     }
+
+    let entry_recheck_snapshot =
+        if config.llm.execution.enabled && !management_mode && !pending_order_mode {
+            match load_entry_freshness_recheck_snapshot(
+                &bundle.raw.symbol,
+                &input,
+                stage1_bundle.raw.ts_bucket,
+                bundle.raw.ts_bucket,
+            )
+            .await
+            {
+                Ok(snapshot) => {
+                    if let Some(snapshot) = &snapshot {
+                        info!(
+                            symbol = %bundle.raw.symbol,
+                            stage2_core_ts_bucket = %bundle.raw.ts_bucket,
+                            latest_bundle_ts_bucket = %snapshot.latest_bundle_ts_bucket,
+                            bundle_update_minutes = snapshot.bundle_update_minutes,
+                            latest_bundle_age_secs = snapshot.latest_bundle_age_secs,
+                            regime_15m = snapshot
+                                .realtime_flow_context
+                                .pointer("/cvd_partial_windows/15m/regime")
+                                .and_then(|value| value.as_str())
+                                .unwrap_or("unknown"),
+                            since_stage1_delta_fut_sum = snapshot
+                                .realtime_flow_context
+                                .pointer("/since_stage1_increment/delta_fut_sum")
+                                .and_then(|value| value.as_f64())
+                                .unwrap_or_default(),
+                            "loaded entry freshness recheck snapshot"
+                        );
+                    }
+                    snapshot
+                }
+                Err(err) => {
+                    warn!(
+                        symbol = %bundle.raw.symbol,
+                        error = %err,
+                        "load entry freshness recheck snapshot failed"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
     for out in outputs {
         if out.batch_id.is_some() || out.batch_status.is_some() {
@@ -3901,7 +3973,7 @@ async fn invoke_bundle_models(
                 out.model,
             );
         }
-        let response_event = json!({
+        let mut response_event = json!({
             "event_type": "llm_response",
             "event_ts": Utc::now().to_rfc3339(),
             "ts_bucket": bundle.raw.ts_bucket.to_rfc3339(),
@@ -3921,6 +3993,11 @@ async fn invoke_bundle_models(
             "entry_stage_trace": out.entry_stage_trace.clone(),
             "raw_response_text": out.raw_response_text.clone(),
         });
+        if let Some(object) = response_event.as_object_mut() {
+            for (key, value) in stage2_rtf_rollout_fields.clone() {
+                object.insert(key, value);
+            }
+        }
         if let Err(err) = append_journal_event(response_event) {
             warn!(error = %err, "append llm_response journal failed");
         }
@@ -5192,7 +5269,134 @@ async fn invoke_bundle_models(
                 execution_done = true;
                 continue;
             }
+            let entry_recheck_evaluation = if matches!(
+                execution_intent.decision,
+                TradeDecision::Long | TradeDecision::Short
+            ) {
+                entry_recheck_snapshot.as_ref().map(|snapshot| {
+                    evaluate_entry_freshness_recheck(&execution_intent.decision, snapshot)
+                })
+            } else {
+                None
+            };
+            let recheck_result = entry_recheck_evaluation
+                .as_ref()
+                .map(|evaluation| evaluation.result)
+                .unwrap_or("not_needed");
+            let rtf_recheck_triggered = entry_recheck_evaluation.is_some();
+            let rtf_recheck_vetoed = recheck_result == "veto";
+            let recheck_rules_hit = entry_recheck_evaluation
+                .as_ref()
+                .map(|evaluation| {
+                    evaluation
+                        .rules_hit
+                        .iter()
+                        .map(|rule| (*rule).to_string())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let recheck_snapshot_value = entry_recheck_snapshot
+                .as_ref()
+                .map(entry_freshness_recheck_snapshot_json)
+                .unwrap_or(Value::Null);
+
+            if let Some(evaluation) = entry_recheck_evaluation.as_ref() {
+                if evaluation.result == "veto" {
+                    let notification_fields = preview_trade_signal_fields(
+                        &http_client,
+                        &config,
+                        &bundle.raw.symbol,
+                        &execution_intent,
+                    )
+                    .await;
+                    execution_done = true;
+                    warn!(
+                        model_name = %out.model_name,
+                        symbol = %bundle.raw.symbol,
+                        decision = execution_intent.decision.as_str(),
+                        recheck_rules_hit = ?recheck_rules_hit,
+                        recheck_snapshot = %recheck_snapshot_value,
+                        reason = %intent.reason,
+                        "llm trade execution skipped: freshness recheck vetoed entry decision"
+                    );
+                    println!(
+                        "LLM_ORDER_SIGNAL_ONLY_RECHECK_VETO ts_bucket={} trigger={} symbol={} model={} decision={} recheck_result=veto latest_bundle_ts_bucket={} rules_hit={} entry={} leverage={} rr={} tp={} sl={} reason={}",
+                        bundle.raw.ts_bucket,
+                        &*trigger,
+                        bundle.raw.symbol,
+                        out.model_name,
+                        execution_intent.decision.as_str(),
+                        entry_recheck_snapshot
+                            .as_ref()
+                            .map(|snapshot| snapshot.latest_bundle_ts_bucket.to_rfc3339())
+                            .unwrap_or_else(|| "-".to_string()),
+                        serde_json::to_string(&recheck_rules_hit).unwrap_or_else(|_| "[]".to_string()),
+                        format_metric_number(notification_fields.entry_price),
+                        format_metric_number(notification_fields.leverage),
+                        format_metric_number(notification_fields.risk_reward_ratio),
+                        format_metric_number(notification_fields.take_profit),
+                        format_metric_number(notification_fields.stop_loss),
+                        intent.reason.replace('\n', " "),
+                    );
+                    let mut event = json!({
+                        "event_type": "llm_order_signal_only_recheck_veto",
+                        "event_ts": Utc::now().to_rfc3339(),
+                        "ts_bucket": bundle.raw.ts_bucket.to_rfc3339(),
+                        "trigger": &*trigger,
+                        "symbol": bundle.raw.symbol,
+                        "model_name": out.model_name.clone(),
+                        "decision": execution_intent.decision.as_str(),
+                        "entry_price": notification_fields.entry_price,
+                        "leverage": notification_fields.leverage,
+                        "risk_reward_ratio": notification_fields.risk_reward_ratio,
+                        "take_profit": notification_fields.take_profit,
+                        "stop_loss": notification_fields.stop_loss,
+                        "reason": intent.reason.clone(),
+                        "rtf_recheck_triggered": rtf_recheck_triggered,
+                        "rtf_recheck_vetoed": rtf_recheck_vetoed,
+                        "rtf_recheck_result": recheck_result,
+                        "rtf_recheck_veto_rules_hit": recheck_rules_hit.clone(),
+                        "rtf_recheck_veto_snapshot": recheck_snapshot_value.clone(),
+                        "recheck_result": recheck_result,
+                        "recheck_veto_rules_hit": recheck_rules_hit,
+                        "recheck_veto_snapshot": recheck_snapshot_value.clone(),
+                    });
+                    if let Some(object) = event.as_object_mut() {
+                        for (key, value) in stage2_rtf_rollout_fields.clone() {
+                            object.insert(key, value);
+                        }
+                    }
+                    if let Err(err) = append_journal_event(event) {
+                        warn!(error = %err, "append llm_order_signal_only_recheck_veto journal failed");
+                    }
+                    continue;
+                }
+            }
+
+            let mut execution_blocked_due_to_stale_after_recheck = execution_blocked_due_to_stale;
             if execution_blocked_due_to_stale {
+                if let (Some(evaluation), Some(snapshot)) = (
+                    entry_recheck_evaluation.as_ref(),
+                    entry_recheck_snapshot.as_ref(),
+                ) {
+                    if evaluation.result == "confirm"
+                        && snapshot.latest_bundle_age_secs <= max_exec_stale_secs
+                    {
+                        execution_blocked_due_to_stale_after_recheck = false;
+                        info!(
+                            model_name = %out.model_name,
+                            symbol = %bundle.raw.symbol,
+                            decision = execution_intent.decision.as_str(),
+                            original_stage2_core_ts_bucket = %bundle.raw.ts_bucket,
+                            latest_bundle_ts_bucket = %snapshot.latest_bundle_ts_bucket,
+                            latest_bundle_age_secs = snapshot.latest_bundle_age_secs,
+                            "entry freshness recheck confirmed decision and cleared stale execution block"
+                        );
+                    }
+                }
+            }
+
+            if execution_blocked_due_to_stale_after_recheck {
                 let notification_fields = preview_trade_signal_fields(
                     &http_client,
                     &config,
@@ -5226,7 +5430,7 @@ async fn invoke_bundle_models(
                     format_metric_number(notification_fields.stop_loss),
                     intent.reason.replace('\n', " "),
                 );
-                let event = json!({
+                let mut event = json!({
                     "event_type": "llm_order_signal_only_stale",
                     "event_ts": Utc::now().to_rfc3339(),
                     "ts_bucket": bundle.raw.ts_bucket.to_rfc3339(),
@@ -5242,7 +5446,20 @@ async fn invoke_bundle_models(
                     "post_invoke_data_age_secs": post_invoke_data_age_secs,
                     "max_execution_stale_secs": max_exec_stale_secs,
                     "reason": intent.reason.clone(),
+                    "rtf_recheck_triggered": rtf_recheck_triggered,
+                    "rtf_recheck_vetoed": rtf_recheck_vetoed,
+                    "rtf_recheck_result": recheck_result,
+                    "rtf_recheck_veto_rules_hit": recheck_rules_hit.clone(),
+                    "rtf_recheck_veto_snapshot": recheck_snapshot_value.clone(),
+                    "recheck_result": recheck_result,
+                    "recheck_veto_rules_hit": recheck_rules_hit,
+                    "recheck_veto_snapshot": recheck_snapshot_value.clone(),
                 });
+                if let Some(object) = event.as_object_mut() {
+                    for (key, value) in stage2_rtf_rollout_fields.clone() {
+                        object.insert(key, value);
+                    }
+                }
                 if let Err(err) = append_journal_event(event) {
                     warn!(error = %err, "append llm_order_signal_only_stale journal failed");
                 }
@@ -5647,7 +5864,7 @@ async fn invoke_bundle_models(
                         intent.horizon.as_deref(),
                         &intent.reason,
                     );
-                    let event = json!({
+                    let mut event = json!({
                         "event_type": "llm_order_execution",
                         "event_ts": Utc::now().to_rfc3339(),
                         "ts_bucket": bundle.raw.ts_bucket.to_rfc3339(),
@@ -5685,6 +5902,55 @@ async fn invoke_bundle_models(
                         "horizon": captured_entry_context.horizon.clone(),
                         "entry_v": captured_entry_context.entry_v,
                     });
+                    if let Some(object) = event.as_object_mut() {
+                        object.insert(
+                            "rtf_recheck_triggered".to_string(),
+                            Value::Bool(rtf_recheck_triggered),
+                        );
+                        object.insert(
+                            "rtf_recheck_vetoed".to_string(),
+                            Value::Bool(rtf_recheck_vetoed),
+                        );
+                        object.insert(
+                            "rtf_recheck_result".to_string(),
+                            Value::String(recheck_result.to_string()),
+                        );
+                        object.insert(
+                            "rtf_recheck_veto_rules_hit".to_string(),
+                            Value::Array(
+                                recheck_rules_hit
+                                    .iter()
+                                    .cloned()
+                                    .map(Value::String)
+                                    .collect(),
+                            ),
+                        );
+                        object.insert(
+                            "rtf_recheck_veto_snapshot".to_string(),
+                            recheck_snapshot_value.clone(),
+                        );
+                        object.insert(
+                            "recheck_result".to_string(),
+                            Value::String(recheck_result.to_string()),
+                        );
+                        object.insert(
+                            "recheck_veto_rules_hit".to_string(),
+                            Value::Array(
+                                recheck_rules_hit
+                                    .iter()
+                                    .cloned()
+                                    .map(Value::String)
+                                    .collect(),
+                            ),
+                        );
+                        object.insert(
+                            "recheck_veto_snapshot".to_string(),
+                            recheck_snapshot_value.clone(),
+                        );
+                        for (key, value) in stage2_rtf_rollout_fields.clone() {
+                            object.insert(key, value);
+                        }
+                    }
                     if let Err(err) = append_journal_event(event) {
                         warn!(error = %err, "append llm_order_execution journal failed");
                     }
@@ -6018,6 +6284,267 @@ async fn load_latest_temp_indicator_bundle(symbol: &str) -> Result<LatestBundle>
         missing_indicator_codes: Vec::new(),
         received_at: Utc::now(),
     })
+}
+
+async fn load_entry_freshness_recheck_snapshot(
+    symbol: &str,
+    base_input: &ModelInvocationInput,
+    stage1_scan_ts_bucket: DateTime<Utc>,
+    stage2_core_ts_bucket: DateTime<Utc>,
+) -> Result<Option<EntryFreshnessRecheckSnapshot>> {
+    let latest_bundle = load_latest_temp_indicator_bundle(symbol).await?;
+    if latest_bundle.raw.ts_bucket <= stage2_core_ts_bucket {
+        return Ok(None);
+    }
+
+    let bundle_update_minutes = latest_bundle
+        .raw
+        .ts_bucket
+        .signed_duration_since(stage2_core_ts_bucket)
+        .num_minutes();
+    if bundle_update_minutes < ENTRY_RECHECK_MIN_BUNDLE_UPDATE_MINUTES {
+        return Ok(None);
+    }
+
+    Ok(Some(build_entry_freshness_recheck_snapshot(
+        &latest_bundle,
+        base_input,
+        stage1_scan_ts_bucket,
+        bundle_update_minutes,
+    )?))
+}
+
+fn build_entry_freshness_recheck_snapshot(
+    latest_bundle: &LatestBundle,
+    base_input: &ModelInvocationInput,
+    stage1_scan_ts_bucket: DateTime<Utc>,
+    bundle_update_minutes: i64,
+) -> Result<EntryFreshnessRecheckSnapshot> {
+    let latest_input = model_input_from_bundle(base_input, latest_bundle);
+    let realtime_flow_context =
+        build_runtime_realtime_flow_context_for_input(&latest_input, stage1_scan_ts_bucket)
+            .ok_or_else(|| anyhow!("build runtime realtime_flow_context for recheck snapshot"))?;
+
+    Ok(EntryFreshnessRecheckSnapshot {
+        latest_bundle_ts_bucket: latest_bundle.raw.ts_bucket,
+        latest_bundle_age_secs: Utc::now()
+            .signed_duration_since(latest_bundle.raw.ts_bucket)
+            .num_seconds()
+            .max(0),
+        bundle_update_minutes,
+        realtime_flow_context,
+    })
+}
+
+fn sum_partial_window_delta_since_scan(
+    recent_series: Option<&Vec<Value>>,
+    stage1_scan_ts_bucket: DateTime<Utc>,
+    current_ts_bucket: DateTime<Utc>,
+) -> f64 {
+    recent_series
+        .into_iter()
+        .flat_map(|series| series.iter())
+        .filter_map(Value::as_object)
+        .filter_map(|minute| {
+            let minute_ts = minute
+                .get("ts")
+                .and_then(Value::as_str)
+                .and_then(parse_rfc3339_utc)?;
+            if minute_ts <= stage1_scan_ts_bucket || minute_ts > current_ts_bucket {
+                return None;
+            }
+            minute.get("delta_fut").and_then(Value::as_f64)
+        })
+        .sum()
+}
+
+fn evaluate_entry_freshness_recheck(
+    decision: &TradeDecision,
+    snapshot: &EntryFreshnessRecheckSnapshot,
+) -> EntryFreshnessRecheckEvaluation {
+    let mut rules_hit = Vec::new();
+    let regime_15m = snapshot
+        .realtime_flow_context
+        .pointer("/cvd_partial_windows/15m/regime")
+        .and_then(Value::as_str);
+    let since_stage1_delta_fut_sum = snapshot
+        .realtime_flow_context
+        .pointer("/since_stage1_increment/delta_fut_sum")
+        .and_then(Value::as_f64)
+        .unwrap_or_default();
+    let orderbook_ofi_norm_fut = snapshot
+        .realtime_flow_context
+        .pointer("/live_refs/orderbook_ofi_norm_fut")
+        .and_then(Value::as_f64);
+    let orderbook_exec_confirm_fut = snapshot
+        .realtime_flow_context
+        .pointer("/live_refs/orderbook_exec_confirm_fut")
+        .and_then(Value::as_bool);
+    let orderbook_spot_confirm = snapshot
+        .realtime_flow_context
+        .pointer("/live_refs/orderbook_spot_confirm")
+        .and_then(Value::as_bool);
+    match decision {
+        TradeDecision::Long => {
+            if regime_15m == Some("reversal_to_selling") {
+                rules_hit.push("cvd_15m_reversal_to_selling");
+            }
+            if since_stage1_delta_fut_sum < 0.0 {
+                rules_hit.push("since_stage1_delta_fut_negative");
+            }
+            if orderbook_ofi_norm_fut
+                .map(|value| value < 0.0)
+                .unwrap_or(false)
+            {
+                rules_hit.push("orderbook_ofi_negative");
+            }
+            if orderbook_exec_confirm_fut == Some(false) && orderbook_spot_confirm == Some(false) {
+                rules_hit.push("execution_and_spot_unconfirmed");
+            }
+        }
+        TradeDecision::Short => {
+            if regime_15m == Some("reversal_to_buying") {
+                rules_hit.push("cvd_15m_reversal_to_buying");
+            }
+            if since_stage1_delta_fut_sum > 0.0 {
+                rules_hit.push("since_stage1_delta_fut_positive");
+            }
+            if orderbook_ofi_norm_fut
+                .map(|value| value > 0.0)
+                .unwrap_or(false)
+            {
+                rules_hit.push("orderbook_ofi_positive");
+            }
+            if orderbook_exec_confirm_fut == Some(false) && orderbook_spot_confirm == Some(false) {
+                rules_hit.push("execution_and_spot_unconfirmed");
+            }
+        }
+        _ => {}
+    }
+
+    EntryFreshnessRecheckEvaluation {
+        result: if rules_hit.len() >= ENTRY_RECHECK_VETO_THRESHOLD {
+            "veto"
+        } else {
+            "confirm"
+        },
+        rules_hit,
+    }
+}
+
+fn entry_freshness_recheck_snapshot_json(snapshot: &EntryFreshnessRecheckSnapshot) -> Value {
+    json!({
+        "latest_bundle_ts_bucket": snapshot.latest_bundle_ts_bucket.to_rfc3339(),
+        "latest_bundle_age_secs": snapshot.latest_bundle_age_secs,
+        "bundle_update_minutes": snapshot.bundle_update_minutes,
+        "realtime_flow_context": snapshot.realtime_flow_context.clone(),
+    })
+}
+
+fn model_input_from_bundle(
+    base_input: &ModelInvocationInput,
+    bundle: &LatestBundle,
+) -> ModelInvocationInput {
+    ModelInvocationInput {
+        symbol: bundle.raw.symbol.clone(),
+        ts_bucket: bundle.raw.ts_bucket,
+        window_code: bundle.raw.window_code.clone(),
+        indicator_count: bundle.raw.indicator_count,
+        source_routing_key: bundle.raw.routing_key.clone(),
+        source_published_at: bundle.raw.published_at,
+        received_at: bundle.received_at,
+        indicators: bundle.indicators.clone(),
+        missing_indicator_codes: bundle.missing_indicator_codes.clone(),
+        management_mode: base_input.management_mode,
+        pending_order_mode: base_input.pending_order_mode,
+        trading_state: base_input.trading_state.clone(),
+        management_snapshot: base_input.management_snapshot.clone(),
+    }
+}
+
+fn realtime_flow_context_settings(input: &ModelInvocationInput) -> (bool, usize) {
+    if input.management_mode {
+        (false, 2)
+    } else {
+        (true, 6)
+    }
+}
+
+fn build_runtime_realtime_flow_context_for_input(
+    input: &ModelInvocationInput,
+    stage1_scan_ts_bucket: DateTime<Utc>,
+) -> Option<Value> {
+    let filtered_root = CoreFilter::build_value(input).ok()?;
+    let filtered_indicators = filtered_root.get("indicators").and_then(Value::as_object)?;
+    let raw_indicators = input.indicators.as_object()?;
+    let (include_15m_series, max_new_events) = realtime_flow_context_settings(input);
+
+    crate::llm::filter::core_shared::build_realtime_flow_context(
+        raw_indicators,
+        filtered_indicators,
+        Some(input.ts_bucket),
+        Some(stage1_scan_ts_bucket),
+        include_15m_series,
+        max_new_events,
+    )
+}
+
+fn build_rtf_rollout_fields(realtime_flow_context: Option<&Value>) -> Map<String, Value> {
+    let mut fields = Map::new();
+    fields.insert(
+        "realtime_flow_context_present".to_string(),
+        Value::Bool(realtime_flow_context.is_some()),
+    );
+    fields.insert(
+        "rtf_stage1_to_stage2_gap_minutes".to_string(),
+        realtime_flow_context
+            .and_then(|ctx| ctx.pointer("/freshness/stage1_to_stage2_gap_minutes"))
+            .cloned()
+            .unwrap_or(Value::Null),
+    );
+    fields.insert(
+        "rtf_15m_regime".to_string(),
+        realtime_flow_context
+            .and_then(|ctx| ctx.pointer("/cvd_partial_windows/15m/regime"))
+            .cloned()
+            .unwrap_or(Value::Null),
+    );
+    fields.insert(
+        "rtf_15m_direction_consistent".to_string(),
+        realtime_flow_context
+            .and_then(|ctx| {
+                ctx.pointer("/cvd_partial_windows/15m/vs_last_closed_bar/direction_consistent")
+            })
+            .cloned()
+            .unwrap_or(Value::Null),
+    );
+    fields.insert(
+        "rtf_since_stage1_delta_fut_sum".to_string(),
+        realtime_flow_context
+            .and_then(|ctx| ctx.pointer("/since_stage1_increment/delta_fut_sum"))
+            .cloned()
+            .unwrap_or(Value::Null),
+    );
+    let new_events = realtime_flow_context
+        .and_then(|ctx| ctx.pointer("/since_stage1_increment/new_events_since_scan"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    fields.insert(
+        "rtf_new_events_since_scan_count".to_string(),
+        json!(new_events.len()),
+    );
+    fields.insert(
+        "rtf_new_events_since_scan_types".to_string(),
+        Value::Array(
+            new_events
+                .iter()
+                .filter_map(|event| event.get("type").and_then(Value::as_str))
+                .map(|event_type| Value::String(event_type.to_string()))
+                .collect(),
+        ),
+    );
+    fields
 }
 
 #[cfg(test)]
@@ -6779,6 +7306,112 @@ mod tests {
             total_wallet_balance: 1000.0,
             available_balance: 900.0,
         }
+    }
+
+    #[test]
+    fn sum_partial_window_delta_since_scan_uses_only_post_scan_minutes() {
+        let series = vec![
+            json!({"ts": "2026-03-18T07:00:00Z", "delta_fut": 100.0}),
+            json!({"ts": "2026-03-18T07:01:00Z", "delta_fut": -40.0}),
+            json!({"ts": "2026-03-18T07:02:00Z", "delta_fut": 25.0}),
+        ];
+        let stage1_scan_ts_bucket = DateTime::parse_from_rfc3339("2026-03-18T07:00:00Z")
+            .expect("parse stage1 ts")
+            .with_timezone(&Utc);
+        let current_ts_bucket = DateTime::parse_from_rfc3339("2026-03-18T07:02:00Z")
+            .expect("parse current ts")
+            .with_timezone(&Utc);
+
+        let sum = sum_partial_window_delta_since_scan(
+            Some(&series),
+            stage1_scan_ts_bucket,
+            current_ts_bucket,
+        );
+
+        assert_eq!(sum, -15.0);
+    }
+
+    #[test]
+    fn evaluate_entry_freshness_recheck_vetoes_long_on_two_or_more_hits() {
+        let snapshot = EntryFreshnessRecheckSnapshot {
+            latest_bundle_ts_bucket: DateTime::parse_from_rfc3339("2026-03-18T07:09:00Z")
+                .expect("parse latest ts")
+                .with_timezone(&Utc),
+            latest_bundle_age_secs: 8,
+            bundle_update_minutes: 4,
+            realtime_flow_context: json!({
+                "cvd_partial_windows": {
+                    "15m": {
+                        "regime": "reversal_to_selling"
+                    }
+                },
+                "since_stage1_increment": {
+                    "delta_fut_sum": -120.0
+                },
+                "live_refs": {
+                    "orderbook_ofi_norm_fut": -0.8,
+                    "orderbook_exec_confirm_fut": false,
+                    "orderbook_spot_confirm": false
+                }
+            }),
+        };
+
+        let evaluation = evaluate_entry_freshness_recheck(&TradeDecision::Long, &snapshot);
+
+        assert_eq!(evaluation.result, "veto");
+        assert!(evaluation.rules_hit.len() >= 2);
+        assert!(evaluation
+            .rules_hit
+            .contains(&"cvd_15m_reversal_to_selling"));
+    }
+
+    #[test]
+    fn build_rtf_rollout_fields_extracts_summary_metrics() {
+        let realtime_flow_context = json!({
+            "cvd_partial_windows": {
+                "15m": {
+                    "regime": "reversal_to_selling",
+                    "vs_last_closed_bar": {
+                        "direction_consistent": false
+                    }
+                }
+            },
+            "since_stage1_increment": {
+                "delta_fut_sum": -62.5,
+                "new_events_since_scan": [
+                    {"type": "absorption"},
+                    {"type": "initiation"}
+                ]
+            },
+            "freshness": {
+                "stage1_to_stage2_gap_minutes": 9.0
+            }
+        });
+
+        let fields = build_rtf_rollout_fields(Some(&realtime_flow_context));
+
+        assert_eq!(
+            fields
+                .get("realtime_flow_context_present")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            fields
+                .get("rtf_stage1_to_stage2_gap_minutes")
+                .and_then(Value::as_f64),
+            Some(9.0)
+        );
+        assert_eq!(
+            fields.get("rtf_15m_regime").and_then(Value::as_str),
+            Some("reversal_to_selling")
+        );
+        assert_eq!(
+            fields
+                .get("rtf_new_events_since_scan_count")
+                .and_then(Value::as_u64),
+            Some(2)
+        );
     }
 
     #[test]

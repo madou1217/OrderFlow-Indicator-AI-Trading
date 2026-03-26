@@ -1128,7 +1128,8 @@ fn build_precomputed_flow_base_for_window(
 
     let futures_side = classify_signed_delta(latest_closed_delta_fut);
     let spot_side = classify_signed_delta(latest_closed_delta_spot);
-    let delta_relation = classify_alignment_relation(latest_closed_delta_fut, latest_closed_delta_spot);
+    let delta_relation =
+        classify_alignment_relation(latest_closed_delta_fut, latest_closed_delta_spot);
     let cvd_state = classify_signed_cvd(cvd_slope);
     let whale_state = classify_signed_whales(fut_whale_delta);
     let whale_relation = classify_alignment_relation(fut_whale_delta, spot_whale_delta);
@@ -1171,8 +1172,7 @@ fn build_flow_supporting_evidence(
             .and_then(Value::as_object)
             .and_then(|by_window| by_window.get(tf));
         let whale_window = whale_by_window.and_then(|by_window| by_window.get(tf));
-        let footprint_window = filtered_footprint
-            .pointer(&format!("/by_window/{tf}"));
+        let footprint_window = filtered_footprint.pointer(&format!("/by_window/{tf}"));
         let orderbook_window = if tf == "15m" {
             filtered_orderbook.pointer("/current_window_15m")
         } else {
@@ -1281,8 +1281,10 @@ fn build_flow_supporting_evidence_for_window(
         .and_then(Value::as_f64)
         .map(round2);
 
-    let nearest_sell_imb_prices = nearest_footprint_cluster_prices(footprint_window, "sell_imb_clusters");
-    let nearest_buy_imb_prices = nearest_footprint_cluster_prices(footprint_window, "buy_imb_clusters");
+    let nearest_sell_imb_prices =
+        nearest_footprint_cluster_prices(footprint_window, "sell_imb_clusters");
+    let nearest_buy_imb_prices =
+        nearest_footprint_cluster_prices(footprint_window, "buy_imb_clusters");
 
     let stacked_sell_near_price = footprint_window
         .and_then(Value::as_object)
@@ -1338,9 +1340,7 @@ fn build_precomputed_cross_market(source: &Map<String, Value>, price_anchor: &Va
     let futures_last_price = price_anchor
         .get("futures_last_price")
         .and_then(Value::as_f64);
-    let spot_proxy_price = price_anchor
-        .get("spot_proxy_price")
-        .and_then(Value::as_f64);
+    let spot_proxy_price = price_anchor.get("spot_proxy_price").and_then(Value::as_f64);
     let spot_vs_futures_gap_pct = match (futures_last_price, spot_proxy_price) {
         (Some(futures), Some(spot)) if spot.abs() > f64::EPSILON => {
             Some(round2((futures - spot) / spot * 100.0))
@@ -1376,7 +1376,11 @@ fn build_precomputed_cross_market(source: &Map<String, Value>, price_anchor: &Va
     })
 }
 
-fn mapped_value_read_for_source(value_state_board: &[Value], tf: &str, source_name: &str) -> &'static str {
+fn mapped_value_read_for_source(
+    value_state_board: &[Value],
+    tf: &str,
+    source_name: &str,
+) -> &'static str {
     value_state_board
         .iter()
         .rev()

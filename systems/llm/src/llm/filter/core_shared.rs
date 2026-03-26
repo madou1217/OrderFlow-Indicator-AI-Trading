@@ -2202,6 +2202,349 @@ pub(super) fn round2(value: f64) -> f64 {
     (value * 100.0).round() / 100.0
 }
 
+pub(crate) fn build_realtime_flow_context(
+    source: &Map<String, Value>,
+    filtered_indicators: &Map<String, Value>,
+    current_ts: Option<DateTime<Utc>>,
+    stage1_scan_ts_bucket: Option<DateTime<Utc>>,
+    include_15m_series: bool,
+    max_new_events: usize,
+) -> Option<Value> {
+    let current_ts = current_ts?;
+    let stage1_scan_ts_bucket = stage1_scan_ts_bucket?;
+    let cvd_payload = source
+        .get("cvd_pack")
+        .and_then(|indicator| indicator.get("payload"))
+        .and_then(Value::as_object);
+    let partial_windows = cvd_payload
+        .and_then(|payload| payload.get("partial_window"))
+        .and_then(Value::as_object);
+    let by_window = cvd_payload
+        .and_then(|payload| payload.get("by_window"))
+        .and_then(Value::as_object);
+
+    let mut realtime = Map::new();
+    realtime.insert(
+        "bundle_ts".to_string(),
+        Value::String(current_ts.to_rfc3339()),
+    );
+    realtime.insert(
+        "stage1_scan_ts_bucket".to_string(),
+        Value::String(stage1_scan_ts_bucket.to_rfc3339()),
+    );
+    realtime.insert(
+        "data_lag_minutes".to_string(),
+        json!(round2(
+            (current_ts - stage1_scan_ts_bucket).num_seconds().max(0) as f64 / 60.0
+        )),
+    );
+
+    let mut cvd_partial_windows = Map::new();
+    for window in CORE_WINDOWS {
+        let summary = build_partial_window_summary(
+            partial_windows.and_then(|windows| windows.get(*window)),
+            by_window.and_then(|windows| windows.get(*window)),
+            *window,
+            include_15m_series,
+        );
+        if let Some(summary) = summary {
+            cvd_partial_windows.insert((*window).to_string(), summary);
+        }
+    }
+    if !cvd_partial_windows.is_empty() {
+        realtime.insert(
+            "cvd_partial_windows".to_string(),
+            Value::Object(cvd_partial_windows),
+        );
+    }
+
+    if let Some(increment) = build_since_stage1_increment(
+        partial_windows.and_then(|windows| windows.get("15m")),
+        filtered_indicators,
+        current_ts,
+        stage1_scan_ts_bucket,
+        max_new_events,
+    ) {
+        realtime.insert("since_stage1_increment".to_string(), increment);
+    }
+
+    let live_refs = build_live_refs(source);
+    if !live_refs.is_empty() {
+        realtime.insert("live_refs".to_string(), Value::Object(live_refs));
+    }
+
+    realtime.insert(
+        "freshness".to_string(),
+        json!({
+            "stage1_to_stage2_gap_minutes": round2(
+                (current_ts - stage1_scan_ts_bucket)
+                    .num_seconds()
+                    .max(0) as f64
+                    / 60.0
+            ),
+            "prompt_bundle_age_seconds": (Utc::now() - current_ts).num_seconds().max(0),
+        }),
+    );
+
+    Some(Value::Object(realtime))
+}
+
+fn build_partial_window_summary(
+    partial_window: Option<&Value>,
+    latest_closed_window: Option<&Value>,
+    window: &str,
+    include_15m_series: bool,
+) -> Option<Value> {
+    let partial = partial_window?.as_object()?;
+    let mut summary = Map::new();
+    copy_fields(
+        &mut summary,
+        partial,
+        &[
+            "window_start",
+            "window_end",
+            "last_minute_ts",
+            "minutes_elapsed",
+            "minutes_total",
+            "progress_pct",
+            "cum_delta_fut",
+            "cum_delta_spot",
+            "cum_volume_fut",
+            "recent_3m_delta_fut",
+            "recent_5m_delta_fut",
+            "recent_15m_delta_fut",
+            "slope_recent_5m_fut",
+            "slope_prev_5m_fut",
+            "slope_change_ratio",
+            "regime",
+        ],
+    );
+
+    if let Some(vs_last_closed_bar) = build_vs_last_closed_bar(partial, latest_closed_window) {
+        summary.insert("vs_last_closed_bar".to_string(), vs_last_closed_bar);
+    }
+
+    if window == "15m" && include_15m_series {
+        if let Some(recent_series) = partial.get("recent_series").and_then(Value::as_array) {
+            summary.insert(
+                "recent_series".to_string(),
+                Value::Array(recent_series.clone()),
+            );
+        }
+    }
+
+    Some(Value::Object(summary))
+}
+
+fn build_vs_last_closed_bar(
+    partial: &Map<String, Value>,
+    latest_closed_window: Option<&Value>,
+) -> Option<Value> {
+    let last_closed_delta_fut = latest_closed_window
+        .and_then(Value::as_object)
+        .and_then(|window| window.get("series"))
+        .and_then(Value::as_array)
+        .and_then(|series| series.last())
+        .and_then(|entry| entry.get("delta_fut"))
+        .and_then(Value::as_f64)?;
+    let current_partial_delta_fut = partial.get("cum_delta_fut").and_then(Value::as_f64)?;
+    let direction_consistent =
+        same_delta_direction(last_closed_delta_fut, current_partial_delta_fut);
+    let magnitude_ratio = if last_closed_delta_fut.abs() <= 1e-12 {
+        None
+    } else {
+        Some(round2(current_partial_delta_fut / last_closed_delta_fut))
+    };
+
+    Some(json!({
+        "last_closed_delta_fut": round2(last_closed_delta_fut),
+        "current_partial_delta_fut": round2(current_partial_delta_fut),
+        "direction_consistent": direction_consistent,
+        "magnitude_ratio": magnitude_ratio,
+    }))
+}
+
+fn same_delta_direction(left: f64, right: f64) -> bool {
+    if left.abs() <= 1e-12 || right.abs() <= 1e-12 {
+        return false;
+    }
+    left.signum() == right.signum()
+}
+
+fn build_since_stage1_increment(
+    partial_window_15m: Option<&Value>,
+    filtered_indicators: &Map<String, Value>,
+    current_ts: DateTime<Utc>,
+    stage1_scan_ts_bucket: DateTime<Utc>,
+    max_new_events: usize,
+) -> Option<Value> {
+    let mut payload = Map::new();
+    let stage_gap_minutes = (current_ts - stage1_scan_ts_bucket).num_minutes().max(0);
+    payload.insert("minutes".to_string(), Value::from(stage_gap_minutes));
+
+    let mut coverage_limited = true;
+    let mut delta_fut_sum = 0.0;
+    let mut delta_spot_sum = 0.0;
+    let mut volume_fut_sum = 0.0;
+    let mut max_abs_1m_delta_fut = 0.0_f64;
+
+    if let Some(partial) = partial_window_15m.and_then(Value::as_object) {
+        let window_start = partial
+            .get("window_start")
+            .and_then(Value::as_str)
+            .and_then(parse_rfc3339_utc);
+        coverage_limited = window_start
+            .map(|window_start| stage1_scan_ts_bucket < window_start)
+            .unwrap_or(true);
+
+        if let Some(recent_series) = partial.get("recent_series").and_then(Value::as_array) {
+            for minute in recent_series.iter().filter_map(Value::as_object) {
+                let minute_ts = minute
+                    .get("ts")
+                    .and_then(Value::as_str)
+                    .and_then(parse_rfc3339_utc);
+                let Some(minute_ts) = minute_ts else {
+                    continue;
+                };
+                if minute_ts <= stage1_scan_ts_bucket || minute_ts > current_ts {
+                    continue;
+                }
+                let delta_fut = minute
+                    .get("delta_fut")
+                    .and_then(Value::as_f64)
+                    .unwrap_or_default();
+                let delta_spot = minute
+                    .get("delta_spot")
+                    .and_then(Value::as_f64)
+                    .unwrap_or_default();
+                let volume_fut = minute
+                    .get("volume_fut")
+                    .and_then(Value::as_f64)
+                    .unwrap_or_default();
+                delta_fut_sum += delta_fut;
+                delta_spot_sum += delta_spot;
+                volume_fut_sum += volume_fut;
+                max_abs_1m_delta_fut = max_abs_1m_delta_fut.max(delta_fut.abs());
+            }
+        }
+    }
+
+    payload.insert(
+        "coverage_limited".to_string(),
+        Value::Bool(coverage_limited),
+    );
+    payload.insert("delta_fut_sum".to_string(), json!(round2(delta_fut_sum)));
+    payload.insert("delta_spot_sum".to_string(), json!(round2(delta_spot_sum)));
+    payload.insert("volume_fut_sum".to_string(), json!(round2(volume_fut_sum)));
+    payload.insert(
+        "max_abs_1m_delta_fut".to_string(),
+        json!(round2(max_abs_1m_delta_fut)),
+    );
+    payload.insert(
+        "dominant_flow".to_string(),
+        Value::String(classify_dominant_flow(delta_fut_sum).to_string()),
+    );
+    payload.insert(
+        "new_events_since_scan".to_string(),
+        Value::Array(build_new_events_since_scan(
+            filtered_indicators,
+            stage1_scan_ts_bucket,
+            max_new_events,
+        )),
+    );
+
+    Some(Value::Object(payload))
+}
+
+fn classify_dominant_flow(delta_fut_sum: f64) -> &'static str {
+    if delta_fut_sum > 1e-12 {
+        "buying"
+    } else if delta_fut_sum < -1e-12 {
+        "selling"
+    } else {
+        "balanced"
+    }
+}
+
+fn build_new_events_since_scan(
+    filtered_indicators: &Map<String, Value>,
+    stage1_scan_ts_bucket: DateTime<Utc>,
+    max_new_events: usize,
+) -> Vec<Value> {
+    let Some(summary_payload) = filtered_indicators
+        .get("events_summary")
+        .and_then(|indicator| indicator.get("payload"))
+        .and_then(Value::as_object)
+    else {
+        return Vec::new();
+    };
+
+    let mut events = Vec::new();
+    for (key, event_type) in [
+        ("most_recent_absorption", "absorption"),
+        ("most_recent_initiation", "initiation"),
+        ("most_recent_buying_exhaustion", "buying_exhaustion"),
+        ("most_recent_selling_exhaustion", "selling_exhaustion"),
+    ] {
+        let Some(event) = summary_payload.get(key).and_then(Value::as_object) else {
+            continue;
+        };
+        let Some(confirm_ts_str) = event.get("confirm_ts").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(confirm_ts) = parse_rfc3339_utc(confirm_ts_str) else {
+            continue;
+        };
+        if confirm_ts <= stage1_scan_ts_bucket {
+            continue;
+        }
+        let mut normalized = Map::new();
+        normalized.insert("type".to_string(), Value::String(event_type.to_string()));
+        copy_fields(
+            &mut normalized,
+            event,
+            &["direction", "price", "minutes_ago", "confirm_ts"],
+        );
+        events.push((confirm_ts, Value::Object(normalized)));
+    }
+    events.sort_by(|left, right| right.0.cmp(&left.0));
+    events
+        .into_iter()
+        .take(max_new_events)
+        .map(|(_, value)| value)
+        .collect()
+}
+
+fn build_live_refs(source: &Map<String, Value>) -> Map<String, Value> {
+    let mut live_refs = Map::new();
+    if let Some(orderbook_payload) = source
+        .get("orderbook_depth")
+        .and_then(|indicator| indicator.get("payload"))
+        .and_then(Value::as_object)
+    {
+        for (source_key, target_key) in [
+            ("ofi_norm_fut", "orderbook_ofi_norm_fut"),
+            ("obi_k_dw_close_fut", "orderbook_obi_k_dw_close_fut"),
+            ("exec_confirm_fut", "orderbook_exec_confirm_fut"),
+            ("spot_confirm", "orderbook_spot_confirm"),
+        ] {
+            if let Some(value) = orderbook_payload.get(source_key) {
+                live_refs.insert(target_key.to_string(), value.clone());
+            }
+        }
+    }
+    if let Some(window_delta) = source
+        .get("footprint")
+        .and_then(|indicator| indicator.pointer("/payload/by_window/15m/window_delta"))
+    {
+        live_refs.insert(
+            "footprint_15m_window_delta".to_string(),
+            window_delta.clone(),
+        );
+    }
+    live_refs
+}
+
 pub(super) fn truncate_tpo_dev_series_v4(value: Option<&mut Value>) {
     let Some(dev_series) = value.and_then(Value::as_object_mut) else {
         return;

@@ -1162,7 +1162,10 @@ fn merge_scan_model_response(prompt_input: &Value, response: &Value) -> Result<V
     Ok(merged)
 }
 
-fn merge_flow_parse_from_base_and_override(flow_base: &Value, flow_override: &Value) -> Result<Value> {
+fn merge_flow_parse_from_base_and_override(
+    flow_base: &Value,
+    flow_override: &Value,
+) -> Result<Value> {
     let delta_read = flow_base
         .get("delta_read")
         .cloned()
@@ -1767,8 +1770,9 @@ async fn invoke_one_model_scan_stage(
                 .ok_or_else(|| anyhow!("scan stage missing captured prompt input"));
             match scan_prompt_input
                 .map_err(provider_failure_plain)
-                .and_then(|prompt_input| parse_entry_scan_output(&provider, &raw_text, &prompt_input))
-            {
+                .and_then(|prompt_input| {
+                    parse_entry_scan_output(&provider, &raw_text, &prompt_input)
+                }) {
                 Ok(scan_value) => {
                     trace.push_entry_stage_event(build_entry_scan_trace_event(
                         &provider,
@@ -5468,6 +5472,75 @@ mod tests {
     use chrono::{DateTime, Utc};
     use serde_json::{json, Value};
 
+    fn prompt_route_partial_window_15m() -> Value {
+        json!({
+            "window_start": "2026-03-18T07:00:00Z",
+            "window_end": "2026-03-18T07:15:00Z",
+            "last_minute_ts": "2026-03-18T07:09:00Z",
+            "minutes_elapsed": 10,
+            "minutes_total": 15,
+            "progress_pct": 66.67,
+            "cum_delta_fut": -140.0,
+            "cum_delta_spot": -35.0,
+            "cum_volume_fut": 8200.0,
+            "recent_3m_delta_fut": -210.0,
+            "recent_5m_delta_fut": -320.0,
+            "recent_15m_delta_fut": -140.0,
+            "slope_recent_5m_fut": -64.0,
+            "slope_prev_5m_fut": 38.0,
+            "slope_change_ratio": -1.68,
+            "regime": "reversal_to_selling",
+            "recent_series": [
+                {"ts": "2026-03-18T07:00:00Z", "delta_fut": 90.0, "delta_spot": 12.0, "volume_fut": 900.0, "cum_delta_fut": 90.0, "cum_delta_spot": 12.0},
+                {"ts": "2026-03-18T07:01:00Z", "delta_fut": 70.0, "delta_spot": 10.0, "volume_fut": 860.0, "cum_delta_fut": 160.0, "cum_delta_spot": 22.0},
+                {"ts": "2026-03-18T07:02:00Z", "delta_fut": 50.0, "delta_spot": 8.0, "volume_fut": 840.0, "cum_delta_fut": 210.0, "cum_delta_spot": 30.0},
+                {"ts": "2026-03-18T07:03:00Z", "delta_fut": -40.0, "delta_spot": -4.0, "volume_fut": 820.0, "cum_delta_fut": 170.0, "cum_delta_spot": 26.0},
+                {"ts": "2026-03-18T07:04:00Z", "delta_fut": -55.0, "delta_spot": -5.0, "volume_fut": 810.0, "cum_delta_fut": 115.0, "cum_delta_spot": 21.0},
+                {"ts": "2026-03-18T07:05:00Z", "delta_fut": -60.0, "delta_spot": -6.0, "volume_fut": 800.0, "cum_delta_fut": 55.0, "cum_delta_spot": 15.0},
+                {"ts": "2026-03-18T07:06:00Z", "delta_fut": -62.0, "delta_spot": -8.0, "volume_fut": 790.0, "cum_delta_fut": -7.0, "cum_delta_spot": 7.0},
+                {"ts": "2026-03-18T07:07:00Z", "delta_fut": -65.0, "delta_spot": -10.0, "volume_fut": 780.0, "cum_delta_fut": -72.0, "cum_delta_spot": -3.0},
+                {"ts": "2026-03-18T07:08:00Z", "delta_fut": -33.0, "delta_spot": -12.0, "volume_fut": 760.0, "cum_delta_fut": -105.0, "cum_delta_spot": -15.0},
+                {"ts": "2026-03-18T07:09:00Z", "delta_fut": -35.0, "delta_spot": -20.0, "volume_fut": 740.0, "cum_delta_fut": -140.0, "cum_delta_spot": -35.0}
+            ]
+        })
+    }
+
+    fn prompt_route_signal_event(
+        confirm_ts: &str,
+        indicator_code: &str,
+        direction: &str,
+        price: f64,
+    ) -> Value {
+        json!({
+            "event_id": format!("{indicator_code}-{confirm_ts}"),
+            "indicator_code": indicator_code,
+            "start_ts": confirm_ts,
+            "end_ts": confirm_ts,
+            "event_start_ts": confirm_ts,
+            "event_end_ts": confirm_ts,
+            "event_available_ts": confirm_ts,
+            "confirm_ts": confirm_ts,
+            "direction": direction,
+            "pivot_price": price,
+            "price_high": price + 1.0,
+            "price_low": price - 1.0,
+            "score": 0.8,
+            "score_base": 0.7,
+            "strength_score_xmk": 0.72,
+            "trigger_side": if direction == "bullish" { "buy" } else { "sell" },
+            "type": indicator_code,
+            "delta_sum": 90.0,
+            "reject_ratio": 0.5,
+            "stacked_buy_imbalance": direction == "bullish",
+            "stacked_sell_imbalance": direction == "bearish",
+            "key_distance_ticks": 3,
+            "spot_flow_confirm_score": 0.66,
+            "spot_whale_confirm_score": 0.61,
+            "spot_rdelta_1m_mean": 11.0,
+            "spot_cvd_1m_change": 16.0
+        })
+    }
+
     fn sample_stage_1_scan() -> Value {
         json!({
             "schema_version": "scan_v4_0_0",
@@ -5772,7 +5845,9 @@ mod tests {
         management_mode: bool,
         pending_order_mode: bool,
     ) -> ModelInvocationInput {
-        let now = Utc::now();
+        let now = DateTime::parse_from_rfc3339("2026-03-18T07:09:00Z")
+            .expect("parse prompt-route ts")
+            .with_timezone(&Utc);
         let avwap_15m = (0..10)
             .map(|idx| {
                 json!({
@@ -5830,7 +5905,7 @@ mod tests {
             symbol: "TESTUSDT".to_string(),
             ts_bucket: now,
             window_code: "15m".to_string(),
-            indicator_count: 4,
+            indicator_count: 10,
             source_routing_key: "llm_indicator_minute".to_string(),
             source_published_at: None,
             received_at: now,
@@ -5898,7 +5973,11 @@ mod tests {
                 "orderbook_depth": {
                     "payload": {
                         "obi_fut": 0.12,
+                        "obi_k_dw_close_fut": -0.41,
                         "obi_k_dw_twa_fut": 0.09,
+                        "exec_confirm_fut": false,
+                        "spot_confirm": true,
+                        "ofi_norm_fut": -0.64,
                         "spread_twa_fut": 0.01,
                         "levels": orderbook_levels,
                         "by_window": {
@@ -5916,6 +5995,110 @@ mod tests {
                             "15m": {"val": 1994.0, "vah": 2014.0},
                             "4h": {"val": 1988.0, "vah": 2022.0},
                             "1d": {"val": 1970.0, "vah": 2040.0}
+                        }
+                    }
+                },
+                "footprint": {
+                    "payload": {
+                        "by_window": {
+                            "15m": {
+                                "window_delta": -57.3,
+                                "window_total_qty": 8800.0,
+                                "unfinished_auction": true,
+                                "ua_top": 2009.0,
+                                "ua_bottom": 1997.0,
+                                "stacked_buy": false,
+                                "stacked_sell": true,
+                                "buy_stacks": [],
+                                "sell_stacks": [2003.0],
+                                "max_buy_stack_len": 0,
+                                "max_sell_stack_len": 1,
+                                "levels": []
+                            }
+                        }
+                    }
+                },
+                "cvd_pack": {
+                    "payload": {
+                        "delta_fut": -35.0,
+                        "delta_spot": -20.0,
+                        "relative_delta_fut": -0.11,
+                        "relative_delta_spot": -0.06,
+                        "likely_driver": "futures",
+                        "spot_flow_dominance": 0.32,
+                        "spot_lead_score": 0.45,
+                        "xmk_delta_gap_s_minus_f": 15.0,
+                        "cvd_slope_fut": -0.8,
+                        "cvd_slope_spot": -0.3,
+                        "by_window": {
+                            "15m": {"series": [{"ts": "2026-03-18T06:45:00Z", "delta_fut": 84.0}]},
+                            "4h": {"series": [{"ts": "2026-03-18T04:00:00Z", "delta_fut": 220.0}]},
+                            "1d": {"series": [{"ts": "2026-03-18T00:00:00Z", "delta_fut": 410.0}]}
+                        },
+                        "partial_window": {
+                            "15m": prompt_route_partial_window_15m(),
+                            "4h": {
+                                "window_start": "2026-03-18T04:00:00Z",
+                                "window_end": "2026-03-18T08:00:00Z",
+                                "last_minute_ts": "2026-03-18T07:09:00Z",
+                                "minutes_elapsed": 190,
+                                "minutes_total": 240,
+                                "progress_pct": 79.17,
+                                "cum_delta_fut": -620.0,
+                                "cum_delta_spot": -150.0,
+                                "cum_volume_fut": 24000.0,
+                                "recent_3m_delta_fut": -95.0,
+                                "recent_5m_delta_fut": -140.0,
+                                "recent_15m_delta_fut": -310.0,
+                                "slope_recent_5m_fut": -28.0,
+                                "slope_prev_5m_fut": 17.0,
+                                "slope_change_ratio": -1.65,
+                                "regime": "reversal_to_selling",
+                                "recent_series": []
+                            },
+                            "1d": {
+                                "window_start": "2026-03-18T00:00:00Z",
+                                "window_end": "2026-03-19T00:00:00Z",
+                                "last_minute_ts": "2026-03-18T07:09:00Z",
+                                "minutes_elapsed": 430,
+                                "minutes_total": 1440,
+                                "progress_pct": 29.86,
+                                "cum_delta_fut": -240.0,
+                                "cum_delta_spot": -60.0,
+                                "cum_volume_fut": 51000.0,
+                                "recent_3m_delta_fut": -28.0,
+                                "recent_5m_delta_fut": -40.0,
+                                "recent_15m_delta_fut": -95.0,
+                                "slope_recent_5m_fut": -8.0,
+                                "slope_prev_5m_fut": 5.0,
+                                "slope_change_ratio": -1.6,
+                                "regime": "reversal_to_selling",
+                                "recent_series": []
+                            }
+                        }
+                    }
+                },
+                "absorption": {
+                    "payload": {
+                        "recent_7d": {
+                            "event_count": 2,
+                            "lookback_coverage_ratio": 1.0,
+                            "events": [
+                                prompt_route_signal_event("2026-03-18T07:05:00Z", "absorption", "bullish", 1998.5),
+                                prompt_route_signal_event("2026-03-18T06:48:00Z", "absorption", "bearish", 2007.2)
+                            ]
+                        }
+                    }
+                },
+                "initiation": {
+                    "payload": {
+                        "recent_7d": {
+                            "event_count": 2,
+                            "lookback_coverage_ratio": 1.0,
+                            "events": [
+                                prompt_route_signal_event("2026-03-18T07:07:00Z", "initiation", "bearish", 2006.8),
+                                prompt_route_signal_event("2026-03-18T06:44:00Z", "initiation", "bullish", 1996.4)
+                            ]
                         }
                     }
                 }
@@ -6661,9 +6844,7 @@ mod tests {
             Some("reentry")
         );
         assert_eq!(
-            event
-                .get("execution_alignment_15m")
-                .and_then(Value::as_str),
+            event.get("execution_alignment_15m").and_then(Value::as_str),
             Some("conflicted")
         );
         assert_eq!(
@@ -7010,7 +7191,9 @@ mod tests {
             capture
                 .stage_1_setup_scan_json
                 .as_ref()
-                .and_then(|value| value.pointer("/execution_context_15m/nearest_executable_support/low"))
+                .and_then(
+                    |value| value.pointer("/execution_context_15m/nearest_executable_support/low")
+                )
                 .and_then(Value::as_f64),
             Some(1994.0)
         );
@@ -7367,6 +7550,18 @@ mod tests {
             Some("2026-03-18T07:05:00+00:00")
         );
         assert!(capture
+            .prompt_input
+            .pointer("/realtime_flow_context")
+            .is_some());
+        assert_eq!(
+            capture
+                .prompt_input
+                .pointer("/realtime_flow_context/since_stage1_increment/new_events_since_scan")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(2)
+        );
+        assert!(capture
             .stage_1_setup_scan_json
             .as_ref()
             .and_then(|value| value.get("scan_audit"))
@@ -7439,6 +7634,43 @@ mod tests {
     }
 
     #[test]
+    fn management_finalize_prompt_includes_realtime_flow_context_when_scan_is_annotated() {
+        let input = prompt_route_test_input(true, false);
+        let scan = super::annotate_scan_for_stage2(
+            &sample_stage_1_scan(),
+            super::FinalizeStageContext {
+                stage1_scan_ts_bucket: DateTime::parse_from_rfc3339("2026-03-18T07:00:00Z")
+                    .expect("parse stage1 ts")
+                    .with_timezone(&Utc),
+                stage2_core_ts_bucket: DateTime::parse_from_rfc3339("2026-03-18T07:09:00Z")
+                    .expect("parse stage2 ts")
+                    .with_timezone(&Utc),
+            },
+        );
+
+        let prompt = super::build_prompt_pair(
+            &input,
+            "medium_large_opportunity",
+            super::prompt::EntryPromptStage::Finalize,
+            Some(&scan),
+        )
+        .expect("build annotated management prompt");
+        let capture = prompt
+            .prompt_input_capture
+            .expect("capture annotated management prompt");
+
+        assert!(capture.prompt_input.pointer("/finalize_focus").is_none());
+        assert!(capture
+            .prompt_input
+            .pointer("/realtime_flow_context")
+            .is_some());
+        assert!(capture
+            .prompt_input
+            .pointer("/realtime_flow_context/cvd_partial_windows/15m/recent_series")
+            .is_none());
+    }
+
+    #[test]
     fn pending_prompt_uses_pending_core() {
         let input = prompt_route_test_input(false, true);
         let scan = sample_stage_1_scan();
@@ -7488,6 +7720,51 @@ mod tests {
             Some(81)
         );
         assert!(capture.prompt_input.pointer("/finalize_focus").is_none());
+    }
+
+    #[test]
+    fn pending_finalize_prompt_includes_realtime_flow_context_when_scan_is_annotated() {
+        let input = prompt_route_test_input(false, true);
+        let scan = super::annotate_scan_for_stage2(
+            &sample_stage_1_scan(),
+            super::FinalizeStageContext {
+                stage1_scan_ts_bucket: DateTime::parse_from_rfc3339("2026-03-18T07:00:00Z")
+                    .expect("parse stage1 ts")
+                    .with_timezone(&Utc),
+                stage2_core_ts_bucket: DateTime::parse_from_rfc3339("2026-03-18T07:09:00Z")
+                    .expect("parse stage2 ts")
+                    .with_timezone(&Utc),
+            },
+        );
+
+        let prompt = super::build_prompt_pair(
+            &input,
+            "medium_large_opportunity",
+            super::prompt::EntryPromptStage::Finalize,
+            Some(&scan),
+        )
+        .expect("build annotated pending prompt");
+        let capture = prompt
+            .prompt_input_capture
+            .expect("capture annotated pending prompt");
+
+        assert!(capture.prompt_input.pointer("/finalize_focus").is_none());
+        assert_eq!(
+            capture
+                .prompt_input
+                .pointer("/realtime_flow_context/cvd_partial_windows/15m/recent_series")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(10)
+        );
+        assert_eq!(
+            capture
+                .prompt_input
+                .pointer("/realtime_flow_context/since_stage1_increment/new_events_since_scan")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(2)
+        );
     }
 
     #[test]

@@ -12,6 +12,20 @@ while controlling drawdown and thesis-failure risk.
 
 Evaluate the position from the current state forward.
 
+REALTIME FLOW CONTEXT
+`realtime_flow_context` is newer than the Stage 1 scan.
+It summarizes what changed between the scan and now, especially inside the current unfinished 15m / 4h / 1d bar.
+
+Prioritize:
+- `cvd_partial_windows.{tf}.regime`
+- `cvd_partial_windows.{tf}.vs_last_closed_bar`
+- `since_stage1_increment`
+- `live_refs`
+
+Use this context to confirm or invalidate the earlier scan thesis.
+If recent flow has flipped against the held direction, prefer reducing, tightening risk, adjusting, or closing rather than blindly following the older scan.
+If `new_events_since_scan` shows a newly confirmed absorption, initiation, or exhaustion event, treat it as fresher than the older scan.
+
 BEFORE YOU OUTPUT
 1. From now, what is the current 4h to 1d directional edge of this position?
 2. Over the next few 15m bars, what is the most important reversal, squeeze, or stop-out risk against that edge?
@@ -25,6 +39,7 @@ BEFORE YOU OUTPUT
 9. To achieve the GOAL, is there a better action from now than keeping the position unchanged?
 10. If short-term price action is more likely to produce a counter-move, balance, or pullback first,
     would protecting current profit, reducing risk, and waiting for a better re-entry satisfy the GOAL better than holding unchanged?
+11. Have you checked whether `realtime_flow_context` shows a post-scan flow reversal, acceleration, invalidation, or newly confirmed absorption / initiation / exhaustion inside the unfinished 15m / 4h / 1d bar?
 
 Decision meaning:
 - HOLD: keeping the position unchanged is the best current profit-risk choice.

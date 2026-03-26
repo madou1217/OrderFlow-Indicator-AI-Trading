@@ -753,10 +753,7 @@ impl FeatureWriter {
         Ok(())
     }
 
-    async fn insert_long_short_ratio_feature_windows(
-        &self,
-        ctx: &IndicatorContext,
-    ) -> Result<()> {
+    async fn insert_long_short_ratio_feature_windows(&self, ctx: &IndicatorContext) -> Result<()> {
         let view = build_long_short_ratio_view(ctx);
         let Some(as_of_ts) = view.as_of_ts else {
             return Ok(());
@@ -832,9 +829,7 @@ impl FeatureWriter {
             }))
             .execute(&self.pool)
             .await
-            .with_context(|| {
-                format!("insert long_short_ratio_feature {}", metrics.window_label)
-            })?;
+            .with_context(|| format!("insert long_short_ratio_feature {}", metrics.window_label))?;
         }
 
         Ok(())

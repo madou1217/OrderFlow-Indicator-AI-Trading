@@ -356,9 +356,7 @@ pub fn decode_contract_body(payload: &[u8]) -> Result<EngineEvent> {
         "md.agg.trade.1m" => MdData::AggTrade1m(parse_agg_trade_1m(&data_obj)?),
         "md.agg.orderbook.1m" => MdData::AggOrderbook1m(parse_agg_orderbook_1m(&data_obj)?),
         "md.agg.liq.1m" => MdData::AggLiq1m(parse_agg_liq_1m(&data_obj)?),
-        "md.agg.funding_mark.1m" => {
-            MdData::AggFundingMark1m(parse_agg_funding_mark_1m(&data_obj)?)
-        }
+        "md.agg.funding_mark.1m" => MdData::AggFundingMark1m(parse_agg_funding_mark_1m(&data_obj)?),
         "md.open_interest_current" => {
             MdData::OpenInterestCurrent(parse_open_interest_current(&data_obj)?)
         }

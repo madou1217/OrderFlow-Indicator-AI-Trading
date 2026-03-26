@@ -59,7 +59,10 @@ impl Indicator for I25OpenInterest {
         let view = build_open_interest_view(ctx);
         let mut by_window = Map::new();
         for metrics in &view.by_window {
-            by_window.insert(metrics.window_label.to_string(), open_interest_window_json(metrics));
+            by_window.insert(
+                metrics.window_label.to_string(),
+                open_interest_window_json(metrics),
+            );
         }
         let mut snapshot_rows = Vec::new();
         for metrics in &view.by_window {
@@ -114,7 +117,10 @@ pub fn build_open_interest_view(ctx: &IndicatorContext) -> OpenInterestIndicator
         .current_open_interest
         .as_ref()
         .map(|value| value.open_interest_contracts);
-    let current_mark_price = ctx.current_open_interest.as_ref().and_then(|value| value.mark_price);
+    let current_mark_price = ctx
+        .current_open_interest
+        .as_ref()
+        .and_then(|value| value.mark_price);
     let current_open_interest_value_usdt = ctx
         .current_open_interest
         .as_ref()
@@ -122,9 +128,15 @@ pub fn build_open_interest_view(ctx: &IndicatorContext) -> OpenInterestIndicator
     let current_delta_abs = current_open_interest_value_usdt
         .zip(latest_hist.map(|point| point.open_interest_value_usdt))
         .map(|(current, hist)| current - hist);
-    let current_delta_pct = current_delta_abs.zip(latest_hist.map(|point| point.open_interest_value_usdt)).and_then(
-        |(delta, base)| if base.abs() > EPS { Some(delta / base) } else { None },
-    );
+    let current_delta_pct = current_delta_abs
+        .zip(latest_hist.map(|point| point.open_interest_value_usdt))
+        .and_then(|(delta, base)| {
+            if base.abs() > EPS {
+                Some(delta / base)
+            } else {
+                None
+            }
+        });
     let current_state = classify_price_oi_relation(
         current_mark_price
             .zip(latest_hist.and_then(|point| point.reference_price))
@@ -185,7 +197,9 @@ pub fn compute_open_interest_window(
     let oi_log_return = log_return(oi_start, oi_end);
     let price_start = start.reference_price;
     let price_end = end.reference_price;
-    let price_delta_pct = price_start.zip(price_end).and_then(|(a, b)| pct_change(a, b));
+    let price_delta_pct = price_start
+        .zip(price_end)
+        .and_then(|(a, b)| pct_change(a, b));
     let state = classify_price_oi_relation(price_delta_pct, oi_delta_pct);
     let oi_accel = compute_oi_accel(series, sample_count);
     let oi_zscore = rolling_window_zscore(series, sample_count, oi_delta_pct);
