@@ -22,6 +22,8 @@ use crate::indicators::i21_rvwap_sigma_bands::I21RvwapSigmaBands;
 use crate::indicators::i22_high_volume_pulse::I22HighVolumePulse;
 use crate::indicators::i23_ema_trend_regime::I23EmaTrendRegime;
 use crate::indicators::i24_fvg::I24Fvg;
+use crate::indicators::i25_open_interest::I25OpenInterest;
+use crate::indicators::i26_long_short_ratios::I26LongShortRatios;
 use crate::indicators::indicator_trait::Indicator;
 use std::sync::Arc;
 
@@ -51,5 +53,7 @@ pub fn build_registry() -> Vec<Arc<dyn Indicator>> {
         Arc::new(I22HighVolumePulse),
         Arc::new(I23EmaTrendRegime),
         Arc::new(I24Fvg),
+        Arc::new(I25OpenInterest),
+        Arc::new(I26LongShortRatios),
     ]
 }

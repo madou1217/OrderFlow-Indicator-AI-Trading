@@ -48,6 +48,9 @@ pub enum MdData {
     AggOrderbook1m(AggOrderbook1mEvent),
     AggLiq1m(AggLiq1mEvent),
     AggFundingMark1m(AggFundingMark1mEvent),
+    OpenInterestCurrent(OpenInterestCurrentEvent),
+    OpenInterestHist5m(OpenInterestHist5mEvent),
+    LongShortRatio5m(LongShortRatio5mEvent),
 }
 
 #[derive(Debug, Clone)]
@@ -279,6 +282,48 @@ pub struct AggFundingMark1mEvent {
     pub funding_points: Vec<AggFundingPoint>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpenInterestCurrentEvent {
+    pub ts_effective: DateTime<Utc>,
+    pub open_interest_contracts: f64,
+    pub mark_price: Option<f64>,
+    pub open_interest_value_usdt: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpenInterestHist5mEvent {
+    pub ts_bucket: DateTime<Utc>,
+    pub open_interest_contracts: f64,
+    pub open_interest_value_usdt: f64,
+    pub reference_price: Option<f64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum LongShortRatioType {
+    GlobalAccount,
+    TopAccount,
+    TopPosition,
+}
+
+impl LongShortRatioType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::GlobalAccount => "global_account",
+            Self::TopAccount => "top_account",
+            Self::TopPosition => "top_position",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LongShortRatio5mEvent {
+    pub ts_bucket: DateTime<Utc>,
+    pub ratio_type: LongShortRatioType,
+    pub long_short_ratio: f64,
+    pub long_account_ratio: Option<f64>,
+    pub short_account_ratio: Option<f64>,
+}
+
 pub fn decode_contract_body(payload: &[u8]) -> Result<EngineEvent> {
     let root: Value = serde_json::from_slice(payload).context("decode mq body json")?;
 
@@ -311,7 +356,16 @@ pub fn decode_contract_body(payload: &[u8]) -> Result<EngineEvent> {
         "md.agg.trade.1m" => MdData::AggTrade1m(parse_agg_trade_1m(&data_obj)?),
         "md.agg.orderbook.1m" => MdData::AggOrderbook1m(parse_agg_orderbook_1m(&data_obj)?),
         "md.agg.liq.1m" => MdData::AggLiq1m(parse_agg_liq_1m(&data_obj)?),
-        "md.agg.funding_mark.1m" => MdData::AggFundingMark1m(parse_agg_funding_mark_1m(&data_obj)?),
+        "md.agg.funding_mark.1m" => {
+            MdData::AggFundingMark1m(parse_agg_funding_mark_1m(&data_obj)?)
+        }
+        "md.open_interest_current" => {
+            MdData::OpenInterestCurrent(parse_open_interest_current(&data_obj)?)
+        }
+        "md.open_interest_hist_5m" => {
+            MdData::OpenInterestHist5m(parse_open_interest_hist_5m(&data_obj)?)
+        }
+        "md.long_short_ratio_5m" => MdData::LongShortRatio5m(parse_long_short_ratio_5m(&data_obj)?),
         other => return Err(anyhow!("unsupported msg_type: {}", other)),
     };
 
@@ -559,6 +613,50 @@ fn parse_agg_funding_mark_1m(data: &Value) -> Result<AggFundingMark1mEvent> {
         mark_points: parse_mark_points(required_value(data, "mark_points")?)?,
         funding_points: parse_funding_points(required_value(data, "funding_points")?)?,
     })
+}
+
+fn parse_open_interest_current(data: &Value) -> Result<OpenInterestCurrentEvent> {
+    Ok(OpenInterestCurrentEvent {
+        ts_effective: parse_ts(required_str(data, "ts_effective")?, "ts_effective")?,
+        open_interest_contracts: required_f64(data, "open_interest_contracts")?,
+        mark_price: optional_f64(data, "mark_price")?,
+        open_interest_value_usdt: optional_f64(data, "open_interest_value_usdt")?,
+    })
+}
+
+fn parse_open_interest_hist_5m(data: &Value) -> Result<OpenInterestHist5mEvent> {
+    let open_interest_contracts = required_f64(data, "open_interest_contracts")?;
+    let open_interest_value_usdt = required_f64(data, "open_interest_value_usdt")?;
+    let reference_price = if open_interest_contracts.abs() > f64::EPSILON {
+        Some(open_interest_value_usdt / open_interest_contracts)
+    } else {
+        None
+    };
+    Ok(OpenInterestHist5mEvent {
+        ts_bucket: parse_ts(required_str(data, "ts_effective")?, "ts_effective")?,
+        open_interest_contracts,
+        open_interest_value_usdt,
+        reference_price,
+    })
+}
+
+fn parse_long_short_ratio_5m(data: &Value) -> Result<LongShortRatio5mEvent> {
+    Ok(LongShortRatio5mEvent {
+        ts_bucket: parse_ts(required_str(data, "ts_effective")?, "ts_effective")?,
+        ratio_type: parse_long_short_ratio_type(&required_str(data, "ratio_type")?)?,
+        long_short_ratio: required_f64(data, "long_short_ratio")?,
+        long_account_ratio: optional_f64(data, "long_account_ratio")?,
+        short_account_ratio: optional_f64(data, "short_account_ratio")?,
+    })
+}
+
+fn parse_long_short_ratio_type(value: &str) -> Result<LongShortRatioType> {
+    match value {
+        "global_account" => Ok(LongShortRatioType::GlobalAccount),
+        "top_account" => Ok(LongShortRatioType::TopAccount),
+        "top_position" => Ok(LongShortRatioType::TopPosition),
+        other => Err(anyhow!("unsupported long short ratio type: {}", other)),
+    }
 }
 
 fn parse_profile_levels(value: Value) -> Result<Vec<AggProfileLevel>> {

@@ -2440,13 +2440,17 @@ async fn persist_events_batch(
     enqueue_raw_jobs_for_parquet(jobs);
     let pipeline_events =
         minute_aggregator.aggregate_batch_refs(jobs.iter().flat_map(|j| j.events.iter()));
+    let mut publish_events = pipeline_events.clone();
+    publish_events.extend(collect_publish_passthrough_events(
+        jobs.iter().flat_map(|job| job.events.iter()),
+    ));
     let mut db_events = pipeline_events.clone();
-    db_events.extend(collect_db_passthrough_klines(
+    db_events.extend(collect_db_passthrough_events(
         jobs.iter().flat_map(|job| job.events.iter()),
     ));
 
     let outbox_stage_started_at = Instant::now();
-    let publish_results = stream::iter(pipeline_events.into_iter())
+    let publish_results = stream::iter(publish_events.into_iter())
         .map(|event| {
             let publisher = Arc::clone(publisher);
             let outbox_writer = Arc::clone(outbox_writer);
@@ -2688,13 +2692,37 @@ fn coalesce_non_trade_events_for_db(events: &[NormalizedMdEvent]) -> Vec<Normali
     coalesced
 }
 
-fn collect_db_passthrough_klines<'a, I>(events: I) -> Vec<NormalizedMdEvent>
+fn collect_db_passthrough_events<'a, I>(events: I) -> Vec<NormalizedMdEvent>
 where
     I: IntoIterator<Item = &'a NormalizedMdEvent>,
 {
     events
         .into_iter()
-        .filter(|event| event.msg_type == "md.kline")
+        .filter(|event| {
+            matches!(
+                event.msg_type.as_str(),
+                "md.kline"
+                    | "md.open_interest_current"
+                    | "md.open_interest_hist_5m"
+                    | "md.long_short_ratio_5m"
+            )
+        })
+        .cloned()
+        .collect()
+}
+
+fn collect_publish_passthrough_events<'a, I>(events: I) -> Vec<NormalizedMdEvent>
+where
+    I: IntoIterator<Item = &'a NormalizedMdEvent>,
+{
+    events
+        .into_iter()
+        .filter(|event| {
+            matches!(
+                event.msg_type.as_str(),
+                "md.open_interest_current" | "md.open_interest_hist_5m" | "md.long_short_ratio_5m"
+            )
+        })
         .cloned()
         .collect()
 }
@@ -2917,13 +2945,15 @@ async fn persist_event_internal(
         pipeline_events.extend(minute_aggregator.flush_closed_minutes(Utc::now()));
         pipeline_events
     };
+    let mut publish_events = pipeline_events.clone();
+    publish_events.extend(collect_publish_passthrough_events(std::iter::once(event)));
     let mut db_events = pipeline_events.clone();
-    db_events.extend(collect_db_passthrough_klines(std::iter::once(event)));
+    db_events.extend(collect_db_passthrough_events(std::iter::once(event)));
 
     let outbox_stage_started_at = Instant::now();
     let mut hot_direct_count: usize = 0;
     let mut outbox_count: usize = 0;
-    for agg_event in pipeline_events.iter().cloned() {
+    for agg_event in publish_events.iter().cloned() {
         let (direct_delta, outbox_delta) = publish_pipeline_event(
             agg_event,
             Arc::clone(publisher),
@@ -2935,7 +2965,7 @@ async fn persist_event_internal(
         outbox_count = outbox_count.saturating_add(outbox_delta);
     }
     let outbox_enqueue_ms = outbox_stage_started_at.elapsed().as_millis();
-    for agg_event in &pipeline_events {
+    for agg_event in &publish_events {
         metrics.inc_processed(agg_event.event_ts);
     }
 
@@ -3234,7 +3264,7 @@ fn is_hot_path_md_event(event: &NormalizedMdEvent) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_trade_raw_event, collect_db_passthrough_klines, TradeSecondChunk, TradeVpinState,
+        apply_trade_raw_event, collect_db_passthrough_events, TradeSecondChunk, TradeVpinState,
     };
     use crate::normalize::NormalizedMdEvent;
     use chrono::{TimeZone, Utc};
@@ -3309,9 +3339,41 @@ mod tests {
             data: json!({}),
         };
 
-        let passthrough = collect_db_passthrough_klines([&trade, &kline]);
+        let passthrough = collect_db_passthrough_events([&trade, &kline]);
         assert_eq!(passthrough.len(), 1);
         assert_eq!(passthrough[0].msg_type, "md.kline");
         assert_eq!(passthrough[0].data["interval_code"].as_str(), Some("1h"));
+    }
+
+    #[test]
+    fn db_path_preserves_oi_and_ratio_events() {
+        let ts = Utc.with_ymd_and_hms(2026, 3, 26, 5, 0, 0).single().unwrap();
+        let oi_current = NormalizedMdEvent {
+            msg_type: "md.open_interest_current".to_string(),
+            market: "futures".to_string(),
+            symbol: "BTCUSDT".to_string(),
+            source_kind: "rest".to_string(),
+            backfill_in_progress: false,
+            routing_key: "md.futures.open_interest.current.btcusdt".to_string(),
+            stream_name: "fapi/v1/openInterest".to_string(),
+            event_ts: ts,
+            data: json!({}),
+        };
+        let ratio = NormalizedMdEvent {
+            msg_type: "md.long_short_ratio_5m".to_string(),
+            market: "futures".to_string(),
+            symbol: "BTCUSDT".to_string(),
+            source_kind: "rest".to_string(),
+            backfill_in_progress: false,
+            routing_key: "md.futures.long_short_ratio.global_account.5m.btcusdt".to_string(),
+            stream_name: "futures/data/globalLongShortAccountRatio".to_string(),
+            event_ts: ts,
+            data: json!({}),
+        };
+
+        let passthrough = collect_db_passthrough_events([&oi_current, &ratio]);
+        assert_eq!(passthrough.len(), 2);
+        assert_eq!(passthrough[0].msg_type, "md.open_interest_current");
+        assert_eq!(passthrough[1].msg_type, "md.long_short_ratio_5m");
     }
 }

@@ -133,12 +133,26 @@ pub async fn run(ctx: AppContext) -> Result<()> {
         "funding rate backfill loop",
         backfill_scheduler::run_funding_rate_backfill_loop(
             ctx.clone(),
-            rest_client,
-            db_writer,
-            ops_writer,
-            publisher,
-            outbox_writer,
-            metrics,
+            rest_client.clone(),
+            db_writer.clone(),
+            ops_writer.clone(),
+            publisher.clone(),
+            outbox_writer.clone(),
+            metrics.clone(),
+        ),
+    );
+
+    spawn_critical_task(
+        &mut tasks,
+        "open interest + long short ratio loop",
+        backfill_scheduler::run_open_interest_ratio_loop(
+            ctx.clone(),
+            rest_client.clone(),
+            db_writer.clone(),
+            ops_writer.clone(),
+            publisher.clone(),
+            outbox_writer.clone(),
+            metrics.clone(),
         ),
     );
 

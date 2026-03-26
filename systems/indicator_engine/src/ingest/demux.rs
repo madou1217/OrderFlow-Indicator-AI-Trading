@@ -17,7 +17,10 @@ pub fn classify(event: &EngineEvent) -> StreamLane {
         MdData::AggOrderbook1m(_) => StreamLane::Orderbook,
         MdData::Kline(_) => StreamLane::Kline,
         MdData::MarkPrice(_) | MdData::FundingRate(_) => StreamLane::MarkFunding,
-        MdData::AggFundingMark1m(_) => StreamLane::MarkFunding,
+        MdData::AggFundingMark1m(_)
+        | MdData::OpenInterestCurrent(_)
+        | MdData::OpenInterestHist5m(_)
+        | MdData::LongShortRatio5m(_) => StreamLane::MarkFunding,
         MdData::ForceOrder(_) | MdData::AggLiq1m(_) => StreamLane::ForceOrder,
     }
 }

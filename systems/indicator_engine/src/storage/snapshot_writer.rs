@@ -29,8 +29,9 @@ impl SnapshotWriter {
             return Ok(());
         }
 
-        // One snapshot row per indicator per minute; do not expand by_window /
-        // series_by_window into extra rows, which would multiply storage.
+        // Most indicators write one snapshot row per minute. A small number of
+        // indicators can additionally materialize explicit per-window rows so
+        // feat.indicator_snapshot exposes stable window_code coverage.
         let mut ts_snapshots: Vec<DateTime<Utc>> = Vec::new();
         let mut bar_intervals: Vec<String> = Vec::new();
         let mut symbols: Vec<String> = Vec::new();
@@ -423,6 +424,7 @@ async fn enqueue_outbox_batch_in_tx(
 
 fn interval_text_by_window(window_code: &str) -> String {
     match window_code {
+        "5m" => "5 minutes".to_string(),
         "15m" => "15 minutes".to_string(),
         "1h" => "1 hour".to_string(),
         "4h" => "4 hours".to_string(),

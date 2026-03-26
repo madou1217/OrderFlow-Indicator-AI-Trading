@@ -3,7 +3,9 @@ pub mod depth_normalizer;
 pub mod force_order_normalizer;
 pub mod funding_rate_normalizer;
 pub mod kline_normalizer;
+pub mod long_short_ratio_normalizer;
 pub mod mark_price_normalizer;
+pub mod open_interest_normalizer;
 pub mod trade_normalizer;
 
 use anyhow::{anyhow, Context, Result};

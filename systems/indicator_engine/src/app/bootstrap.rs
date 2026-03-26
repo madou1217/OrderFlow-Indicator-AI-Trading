@@ -658,6 +658,7 @@ fn default_fvg_invalid_close_bars() -> usize {
 fn default_window_codes() -> Vec<String> {
     vec![
         "1m".to_string(),
+        "5m".to_string(),
         "15m".to_string(),
         "1h".to_string(),
         "4h".to_string(),
@@ -1590,7 +1591,7 @@ fn validate_config(cfg: &RootConfig) -> Result<()> {
     }
     for code in &cfg.indicator.window_codes {
         match code.as_str() {
-            "1m" | "15m" | "1h" | "4h" | "1d" | "3d" => {}
+            "1m" | "5m" | "15m" | "1h" | "4h" | "1d" | "3d" => {}
             other => {
                 return Err(anyhow!(
                     "unsupported indicator.window_codes value: {}",

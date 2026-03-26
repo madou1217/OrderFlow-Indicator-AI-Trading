@@ -1,4 +1,6 @@
 use crate::indicators::context::{zscore, IndicatorContext};
+use crate::indicators::i25_open_interest::build_open_interest_view;
+use crate::indicators::i26_long_short_ratios::build_long_short_ratio_view;
 use crate::ingest::decoder::MarketKind;
 use crate::runtime::state_store::{MinuteHistory, WhaleStats};
 use anyhow::{Context, Result};
@@ -57,7 +59,13 @@ impl FeatureWriter {
     }
 
     pub async fn write_all(&self, ctx: &IndicatorContext) -> Result<()> {
-        let mut windows = ctx.enabled_windows();
+        // `5m` is currently reserved for i25/i26 OI + ratio features.
+        // Legacy feature tables keep their existing allowed window set.
+        let mut windows = ctx
+            .enabled_windows()
+            .into_iter()
+            .filter(|(_, mins)| *mins != 5)
+            .collect::<Vec<_>>();
         if !windows.iter().any(|(_, m)| *m == 1) {
             windows.push(("1m".to_string(), 1));
         }
@@ -106,6 +114,9 @@ impl FeatureWriter {
             )
             .await?;
         }
+
+        self.insert_open_interest_feature_windows(ctx).await?;
+        self.insert_long_short_ratio_feature_windows(ctx).await?;
 
         self.insert_orderbook_feature(ctx).await?;
         self.insert_funding_changes(ctx).await?;
@@ -661,6 +672,171 @@ impl FeatureWriter {
             .await
             .context("insert funding_change_event")?;
         }
+        Ok(())
+    }
+
+    async fn insert_open_interest_feature_windows(&self, ctx: &IndicatorContext) -> Result<()> {
+        let view = build_open_interest_view(ctx);
+        let Some(as_of_ts) = view.as_of_ts else {
+            return Ok(());
+        };
+        let latest_contracts = ctx
+            .open_interest_hist_5m
+            .last()
+            .map(|point| point.open_interest_contracts);
+
+        for metrics in &view.by_window {
+            if !metrics.is_ready {
+                continue;
+            }
+            let bar_interval = interval_text(metrics.window_minutes);
+            sqlx::query(
+                r#"
+                INSERT INTO feat.open_interest_feature (
+                    ts_bucket, bar_interval, symbol,
+                    oi_latest_contracts, oi_latest_value_usdt, oi_start_value_usdt,
+                    oi_delta_abs, oi_delta_pct, oi_log_return, oi_zscore, oi_accel,
+                    price_start, price_end, price_delta_pct, price_oi_relation,
+                    calc_version, extra_json
+                )
+                VALUES (
+                    $1, $2::interval, $3,
+                    $4, $5, $6,
+                    $7, $8, $9, $10, $11,
+                    $12, $13, $14, $15,
+                    'indicator_engine.v1', $16
+                )
+                ON CONFLICT (venue, symbol, bar_interval, ts_bucket)
+                DO UPDATE SET
+                    oi_latest_contracts = EXCLUDED.oi_latest_contracts,
+                    oi_latest_value_usdt = EXCLUDED.oi_latest_value_usdt,
+                    oi_start_value_usdt = EXCLUDED.oi_start_value_usdt,
+                    oi_delta_abs = EXCLUDED.oi_delta_abs,
+                    oi_delta_pct = EXCLUDED.oi_delta_pct,
+                    oi_log_return = EXCLUDED.oi_log_return,
+                    oi_zscore = EXCLUDED.oi_zscore,
+                    oi_accel = EXCLUDED.oi_accel,
+                    price_start = EXCLUDED.price_start,
+                    price_end = EXCLUDED.price_end,
+                    price_delta_pct = EXCLUDED.price_delta_pct,
+                    price_oi_relation = EXCLUDED.price_oi_relation,
+                    calc_version = EXCLUDED.calc_version,
+                    extra_json = EXCLUDED.extra_json
+                "#,
+            )
+            .bind(as_of_ts)
+            .bind(bar_interval)
+            .bind(&ctx.symbol)
+            .bind(latest_contracts)
+            .bind(metrics.oi_end)
+            .bind(metrics.oi_start)
+            .bind(metrics.oi_delta_abs)
+            .bind(metrics.oi_delta_pct)
+            .bind(metrics.oi_log_return)
+            .bind(metrics.oi_zscore)
+            .bind(metrics.oi_accel)
+            .bind(metrics.price_start)
+            .bind(metrics.price_end)
+            .bind(metrics.price_delta_pct)
+            .bind(metrics.price_oi_relation)
+            .bind(json!({
+                "window_code": metrics.window_label,
+                "window_minutes": metrics.window_minutes,
+                "latest_effective_ts": as_of_ts.to_rfc3339(),
+                "source_minute_ts": ctx.ts_bucket.to_rfc3339(),
+            }))
+            .execute(&self.pool)
+            .await
+            .with_context(|| format!("insert open_interest_feature {}", metrics.window_label))?;
+        }
+
+        Ok(())
+    }
+
+    async fn insert_long_short_ratio_feature_windows(
+        &self,
+        ctx: &IndicatorContext,
+    ) -> Result<()> {
+        let view = build_long_short_ratio_view(ctx);
+        let Some(as_of_ts) = view.as_of_ts else {
+            return Ok(());
+        };
+
+        for metrics in &view.by_window {
+            if !metrics.is_ready {
+                continue;
+            }
+            let bar_interval = interval_text(metrics.window_minutes);
+            sqlx::query(
+                r#"
+                INSERT INTO feat.long_short_ratio_feature (
+                    ts_bucket, bar_interval, symbol,
+                    global_ratio_latest, top_account_ratio_latest, top_position_ratio_latest,
+                    global_ratio_log, top_account_ratio_log, top_position_ratio_log,
+                    global_ratio_change, top_account_ratio_change, top_position_ratio_change,
+                    account_crowding_gap, position_crowding_gap,
+                    crowding_stretch, crowding_zscore, crowding_state,
+                    calc_version, extra_json
+                )
+                VALUES (
+                    $1, $2::interval, $3,
+                    $4, $5, $6,
+                    $7, $8, $9,
+                    $10, $11, $12,
+                    $13, $14,
+                    $15, $16, $17,
+                    'indicator_engine.v1', $18
+                )
+                ON CONFLICT (venue, symbol, bar_interval, ts_bucket)
+                DO UPDATE SET
+                    global_ratio_latest = EXCLUDED.global_ratio_latest,
+                    top_account_ratio_latest = EXCLUDED.top_account_ratio_latest,
+                    top_position_ratio_latest = EXCLUDED.top_position_ratio_latest,
+                    global_ratio_log = EXCLUDED.global_ratio_log,
+                    top_account_ratio_log = EXCLUDED.top_account_ratio_log,
+                    top_position_ratio_log = EXCLUDED.top_position_ratio_log,
+                    global_ratio_change = EXCLUDED.global_ratio_change,
+                    top_account_ratio_change = EXCLUDED.top_account_ratio_change,
+                    top_position_ratio_change = EXCLUDED.top_position_ratio_change,
+                    account_crowding_gap = EXCLUDED.account_crowding_gap,
+                    position_crowding_gap = EXCLUDED.position_crowding_gap,
+                    crowding_stretch = EXCLUDED.crowding_stretch,
+                    crowding_zscore = EXCLUDED.crowding_zscore,
+                    crowding_state = EXCLUDED.crowding_state,
+                    calc_version = EXCLUDED.calc_version,
+                    extra_json = EXCLUDED.extra_json
+                "#,
+            )
+            .bind(as_of_ts)
+            .bind(bar_interval)
+            .bind(&ctx.symbol)
+            .bind(metrics.global_ratio_latest)
+            .bind(metrics.top_account_ratio_latest)
+            .bind(metrics.top_position_ratio_latest)
+            .bind(metrics.global_ratio_log)
+            .bind(metrics.top_account_ratio_log)
+            .bind(metrics.top_position_ratio_log)
+            .bind(metrics.global_ratio_change)
+            .bind(metrics.top_account_ratio_change)
+            .bind(metrics.top_position_ratio_change)
+            .bind(metrics.account_crowding_gap)
+            .bind(metrics.position_crowding_gap)
+            .bind(metrics.crowding_stretch)
+            .bind(metrics.crowding_zscore)
+            .bind(metrics.crowding_state)
+            .bind(json!({
+                "window_code": metrics.window_label,
+                "window_minutes": metrics.window_minutes,
+                "latest_effective_ts": as_of_ts.to_rfc3339(),
+                "source_minute_ts": ctx.ts_bucket.to_rfc3339(),
+            }))
+            .execute(&self.pool)
+            .await
+            .with_context(|| {
+                format!("insert long_short_ratio_feature {}", metrics.window_label)
+            })?;
+        }
+
         Ok(())
     }
 

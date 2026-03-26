@@ -23,6 +23,8 @@ pub mod i21_rvwap_sigma_bands;
 pub mod i22_high_volume_pulse;
 pub mod i23_ema_trend_regime;
 pub mod i24_fvg;
+pub mod i25_open_interest;
+pub mod i26_long_short_ratios;
 pub mod indicator_trait;
 pub mod registry;
 pub mod shared;

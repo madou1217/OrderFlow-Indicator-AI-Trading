@@ -39,6 +39,9 @@ impl MdDbWriter {
             "md.agg.orderbook.1m" => self.insert_agg_orderbook_1m(event).await,
             "md.agg.liq.1m" => self.insert_agg_liq_1m(event).await,
             "md.agg.funding_mark.1m" => self.insert_agg_funding_mark_1m(event).await,
+            "md.open_interest_current" => self.insert_open_interest_current_1m(event).await,
+            "md.open_interest_hist_5m" => self.insert_open_interest_hist_5m(event).await,
+            "md.long_short_ratio_5m" => self.insert_long_short_ratio_5m(event).await,
             other => Err(anyhow!("unsupported msg_type for md writer: {}", other)),
         }
     }
@@ -132,6 +135,126 @@ impl MdDbWriter {
         .execute(&self.pool)
         .await
         .context("insert md.trade_event")?;
+        Ok(())
+    }
+
+    async fn insert_open_interest_current_1m(&self, event: &NormalizedMdEvent) -> Result<()> {
+        let d = &event.data;
+        sqlx::query(
+            r#"
+            INSERT INTO md.open_interest_current_1m (
+                ts_event, ts_recv, venue, market, symbol, source_kind, stream_name,
+                open_interest_contracts, mark_price, open_interest_value_usdt, payload_json
+            )
+            VALUES (
+                $1, $2, 'binance', $3::cfg.market_type, $4, $5::cfg.source_type, $6,
+                $7, $8, $9, $10
+            )
+            ON CONFLICT (market, symbol, ts_event)
+            DO UPDATE SET
+                ts_recv = EXCLUDED.ts_recv,
+                source_kind = EXCLUDED.source_kind,
+                stream_name = EXCLUDED.stream_name,
+                open_interest_contracts = EXCLUDED.open_interest_contracts,
+                mark_price = EXCLUDED.mark_price,
+                open_interest_value_usdt = EXCLUDED.open_interest_value_usdt,
+                payload_json = EXCLUDED.payload_json
+            "#,
+        )
+        .bind(event.event_ts)
+        .bind(parse_ts(d, "ts_recv")?)
+        .bind(event.market.as_str())
+        .bind(event.symbol.as_str())
+        .bind(event.source_kind.as_str())
+        .bind(required_str(d, "stream_name")?)
+        .bind(required_f64(d, "open_interest_contracts")?)
+        .bind(optional_f64(d, "mark_price"))
+        .bind(optional_f64(d, "open_interest_value_usdt"))
+        .bind(payload_json(d))
+        .execute(&self.pool)
+        .await
+        .context("insert md.open_interest_current_1m")?;
+        Ok(())
+    }
+
+    async fn insert_open_interest_hist_5m(&self, event: &NormalizedMdEvent) -> Result<()> {
+        let d = &event.data;
+        sqlx::query(
+            r#"
+            INSERT INTO md.open_interest_hist_5m (
+                ts_event, ts_recv, venue, ts_bucket, market, symbol, source_kind, stream_name,
+                open_interest_contracts, open_interest_value_usdt, payload_json
+            )
+            VALUES (
+                $1, $2, 'binance', $3, $4::cfg.market_type, $5, $6::cfg.source_type, $7,
+                $8, $9, $10
+            )
+            ON CONFLICT (market, symbol, ts_bucket)
+            DO UPDATE SET
+                ts_event = EXCLUDED.ts_event,
+                ts_recv = EXCLUDED.ts_recv,
+                source_kind = EXCLUDED.source_kind,
+                stream_name = EXCLUDED.stream_name,
+                open_interest_contracts = EXCLUDED.open_interest_contracts,
+                open_interest_value_usdt = EXCLUDED.open_interest_value_usdt,
+                payload_json = EXCLUDED.payload_json
+            "#,
+        )
+        .bind(event.event_ts)
+        .bind(parse_ts(d, "ts_recv")?)
+        .bind(parse_ts(d, "ts_bucket")?)
+        .bind(event.market.as_str())
+        .bind(event.symbol.as_str())
+        .bind(event.source_kind.as_str())
+        .bind(required_str(d, "stream_name")?)
+        .bind(required_f64(d, "open_interest_contracts")?)
+        .bind(required_f64(d, "open_interest_value_usdt")?)
+        .bind(payload_json(d))
+        .execute(&self.pool)
+        .await
+        .context("insert md.open_interest_hist_5m")?;
+        Ok(())
+    }
+
+    async fn insert_long_short_ratio_5m(&self, event: &NormalizedMdEvent) -> Result<()> {
+        let d = &event.data;
+        sqlx::query(
+            r#"
+            INSERT INTO md.long_short_ratio_5m (
+                ts_event, ts_recv, venue, ts_bucket, market, symbol, source_kind, stream_name,
+                ratio_type, long_short_ratio, long_account_ratio, short_account_ratio, payload_json
+            )
+            VALUES (
+                $1, $2, 'binance', $3, $4::cfg.market_type, $5, $6::cfg.source_type, $7,
+                $8, $9, $10, $11, $12
+            )
+            ON CONFLICT (market, symbol, ratio_type, ts_bucket)
+            DO UPDATE SET
+                ts_event = EXCLUDED.ts_event,
+                ts_recv = EXCLUDED.ts_recv,
+                source_kind = EXCLUDED.source_kind,
+                stream_name = EXCLUDED.stream_name,
+                long_short_ratio = EXCLUDED.long_short_ratio,
+                long_account_ratio = EXCLUDED.long_account_ratio,
+                short_account_ratio = EXCLUDED.short_account_ratio,
+                payload_json = EXCLUDED.payload_json
+            "#,
+        )
+        .bind(event.event_ts)
+        .bind(parse_ts(d, "ts_recv")?)
+        .bind(parse_ts(d, "ts_bucket")?)
+        .bind(event.market.as_str())
+        .bind(event.symbol.as_str())
+        .bind(event.source_kind.as_str())
+        .bind(required_str(d, "stream_name")?)
+        .bind(required_str(d, "ratio_type")?)
+        .bind(required_f64(d, "long_short_ratio")?)
+        .bind(optional_f64(d, "long_account_ratio"))
+        .bind(optional_f64(d, "short_account_ratio"))
+        .bind(payload_json(d))
+        .execute(&self.pool)
+        .await
+        .context("insert md.long_short_ratio_5m")?;
         Ok(())
     }
 

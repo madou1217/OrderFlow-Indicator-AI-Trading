@@ -3,6 +3,9 @@ use crate::exchange::binance::rest::depth_snapshot::BinanceDepthSnapshot;
 use crate::exchange::binance::rest::exchange_info::BinanceExchangeInfo;
 use crate::exchange::binance::rest::funding_rate::BinanceFundingRateRecord;
 use crate::exchange::binance::rest::klines::BinanceKlineRow;
+use crate::exchange::binance::rest::long_short_ratio::BinanceLongShortRatioRecord;
+use crate::exchange::binance::rest::open_interest::BinanceOpenInterest;
+use crate::exchange::binance::rest::open_interest_hist::BinanceOpenInterestHistRecord;
 use crate::exchange::binance::rest::premium_index::BinancePremiumIndex;
 use anyhow::{anyhow, Context, Result};
 use reqwest::{header::CONTENT_TYPE, Client, StatusCode};
@@ -341,6 +344,113 @@ impl BinanceRestClient {
         Ok(rows.pop())
     }
 
+    pub async fn fetch_open_interest(&self, symbol: &str) -> Result<BinanceOpenInterest> {
+        let url = "https://fapi.binance.com/fapi/v1/openInterest";
+        self.send_with_retry("request open interest", url, || {
+            self.client.get(url).query(&[("symbol", symbol)])
+        })
+        .await
+        .context("request open interest")?
+        .error_for_status()
+        .context("open interest bad status")?
+        .json::<BinanceOpenInterest>()
+        .await
+        .context("decode open interest")
+    }
+
+    pub async fn fetch_open_interest_hist(
+        &self,
+        symbol: &str,
+        period: &str,
+        start_time_ms: Option<i64>,
+        end_time_ms: Option<i64>,
+        limit: u16,
+    ) -> Result<Vec<BinanceOpenInterestHistRecord>> {
+        let url = "https://fapi.binance.com/futures/data/openInterestHist";
+        let mut query: Vec<(&str, String)> = vec![
+            ("symbol", symbol.to_string()),
+            ("period", period.to_string()),
+            ("limit", limit.to_string()),
+        ];
+        if let Some(start) = start_time_ms {
+            query.push(("startTime", start.to_string()));
+        }
+        if let Some(end) = end_time_ms {
+            query.push(("endTime", end.to_string()));
+        }
+
+        self.send_with_retry("request open interest history", url, || {
+            self.client.get(url).query(&query)
+        })
+        .await
+        .context("request open interest history")?
+        .error_for_status()
+        .context("open interest history bad status")?
+        .json::<Vec<BinanceOpenInterestHistRecord>>()
+        .await
+        .context("decode open interest history")
+    }
+
+    pub async fn fetch_global_long_short_account_ratio(
+        &self,
+        symbol: &str,
+        period: &str,
+        start_time_ms: Option<i64>,
+        end_time_ms: Option<i64>,
+        limit: u16,
+    ) -> Result<Vec<BinanceLongShortRatioRecord>> {
+        self.fetch_long_short_ratio_series(
+            "request global long short account ratio",
+            "https://fapi.binance.com/futures/data/globalLongShortAccountRatio",
+            symbol,
+            period,
+            start_time_ms,
+            end_time_ms,
+            limit,
+        )
+        .await
+    }
+
+    pub async fn fetch_top_long_short_account_ratio(
+        &self,
+        symbol: &str,
+        period: &str,
+        start_time_ms: Option<i64>,
+        end_time_ms: Option<i64>,
+        limit: u16,
+    ) -> Result<Vec<BinanceLongShortRatioRecord>> {
+        self.fetch_long_short_ratio_series(
+            "request top long short account ratio",
+            "https://fapi.binance.com/futures/data/topLongShortAccountRatio",
+            symbol,
+            period,
+            start_time_ms,
+            end_time_ms,
+            limit,
+        )
+        .await
+    }
+
+    pub async fn fetch_top_long_short_position_ratio(
+        &self,
+        symbol: &str,
+        period: &str,
+        start_time_ms: Option<i64>,
+        end_time_ms: Option<i64>,
+        limit: u16,
+    ) -> Result<Vec<BinanceLongShortRatioRecord>> {
+        self.fetch_long_short_ratio_series(
+            "request top long short position ratio",
+            "https://fapi.binance.com/futures/data/topLongShortPositionRatio",
+            symbol,
+            period,
+            start_time_ms,
+            end_time_ms,
+            limit,
+        )
+        .await
+    }
+
     async fn send_with_retry<F>(
         &self,
         op_name: &str,
@@ -368,7 +478,8 @@ impl BinanceRestClient {
                     }
 
                     let class = classify_status(status);
-                    let backoff = self.retry_backoff(attempt);
+                    let backoff = retry_after_duration(&resp)
+                        .unwrap_or_else(|| self.retry_backoff(attempt));
                     warn!(
                         op = op_name,
                         url = url,
@@ -427,6 +538,38 @@ impl BinanceRestClient {
         let backoff = self.retry.base_backoff_ms.saturating_mul(factor);
         let capped = backoff.min(self.retry.max_backoff_ms.max(self.retry.base_backoff_ms));
         Duration::from_millis(capped.max(1))
+    }
+
+    async fn fetch_long_short_ratio_series(
+        &self,
+        op_name: &str,
+        url: &str,
+        symbol: &str,
+        period: &str,
+        start_time_ms: Option<i64>,
+        end_time_ms: Option<i64>,
+        limit: u16,
+    ) -> Result<Vec<BinanceLongShortRatioRecord>> {
+        let mut query: Vec<(&str, String)> = vec![
+            ("symbol", symbol.to_string()),
+            ("period", period.to_string()),
+            ("limit", limit.to_string()),
+        ];
+        if let Some(start) = start_time_ms {
+            query.push(("startTime", start.to_string()));
+        }
+        if let Some(end) = end_time_ms {
+            query.push(("endTime", end.to_string()));
+        }
+
+        self.send_with_retry(op_name, url, || self.client.get(url).query(&query))
+            .await
+            .with_context(|| format!("{op_name} symbol={symbol} period={period}"))?
+            .error_for_status()
+            .with_context(|| format!("{op_name} bad status symbol={symbol} period={period}"))?
+            .json::<Vec<BinanceLongShortRatioRecord>>()
+            .await
+            .with_context(|| format!("decode long short ratio series symbol={symbol} period={period}"))
     }
 }
 
@@ -636,4 +779,14 @@ fn error_chain_string(err: &reqwest::Error) -> String {
 
 fn contains_any(haystack: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| haystack.contains(needle))
+}
+
+fn retry_after_duration(resp: &reqwest::Response) -> Option<Duration> {
+    let raw = resp
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?;
+    let secs = raw.trim().parse::<u64>().ok()?;
+    Some(Duration::from_secs(secs.max(1)))
 }

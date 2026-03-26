@@ -4,5 +4,8 @@ pub mod depth_snapshot;
 pub mod exchange_info;
 pub mod funding_rate;
 pub mod klines;
+pub mod long_short_ratio;
+pub mod open_interest;
+pub mod open_interest_hist;
 pub mod premium_index;
 pub mod rate_limit;

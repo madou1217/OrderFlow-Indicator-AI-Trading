@@ -95,6 +95,12 @@ pub struct IndicatorContext {
     pub funding_changes_recent: Vec<FundingChange>,
     pub funding_points_recent: Vec<LatestFundingState>,
     pub mark_points_recent: Vec<LatestMarkState>,
+    pub latest_common_oi_ratio_bucket: Option<DateTime<Utc>>,
+    pub current_open_interest: Option<OpenInterestCurrentSidecar>,
+    pub open_interest_hist_5m: Vec<OpenInterestHistPoint>,
+    pub global_account_ratio_5m: Vec<LongShortRatioPoint>,
+    pub top_account_ratio_5m: Vec<LongShortRatioPoint>,
+    pub top_position_ratio_5m: Vec<LongShortRatioPoint>,
     pub whale_threshold_usdt: f64,
     pub kline_history_bars_1m: usize,
     pub kline_history_bars_15m: usize,
@@ -181,12 +187,42 @@ pub struct KlineHistoryBar {
     pub expected_minutes: i64,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct OpenInterestCurrentSidecar {
+    pub ts_effective: DateTime<Utc>,
+    pub open_interest_contracts: f64,
+    pub mark_price: Option<f64>,
+    pub open_interest_value_usdt: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct OpenInterestHistPoint {
+    pub ts_bucket: DateTime<Utc>,
+    pub open_interest_contracts: f64,
+    pub open_interest_value_usdt: f64,
+    pub reference_price: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct LongShortRatioPoint {
+    pub ts_bucket: DateTime<Utc>,
+    pub long_short_ratio: f64,
+    pub long_account_ratio: Option<f64>,
+    pub short_account_ratio: Option<f64>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct KlineHistorySupplement {
     pub futures_4h_db: Vec<KlineHistoryBar>,
     pub futures_1d_db: Vec<KlineHistoryBar>,
     pub spot_4h_db: Vec<KlineHistoryBar>,
     pub spot_1d_db: Vec<KlineHistoryBar>,
+    pub latest_common_oi_ratio_bucket: Option<DateTime<Utc>>,
+    pub current_open_interest: Option<OpenInterestCurrentSidecar>,
+    pub open_interest_hist_5m: Vec<OpenInterestHistPoint>,
+    pub global_account_ratio_5m: Vec<LongShortRatioPoint>,
+    pub top_account_ratio_5m: Vec<LongShortRatioPoint>,
+    pub top_position_ratio_5m: Vec<LongShortRatioPoint>,
 }
 
 impl IndicatorContext {
@@ -212,6 +248,12 @@ impl IndicatorContext {
             funding_changes_recent: bundle.funding_changes_recent.clone(),
             funding_points_recent: bundle.funding_points_recent.clone(),
             mark_points_recent: bundle.mark_points_recent.clone(),
+            latest_common_oi_ratio_bucket: bundle.latest_common_oi_ratio_bucket,
+            current_open_interest: bundle.current_open_interest.clone(),
+            open_interest_hist_5m: bundle.open_interest_hist_5m.clone(),
+            global_account_ratio_5m: bundle.global_account_ratio_5m.clone(),
+            top_account_ratio_5m: bundle.top_account_ratio_5m.clone(),
+            top_position_ratio_5m: bundle.top_position_ratio_5m.clone(),
             whale_threshold_usdt: options.whale_threshold_usdt,
             kline_history_bars_1m: options.kline_history_bars_1m,
             kline_history_bars_15m: options.kline_history_bars_15m,
@@ -315,6 +357,7 @@ impl IndicatorContext {
         fn window_to_minutes(code: &str) -> Option<i64> {
             match code {
                 "1m" => Some(1),
+                "5m" => Some(5),
                 "15m" => Some(15),
                 "1h" => Some(60),
                 "4h" => Some(240),
@@ -881,6 +924,7 @@ pub struct LiquidationLevelRow {
 #[derive(Debug, Clone, Default)]
 pub struct IndicatorComputation {
     pub snapshot: Option<IndicatorSnapshotRow>,
+    pub snapshot_rows: Vec<IndicatorSnapshotRow>,
     pub level_rows: Vec<IndicatorLevelRow>,
     pub event_rows: Vec<IndicatorEventRow>,
     pub divergence_rows: Vec<DivergenceEventRow>,

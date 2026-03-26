@@ -1063,7 +1063,7 @@ async fn shutdown_drain_and_persist(
     Ok(())
 }
 
-const INDICATOR_COVERAGE_ORDER: [(&str, &str); 24] = [
+const INDICATOR_COVERAGE_ORDER: [(&str, &str); 26] = [
     ("i01", "price_volume_structure"),
     ("i02", "footprint"),
     ("i03", "divergence"),
@@ -1088,6 +1088,8 @@ const INDICATOR_COVERAGE_ORDER: [(&str, &str); 24] = [
     ("i22", "high_volume_pulse"),
     ("i23", "ema_trend_regime"),
     ("i24", "fvg"),
+    ("i25", "open_interest"),
+    ("i26", "long_short_ratios"),
 ];
 
 fn indicator_coverage(snapshots: &[IndicatorSnapshotRow]) -> (Vec<String>, Vec<String>) {
@@ -1567,6 +1569,7 @@ pub async fn load_kline_history_supplement(
         futures_1d_db,
         spot_4h_db,
         spot_1d_db,
+        ..KlineHistorySupplement::default()
     }
 }
 
@@ -1955,6 +1958,9 @@ fn logical_event_bucket_ts(event: &EngineEvent) -> DateTime<Utc> {
         MdData::AggOrderbook1m(v) => v.ts_bucket,
         MdData::AggLiq1m(v) => v.ts_bucket,
         MdData::AggFundingMark1m(v) => v.ts_bucket,
+        MdData::OpenInterestHist5m(v) => v.ts_bucket,
+        MdData::LongShortRatio5m(v) => v.ts_bucket,
+        MdData::OpenInterestCurrent(v) => floor_minute(v.ts_effective),
         _ => floor_minute(event.event_ts),
     }
 }
@@ -3382,6 +3388,58 @@ fn build_backfill_data_json(row: &PgRow, src: &str) -> Result<Value> {
                 "funding_points": funding_points
             }))
         }
+        "oi_current" => Ok(json!({
+            "ts_effective": require_backfill_field(
+                src,
+                "oi_current_ts_effective",
+                row.get::<Option<DateTime<Utc>>, _>("oi_current_ts_effective"),
+            )?,
+            "open_interest_contracts": require_backfill_field(
+                src,
+                "oi_current_contracts",
+                row.get::<Option<f64>, _>("oi_current_contracts"),
+            )?,
+            "mark_price": row.get::<Option<f64>, _>("oi_current_mark_price"),
+            "open_interest_value_usdt": row.get::<Option<f64>, _>("oi_current_value_usdt"),
+        })),
+        "oi_hist_5m" => Ok(json!({
+            "ts_effective": require_backfill_field(
+                src,
+                "oi_hist_ts_bucket",
+                row.get::<Option<DateTime<Utc>>, _>("oi_hist_ts_bucket"),
+            )?,
+            "ts_bucket": row.get::<Option<DateTime<Utc>>, _>("oi_hist_ts_bucket"),
+            "open_interest_contracts": require_backfill_field(
+                src,
+                "oi_hist_contracts",
+                row.get::<Option<f64>, _>("oi_hist_contracts"),
+            )?,
+            "open_interest_value_usdt": require_backfill_field(
+                src,
+                "oi_hist_value_usdt",
+                row.get::<Option<f64>, _>("oi_hist_value_usdt"),
+            )?,
+        })),
+        "long_short_ratio_5m" => Ok(json!({
+            "ts_effective": require_backfill_field(
+                src,
+                "lsr_ts_bucket",
+                row.get::<Option<DateTime<Utc>>, _>("lsr_ts_bucket"),
+            )?,
+            "ts_bucket": row.get::<Option<DateTime<Utc>>, _>("lsr_ts_bucket"),
+            "ratio_type": require_backfill_field(
+                src,
+                "lsr_ratio_type",
+                row.get::<Option<String>, _>("lsr_ratio_type"),
+            )?,
+            "long_short_ratio": require_backfill_field(
+                src,
+                "lsr_long_short_ratio",
+                row.get::<Option<f64>, _>("lsr_long_short_ratio"),
+            )?,
+            "long_account_ratio": row.get::<Option<f64>, _>("lsr_long_account_ratio"),
+            "short_account_ratio": row.get::<Option<f64>, _>("lsr_short_account_ratio"),
+        })),
         _ => anyhow::bail!("unsupported startup backfill source: {src}"),
     }
 }
@@ -3404,7 +3462,15 @@ async fn fetch_backfill_window(
     let mut rows = Vec::new();
 
     if include_futures {
-        let (trade_rows, orderbook_rows, liq_rows, funding_rows) = tokio::try_join!(
+        let (
+            trade_rows,
+            orderbook_rows,
+            liq_rows,
+            funding_rows,
+            oi_current_rows,
+            oi_hist_rows,
+            long_short_ratio_rows,
+        ) = tokio::try_join!(
             fetch_backfill_source_rows(
                 pool,
                 TRADE_BACKFILL_WINDOW_SQL,
@@ -3441,11 +3507,41 @@ async fn fetch_backfill_window(
                 &symbol_upper,
                 "futures",
             ),
+            fetch_backfill_source_rows(
+                pool,
+                OI_CURRENT_BACKFILL_WINDOW_SQL,
+                "oi_current",
+                from_ts,
+                to_ts,
+                &symbol_upper,
+                "futures",
+            ),
+            fetch_backfill_source_rows(
+                pool,
+                OI_HIST_5M_BACKFILL_WINDOW_SQL,
+                "oi_hist_5m",
+                from_ts,
+                to_ts,
+                &symbol_upper,
+                "futures",
+            ),
+            fetch_backfill_source_rows(
+                pool,
+                LONG_SHORT_RATIO_5M_BACKFILL_WINDOW_SQL,
+                "long_short_ratio_5m",
+                from_ts,
+                to_ts,
+                &symbol_upper,
+                "futures",
+            ),
         )?;
         rows.extend(trade_rows);
         rows.extend(orderbook_rows);
         rows.extend(liq_rows);
         rows.extend(funding_rows);
+        rows.extend(oi_current_rows);
+        rows.extend(oi_hist_rows);
+        rows.extend(long_short_ratio_rows);
     }
 
     if include_spot {
@@ -3668,6 +3764,64 @@ const FUNDING_BACKFILL_WINDOW_SQL: &str = r#"
     ORDER BY ts_event ASC, market ASC, symbol ASC
 "#;
 
+const OI_CURRENT_BACKFILL_WINDOW_SQL: &str = r#"
+    SELECT
+        ts_event AS event_ts,
+        'md.open_interest_current'::text AS msg_type,
+        market::text AS market,
+        symbol,
+        format('md.%s.open_interest.current.%s', market::text, lower(symbol)) AS routing_key,
+        ts_event AS oi_current_ts_effective,
+        open_interest_contracts AS oi_current_contracts,
+        mark_price AS oi_current_mark_price,
+        open_interest_value_usdt AS oi_current_value_usdt
+    FROM md.open_interest_current_1m
+    WHERE ts_event >= $1
+      AND ts_event < $2
+      AND symbol = $3
+      AND market = $4::cfg.market_type
+    ORDER BY ts_event ASC, market ASC, symbol ASC
+"#;
+
+const OI_HIST_5M_BACKFILL_WINDOW_SQL: &str = r#"
+    SELECT
+        ts_event AS event_ts,
+        'md.open_interest_hist_5m'::text AS msg_type,
+        market::text AS market,
+        symbol,
+        format('md.%s.open_interest.5m.%s', market::text, lower(symbol)) AS routing_key,
+        ts_bucket AS oi_hist_ts_bucket,
+        open_interest_contracts AS oi_hist_contracts,
+        open_interest_value_usdt AS oi_hist_value_usdt
+    FROM md.open_interest_hist_5m
+    WHERE ts_bucket >= $1
+      AND ts_bucket < $2
+      AND symbol = $3
+      AND market = $4::cfg.market_type
+    ORDER BY ts_event ASC, market ASC, symbol ASC
+"#;
+
+const LONG_SHORT_RATIO_5M_BACKFILL_WINDOW_SQL: &str = r#"
+    SELECT
+        ts_event AS event_ts,
+        'md.long_short_ratio_5m'::text AS msg_type,
+        market::text AS market,
+        symbol,
+        format('md.%s.long_short_ratio.%s.5m.%s', market::text, ratio_type, lower(symbol)) AS routing_key,
+        ts_bucket AS lsr_ts_bucket,
+        ratio_type AS lsr_ratio_type,
+        long_short_ratio AS lsr_long_short_ratio,
+        long_account_ratio AS lsr_long_account_ratio,
+        short_account_ratio AS lsr_short_account_ratio
+    FROM md.long_short_ratio_5m
+    WHERE ts_bucket >= $1
+      AND ts_bucket < $2
+      AND symbol = $3
+      AND market = $4::cfg.market_type
+      AND ratio_type IN ('global_account', 'top_account', 'top_position')
+    ORDER BY ts_event ASC, market ASC, symbol ASC, ratio_type ASC
+"#;
+
 pub async fn fetch_backfill_batch(
     pool: &PgPool,
     from_ts: DateTime<Utc>,
@@ -3677,80 +3831,35 @@ pub async fn fetch_backfill_batch(
     limit: i64,
     cursor: Option<&BackfillCursor>,
 ) -> Result<Vec<ReplayRow>> {
-    let filter_market = !market.eq_ignore_ascii_case("all");
-    let with_cursor = cursor.is_some();
-    let sql = build_backfill_sql(filter_market, with_cursor);
-    let symbol_upper = symbol.to_uppercase();
+    let mut rows = fetch_backfill_window(pool, from_ts, to_ts, symbol, market)
+        .await
+        .context("fetch startup backfill batch")?;
 
-    let rows = match (filter_market, cursor) {
-        (false, None) => {
-            sqlx::query(&sql)
-                .bind(from_ts)
-                .bind(to_ts)
-                .bind(&symbol_upper)
-                .bind(limit)
-                .fetch_all(pool)
-                .await
-        }
-        (false, Some(c)) => {
-            sqlx::query(&sql)
-                .bind(from_ts)
-                .bind(to_ts)
-                .bind(&symbol_upper)
-                .bind(limit)
-                .bind(c.event_ts)
-                .bind(&c.msg_type)
-                .bind(&c.market)
-                .bind(&c.symbol)
-                .bind(&c.routing_key)
-                .fetch_all(pool)
-                .await
-        }
-        (true, None) => {
-            sqlx::query(&sql)
-                .bind(from_ts)
-                .bind(to_ts)
-                .bind(&symbol_upper)
-                .bind(market)
-                .bind(limit)
-                .fetch_all(pool)
-                .await
-        }
-        (true, Some(c)) => {
-            sqlx::query(&sql)
-                .bind(from_ts)
-                .bind(to_ts)
-                .bind(&symbol_upper)
-                .bind(market)
-                .bind(limit)
-                .bind(c.event_ts)
-                .bind(&c.msg_type)
-                .bind(&c.market)
-                .bind(&c.symbol)
-                .bind(&c.routing_key)
-                .fetch_all(pool)
-                .await
-        }
-    }
-    .context("fetch startup backfill batch")?;
-
-    let mut out = Vec::with_capacity(rows.len());
-    for row in rows {
-        let src: String = row.get("src");
-        let data_json = build_backfill_data_json(&row, &src)
-            .with_context(|| format!("build startup backfill payload for src={src}"))?;
-
-        out.push(ReplayRow {
-            event_ts: row.get("event_ts"),
-            msg_type: row.get("msg_type"),
-            market: row.get("market"),
-            symbol: row.get("symbol"),
-            routing_key: row.get("routing_key"),
-            data_json,
-        });
+    if let Some(cursor) = cursor {
+        rows.retain(|row| replay_row_after_cursor(row, cursor));
     }
 
-    Ok(out)
+    if limit >= 0 && rows.len() > limit as usize {
+        rows.truncate(limit as usize);
+    }
+
+    Ok(rows)
+}
+
+fn replay_row_after_cursor(row: &ReplayRow, cursor: &BackfillCursor) -> bool {
+    (
+        row.event_ts,
+        row.msg_type.as_str(),
+        row.market.as_str(),
+        row.symbol.as_str(),
+        row.routing_key.as_str(),
+    ) > (
+        cursor.event_ts,
+        cursor.msg_type.as_str(),
+        cursor.market.as_str(),
+        cursor.symbol.as_str(),
+        cursor.routing_key.as_str(),
+    )
 }
 
 async fn hydrate_futures_orderbook_heatmaps_for_range_with_fetch<F, Fut>(
@@ -4079,6 +4188,11 @@ mod tests {
             funding_changes: Vec::<FundingChange>::new(),
             mark_timeline: Vec::<LatestMarkState>::new(),
             funding_timeline: Vec::<LatestFundingState>::new(),
+            current_open_interest_timeline: Vec::new(),
+            open_interest_hist_5m: Vec::new(),
+            global_account_ratio_5m: Vec::new(),
+            top_account_ratio_5m: Vec::new(),
+            top_position_ratio_5m: Vec::new(),
         }
     }
 

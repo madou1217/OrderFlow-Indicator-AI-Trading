@@ -118,7 +118,7 @@ impl IndPublisher {
         indicators_json: &Value,
         indicator_count: usize,
     ) -> Result<OutboxMessage> {
-        let (routing_key, message_id, trace_id, payload_json) =
+        let (routing_key, message_id, _trace_id, payload_json) =
             self.build_minute_bundle_payload(ts_bucket, symbol, indicators_json, indicator_count)?;
 
         Ok(OutboxMessage {

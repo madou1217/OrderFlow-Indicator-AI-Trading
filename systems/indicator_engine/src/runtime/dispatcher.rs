@@ -88,7 +88,10 @@ impl Dispatcher {
                 | "high_volume_pulse"
                 | "ema_trend_regime"
                 | "fvg" => flow_indicators.push(indicator),
-                "liquidation_density" | "funding_rate" => deriv_indicators.push(indicator),
+                "liquidation_density"
+                | "funding_rate"
+                | "open_interest"
+                | "long_short_ratios" => deriv_indicators.push(indicator),
                 _ => orderbook_indicators.push(indicator),
             }
         }
@@ -166,17 +169,22 @@ impl Dispatcher {
             &mut exhaustion_rows,
             &mut liq_rows,
         );
-        snapshots.sort_by(|a, b| a.indicator_code.cmp(b.indicator_code));
+        snapshots.sort_by(|a, b| {
+            a.indicator_code
+                .cmp(b.indicator_code)
+                .then_with(|| snapshot_window_rank(a.window_code).cmp(&snapshot_window_rank(b.window_code)))
+        });
 
         let mut indicators_json = Map::new();
         for s in &snapshots {
-            indicators_json.insert(
-                s.indicator_code.to_string(),
-                json!({
-                    "window_code": s.window_code,
-                    "payload": s.payload_json.clone(),
-                }),
-            );
+            indicators_json
+                .entry(s.indicator_code.to_string())
+                .or_insert_with(|| {
+                    json!({
+                        "window_code": s.window_code,
+                        "payload": s.payload_json.clone(),
+                    })
+                });
         }
         let live_messages = if mode.publish_outputs() {
             let indicators_json_value = Value::Object(indicators_json.clone());
@@ -375,6 +383,9 @@ fn evaluate_indicator_group(
         if let Some(s) = comp.snapshot {
             out.snapshots.push(s);
         }
+        if !comp.snapshot_rows.is_empty() {
+            out.snapshots.extend(comp.snapshot_rows);
+        }
         if !comp.level_rows.is_empty() {
             out.levels.extend(comp.level_rows);
         }
@@ -419,6 +430,19 @@ fn merge_group_output(
     initiation_rows.extend(group.initiation_rows);
     exhaustion_rows.extend(group.exhaustion_rows);
     liq_rows.extend(group.liq_rows);
+}
+
+fn snapshot_window_rank(window_code: &str) -> usize {
+    match window_code {
+        "5m" => 0,
+        "1m" => 1,
+        "15m" => 2,
+        "1h" => 3,
+        "4h" => 4,
+        "1d" => 5,
+        "3d" => 6,
+        _ => usize::MAX,
+    }
 }
 
 #[cfg(test)]

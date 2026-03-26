@@ -1,6 +1,10 @@
+use crate::indicators::context::{
+    LongShortRatioPoint, OpenInterestCurrentSidecar, OpenInterestHistPoint,
+};
 use crate::ingest::decoder::{
     AggFundingMark1mEvent, AggLiq1mEvent, AggOrderbook1mEvent, AggTrade1mEvent, AggVpinSnapshot,
-    BboEvent, DepthDeltaEvent, EngineEvent, ForceOrderEvent, MarketKind, MdData,
+    BboEvent, DepthDeltaEvent, EngineEvent, ForceOrderEvent, LongShortRatio5mEvent,
+    LongShortRatioType, MarketKind, MdData, OpenInterestCurrentEvent, OpenInterestHist5mEvent,
     OrderbookSnapshotEvent, TradeEvent,
 };
 use chrono::{DateTime, Duration, TimeZone, Utc};
@@ -24,6 +28,8 @@ const VPIN_EPS: f64 = 1e-12;
 // This retention also keeps the paired VPIN snapshots long enough to restore the
 // correct trade-state when reopening an older finalized minute.
 const CANONICAL_REPLAY_KEEP_MINUTES: i64 = 60 * 24;
+const OI_RATIO_HISTORY_KEEP_5M_BUCKETS: usize = 12 * 24 * 10; // 10 days
+const OI_CURRENT_HISTORY_KEEP_MINUTES: usize = 60 * 24;
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct LevelAgg {
@@ -267,6 +273,12 @@ pub struct WindowBundle {
     pub funding_changes_recent: Vec<FundingChange>,
     pub funding_points_recent: Vec<LatestFundingState>,
     pub mark_points_recent: Vec<LatestMarkState>,
+    pub latest_common_oi_ratio_bucket: Option<DateTime<Utc>>,
+    pub current_open_interest: Option<OpenInterestCurrentSidecar>,
+    pub open_interest_hist_5m: Vec<OpenInterestHistPoint>,
+    pub global_account_ratio_5m: Vec<LongShortRatioPoint>,
+    pub top_account_ratio_5m: Vec<LongShortRatioPoint>,
+    pub top_position_ratio_5m: Vec<LongShortRatioPoint>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -354,6 +366,16 @@ pub struct CanonicalFrontierSnapshot {
     pub effective_history_floor_ts: Option<DateTime<Utc>>,
     pub dirty_recompute_from_ts: Option<DateTime<Utc>>,
     pub dirty_recompute_end_ts: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct OiRatioWindowView {
+    latest_common_bucket: Option<DateTime<Utc>>,
+    current_open_interest: Option<OpenInterestCurrentSidecar>,
+    open_interest_hist_5m: Vec<OpenInterestHistPoint>,
+    global_account_ratio_5m: Vec<LongShortRatioPoint>,
+    top_account_ratio_5m: Vec<LongShortRatioPoint>,
+    top_position_ratio_5m: Vec<LongShortRatioPoint>,
 }
 
 fn canonical_minute_presence(minute: Option<&CanonicalMinuteByMarket>) -> CanonicalMinutePresence {
@@ -1193,6 +1215,11 @@ pub struct StateStore {
     funding_changes: VecDeque<FundingChange>,
     mark_timeline: VecDeque<LatestMarkState>,
     funding_timeline: VecDeque<LatestFundingState>,
+    current_open_interest_timeline: VecDeque<OpenInterestCurrentSidecar>,
+    open_interest_hist_5m: VecDeque<OpenInterestHistPoint>,
+    global_account_ratio_5m: VecDeque<LongShortRatioPoint>,
+    top_account_ratio_5m: VecDeque<LongShortRatioPoint>,
+    top_position_ratio_5m: VecDeque<LongShortRatioPoint>,
     dirty_recompute_from: Option<DateTime<Utc>>,
     // Fixed target end for the current dirty-recompute batch series.
     // Set when dirty is first triggered; extended if later minutes become dirty.
@@ -1232,6 +1259,11 @@ impl StateStore {
             funding_changes: VecDeque::new(),
             mark_timeline: VecDeque::new(),
             funding_timeline: VecDeque::new(),
+            current_open_interest_timeline: VecDeque::new(),
+            open_interest_hist_5m: VecDeque::new(),
+            global_account_ratio_5m: VecDeque::new(),
+            top_account_ratio_5m: VecDeque::new(),
+            top_position_ratio_5m: VecDeque::new(),
             dirty_recompute_from: None,
             dirty_recompute_end: None,
             dirty_recompute_truncated: false,
@@ -1261,6 +1293,11 @@ impl StateStore {
         self.funding_changes.clear();
         self.mark_timeline.clear();
         self.funding_timeline.clear();
+        self.current_open_interest_timeline.clear();
+        self.open_interest_hist_5m.clear();
+        self.global_account_ratio_5m.clear();
+        self.top_account_ratio_5m.clear();
+        self.top_position_ratio_5m.clear();
         self.dirty_recompute_from = None;
         self.dirty_recompute_end = None;
         self.dirty_recompute_truncated = false;
@@ -1524,6 +1561,15 @@ impl StateStore {
             MdData::AggFundingMark1m(funding_mark) => {
                 self.store_canonical_funding_mark(event.market, funding_mark);
             }
+            MdData::OpenInterestCurrent(open_interest) => {
+                self.store_current_open_interest(open_interest);
+            }
+            MdData::OpenInterestHist5m(open_interest_hist) => {
+                self.store_open_interest_hist_5m(open_interest_hist);
+            }
+            MdData::LongShortRatio5m(long_short_ratio) => {
+                self.store_long_short_ratio_5m(long_short_ratio);
+            }
         }
     }
 
@@ -1751,6 +1797,76 @@ impl StateStore {
         }
     }
 
+    fn store_current_open_interest(&mut self, open_interest: OpenInterestCurrentEvent) {
+        let point = OpenInterestCurrentSidecar {
+            ts_effective: open_interest.ts_effective,
+            open_interest_contracts: open_interest.open_interest_contracts,
+            mark_price: open_interest.mark_price,
+            open_interest_value_usdt: open_interest.open_interest_value_usdt,
+        };
+        upsert_sorted_point(
+            &mut self.current_open_interest_timeline,
+            point.ts_effective,
+            point,
+            OI_CURRENT_HISTORY_KEEP_MINUTES,
+            |item| item.ts_effective,
+        );
+    }
+
+    fn store_open_interest_hist_5m(&mut self, open_interest_hist: OpenInterestHist5mEvent) {
+        let point = OpenInterestHistPoint {
+            ts_bucket: open_interest_hist.ts_bucket,
+            open_interest_contracts: open_interest_hist.open_interest_contracts,
+            open_interest_value_usdt: open_interest_hist.open_interest_value_usdt,
+            reference_price: open_interest_hist.reference_price,
+        };
+        let changed = upsert_sorted_point(
+            &mut self.open_interest_hist_5m,
+            point.ts_bucket,
+            point,
+            OI_RATIO_HISTORY_KEEP_5M_BUCKETS,
+            |item| item.ts_bucket,
+        );
+        if changed {
+            self.mark_dirty_recompute_if_finalized(open_interest_hist.ts_bucket);
+        }
+    }
+
+    fn store_long_short_ratio_5m(&mut self, long_short_ratio: LongShortRatio5mEvent) {
+        let point = LongShortRatioPoint {
+            ts_bucket: long_short_ratio.ts_bucket,
+            long_short_ratio: long_short_ratio.long_short_ratio,
+            long_account_ratio: long_short_ratio.long_account_ratio,
+            short_account_ratio: long_short_ratio.short_account_ratio,
+        };
+        let changed = match long_short_ratio.ratio_type {
+            LongShortRatioType::GlobalAccount => upsert_sorted_point(
+                &mut self.global_account_ratio_5m,
+                point.ts_bucket,
+                point,
+                OI_RATIO_HISTORY_KEEP_5M_BUCKETS,
+                |item| item.ts_bucket,
+            ),
+            LongShortRatioType::TopAccount => upsert_sorted_point(
+                &mut self.top_account_ratio_5m,
+                point.ts_bucket,
+                point,
+                OI_RATIO_HISTORY_KEEP_5M_BUCKETS,
+                |item| item.ts_bucket,
+            ),
+            LongShortRatioType::TopPosition => upsert_sorted_point(
+                &mut self.top_position_ratio_5m,
+                point.ts_bucket,
+                point,
+                OI_RATIO_HISTORY_KEEP_5M_BUCKETS,
+                |item| item.ts_bucket,
+            ),
+        };
+        if changed {
+            self.mark_dirty_recompute_if_finalized(long_short_ratio.ts_bucket);
+        }
+    }
+
     fn canonical_slot_mut(
         &mut self,
         market: MarketKind,
@@ -1922,6 +2038,8 @@ impl StateStore {
             .cloned()
             .collect::<Vec<_>>();
 
+        let oi_ratio_view = self.build_oi_ratio_view_for_minute(ts_bucket);
+
         WindowBundle {
             ts_bucket,
             symbol: self.symbol.clone(),
@@ -1940,6 +2058,80 @@ impl StateStore {
             funding_changes_recent: self.funding_changes.iter().cloned().collect(),
             funding_points_recent: self.funding_timeline.iter().cloned().collect(),
             mark_points_recent: self.mark_timeline.iter().cloned().collect(),
+            latest_common_oi_ratio_bucket: oi_ratio_view.latest_common_bucket,
+            current_open_interest: oi_ratio_view.current_open_interest,
+            open_interest_hist_5m: oi_ratio_view.open_interest_hist_5m,
+            global_account_ratio_5m: oi_ratio_view.global_account_ratio_5m,
+            top_account_ratio_5m: oi_ratio_view.top_account_ratio_5m,
+            top_position_ratio_5m: oi_ratio_view.top_position_ratio_5m,
+        }
+    }
+
+    fn build_oi_ratio_view_for_minute(&self, ts_bucket: DateTime<Utc>) -> OiRatioWindowView {
+        let as_of_ts = ts_bucket + Duration::minutes(1);
+        let current_open_interest = self
+            .current_open_interest_timeline
+            .iter()
+            .rev()
+            .find(|point| point.ts_effective <= as_of_ts)
+            .cloned();
+
+        let mut open_interest_hist_5m = self
+            .open_interest_hist_5m
+            .iter()
+            .filter(|point| point.ts_bucket <= as_of_ts)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut global_account_ratio_5m = self
+            .global_account_ratio_5m
+            .iter()
+            .filter(|point| point.ts_bucket <= as_of_ts)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut top_account_ratio_5m = self
+            .top_account_ratio_5m
+            .iter()
+            .filter(|point| point.ts_bucket <= as_of_ts)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut top_position_ratio_5m = self
+            .top_position_ratio_5m
+            .iter()
+            .filter(|point| point.ts_bucket <= as_of_ts)
+            .cloned()
+            .collect::<Vec<_>>();
+
+        let latest_common_bucket = match (
+            open_interest_hist_5m.last().map(|point| point.ts_bucket),
+            global_account_ratio_5m.last().map(|point| point.ts_bucket),
+            top_account_ratio_5m.last().map(|point| point.ts_bucket),
+            top_position_ratio_5m.last().map(|point| point.ts_bucket),
+        ) {
+            (Some(oi), Some(global), Some(top_account), Some(top_position)) => {
+                Some(oi.min(global).min(top_account).min(top_position))
+            }
+            _ => None,
+        };
+
+        let Some(common_bucket) = latest_common_bucket else {
+            return OiRatioWindowView {
+                current_open_interest,
+                ..OiRatioWindowView::default()
+            };
+        };
+
+        open_interest_hist_5m.retain(|point| point.ts_bucket <= common_bucket);
+        global_account_ratio_5m.retain(|point| point.ts_bucket <= common_bucket);
+        top_account_ratio_5m.retain(|point| point.ts_bucket <= common_bucket);
+        top_position_ratio_5m.retain(|point| point.ts_bucket <= common_bucket);
+
+        OiRatioWindowView {
+            latest_common_bucket: Some(common_bucket),
+            current_open_interest,
+            open_interest_hist_5m,
+            global_account_ratio_5m,
+            top_account_ratio_5m,
+            top_position_ratio_5m,
         }
     }
 
@@ -2229,6 +2421,15 @@ impl StateStore {
             funding_changes: self.funding_changes.iter().cloned().collect(),
             mark_timeline: self.mark_timeline.iter().cloned().collect(),
             funding_timeline: self.funding_timeline.iter().cloned().collect(),
+            current_open_interest_timeline: self
+                .current_open_interest_timeline
+                .iter()
+                .cloned()
+                .collect(),
+            open_interest_hist_5m: self.open_interest_hist_5m.iter().cloned().collect(),
+            global_account_ratio_5m: self.global_account_ratio_5m.iter().cloned().collect(),
+            top_account_ratio_5m: self.top_account_ratio_5m.iter().cloned().collect(),
+            top_position_ratio_5m: self.top_position_ratio_5m.iter().cloned().collect(),
         }
     }
 
@@ -2245,6 +2446,12 @@ impl StateStore {
         self.funding_changes = snap.funding_changes.into_iter().collect();
         self.mark_timeline = snap.mark_timeline.into_iter().collect();
         self.funding_timeline = snap.funding_timeline.into_iter().collect();
+        self.current_open_interest_timeline =
+            snap.current_open_interest_timeline.into_iter().collect();
+        self.open_interest_hist_5m = snap.open_interest_hist_5m.into_iter().collect();
+        self.global_account_ratio_5m = snap.global_account_ratio_5m.into_iter().collect();
+        self.top_account_ratio_5m = snap.top_account_ratio_5m.into_iter().collect();
+        self.top_position_ratio_5m = snap.top_position_ratio_5m.into_iter().collect();
         // CVD must be derived from history tail (not stored value) to ensure accuracy.
         self.cvd_futures = self.history_futures.back().map(|h| h.cvd).unwrap_or(0.0);
         self.cvd_spot = self.history_spot.back().map(|h| h.cvd).unwrap_or(0.0);
@@ -2253,7 +2460,7 @@ impl StateStore {
     }
 }
 
-pub const STATE_SNAPSHOT_VERSION: u32 = 1;
+pub const STATE_SNAPSHOT_VERSION: u32 = 2;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct StateSnapshot {
@@ -2278,12 +2485,58 @@ pub struct StateSnapshot {
     pub funding_changes: Vec<FundingChange>,
     pub mark_timeline: Vec<LatestMarkState>,
     pub funding_timeline: Vec<LatestFundingState>,
+    #[serde(default)]
+    pub current_open_interest_timeline: Vec<OpenInterestCurrentSidecar>,
+    #[serde(default)]
+    pub open_interest_hist_5m: Vec<OpenInterestHistPoint>,
+    #[serde(default)]
+    pub global_account_ratio_5m: Vec<LongShortRatioPoint>,
+    #[serde(default)]
+    pub top_account_ratio_5m: Vec<LongShortRatioPoint>,
+    #[serde(default)]
+    pub top_position_ratio_5m: Vec<LongShortRatioPoint>,
 }
 
 pub fn floor_minute(ts: DateTime<Utc>) -> DateTime<Utc> {
     let sec = ts.timestamp();
     let floored = sec - sec.rem_euclid(60);
     Utc.timestamp_opt(floored, 0).single().unwrap_or(ts)
+}
+
+fn upsert_sorted_point<T, F>(
+    deque: &mut VecDeque<T>,
+    point_ts: DateTime<Utc>,
+    point: T,
+    keep_limit: usize,
+    ts_of: F,
+) -> bool
+where
+    T: Clone + PartialEq,
+    F: Fn(&T) -> DateTime<Utc>,
+{
+    if let Some(existing_idx) = deque.iter().position(|item| ts_of(item) == point_ts) {
+        if deque[existing_idx] == point {
+            return false;
+        }
+        deque[existing_idx] = point;
+        return true;
+    }
+
+    match deque.back().map(|item| ts_of(item) <= point_ts).unwrap_or(true) {
+        true => deque.push_back(point),
+        false => {
+            let insert_idx = deque
+                .iter()
+                .position(|item| ts_of(item) > point_ts)
+                .unwrap_or(deque.len());
+            deque.insert(insert_idx, point);
+        }
+    }
+
+    while deque.len() > keep_limit {
+        deque.pop_front();
+    }
+    true
 }
 
 pub fn price_to_tick(price: f64) -> i64 {
