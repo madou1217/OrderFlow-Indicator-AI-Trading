@@ -75,6 +75,13 @@ price all the way to the thesis boundaries. `support_ladder` and
 path. `thesis_floor` marks the outer invalidation boundary. `thesis_ceiling`
 marks the outer objective or structural ceiling.
 
+Timeframe-native boundary:
+For a 4h map, `thesis_floor` and `thesis_ceiling` need to express the still-live
+outer 4h boundary. For a 1d map, they need to express the still-live outer 1d
+boundary. A nearer cross-timeframe cap or support can still appear in the ladder
+when it shapes the path from current price, but it does not replace that
+timeframe's own outer boundary.
+
 Spacing:
 Each price band represents a distinct major structural level. Bands that are
 too close together and serve the same structural role are merged into one. The
@@ -106,6 +113,8 @@ For each thesis timeframe, the output needs:
 - one direct `fragility_summary`
 
 `support_ladder` and `resistance_ladder` combined should carry only the near and intermediate path nodes for that timeframe, with at most 5 major price bands total.
+`thesis_floor` and `thesis_ceiling` should carry the farthest still-live boundary
+of that timeframe, not merely the nearest cap or support that may react first.
 
 15M EXECUTION CONTEXT
 

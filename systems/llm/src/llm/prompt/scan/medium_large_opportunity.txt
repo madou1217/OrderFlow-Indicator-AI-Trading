@@ -68,6 +68,16 @@ take-profit, and leverage for a 4h to 1d swing trade.
 
 For this to work, the map needs to satisfy:
 
+Band edges:
+The downstream model uses `low` and `high` directly as order-placement references.
+They define the boundaries of one structural reaction zone — the price range where
+converging structural evidence (value area boundary, sigma level, wall, absorption
+event, structure node) clusters into one concentrated zone.
+
+When multiple input indicators converge tightly, the band edges capture that tight
+cluster. When the input shows two clusters separated by a gap where no structural
+evidence sits, those are two separate bands.
+
 Coverage:
 The map spans from the nearest major structural zone on each side of current
 price all the way to the thesis boundaries. `support_ladder` and
@@ -75,16 +85,25 @@ price all the way to the thesis boundaries. `support_ladder` and
 path. `thesis_floor` marks the outer invalidation boundary. `thesis_ceiling`
 marks the outer objective or structural ceiling.
 
+Timeframe-native boundary:
+For a 4h map, `thesis_floor` and `thesis_ceiling` need to express the still-live
+outer 4h boundary. For a 1d map, they need to express the still-live outer 1d
+boundary. A nearer cross-timeframe cap or support can still appear in the ladder
+when it shapes the path from current price, but it does not replace that
+timeframe's own outer boundary.
+
 Spacing:
-Each price band represents a distinct major structural level. Bands that are
-too close together and serve the same structural role are merged into one. The
-result is a small set of well-spaced major bands that a downstream model can
-directly use for trade placement.
+Each price band represents one structural reaction zone. When two input structures
+sit close enough that a trader would treat them as one order-placement zone, they
+merge into one band whose edges capture the tightest range around that combined
+cluster. The result is a small set of well-spaced major bands that a downstream
+model can directly use for trade placement.
 
 Resolution:
-The 1d map expresses 1d-resolution structure with wider spacing and higher-level
-bands. The 4h map expresses the nearer thesis structure within that broader 1d
-frame.
+The 1d map selects from higher-order structural levels with wider spacing between
+bands. Each individual band is still a precise structural zone — 1d resolution
+means fewer and more widely spaced reaction zones, not wider individual bands.
+The 4h map expresses the nearer thesis structure within that broader 1d frame.
 
 Current role:
 Each zone in the ladder reflects its current live structural role. A zone that
@@ -106,6 +125,8 @@ For each thesis timeframe, the output needs:
 - one direct `fragility_summary`
 
 `support_ladder` and `resistance_ladder` combined should carry only the near and intermediate path nodes for that timeframe, with at most 5 major price bands total.
+`thesis_floor` and `thesis_ceiling` should carry the farthest still-live boundary
+of that timeframe, not merely the nearest cap or support that may react first.
 
 15M EXECUTION CONTEXT
 
@@ -272,16 +293,17 @@ Before finalizing the JSON, run this self-check:
 MARKET MAP COMPLETENESS
 
 1. Do the ladders cover only the near and intermediate path, with the outer boundary held separately in `thesis_floor` or `thesis_ceiling`?
-2. Does the 1d ladder express wider 1d structure rather than a narrow 4h copy?
-3. Are participant tasks tied to concrete price bands that matter for the thesis path?
-4. Could a downstream model make a 4h-1d trade decision from this map without reconstructing the raw input?
+2. Does each band's `low` and `high` define one structural reaction zone that the downstream model can use directly for order placement?
+3. Does the 1d ladder express wider 1d structure rather than a narrow 4h copy?
+4. Are participant tasks tied to concrete price bands that matter for the thesis path?
+5. Could a downstream model make a 4h-1d trade decision from this map without reconstructing the raw input?
 
 SCHEMA & MERGE CONSISTENCY
 
-5. Have I used `precomputed_value_read` as the fixed value-state base?
-6. Have I limited `flow_override` to the 4 context-sensitive flow judgements?
-7. Does `combined_flow_state` match the relationship between current flow evidence and `state_parse.control_read.side`?
-8. Is `execution_context_15m` a pure execution-layer summary that only contributes entry-quality context?
+6. Have I used `precomputed_value_read` as the fixed value-state base?
+7. Have I limited `flow_override` to the 4 context-sensitive flow judgements?
+8. Does `combined_flow_state` match the relationship between current flow evidence and `state_parse.control_read.side`?
+9. Is `execution_context_15m` a pure execution-layer summary that only contributes entry-quality context?
 
 If any answer is no, revise the parse before emitting the final JSON.
 
