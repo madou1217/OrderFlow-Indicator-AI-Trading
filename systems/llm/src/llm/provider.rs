@@ -17,8 +17,8 @@ use uuid::Uuid;
 
 const CLAUDE_EXTENDED_CACHE_TTL_BETA: &str = "extended-cache-ttl-2025-04-11";
 const CLAUDE_DECISION_TOOL_NAME: &str = "emit_decision";
-const FULL_SCAN_SCHEMA_VERSION: &str = "scan_v3_4_0";
-const SCAN_RESPONSE_SCHEMA_VERSION: &str = "scan_v3_4_0_response";
+const FULL_SCAN_SCHEMA_VERSION: &str = "scan_v4_0_0";
+const SCAN_RESPONSE_SCHEMA_VERSION: &str = "scan_v4_0_0_response";
 #[derive(Debug, Clone, Serialize)]
 pub struct ModelInvocationInput {
     pub symbol: String,
@@ -555,7 +555,7 @@ fn validate_scan_output(value: &Value) -> Result<()> {
         ));
     }
 
-    validate_scan_output_v3_4_0(value)
+    validate_scan_output_v4_0_0(value)
 }
 
 fn validate_scan_model_response(value: &Value) -> Result<()> {
@@ -571,10 +571,10 @@ fn validate_scan_model_response(value: &Value) -> Result<()> {
         ));
     }
 
-    validate_scan_model_response_v3_4_0(value)
+    validate_scan_model_response_v4_0_0(value)
 }
 
-fn validate_scan_model_response_v3_4_0(value: &Value) -> Result<()> {
+fn validate_scan_model_response_v4_0_0(value: &Value) -> Result<()> {
     for legacy_path in ["/15m", "/4h", "/1d", "/cross_timeframe_map", "/scan_audit"] {
         reject_present(value, legacy_path)?;
     }
@@ -595,7 +595,7 @@ fn validate_scan_model_response_v3_4_0(value: &Value) -> Result<()> {
     expect_object(value, "/timeframes")?;
     reject_present(value, "/timeframes/15m")?;
     for tf in ["4h", "1d"] {
-        validate_scan_response_v3_4_0_timeframe(value, tf)?;
+        validate_scan_response_v4_0_0_timeframe(value, tf)?;
     }
     validate_execution_context_15m(value)?;
 
@@ -615,7 +615,7 @@ fn validate_scan_model_response_v3_4_0(value: &Value) -> Result<()> {
     Ok(())
 }
 
-fn validate_scan_output_v3_4_0(value: &Value) -> Result<()> {
+fn validate_scan_output_v4_0_0(value: &Value) -> Result<()> {
     for legacy_path in ["/15m", "/4h", "/1d", "/cross_timeframe_map", "/scan_audit"] {
         reject_present(value, legacy_path)?;
     }
@@ -636,7 +636,7 @@ fn validate_scan_output_v3_4_0(value: &Value) -> Result<()> {
     expect_object(value, "/timeframes")?;
     reject_present(value, "/timeframes/15m")?;
     for tf in ["4h", "1d"] {
-        validate_scan_output_v3_4_0_timeframe(value, tf)?;
+        validate_scan_output_v4_0_0_timeframe(value, tf)?;
     }
     validate_execution_context_15m(value)?;
 
@@ -707,63 +707,22 @@ fn validate_execution_context_15m(value: &Value) -> Result<()> {
     Ok(())
 }
 
-fn validate_scan_output_v3_4_0_timeframe(value: &Value, tf: &str) -> Result<()> {
+fn validate_scan_output_v4_0_0_timeframe(value: &Value, tf: &str) -> Result<()> {
     let base = format!("/timeframes/{tf}");
 
-    expect_number(value, &format!("{base}/structure_parse/active_range/low"))?;
-    expect_number(value, &format!("{base}/structure_parse/active_range/high"))?;
-    expect_enum(
-        value,
-        &format!("{base}/structure_parse/range_width_vs_atr"),
-        &["narrow", "normal", "wide"],
-    )?;
-    validate_optional_price_zone(
-        value,
-        &format!("{base}/structure_parse/dominant_demand_zone"),
-    )?;
-    validate_optional_price_zone(
-        value,
-        &format!("{base}/structure_parse/dominant_supply_zone"),
-    )?;
-    validate_key_levels_with_max(value, &format!("{base}/structure_parse/key_levels"), 6)?;
-    expect_number_or_null(value, &format!("{base}/structure_parse/invalidation_level"))?;
-
-    let structures = expect_array(
-        value,
-        &format!("{base}/structure_parse/structure_lifecycle/structures"),
-    )?;
+    validate_simple_zone(value, &format!("{base}/active_range"))?;
+    validate_ladder_with_max(value, &format!("{base}/support_ladder"), 6)?;
+    validate_ladder_with_max(value, &format!("{base}/resistance_ladder"), 6)?;
+    let support_len = expect_array(value, &format!("{base}/support_ladder"))?.len();
+    let resistance_len = expect_array(value, &format!("{base}/resistance_ladder"))?.len();
     ensure_max_items(
-        structures.len(),
-        &format!("{base}/structure_parse/structure_lifecycle/structures"),
-        8,
+        support_len + resistance_len,
+        &format!("{base}/support_ladder + {base}/resistance_ladder"),
+        6,
     )?;
-    for (idx, _) in structures.iter().enumerate() {
-        let item_base = format!("{base}/structure_parse/structure_lifecycle/structures/{idx}");
-        expect_string(value, &format!("{item_base}/structure_id"))?;
-        expect_enum(
-            value,
-            &format!("{item_base}/structure_kind"),
-            &[
-                "active_range",
-                "value_area",
-                "demand_zone",
-                "supply_zone",
-                "imbalance_bracket",
-                "acceptance_attempt",
-                "rejection_band",
-            ],
-        )?;
-        expect_enum(
-            value,
-            &format!("{item_base}/status"),
-            &["active", "failing", "invalidated"],
-        )?;
-        expect_number(value, &format!("{item_base}/price_low"))?;
-        expect_number(value, &format!("{item_base}/price_high"))?;
-        expect_string(value, &format!("{item_base}/reason"))?;
-    }
 
     reject_present(value, &format!("{base}/market_state"))?;
+    reject_present(value, &format!("{base}/structure_parse"))?;
 
     for field in ["pvs", "tpo"] {
         expect_enum(
@@ -924,6 +883,7 @@ fn validate_scan_output_v3_4_0_timeframe(value: &Value, tf: &str) -> Result<()> 
         format!("{base}/structure_map"),
         format!("{base}/validation"),
         format!("{base}/flow_override"),
+        format!("{base}/evidence_trace"),
         format!("{base}/participant_parse/aggressive_side"),
         format!("{base}/participant_parse/absorption_side"),
     ] {
@@ -959,6 +919,7 @@ fn validate_scan_output_v3_4_0_timeframe(value: &Value, tf: &str) -> Result<()> 
             &format!("{item_base}/task_status"),
             &["accepted", "blocked", "failing", "unresolved"],
         )?;
+        validate_optional_simple_zone(value, &format!("{item_base}/target_zone"))?;
         validate_string_array_with_max(value, &format!("{item_base}/constraints"), 3)?;
         validate_string_array_with_max(value, &format!("{item_base}/evidence"), 3)?;
         expect_enum(
@@ -968,85 +929,27 @@ fn validate_scan_output_v3_4_0_timeframe(value: &Value, tf: &str) -> Result<()> 
         )?;
     }
 
-    for removed_evidence_field in [
-        "read_basis",
-        "recent_closed_bars_align_with_read",
-        "cvd_slope_aligns_with_read",
-        "current_partial_bar_aligns_with_read",
-    ] {
-        reject_present(
-            value,
-            &format!("{base}/evidence_trace/{removed_evidence_field}"),
-        )?;
-    }
-    validate_string_array_with_max(value, &format!("{base}/evidence_trace/supporting_facts"), 4)?;
-    validate_string_array_with_max(
-        value,
-        &format!("{base}/evidence_trace/conflicting_facts"),
-        4,
-    )?;
-    expect_string(value, &format!("{base}/evidence_trace/fragility_summary"))?;
+    expect_string(value, &format!("{base}/fragility_summary"))?;
 
     Ok(())
 }
 
-fn validate_scan_response_v3_4_0_timeframe(value: &Value, tf: &str) -> Result<()> {
+fn validate_scan_response_v4_0_0_timeframe(value: &Value, tf: &str) -> Result<()> {
     let base = format!("/timeframes/{tf}");
 
-    expect_number(value, &format!("{base}/structure_parse/active_range/low"))?;
-    expect_number(value, &format!("{base}/structure_parse/active_range/high"))?;
-    expect_enum(
-        value,
-        &format!("{base}/structure_parse/range_width_vs_atr"),
-        &["narrow", "normal", "wide"],
-    )?;
-    validate_optional_price_zone(
-        value,
-        &format!("{base}/structure_parse/dominant_demand_zone"),
-    )?;
-    validate_optional_price_zone(
-        value,
-        &format!("{base}/structure_parse/dominant_supply_zone"),
-    )?;
-    validate_key_levels_with_max(value, &format!("{base}/structure_parse/key_levels"), 6)?;
-    expect_number_or_null(value, &format!("{base}/structure_parse/invalidation_level"))?;
-
-    let structures = expect_array(
-        value,
-        &format!("{base}/structure_parse/structure_lifecycle/structures"),
-    )?;
+    validate_simple_zone(value, &format!("{base}/active_range"))?;
+    validate_ladder_with_max(value, &format!("{base}/support_ladder"), 6)?;
+    validate_ladder_with_max(value, &format!("{base}/resistance_ladder"), 6)?;
+    let support_len = expect_array(value, &format!("{base}/support_ladder"))?.len();
+    let resistance_len = expect_array(value, &format!("{base}/resistance_ladder"))?.len();
     ensure_max_items(
-        structures.len(),
-        &format!("{base}/structure_parse/structure_lifecycle/structures"),
-        8,
+        support_len + resistance_len,
+        &format!("{base}/support_ladder + {base}/resistance_ladder"),
+        6,
     )?;
-    for (idx, _) in structures.iter().enumerate() {
-        let item_base = format!("{base}/structure_parse/structure_lifecycle/structures/{idx}");
-        expect_string(value, &format!("{item_base}/structure_id"))?;
-        expect_enum(
-            value,
-            &format!("{item_base}/structure_kind"),
-            &[
-                "active_range",
-                "value_area",
-                "demand_zone",
-                "supply_zone",
-                "imbalance_bracket",
-                "acceptance_attempt",
-                "rejection_band",
-            ],
-        )?;
-        expect_enum(
-            value,
-            &format!("{item_base}/status"),
-            &["active", "failing", "invalidated"],
-        )?;
-        expect_number(value, &format!("{item_base}/price_low"))?;
-        expect_number(value, &format!("{item_base}/price_high"))?;
-        expect_string(value, &format!("{item_base}/reason"))?;
-    }
 
     reject_present(value, &format!("{base}/market_state"))?;
+    reject_present(value, &format!("{base}/structure_parse"))?;
     reject_present(value, &format!("{base}/state_parse/value_read"))?;
     expect_enum(
         value,
@@ -1123,6 +1026,7 @@ fn validate_scan_response_v3_4_0_timeframe(value: &Value, tf: &str) -> Result<()
         format!("{base}/flow_map"),
         format!("{base}/structure_map"),
         format!("{base}/validation"),
+        format!("{base}/evidence_trace"),
         format!("{base}/participant_parse/aggressive_side"),
         format!("{base}/participant_parse/absorption_side"),
     ] {
@@ -1158,6 +1062,7 @@ fn validate_scan_response_v3_4_0_timeframe(value: &Value, tf: &str) -> Result<()
             &format!("{item_base}/task_status"),
             &["accepted", "blocked", "failing", "unresolved"],
         )?;
+        validate_optional_simple_zone(value, &format!("{item_base}/target_zone"))?;
         validate_string_array_with_max(value, &format!("{item_base}/constraints"), 3)?;
         validate_string_array_with_max(value, &format!("{item_base}/evidence"), 3)?;
         expect_enum(
@@ -1167,24 +1072,7 @@ fn validate_scan_response_v3_4_0_timeframe(value: &Value, tf: &str) -> Result<()
         )?;
     }
 
-    for removed_evidence_field in [
-        "read_basis",
-        "recent_closed_bars_align_with_read",
-        "cvd_slope_aligns_with_read",
-        "current_partial_bar_aligns_with_read",
-    ] {
-        reject_present(
-            value,
-            &format!("{base}/evidence_trace/{removed_evidence_field}"),
-        )?;
-    }
-    validate_string_array_with_max(value, &format!("{base}/evidence_trace/supporting_facts"), 4)?;
-    validate_string_array_with_max(
-        value,
-        &format!("{base}/evidence_trace/conflicting_facts"),
-        4,
-    )?;
-    expect_string(value, &format!("{base}/evidence_trace/fragility_summary"))?;
+    expect_string(value, &format!("{base}/fragility_summary"))?;
 
     Ok(())
 }
@@ -1425,6 +1313,29 @@ fn validate_optional_price_zone(value: &Value, path: &str) -> Result<()> {
     }
 }
 
+fn validate_simple_zone(value: &Value, path: &str) -> Result<()> {
+    match value.pointer(path) {
+        Some(Value::Object(_)) => {
+            expect_number(value, &format!("{path}/low"))?;
+            expect_number(value, &format!("{path}/high"))?;
+            Ok(())
+        }
+        _ => Err(anyhow!("scan {} must be an object", path)),
+    }
+}
+
+fn validate_optional_simple_zone(value: &Value, path: &str) -> Result<()> {
+    match value.pointer(path) {
+        Some(Value::Null) => Ok(()),
+        Some(Value::Object(_)) => {
+            expect_number(value, &format!("{path}/low"))?;
+            expect_number(value, &format!("{path}/high"))?;
+            Ok(())
+        }
+        _ => Err(anyhow!("scan {} must be an object or null", path)),
+    }
+}
+
 fn validate_price_zone(value: &Value, path: &str) -> Result<()> {
     match value.pointer(path) {
         Some(Value::Object(_)) => {
@@ -1435,6 +1346,35 @@ fn validate_price_zone(value: &Value, path: &str) -> Result<()> {
         }
         _ => Err(anyhow!("scan {} must be an object", path)),
     }
+}
+
+fn validate_ladder_with_max(value: &Value, path: &str, max: usize) -> Result<()> {
+    let levels = expect_array(value, path)?;
+    ensure_max_items(levels.len(), path, max)?;
+    for (idx, _) in levels.iter().enumerate() {
+        let level_base = format!("{path}/{idx}");
+        expect_number(value, &format!("{level_base}/low"))?;
+        expect_number(value, &format!("{level_base}/high"))?;
+        expect_enum(
+            value,
+            &format!("{level_base}/role"),
+            &[
+                "value_edge",
+                "imbalance_support",
+                "imbalance_resistance",
+                "demand_flip",
+                "supply_flip",
+                "swing_low",
+                "swing_high",
+                "balance_boundary",
+                "liquidity_cluster",
+                "reclaim_band",
+                "rejection_band",
+            ],
+        )?;
+        expect_string(value, &format!("{level_base}/reason"))?;
+    }
+    Ok(())
 }
 
 fn validate_key_levels_with_max(value: &Value, path: &str, max: usize) -> Result<()> {
@@ -2529,7 +2469,7 @@ fn qwen_output_contract(
 ) -> String {
     if matches!(entry_stage, prompt::EntryPromptStage::Scan) {
         format!(
-            "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- No extra top-level keys.\n- Top-level keys must be `schema_version`, `meta`, `timeframes`, `execution_context_15m`, and `cross_timeframe_parse`.\n- `schema_version` must be `{}`.\n- `timeframes` must contain `4h` and `1d` only.\n- Each timeframe must include `structure_parse`, `state_parse`, `flow_override`, `participant_parse`, and `evidence_trace`.\n- `execution_context_15m` must include `micro_auction_state`, `nearest_executable_support`, `nearest_executable_resistance`, `entry_sweep_risk_15m`, `micro_invalidation_risk`, and `execution_note`.\n- `cross_timeframe_parse` must include `shared_levels`, `execution_alignment_15m`, `main_tension`, and `unresolved_factors`.\n",
+            "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- No extra top-level keys.\n- Top-level keys must be `schema_version`, `meta`, `timeframes`, `execution_context_15m`, and `cross_timeframe_parse`.\n- `schema_version` must be `{}`.\n- `timeframes` must contain `4h` and `1d` only.\n- Each timeframe must include `active_range`, `support_ladder`, `resistance_ladder`, `state_parse`, `flow_override`, `participant_parse`, and `fragility_summary`.\n- `execution_context_15m` must include `micro_auction_state`, `nearest_executable_support`, `nearest_executable_resistance`, `entry_sweep_risk_15m`, `micro_invalidation_risk`, and `execution_note`.\n- `cross_timeframe_parse` must include `shared_levels`, `execution_alignment_15m`, `main_tension`, and `unresolved_factors`.\n",
             SCAN_RESPONSE_SCHEMA_VERSION
         )
     } else if pending_order_mode {
@@ -4175,6 +4115,20 @@ fn scan_v3_3_0_participant_observation_schema_openai() -> Value {
                 "type": "string",
                 "enum": ["accepted", "blocked", "failing", "unresolved"]
             },
+            "target_zone": {
+                "anyOf": [
+                    {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["low", "high"],
+                        "properties": {
+                            "low": { "type": "number" },
+                            "high": { "type": "number" }
+                        }
+                    },
+                    { "type": "null" }
+                ]
+            },
             "constraints": {
                 "type": "array",
                 "maxItems": 3,
@@ -4237,22 +4191,77 @@ fn scan_v3_4_0_execution_context_15m_schema_openai() -> Value {
     })
 }
 
-fn scan_v3_3_0_response_timeframe_schema_openai() -> Value {
+fn scan_v4_0_0_ladder_zone_schema_openai() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["structure_parse", "state_parse", "flow_override", "participant_parse", "evidence_trace"],
+        "required": ["low", "high", "role", "reason"],
         "properties": {
-            "structure_parse": scan_v2_0_1_structure_parse_schema_openai(),
-            "state_parse": scan_v3_3_0_response_state_parse_schema_openai(),
-            "flow_override": scan_v3_3_0_flow_override_schema_openai(),
-            "participant_parse": scan_v3_3_0_participant_parse_schema_openai(),
-            "evidence_trace": scan_v2_0_1_evidence_trace_schema_openai()
+            "low": { "type": "number" },
+            "high": { "type": "number" },
+            "role": {
+                "type": "string",
+                "enum": [
+                    "value_edge",
+                    "imbalance_support",
+                    "imbalance_resistance",
+                    "demand_flip",
+                    "supply_flip",
+                    "swing_low",
+                    "swing_high",
+                    "balance_boundary",
+                    "liquidity_cluster",
+                    "reclaim_band",
+                    "rejection_band"
+                ]
+            },
+            "reason": { "type": "string" }
         }
     })
 }
 
-fn scan_v3_3_0_response_schema_openai() -> Value {
+fn scan_v4_0_0_response_timeframe_schema_openai() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "active_range",
+            "support_ladder",
+            "resistance_ladder",
+            "state_parse",
+            "flow_override",
+            "participant_parse",
+            "fragility_summary"
+        ],
+        "properties": {
+            "active_range": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["low", "high"],
+                "properties": {
+                    "low": { "type": "number" },
+                    "high": { "type": "number" }
+                }
+            },
+            "support_ladder": {
+                "type": "array",
+                "maxItems": 6,
+                "items": scan_v4_0_0_ladder_zone_schema_openai()
+            },
+            "resistance_ladder": {
+                "type": "array",
+                "maxItems": 6,
+                "items": scan_v4_0_0_ladder_zone_schema_openai()
+            },
+            "state_parse": scan_v3_3_0_response_state_parse_schema_openai(),
+            "flow_override": scan_v3_3_0_flow_override_schema_openai(),
+            "participant_parse": scan_v3_3_0_participant_parse_schema_openai(),
+            "fragility_summary": { "type": "string" }
+        }
+    })
+}
+
+fn scan_v4_0_0_response_schema_openai() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
@@ -4273,8 +4282,8 @@ fn scan_v3_3_0_response_schema_openai() -> Value {
                 "additionalProperties": false,
                 "required": ["4h", "1d"],
                 "properties": {
-                    "4h": scan_v3_3_0_response_timeframe_schema_openai(),
-                    "1d": scan_v3_3_0_response_timeframe_schema_openai()
+                    "4h": scan_v4_0_0_response_timeframe_schema_openai(),
+                    "1d": scan_v4_0_0_response_timeframe_schema_openai()
                 }
             },
             "execution_context_15m": scan_v3_4_0_execution_context_15m_schema_openai(),
@@ -4397,6 +4406,15 @@ fn scan_v3_3_0_participant_observation_schema_gemini() -> Value {
                 "type": "STRING",
                 "enum": ["accepted", "blocked", "failing", "unresolved"]
             },
+            "target_zone": {
+                "type": "OBJECT",
+                "nullable": true,
+                "properties": {
+                    "low": { "type": "NUMBER" },
+                    "high": { "type": "NUMBER" }
+                },
+                "required": ["low", "high"]
+            },
             "constraints": {
                 "type": "ARRAY",
                 "maxItems": 3,
@@ -4458,21 +4476,74 @@ fn scan_v3_4_0_execution_context_15m_schema_gemini() -> Value {
     })
 }
 
-fn scan_v3_3_0_response_timeframe_schema_gemini() -> Value {
+fn scan_v4_0_0_ladder_zone_schema_gemini() -> Value {
     json!({
         "type": "OBJECT",
         "properties": {
-            "structure_parse": scan_v2_0_1_structure_parse_schema_gemini(),
-            "state_parse": scan_v3_3_0_response_state_parse_schema_gemini(),
-            "flow_override": scan_v3_3_0_flow_override_schema_gemini(),
-            "participant_parse": scan_v3_3_0_participant_parse_schema_gemini(),
-            "evidence_trace": scan_v2_0_1_evidence_trace_schema_gemini()
+            "low": { "type": "NUMBER" },
+            "high": { "type": "NUMBER" },
+            "role": {
+                "type": "STRING",
+                "enum": [
+                    "value_edge",
+                    "imbalance_support",
+                    "imbalance_resistance",
+                    "demand_flip",
+                    "supply_flip",
+                    "swing_low",
+                    "swing_high",
+                    "balance_boundary",
+                    "liquidity_cluster",
+                    "reclaim_band",
+                    "rejection_band"
+                ]
+            },
+            "reason": { "type": "STRING" }
         },
-        "required": ["structure_parse", "state_parse", "flow_override", "participant_parse", "evidence_trace"]
+        "required": ["low", "high", "role", "reason"]
     })
 }
 
-fn scan_v3_3_0_response_schema_gemini() -> Value {
+fn scan_v4_0_0_response_timeframe_schema_gemini() -> Value {
+    json!({
+        "type": "OBJECT",
+        "properties": {
+            "active_range": {
+                "type": "OBJECT",
+                "properties": {
+                    "low": { "type": "NUMBER" },
+                    "high": { "type": "NUMBER" }
+                },
+                "required": ["low", "high"]
+            },
+            "support_ladder": {
+                "type": "ARRAY",
+                "maxItems": 6,
+                "items": scan_v4_0_0_ladder_zone_schema_gemini()
+            },
+            "resistance_ladder": {
+                "type": "ARRAY",
+                "maxItems": 6,
+                "items": scan_v4_0_0_ladder_zone_schema_gemini()
+            },
+            "state_parse": scan_v3_3_0_response_state_parse_schema_gemini(),
+            "flow_override": scan_v3_3_0_flow_override_schema_gemini(),
+            "participant_parse": scan_v3_3_0_participant_parse_schema_gemini(),
+            "fragility_summary": { "type": "STRING" }
+        },
+        "required": [
+            "active_range",
+            "support_ladder",
+            "resistance_ladder",
+            "state_parse",
+            "flow_override",
+            "participant_parse",
+            "fragility_summary"
+        ]
+    })
+}
+
+fn scan_v4_0_0_response_schema_gemini() -> Value {
     json!({
         "type": "OBJECT",
         "properties": {
@@ -4488,8 +4559,8 @@ fn scan_v3_3_0_response_schema_gemini() -> Value {
             "timeframes": {
                 "type": "OBJECT",
                 "properties": {
-                    "4h": scan_v3_3_0_response_timeframe_schema_gemini(),
-                    "1d": scan_v3_3_0_response_timeframe_schema_gemini()
+                    "4h": scan_v4_0_0_response_timeframe_schema_gemini(),
+                    "1d": scan_v4_0_0_response_timeframe_schema_gemini()
                 },
                 "required": ["4h", "1d"]
             },
@@ -4521,7 +4592,7 @@ fn scan_v3_3_0_response_schema_gemini() -> Value {
 }
 
 fn ml_grok_entry_scan_schema() -> Value {
-    scan_v3_3_0_response_schema_openai()
+    scan_v4_0_0_response_schema_openai()
 }
 
 fn ml_grok_entry_schema() -> Value {
@@ -4555,7 +4626,7 @@ fn ml_grok_management_schema() -> Value {
 }
 
 fn ml_gemini_entry_scan_schema() -> Value {
-    scan_v3_3_0_response_schema_gemini()
+    scan_v4_0_0_response_schema_gemini()
 }
 
 fn ml_gemini_entry_schema() -> Value {
@@ -4596,7 +4667,7 @@ fn ml_gemini_management_schema() -> Value {
 }
 
 fn ml_qwen_entry_scan_schema() -> Value {
-    scan_v3_3_0_response_schema_openai()
+    scan_v4_0_0_response_schema_openai()
 }
 
 fn ml_qwen_entry_schema() -> Value {
@@ -4631,7 +4702,7 @@ fn ml_qwen_management_schema() -> Value {
 }
 
 fn ml_custom_llm_entry_scan_schema() -> Value {
-    scan_v3_3_0_response_schema_openai()
+    scan_v4_0_0_response_schema_openai()
 }
 
 fn ml_custom_llm_entry_schema() -> Value {
@@ -5399,44 +5470,22 @@ mod tests {
 
     fn sample_stage_1_scan() -> Value {
         json!({
-            "schema_version": "scan_v3_4_0",
+            "schema_version": "scan_v4_0_0",
             "meta": {
                 "symbol": "TESTUSDT",
                 "scan_ts_bucket": "2026-03-18T07:00:00+00:00"
             },
             "timeframes": {
                 "4h": {
-                    "structure_parse": {
-                        "active_range": {"low": 1988.0, "high": 2035.0},
-                        "range_width_vs_atr": "normal",
-                        "dominant_demand_zone": {"low": 1988.0, "high": 1996.0, "reason": "4h defended support"},
-                        "dominant_supply_zone": {"low": 2028.0, "high": 2035.0, "reason": "4h upper supply"},
-                        "key_levels": [
-                            {"price": 1988.0, "type": "support", "reason": "4h defended support"},
-                            {"price": 2035.0, "type": "resistance", "reason": "4h upper cap"}
-                        ],
-                        "invalidation_level": 1988.0,
-                        "structure_lifecycle": {
-                            "structures": [
-                                {
-                                    "structure_id": "4h_active_range",
-                                    "structure_kind": "active_range",
-                                    "status": "active",
-                                    "price_low": 1988.0,
-                                    "price_high": 2035.0,
-                                    "reason": "4h swing structure is still intact"
-                                },
-                                {
-                                    "structure_id": "4h_upside_acceptance",
-                                    "structure_kind": "acceptance_attempt",
-                                    "status": "failing",
-                                    "price_low": 2028.0,
-                                    "price_high": 2035.0,
-                                    "reason": "follow-through above upper supply is not yet clean"
-                                }
-                            ]
-                        }
-                    },
+                    "active_range": {"low": 1988.0, "high": 2035.0},
+                    "support_ladder": [
+                        {"low": 1988.0, "high": 1996.0, "role": "value_edge", "reason": "4h defended support"},
+                        {"low": 1960.0, "high": 1960.0, "role": "swing_low", "reason": "daily invalidation swing low"}
+                    ],
+                    "resistance_ladder": [
+                        {"low": 2028.0, "high": 2035.0, "role": "reclaim_band", "reason": "4h upper supply and failed reclaim"},
+                        {"low": 2050.0, "high": 2050.0, "role": "swing_high", "reason": "daily outer ceiling"}
+                    ],
                     "state_parse": {
                         "value_read": {
                             "pvs": "accepted_above",
@@ -5477,6 +5526,7 @@ mod tests {
                                 "participant_role": "higher_timeframe_sponsorship",
                                 "current_task": "hold the 4h swing structure above defended support",
                                 "task_status": "accepted",
+                                "target_zone": {"low": 2028.0, "high": 2035.0},
                                 "constraints": ["follow-through above upper supply is not clean"],
                                 "evidence": ["4h ema bull", "higher support intact"],
                                 "confidence": "medium"
@@ -5485,42 +5535,25 @@ mod tests {
                                 "participant_role": "passive_liquidity",
                                 "current_task": "block clean continuation through 2035",
                                 "task_status": "blocked",
+                                "target_zone": null,
                                 "constraints": ["higher support is still intact"],
                                 "evidence": ["4h upper supply", "follow-through is not clean"],
                                 "confidence": "medium"
                             }
                         ]
                     },
-                    "evidence_trace": {
-                        "supporting_facts": ["4h ema bull", "higher support intact"],
-                        "conflicting_facts": ["whale bias bearish"],
-                        "fragility_summary": "4h buyers still control, but sponsorship is not fully clean."
-                    }
+                    "fragility_summary": "4h buyers still control, but sponsorship is not fully clean."
                 },
                 "1d": {
-                    "structure_parse": {
-                        "active_range": {"low": 1960.0, "high": 2050.0},
-                        "range_width_vs_atr": "wide",
-                        "dominant_demand_zone": {"low": 1960.0, "high": 1980.0, "reason": "daily lower demand"},
-                        "dominant_supply_zone": {"low": 2040.0, "high": 2050.0, "reason": "daily upper supply"},
-                        "key_levels": [
-                            {"price": 1960.0, "type": "support", "reason": "daily lower support"},
-                            {"price": 2050.0, "type": "resistance", "reason": "daily upper resistance"}
-                        ],
-                        "invalidation_level": null,
-                        "structure_lifecycle": {
-                            "structures": [
-                                {
-                                    "structure_id": "1d_value_area",
-                                    "structure_kind": "value_area",
-                                    "status": "active",
-                                    "price_low": 1960.0,
-                                    "price_high": 2050.0,
-                                    "reason": "the broader daily auction is still rotating inside this value area"
-                                }
-                            ]
-                        }
-                    },
+                    "active_range": {"low": 1960.0, "high": 2050.0},
+                    "support_ladder": [
+                        {"low": 1960.0, "high": 1980.0, "role": "value_edge", "reason": "daily lower demand"},
+                        {"low": 1905.0, "high": 1905.0, "role": "swing_low", "reason": "outer daily invalidation"}
+                    ],
+                    "resistance_ladder": [
+                        {"low": 2040.0, "high": 2050.0, "role": "rejection_band", "reason": "daily upper supply"},
+                        {"low": 2080.0, "high": 2080.0, "role": "swing_high", "reason": "outer daily objective"}
+                    ],
                     "state_parse": {
                         "value_read": {
                             "pvs": "inside_value",
@@ -5561,17 +5594,14 @@ mod tests {
                                 "participant_role": "responsive_crowd",
                                 "current_task": "hold the daily auction inside value while higher timeframe participation remains unresolved",
                                 "task_status": "unresolved",
+                                "target_zone": null,
                                 "constraints": ["trend and flow are not fully aligned"],
                                 "evidence": ["daily value area intact", "trend/flow not fully aligned"],
                                 "confidence": "low"
                             }
                         ]
                     },
-                    "evidence_trace": {
-                        "supporting_facts": ["daily value area intact"],
-                        "conflicting_facts": ["trend/flow not fully aligned"],
-                        "fragility_summary": "Daily backdrop is balanced and not yet cleanly sponsored."
-                    }
+                    "fragility_summary": "Daily backdrop is balanced and not yet cleanly sponsored."
                 }
             },
             "execution_context_15m": {
@@ -5603,8 +5633,8 @@ mod tests {
                 },
                 "main_tension": "4h buyers are pressing higher while the 1d backdrop remains only partially sponsored and 15m execution is still contested.",
                 "unresolved_factors": [
-                        "daily sponsorship is unresolved",
-                        "4h flow is constructive but not fully clean"
+                    "daily sponsorship is unresolved",
+                    "4h flow is constructive but not fully clean"
                 ]
             }
         })
@@ -5650,7 +5680,7 @@ mod tests {
         let mut response = sample_stage_1_scan();
         *response
             .pointer_mut("/schema_version")
-            .expect("schema_version should exist") = json!("scan_v3_4_0_response");
+            .expect("schema_version should exist") = json!("scan_v4_0_0_response");
 
         for tf in ["4h", "1d"] {
             let flow_parse = response
@@ -5707,17 +5737,15 @@ mod tests {
             "orderbook_depth still shows sellers leaning above price; buying_exhaustion and absorption still define the local sweep risk."
         );
         *scan
-            .pointer_mut("/timeframes/4h/evidence_trace/supporting_facts")
-            .expect("4h supporting_facts should exist") = json!([
-            "ema_trend_regime is still bull on 4h and 1d",
-            "tpo_market_profile still holds the broader rotation structure",
-            "rvwap_sigma_bands still show price compressing around the higher timeframe mean"
-        ]);
+            .pointer_mut("/timeframes/4h/fragility_summary")
+            .expect("4h fragility_summary should exist") = json!(
+            "ema_trend_regime is still bull on 4h and 1d, but whale_trades and orderbook_depth still constrain the reclaim."
+        );
         *scan
-            .pointer_mut("/timeframes/4h/evidence_trace/conflicting_facts")
-            .expect("4h conflicting_facts should exist") = json!([
-            "whale_trades still lean short into the upper band",
-            "no active 4h or 1d fvg has reopened expansion",
+            .pointer_mut("/timeframes/4h/participant_parse/participant_observations/0/evidence")
+            .expect("4h participant evidence should exist") = json!([
+            "tpo_market_profile still holds the broader rotation structure",
+            "rvwap_sigma_bands still show price compressing around the higher timeframe mean",
             "selling_exhaustion has not yet flipped control cleanly"
         ]);
         scan
@@ -6389,7 +6417,7 @@ mod tests {
                 schema
                     .pointer("/properties/schema_version/enum/0")
                     .and_then(|v| v.as_str()),
-                Some("scan_v3_4_0_response"),
+                Some("scan_v4_0_0_response"),
                 "schema_version should be reduced response for {prompt_template}"
             );
             assert_eq!(
@@ -6435,6 +6463,15 @@ mod tests {
                 .pointer("/properties/timeframes/properties/4h/properties/state_parse")
                 .is_some());
             assert!(schema
+                .pointer("/properties/timeframes/properties/4h/properties/active_range")
+                .is_some());
+            assert!(schema
+                .pointer("/properties/timeframes/properties/4h/properties/support_ladder")
+                .is_some());
+            assert!(schema
+                .pointer("/properties/timeframes/properties/4h/properties/resistance_ladder")
+                .is_some());
+            assert!(schema
                 .pointer("/properties/timeframes/properties/4h/properties/flow_override")
                 .is_some());
             assert!(schema
@@ -6447,8 +6484,14 @@ mod tests {
                 .pointer("/properties/timeframes/properties/4h/properties/market_state")
                 .is_none());
             assert!(schema
-                .pointer("/properties/timeframes/properties/4h/properties/evidence_trace")
+                .pointer("/properties/timeframes/properties/4h/properties/fragility_summary")
                 .is_some());
+            assert!(schema
+                .pointer("/properties/timeframes/properties/4h/properties/structure_parse")
+                .is_none());
+            assert!(schema
+                .pointer("/properties/timeframes/properties/4h/properties/evidence_trace")
+                .is_none());
             assert!(schema
                 .pointer("/properties/cross_timeframe_parse/properties/cross_market_parse")
                 .is_none());
@@ -6481,9 +6524,9 @@ mod tests {
             );
             assert!(contract
                 .contains("`schema_version`, `meta`, `timeframes`, `execution_context_15m`, and `cross_timeframe_parse`"));
-            assert!(contract.contains("`scan_v3_4_0_response`"));
+            assert!(contract.contains("`scan_v4_0_0_response`"));
             assert!(contract.contains(
-                "`structure_parse`, `state_parse`, `flow_override`, `participant_parse`, and `evidence_trace`"
+                "`active_range`, `support_ladder`, `resistance_ladder`, `state_parse`, `flow_override`, `participant_parse`, and `fragility_summary`"
             ));
             assert!(contract.contains(
                 "`micro_auction_state`, `nearest_executable_support`, `nearest_executable_resistance`, `entry_sweep_risk_15m`, `micro_invalidation_risk`, and `execution_note`"
@@ -6632,7 +6675,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_entry_scan_output_accepts_scan_v3_4_0_response_and_merges_full_scan() {
+    fn parse_entry_scan_output_accepts_scan_v4_0_0_response_and_merges_full_scan() {
         let raw_text =
             serde_json::to_string(&sample_stage_1_scan_response()).expect("serialize scan");
         let prompt_input = sample_stage_1_scan_prompt_input();
@@ -6641,7 +6684,7 @@ mod tests {
 
         assert_eq!(
             parsed.get("schema_version").and_then(Value::as_str),
-            Some("scan_v3_4_0")
+            Some("scan_v4_0_0")
         );
         assert_eq!(
             parsed
@@ -6720,7 +6763,7 @@ mod tests {
         assert!(error
             .error
             .to_string()
-            .contains("scan response schema_version must be scan_v3_4_0_response"));
+            .contains("scan response schema_version must be scan_v4_0_0_response"));
     }
 
     #[test]
@@ -6753,7 +6796,7 @@ mod tests {
 
         assert!(error
             .to_string()
-            .contains("scan schema_version must be scan_v3_4_0"));
+            .contains("scan schema_version must be scan_v4_0_0"));
     }
 
     #[test]
@@ -6959,7 +7002,7 @@ mod tests {
             capture
                 .stage_1_setup_scan_json
                 .as_ref()
-                .and_then(|value| value.pointer("/timeframes/4h/structure_parse/active_range/low"))
+                .and_then(|value| value.pointer("/timeframes/4h/active_range/low"))
                 .and_then(Value::as_f64),
             Some(1988.0)
         );

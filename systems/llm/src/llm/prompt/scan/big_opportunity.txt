@@ -4,24 +4,15 @@ Use only the provided scan JSON. Keep every signal, level, participant task, and
 
 GOAL
 
-Use the input to produce a structured parse of the current market.
+Use the input to produce a structured market map for a 4h to 1d trading decision.
 
-The output is only successful if a downstream model can understand the current market without reconstructing the raw input.
+The downstream model reads this market map to decide direction, entry, stop-loss, take-profit, and leverage without reconstructing the raw input.
 
-For each thesis timeframe, you must parse:
-- current structure
-- current state
-- contextual flow judgement
-- current participant tasks
-- unresolved conflicts that still matter now
+The thesis timeframes are:
+- `4h`
+- `1d`
 
-For 15m, do not produce a full market parse.
-Produce only `execution_context_15m`.
-
-Match the resolution of the output to the resolution of the evidence.
-If the market is mixed, preserve mixed.
-If the market is fragile, preserve fragile.
-If the market is unresolved, preserve unresolved.
+`15m` is execution context only.
 
 HOW TO READ THE INPUT
 
@@ -31,18 +22,18 @@ Read the input as one live market environment:
 - `path_newest_to_oldest` shows how price arrived here across timeframes
 - `events_newest_to_oldest` reveals initiation, absorption, exhaustion, and divergence behavior
 - `supporting_context` gives broader flow, cross-market, and background context
-- `raw_overflow` is supplemental detail and should be used only when it materially changes the scan
+- `raw_overflow` is supplemental detail and should be used only when it materially changes the market map
 
 PRECOMPUTED VALUE READ
 
-`now.precomputed_value_read` already contains the value-state truth for each timeframe.
+`now.precomputed_value_read` already contains the value-state truth for each thesis timeframe.
 
 Use it as the fixed value-state base.
 Leave `value_read` out of the response.
 
 PRECOMPUTED FLOW BASE
 
-`now.precomputed_flow_base` already contains the deterministic flow base for each timeframe:
+`now.precomputed_flow_base` already contains the deterministic flow base for each thesis timeframe:
 - `delta_read.futures`
 - `delta_read.spot`
 - `delta_read.relation`
@@ -55,7 +46,7 @@ Leave those deterministic flow fields out of the response.
 
 FLOW SUPPORTING EVIDENCE
 
-`now.flow_supporting_evidence` contains the compact evidence you should use to complete the context-sensitive flow judgement for each timeframe.
+`now.flow_supporting_evidence` contains the compact evidence needed to finish the contextual flow judgement.
 
 Use it to determine only:
 - `cvd_alignment_vs_price`
@@ -70,78 +61,72 @@ PRECOMPUTED CROSS-MARKET
 Use it as the fixed cross-market base.
 Leave `cross_market_parse` out of the response.
 
+THESIS PRICE-BAND MAP
+
+The downstream model reads this price-band map to decide entry, stop-loss,
+take-profit, and leverage for a 4h to 1d swing trade.
+
+For this to work, the map needs to satisfy:
+
+Coverage:
+The map spans from the nearest major structural zone on each side of current
+price all the way to the thesis boundaries. `support_ladder` reaches the thesis
+invalidation area. `resistance_ladder` reaches the thesis objective or outer
+structural ceiling. The major intermediate zones that shape the path between
+current price and those boundaries are included.
+
+Spacing:
+Each price band represents a distinct major structural level. Bands that are
+too close together and serve the same structural role are merged into one. The
+result is a small set of well-spaced major bands that a downstream model can
+directly use for trade placement.
+
+Resolution:
+The 1d map expresses 1d-resolution structure with wider spacing and higher-level
+bands. The 4h map expresses the nearer thesis structure within that broader 1d
+frame.
+
+Current role:
+Each zone in the ladder reflects its current live structural role. A zone that
+was formerly a reclaim attempt but now functions as overhead supply appears as
+supply in the map, because that is the role a downstream trading model needs to
+read now.
+
 REQUIRED COVERAGE
 
-For every thesis timeframe, the required output is a complete five-layer parse:
-- `structure_parse`
-- `state_parse`
-- `flow_override`
-- `participant_parse`
-- `evidence_trace`
+For each thesis timeframe, the output needs:
+- the current containing bracket in `active_range`
+- the support ladder from nearest still-relevant major zone down to the thesis invalidation area
+- the resistance ladder from nearest still-relevant major zone up to the thesis objective or outer structural ceiling
+- the current auction state in `state_parse`
+- the contextual flow judgement in `flow_override`
+- the current participant tasks in `participant_parse`
+- one direct `fragility_summary`
 
-Each thesis timeframe parse must clearly answer:
-- what is organizing price now
-- what is no longer organizing price now
-- what the current auction state is
-- what the contextual flow judgement is relative to the current auction
-- what the main participants are trying to make the market do now
-- what is constraining those tasks now
+`support_ladder` and `resistance_ladder` combined should carry the complete decision-relevant ladder for that timeframe, with at most 6 major price bands total.
 
-For `execution_context_15m`, answer only:
-- what the current micro auction state is
-- where the nearest executable support is
-- where the nearest executable resistance is
-- how high the current entry sweep risk is
-- how high the current micro invalidation risk is
+15M EXECUTION CONTEXT
+
+`execution_context_15m` carries only execution-layer information:
+- the current micro auction state
+- the nearest executable support
+- the nearest executable resistance
+- the current entry sweep risk
+- the current micro invalidation risk
 - one short execution-critical note when needed
 
-If the evidence is mixed or incomplete, do not omit the parse.
-Use explicit uncertainty states such as `balanced`, `unclear`, `mixed`, `conflicted`, `fragile`, `neutral`, or `unresolved`.
-
-ACTIVE NOW VS BACKGROUND
-
-Your primary task is to describe what is still active now in the market.
-
-Treat current price location, current value state, active range, current flow, current participant behavior, and the most recent still-relevant closed bars as the primary active-now evidence.
-
-Treat older events, older path history, and supporting context as background evidence.
-
-Use background evidence to explain the active market state and active participant tasks.
-The active-now layer defines the read; the background layer explains how that read developed.
-
-ACTIVE READ DEFINITION
-
-Define the active read from what is organizing the auction now.
-
-The active read must be grounded in the current combination of:
-- current price location
-- current value state
-- current active structure
-- current flow condition
-- current participant task
-
-If those active organizing factors have changed, rewrite the parse from the new current state.
-
-Prior continuation, acceptance, or defense belongs in the active read only when it still remains part of the current organizing state.
-Otherwise it belongs in structure lifecycle or background explanation.
+This is execution context, not a thesis market map.
 
 PARTICIPANT TASKS
 
-For each timeframe, identify the 1 to 3 participant tasks that matter now.
+The downstream model needs to read each participant task and directly see which
+price zones are at stake.
 
-Express participant tasks in market-native language such as:
-- defending lower value
-- forcing reentry
-- blocking acceptance above resistance
-- holding price inside balance
-- reclaiming upper value
-- stabilizing after rejection
+`current_task` should name the price levels being defended or attacked.
+`target_zone` marks the structured price target when a participant is pushing
+price toward a zone that could become entry, stop-loss, or take-profit for stage2.
 
-Express participants through current tasks rather than side labels.
-State:
-- the current task
-- whether it is accepted, blocked, failing, or unresolved
-- what current constraints are stopping it
+The participant layer should read like a direct trading map, not like abstract behavior commentary.
 
 PRESERVE SIMULTANEOUS TRUTHS
 
@@ -152,41 +137,31 @@ When the input contains:
 - price/flow divergence
 - whale/orderbook disagreement
 
-preserve those conflicts explicitly in the owning fields.
-If the schema requires one combined field, use the schema's conflict or uncertainty state there and keep the underlying conflict visible in the subfields or evidence trace.
+keep those conflicts visible in the fields that own them.
 
-FIELD RESPONSIBILITY DISCIPLINE
+FIELD RESPONSIBILITY
 
-Each layer owns one type of truth:
+Each layer owns one kind of truth:
 
-- `structure_parse` owns structural organization
-- `state_parse` owns current auction state
+- `active_range`, `support_ladder`, and `resistance_ladder` own the thesis price-band map
+- `state_parse` owns the current auction state
 - `flow_override` owns only the contextual flow judgements that require auction interpretation
-- `participant_parse` owns current participant tasks
-- `evidence_trace` owns the minimum supporting and conflicting facts
+- `participant_parse` owns current participant tasks tied to price
+- `fragility_summary` owns the direct fragility conclusion
 - `execution_context_15m` owns only the 15m execution-layer summary
-- `cross_timeframe_parse` integrates only the highest-value shared levels, 15m execution alignment, main tension, and unresolved conflicts
-
-Keep each fact in the layer that owns it unless that fact changes meaning in the new layer.
-
-15m EXECUTION CONTEXT ONLY
-
-`execution_context_15m` is not a market parse.
-Do not analyze 15m structure, participant narrative, or flow narrative beyond the schema fields.
-Only fill the `execution_context_15m` fields.
-Keep `execution_note` to one short sentence only when it adds execution-critical context.
+- `cross_timeframe_parse` integrates shared levels, 15m execution alignment, main tension, and unresolved conflicts
 
 OUTPUT STYLE
 
 - Keep `reason`, `current_task`, `fragility_summary`, `main_tension`, and `unresolved_factors` short, market-native, and evidence-first.
 - Prefer short factual phrases over long explanatory sentences.
-- `key_levels.reason` should identify the level's structural role.
-- Zone `reason` should explain why the zone exists now.
+- Ladder zone `reason` should explain why the band matters now.
 - `constraints` should list only the most important current blockers.
+- `execution_note` should stay short and execution-critical.
 
 OUTPUT
 
-Return JSON only and follow `scan_v3_4_0_response`.
+Return JSON only and follow `scan_v4_0_0_response`.
 
 Generate the output in this order:
 
@@ -197,25 +172,41 @@ Top level:
 - `execution_context_15m`
 - `cross_timeframe_parse`
 
-For each thesis timeframe:
-- `structure_parse`
-- `state_parse`
-- `flow_override`
-- `participant_parse`
-- `evidence_trace`
-
 `timeframes` must contain only:
 - `4h`
 - `1d`
 
-`structure_parse` must contain:
+For each thesis timeframe:
 - `active_range`
-- `range_width_vs_atr`
-- `dominant_demand_zone`
-- `dominant_supply_zone`
-- `key_levels`
-- `invalidation_level`
-- `structure_lifecycle`
+- `support_ladder`
+- `resistance_ladder`
+- `state_parse`
+- `flow_override`
+- `participant_parse`
+- `fragility_summary`
+
+`active_range` must contain:
+- `low`
+- `high`
+
+Each ladder zone must contain:
+- `low`
+- `high`
+- `role`
+- `reason`
+
+Allowed ladder `role` values:
+- `value_edge`
+- `imbalance_support`
+- `imbalance_resistance`
+- `demand_flip`
+- `supply_flip`
+- `swing_low`
+- `swing_high`
+- `balance_boundary`
+- `liquidity_cluster`
+- `reclaim_band`
+- `rejection_band`
 
 `state_parse` must contain:
 - `range_state`
@@ -240,6 +231,9 @@ Each `participant_observation` must contain:
 - `evidence`
 - `confidence`
 
+Optional participant field:
+- `target_zone`
+
 Limit `participant_observations` to at most 3.
 Limit `constraints` to at most 3.
 Limit `evidence` to at most 3.
@@ -262,14 +256,19 @@ BEFORE OUTPUT
 
 Before finalizing the JSON, run this self-check:
 
-1. Have I completed the five-layer parse for `4h` and `1d`, and only the execution context for `15m`?
-2. Have I used `precomputed_value_read` as the fixed value-state base?
-3. Have I limited `flow_override` to the 4 context-sensitive flow judgements?
-4. Does `combined_flow_state` match the relationship between current flow evidence and `state_parse.control_read.side`?
-5. Have I written each participant task with its `task_status` and current `constraints`?
-6. Have I kept `sponsorship_state` as its own state field instead of merging it into `combined_flow_state` or participant prose?
-7. Is `execution_context_15m` strictly execution-layer only, without a hidden 15m full scan?
-8. Could a downstream model understand the current market without reconstructing the raw input?
+MARKET MAP COMPLETENESS
+
+1. Does each ladder span from the nearest active zone to the thesis boundary, not just the immediate neighborhood?
+2. Does the 1d ladder express wider 1d structure rather than a narrow 4h copy?
+3. Are participant tasks tied to concrete price bands that matter for the thesis path?
+4. Could a downstream model make a 4h-1d trade decision from this map without reconstructing the raw input?
+
+SCHEMA & MERGE CONSISTENCY
+
+5. Have I used `precomputed_value_read` as the fixed value-state base?
+6. Have I limited `flow_override` to the 4 context-sensitive flow judgements?
+7. Does `combined_flow_state` match the relationship between current flow evidence and `state_parse.control_read.side`?
+8. Is `execution_context_15m` a pure execution-layer summary that only contributes entry-quality context?
 
 If any answer is no, revise the parse before emitting the final JSON.
 
