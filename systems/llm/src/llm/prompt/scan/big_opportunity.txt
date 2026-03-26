@@ -149,7 +149,7 @@ Each layer owns one kind of truth:
 - `participant_parse` owns current participant tasks tied to price
 - `fragility_summary` owns the direct fragility conclusion
 - `execution_context_15m` owns only the 15m execution-layer summary
-- `cross_timeframe_parse` integrates shared levels, 15m execution alignment, main tension, and unresolved conflicts
+- `cross_timeframe_parse` owns only cross-timeframe relations: 15m execution alignment, main tension, and unresolved conflicts
 
 OUTPUT STYLE
 
@@ -161,7 +161,7 @@ OUTPUT STYLE
 
 OUTPUT
 
-Return JSON only and follow `scan_v4_0_0_response`.
+Return JSON only and follow `scan_v4_1_0_response`.
 
 Generate the output in this order:
 
@@ -231,8 +231,10 @@ Each `participant_observation` must contain:
 - `evidence`
 - `confidence`
 
-Optional participant field:
+Each `participant_observation` must also contain:
 - `target_zone`
+
+Use `null` when no explicit push target applies.
 
 Limit `participant_observations` to at most 3.
 Limit `constraints` to at most 3.
@@ -247,10 +249,12 @@ Limit `evidence` to at most 3.
 - `execution_note`
 
 `cross_timeframe_parse` must contain:
-- `shared_levels`
 - `execution_alignment_15m`
 - `main_tension`
 - `unresolved_factors`
+
+`unresolved_factors` should describe relational tensions between signals or timeframes.
+They are not a price list and they should not restate ladder zones.
 
 BEFORE OUTPUT
 
