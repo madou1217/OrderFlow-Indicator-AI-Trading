@@ -70,10 +70,10 @@ For this to work, the map needs to satisfy:
 
 Coverage:
 The map spans from the nearest major structural zone on each side of current
-price all the way to the thesis boundaries. `support_ladder` reaches the thesis
-invalidation area. `resistance_ladder` reaches the thesis objective or outer
-structural ceiling. The major intermediate zones that shape the path between
-current price and those boundaries are included.
+price all the way to the thesis boundaries. `support_ladder` and
+`resistance_ladder` carry the near and intermediate major zones that shape that
+path. `thesis_floor` marks the outer invalidation boundary. `thesis_ceiling`
+marks the outer objective or structural ceiling.
 
 Spacing:
 Each price band represents a distinct major structural level. Bands that are
@@ -96,14 +96,16 @@ REQUIRED COVERAGE
 
 For each thesis timeframe, the output needs:
 - the current containing bracket in `active_range`
-- the support ladder from nearest still-relevant major zone down to the thesis invalidation area
-- the resistance ladder from nearest still-relevant major zone up to the thesis objective or outer structural ceiling
+- the support ladder of near and intermediate major zones below current price
+- the resistance ladder of near and intermediate major zones above current price
+- one `thesis_floor` for the outer still-live support boundary
+- one `thesis_ceiling` for the outer still-live resistance boundary
 - the current auction state in `state_parse`
 - the contextual flow judgement in `flow_override`
 - the current participant tasks in `participant_parse`
 - one direct `fragility_summary`
 
-`support_ladder` and `resistance_ladder` combined should carry the complete decision-relevant ladder for that timeframe, with at most 6 major price bands total.
+`support_ladder` and `resistance_ladder` combined should carry only the near and intermediate path nodes for that timeframe, with at most 5 major price bands total.
 
 15M EXECUTION CONTEXT
 
@@ -143,7 +145,7 @@ FIELD RESPONSIBILITY
 
 Each layer owns one kind of truth:
 
-- `active_range`, `support_ladder`, and `resistance_ladder` own the thesis price-band map
+- `active_range`, `support_ladder`, `resistance_ladder`, `thesis_floor`, and `thesis_ceiling` own the thesis price-band map
 - `state_parse` owns the current auction state
 - `flow_override` owns only the contextual flow judgements that require auction interpretation
 - `participant_parse` owns current participant tasks tied to price
@@ -161,7 +163,7 @@ OUTPUT STYLE
 
 OUTPUT
 
-Return JSON only and follow `scan_v4_1_0_response`.
+Return JSON only and follow `scan_v4_2_0_response`.
 
 Generate the output in this order:
 
@@ -180,6 +182,8 @@ For each thesis timeframe:
 - `active_range`
 - `support_ladder`
 - `resistance_ladder`
+- `thesis_floor`
+- `thesis_ceiling`
 - `state_parse`
 - `flow_override`
 - `participant_parse`
@@ -193,6 +197,11 @@ Each ladder zone must contain:
 - `low`
 - `high`
 - `role`
+- `reason`
+
+`thesis_floor` and `thesis_ceiling` must each contain:
+- `low`
+- `high`
 - `reason`
 
 Allowed ladder `role` values:
@@ -262,7 +271,7 @@ Before finalizing the JSON, run this self-check:
 
 MARKET MAP COMPLETENESS
 
-1. Does each ladder span from the nearest active zone to the thesis boundary, not just the immediate neighborhood?
+1. Do the ladders cover only the near and intermediate path, with the outer boundary held separately in `thesis_floor` or `thesis_ceiling`?
 2. Does the 1d ladder express wider 1d structure rather than a narrow 4h copy?
 3. Are participant tasks tied to concrete price bands that matter for the thesis path?
 4. Could a downstream model make a 4h-1d trade decision from this map without reconstructing the raw input?

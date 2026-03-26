@@ -17,8 +17,8 @@ use uuid::Uuid;
 
 const CLAUDE_EXTENDED_CACHE_TTL_BETA: &str = "extended-cache-ttl-2025-04-11";
 const CLAUDE_DECISION_TOOL_NAME: &str = "emit_decision";
-const FULL_SCAN_SCHEMA_VERSION: &str = "scan_v4_1_0";
-const SCAN_RESPONSE_SCHEMA_VERSION: &str = "scan_v4_1_0_response";
+const FULL_SCAN_SCHEMA_VERSION: &str = "scan_v4_2_0";
+const SCAN_RESPONSE_SCHEMA_VERSION: &str = "scan_v4_2_0_response";
 #[derive(Debug, Clone, Serialize)]
 pub struct ModelInvocationInput {
     pub symbol: String,
@@ -293,6 +293,22 @@ fn build_entry_finalize_trace_event(
         "scan_1d_control_clarity": scan_trace_state_value(prior_scan, "1d", "control_clarity"),
         "scan_4h_sponsorship_state": scan_trace_state_value(prior_scan, "4h", "sponsorship_state"),
         "scan_1d_sponsorship_state": scan_trace_state_value(prior_scan, "1d", "sponsorship_state"),
+        "scan_4h_thesis_floor": prior_scan
+            .pointer("/timeframes/4h/thesis_floor")
+            .cloned()
+            .unwrap_or(Value::Null),
+        "scan_4h_thesis_ceiling": prior_scan
+            .pointer("/timeframes/4h/thesis_ceiling")
+            .cloned()
+            .unwrap_or(Value::Null),
+        "scan_1d_thesis_floor": prior_scan
+            .pointer("/timeframes/1d/thesis_floor")
+            .cloned()
+            .unwrap_or(Value::Null),
+        "scan_1d_thesis_ceiling": prior_scan
+            .pointer("/timeframes/1d/thesis_ceiling")
+            .cloned()
+            .unwrap_or(Value::Null),
         "execution_15m_micro_auction_state": scan_trace_execution_context_value(
             prior_scan,
             "micro_auction_state",
@@ -555,7 +571,7 @@ fn validate_scan_output(value: &Value) -> Result<()> {
         ));
     }
 
-    validate_scan_output_v4_0_0(value)
+    validate_scan_output_v4_2_0(value)
 }
 
 fn validate_scan_model_response(value: &Value) -> Result<()> {
@@ -571,10 +587,10 @@ fn validate_scan_model_response(value: &Value) -> Result<()> {
         ));
     }
 
-    validate_scan_model_response_v4_0_0(value)
+    validate_scan_model_response_v4_2_0(value)
 }
 
-fn validate_scan_model_response_v4_0_0(value: &Value) -> Result<()> {
+fn validate_scan_model_response_v4_2_0(value: &Value) -> Result<()> {
     for legacy_path in ["/15m", "/4h", "/1d", "/cross_timeframe_map", "/scan_audit"] {
         reject_present(value, legacy_path)?;
     }
@@ -595,7 +611,7 @@ fn validate_scan_model_response_v4_0_0(value: &Value) -> Result<()> {
     expect_object(value, "/timeframes")?;
     reject_present(value, "/timeframes/15m")?;
     for tf in ["4h", "1d"] {
-        validate_scan_response_v4_0_0_timeframe(value, tf)?;
+        validate_scan_response_v4_2_0_timeframe(value, tf)?;
     }
     validate_execution_context_15m(value)?;
 
@@ -615,7 +631,7 @@ fn validate_scan_model_response_v4_0_0(value: &Value) -> Result<()> {
     Ok(())
 }
 
-fn validate_scan_output_v4_0_0(value: &Value) -> Result<()> {
+fn validate_scan_output_v4_2_0(value: &Value) -> Result<()> {
     for legacy_path in ["/15m", "/4h", "/1d", "/cross_timeframe_map", "/scan_audit"] {
         reject_present(value, legacy_path)?;
     }
@@ -636,7 +652,7 @@ fn validate_scan_output_v4_0_0(value: &Value) -> Result<()> {
     expect_object(value, "/timeframes")?;
     reject_present(value, "/timeframes/15m")?;
     for tf in ["4h", "1d"] {
-        validate_scan_output_v4_0_0_timeframe(value, tf)?;
+        validate_scan_output_v4_2_0_timeframe(value, tf)?;
     }
     validate_execution_context_15m(value)?;
 
@@ -707,18 +723,32 @@ fn validate_execution_context_15m(value: &Value) -> Result<()> {
     Ok(())
 }
 
-fn validate_scan_output_v4_0_0_timeframe(value: &Value, tf: &str) -> Result<()> {
+fn validate_scan_output_v4_2_0_timeframe(value: &Value, tf: &str) -> Result<()> {
     let base = format!("/timeframes/{tf}");
 
     validate_simple_zone(value, &format!("{base}/active_range"))?;
-    validate_ladder_with_max(value, &format!("{base}/support_ladder"), 6)?;
-    validate_ladder_with_max(value, &format!("{base}/resistance_ladder"), 6)?;
+    validate_ladder_with_max(value, &format!("{base}/support_ladder"), 3)?;
+    validate_ladder_with_max(value, &format!("{base}/resistance_ladder"), 3)?;
     let support_len = expect_array(value, &format!("{base}/support_ladder"))?.len();
     let resistance_len = expect_array(value, &format!("{base}/resistance_ladder"))?.len();
     ensure_max_items(
         support_len + resistance_len,
         &format!("{base}/support_ladder + {base}/resistance_ladder"),
-        6,
+        5,
+    )?;
+    validate_price_zone(value, &format!("{base}/thesis_floor"))?;
+    validate_price_zone(value, &format!("{base}/thesis_ceiling"))?;
+    validate_outer_boundary_against_ladder(
+        value,
+        &format!("{base}/support_ladder"),
+        &format!("{base}/thesis_floor"),
+        true,
+    )?;
+    validate_outer_boundary_against_ladder(
+        value,
+        &format!("{base}/resistance_ladder"),
+        &format!("{base}/thesis_ceiling"),
+        false,
     )?;
 
     reject_present(value, &format!("{base}/market_state"))?;
@@ -934,18 +964,32 @@ fn validate_scan_output_v4_0_0_timeframe(value: &Value, tf: &str) -> Result<()> 
     Ok(())
 }
 
-fn validate_scan_response_v4_0_0_timeframe(value: &Value, tf: &str) -> Result<()> {
+fn validate_scan_response_v4_2_0_timeframe(value: &Value, tf: &str) -> Result<()> {
     let base = format!("/timeframes/{tf}");
 
     validate_simple_zone(value, &format!("{base}/active_range"))?;
-    validate_ladder_with_max(value, &format!("{base}/support_ladder"), 6)?;
-    validate_ladder_with_max(value, &format!("{base}/resistance_ladder"), 6)?;
+    validate_ladder_with_max(value, &format!("{base}/support_ladder"), 3)?;
+    validate_ladder_with_max(value, &format!("{base}/resistance_ladder"), 3)?;
     let support_len = expect_array(value, &format!("{base}/support_ladder"))?.len();
     let resistance_len = expect_array(value, &format!("{base}/resistance_ladder"))?.len();
     ensure_max_items(
         support_len + resistance_len,
         &format!("{base}/support_ladder + {base}/resistance_ladder"),
-        6,
+        5,
+    )?;
+    validate_price_zone(value, &format!("{base}/thesis_floor"))?;
+    validate_price_zone(value, &format!("{base}/thesis_ceiling"))?;
+    validate_outer_boundary_against_ladder(
+        value,
+        &format!("{base}/support_ladder"),
+        &format!("{base}/thesis_floor"),
+        true,
+    )?;
+    validate_outer_boundary_against_ladder(
+        value,
+        &format!("{base}/resistance_ladder"),
+        &format!("{base}/thesis_ceiling"),
+        false,
     )?;
 
     reject_present(value, &format!("{base}/market_state"))?;
@@ -1329,6 +1373,55 @@ fn validate_price_zone(value: &Value, path: &str) -> Result<()> {
         }
         _ => Err(anyhow!("scan {} must be an object", path)),
     }
+}
+
+fn validate_outer_boundary_against_ladder(
+    value: &Value,
+    ladder_path: &str,
+    boundary_path: &str,
+    is_support_side: bool,
+) -> Result<()> {
+    let ladder = expect_array(value, ladder_path)?;
+    if ladder.is_empty() {
+        return Ok(());
+    }
+
+    let boundary_low = expect_number(value, &format!("{boundary_path}/low"))?;
+    let boundary_high = expect_number(value, &format!("{boundary_path}/high"))?;
+
+    if is_support_side {
+        let nearest_ladder_low = ladder
+            .iter()
+            .enumerate()
+            .map(|(idx, _)| expect_number(value, &format!("{ladder_path}/{idx}/low")))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .fold(f64::INFINITY, f64::min);
+        if boundary_high > nearest_ladder_low {
+            return Err(anyhow!(
+                "scan {} must sit outside {} on the support side",
+                boundary_path,
+                ladder_path
+            ));
+        }
+    } else {
+        let nearest_ladder_high = ladder
+            .iter()
+            .enumerate()
+            .map(|(idx, _)| expect_number(value, &format!("{ladder_path}/{idx}/high")))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .fold(f64::NEG_INFINITY, f64::max);
+        if boundary_low < nearest_ladder_high {
+            return Err(anyhow!(
+                "scan {} must sit outside {} on the resistance side",
+                boundary_path,
+                ladder_path
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 fn validate_ladder_with_max(value: &Value, path: &str, max: usize) -> Result<()> {
@@ -2430,7 +2523,7 @@ fn qwen_output_contract(
 ) -> String {
     if matches!(entry_stage, prompt::EntryPromptStage::Scan) {
         format!(
-            "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- No extra top-level keys.\n- Top-level keys must be `schema_version`, `meta`, `timeframes`, `execution_context_15m`, and `cross_timeframe_parse`.\n- `schema_version` must be `{}`.\n- `timeframes` must contain `4h` and `1d` only.\n- Each timeframe must include `active_range`, `support_ladder`, `resistance_ladder`, `state_parse`, `flow_override`, `participant_parse`, and `fragility_summary`.\n- `execution_context_15m` must include `micro_auction_state`, `nearest_executable_support`, `nearest_executable_resistance`, `entry_sweep_risk_15m`, `micro_invalidation_risk`, and `execution_note`.\n- `cross_timeframe_parse` must include `execution_alignment_15m`, `main_tension`, and `unresolved_factors`.\n",
+            "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- No extra top-level keys.\n- Top-level keys must be `schema_version`, `meta`, `timeframes`, `execution_context_15m`, and `cross_timeframe_parse`.\n- `schema_version` must be `{}`.\n- `timeframes` must contain `4h` and `1d` only.\n- Each timeframe must include `active_range`, `support_ladder`, `resistance_ladder`, `thesis_floor`, `thesis_ceiling`, `state_parse`, `flow_override`, `participant_parse`, and `fragility_summary`.\n- `support_ladder` and `resistance_ladder` together must contain at most 5 items.\n- `execution_context_15m` must include `micro_auction_state`, `nearest_executable_support`, `nearest_executable_resistance`, `entry_sweep_risk_15m`, `micro_invalidation_risk`, and `execution_note`.\n- `cross_timeframe_parse` must include `execution_alignment_15m`, `main_tension`, and `unresolved_factors`.\n",
             SCAN_RESPONSE_SCHEMA_VERSION
         )
     } else if pending_order_mode {
@@ -3931,7 +4024,7 @@ fn scan_v3_4_0_execution_context_15m_schema_openai() -> Value {
     })
 }
 
-fn scan_v4_0_0_ladder_zone_schema_openai() -> Value {
+fn scan_v4_2_0_ladder_zone_schema_openai() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
@@ -3960,7 +4053,7 @@ fn scan_v4_0_0_ladder_zone_schema_openai() -> Value {
     })
 }
 
-fn scan_v4_0_0_response_timeframe_schema_openai() -> Value {
+fn scan_v4_2_0_response_timeframe_schema_openai() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
@@ -3968,6 +4061,8 @@ fn scan_v4_0_0_response_timeframe_schema_openai() -> Value {
             "active_range",
             "support_ladder",
             "resistance_ladder",
+            "thesis_floor",
+            "thesis_ceiling",
             "state_parse",
             "flow_override",
             "participant_parse",
@@ -3985,14 +4080,16 @@ fn scan_v4_0_0_response_timeframe_schema_openai() -> Value {
             },
             "support_ladder": {
                 "type": "array",
-                "maxItems": 6,
-                "items": scan_v4_0_0_ladder_zone_schema_openai()
+                "maxItems": 3,
+                "items": scan_v4_2_0_ladder_zone_schema_openai()
             },
             "resistance_ladder": {
                 "type": "array",
-                "maxItems": 6,
-                "items": scan_v4_0_0_ladder_zone_schema_openai()
+                "maxItems": 3,
+                "items": scan_v4_2_0_ladder_zone_schema_openai()
             },
+            "thesis_floor": scan_v1_7_price_zone_schema_openai(),
+            "thesis_ceiling": scan_v1_7_price_zone_schema_openai(),
             "state_parse": scan_v3_3_0_response_state_parse_schema_openai(),
             "flow_override": scan_v3_3_0_flow_override_schema_openai(),
             "participant_parse": scan_v3_3_0_participant_parse_schema_openai(),
@@ -4001,7 +4098,7 @@ fn scan_v4_0_0_response_timeframe_schema_openai() -> Value {
     })
 }
 
-fn scan_v4_0_0_response_schema_openai() -> Value {
+fn scan_v4_2_0_response_schema_openai() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
@@ -4022,8 +4119,8 @@ fn scan_v4_0_0_response_schema_openai() -> Value {
                 "additionalProperties": false,
                 "required": ["4h", "1d"],
                 "properties": {
-                    "4h": scan_v4_0_0_response_timeframe_schema_openai(),
-                    "1d": scan_v4_0_0_response_timeframe_schema_openai()
+                    "4h": scan_v4_2_0_response_timeframe_schema_openai(),
+                    "1d": scan_v4_2_0_response_timeframe_schema_openai()
                 }
             },
             "execution_context_15m": scan_v3_4_0_execution_context_15m_schema_openai(),
@@ -4219,7 +4316,7 @@ fn scan_v3_4_0_execution_context_15m_schema_gemini() -> Value {
     })
 }
 
-fn scan_v4_0_0_ladder_zone_schema_gemini() -> Value {
+fn scan_v4_2_0_ladder_zone_schema_gemini() -> Value {
     json!({
         "type": "OBJECT",
         "properties": {
@@ -4247,7 +4344,7 @@ fn scan_v4_0_0_ladder_zone_schema_gemini() -> Value {
     })
 }
 
-fn scan_v4_0_0_response_timeframe_schema_gemini() -> Value {
+fn scan_v4_2_0_response_timeframe_schema_gemini() -> Value {
     json!({
         "type": "OBJECT",
         "properties": {
@@ -4261,14 +4358,16 @@ fn scan_v4_0_0_response_timeframe_schema_gemini() -> Value {
             },
             "support_ladder": {
                 "type": "ARRAY",
-                "maxItems": 6,
-                "items": scan_v4_0_0_ladder_zone_schema_gemini()
+                "maxItems": 3,
+                "items": scan_v4_2_0_ladder_zone_schema_gemini()
             },
             "resistance_ladder": {
                 "type": "ARRAY",
-                "maxItems": 6,
-                "items": scan_v4_0_0_ladder_zone_schema_gemini()
+                "maxItems": 3,
+                "items": scan_v4_2_0_ladder_zone_schema_gemini()
             },
+            "thesis_floor": scan_v1_7_price_zone_schema_gemini(),
+            "thesis_ceiling": scan_v1_7_price_zone_schema_gemini(),
             "state_parse": scan_v3_3_0_response_state_parse_schema_gemini(),
             "flow_override": scan_v3_3_0_flow_override_schema_gemini(),
             "participant_parse": scan_v3_3_0_participant_parse_schema_gemini(),
@@ -4278,6 +4377,8 @@ fn scan_v4_0_0_response_timeframe_schema_gemini() -> Value {
             "active_range",
             "support_ladder",
             "resistance_ladder",
+            "thesis_floor",
+            "thesis_ceiling",
             "state_parse",
             "flow_override",
             "participant_parse",
@@ -4286,7 +4387,7 @@ fn scan_v4_0_0_response_timeframe_schema_gemini() -> Value {
     })
 }
 
-fn scan_v4_0_0_response_schema_gemini() -> Value {
+fn scan_v4_2_0_response_schema_gemini() -> Value {
     json!({
         "type": "OBJECT",
         "properties": {
@@ -4302,8 +4403,8 @@ fn scan_v4_0_0_response_schema_gemini() -> Value {
             "timeframes": {
                 "type": "OBJECT",
                 "properties": {
-                    "4h": scan_v4_0_0_response_timeframe_schema_gemini(),
-                    "1d": scan_v4_0_0_response_timeframe_schema_gemini()
+                    "4h": scan_v4_2_0_response_timeframe_schema_gemini(),
+                    "1d": scan_v4_2_0_response_timeframe_schema_gemini()
                 },
                 "required": ["4h", "1d"]
             },
@@ -4330,7 +4431,7 @@ fn scan_v4_0_0_response_schema_gemini() -> Value {
 }
 
 fn ml_grok_entry_scan_schema() -> Value {
-    scan_v4_0_0_response_schema_openai()
+    scan_v4_2_0_response_schema_openai()
 }
 
 fn ml_grok_entry_schema() -> Value {
@@ -4364,7 +4465,7 @@ fn ml_grok_management_schema() -> Value {
 }
 
 fn ml_gemini_entry_scan_schema() -> Value {
-    scan_v4_0_0_response_schema_gemini()
+    scan_v4_2_0_response_schema_gemini()
 }
 
 fn ml_gemini_entry_schema() -> Value {
@@ -4405,7 +4506,7 @@ fn ml_gemini_management_schema() -> Value {
 }
 
 fn ml_qwen_entry_scan_schema() -> Value {
-    scan_v4_0_0_response_schema_openai()
+    scan_v4_2_0_response_schema_openai()
 }
 
 fn ml_qwen_entry_schema() -> Value {
@@ -4440,7 +4541,7 @@ fn ml_qwen_management_schema() -> Value {
 }
 
 fn ml_custom_llm_entry_scan_schema() -> Value {
-    scan_v4_0_0_response_schema_openai()
+    scan_v4_2_0_response_schema_openai()
 }
 
 fn ml_custom_llm_entry_schema() -> Value {
@@ -5277,7 +5378,7 @@ mod tests {
 
     fn sample_stage_1_scan() -> Value {
         json!({
-            "schema_version": "scan_v4_1_0",
+            "schema_version": "scan_v4_2_0",
             "meta": {
                 "symbol": "TESTUSDT",
                 "scan_ts_bucket": "2026-03-18T07:00:00+00:00"
@@ -5286,13 +5387,13 @@ mod tests {
                 "4h": {
                     "active_range": {"low": 1988.0, "high": 2035.0},
                     "support_ladder": [
-                        {"low": 1988.0, "high": 1996.0, "role": "value_edge", "reason": "4h defended support"},
-                        {"low": 1960.0, "high": 1960.0, "role": "swing_low", "reason": "daily invalidation swing low"}
+                        {"low": 1988.0, "high": 1996.0, "role": "value_edge", "reason": "4h defended support"}
                     ],
                     "resistance_ladder": [
-                        {"low": 2028.0, "high": 2035.0, "role": "reclaim_band", "reason": "4h upper supply and failed reclaim"},
-                        {"low": 2050.0, "high": 2050.0, "role": "swing_high", "reason": "daily outer ceiling"}
+                        {"low": 2028.0, "high": 2035.0, "role": "reclaim_band", "reason": "4h upper supply and failed reclaim"}
                     ],
+                    "thesis_floor": {"low": 1960.0, "high": 1960.0, "reason": "daily invalidation swing low"},
+                    "thesis_ceiling": {"low": 2050.0, "high": 2050.0, "reason": "daily outer ceiling"},
                     "state_parse": {
                         "value_read": {
                             "pvs": "accepted_above",
@@ -5354,13 +5455,13 @@ mod tests {
                 "1d": {
                     "active_range": {"low": 1960.0, "high": 2050.0},
                     "support_ladder": [
-                        {"low": 1960.0, "high": 1980.0, "role": "value_edge", "reason": "daily lower demand"},
-                        {"low": 1905.0, "high": 1905.0, "role": "swing_low", "reason": "outer daily invalidation"}
+                        {"low": 1960.0, "high": 1980.0, "role": "value_edge", "reason": "daily lower demand"}
                     ],
                     "resistance_ladder": [
-                        {"low": 2040.0, "high": 2050.0, "role": "rejection_band", "reason": "daily upper supply"},
-                        {"low": 2080.0, "high": 2080.0, "role": "swing_high", "reason": "outer daily objective"}
+                        {"low": 2040.0, "high": 2050.0, "role": "rejection_band", "reason": "daily upper supply"}
                     ],
+                    "thesis_floor": {"low": 1905.0, "high": 1905.0, "reason": "outer daily invalidation"},
+                    "thesis_ceiling": {"low": 2080.0, "high": 2080.0, "reason": "outer daily objective"},
                     "state_parse": {
                         "value_read": {
                             "pvs": "inside_value",
@@ -5483,7 +5584,7 @@ mod tests {
         let mut response = sample_stage_1_scan();
         *response
             .pointer_mut("/schema_version")
-            .expect("schema_version should exist") = json!("scan_v4_1_0_response");
+            .expect("schema_version should exist") = json!("scan_v4_2_0_response");
 
         for tf in ["4h", "1d"] {
             let flow_parse = response
@@ -6330,7 +6431,7 @@ mod tests {
                 schema
                     .pointer("/properties/schema_version/enum/0")
                     .and_then(|v| v.as_str()),
-                Some("scan_v4_1_0_response"),
+                Some("scan_v4_2_0_response"),
                 "schema_version should be reduced response for {prompt_template}"
             );
             assert_eq!(
@@ -6384,6 +6485,26 @@ mod tests {
             assert!(schema
                 .pointer("/properties/timeframes/properties/4h/properties/resistance_ladder")
                 .is_some());
+            assert!(schema
+                .pointer("/properties/timeframes/properties/4h/properties/thesis_floor")
+                .is_some());
+            assert!(schema
+                .pointer("/properties/timeframes/properties/4h/properties/thesis_ceiling")
+                .is_some());
+            assert_eq!(
+                schema
+                    .pointer(
+                        "/properties/timeframes/properties/4h/properties/support_ladder/maxItems"
+                    )
+                    .and_then(Value::as_u64),
+                Some(3)
+            );
+            assert_eq!(
+                schema
+                    .pointer("/properties/timeframes/properties/4h/properties/resistance_ladder/maxItems")
+                    .and_then(Value::as_u64),
+                Some(3)
+            );
             assert!(schema
                 .pointer("/properties/timeframes/properties/4h/properties/flow_override")
                 .is_some());
@@ -6446,16 +6567,16 @@ mod tests {
             );
             assert!(contract
                 .contains("`schema_version`, `meta`, `timeframes`, `execution_context_15m`, and `cross_timeframe_parse`"));
-            assert!(contract.contains("`scan_v4_1_0_response`"));
+            assert!(contract.contains("`scan_v4_2_0_response`"));
             assert!(contract.contains(
-                "`active_range`, `support_ladder`, `resistance_ladder`, `state_parse`, `flow_override`, `participant_parse`, and `fragility_summary`"
+                "`active_range`, `support_ladder`, `resistance_ladder`, `thesis_floor`, `thesis_ceiling`, `state_parse`, `flow_override`, `participant_parse`, and `fragility_summary`"
             ));
+            assert!(contract.contains("at most 5 items"));
             assert!(contract.contains(
                 "`micro_auction_state`, `nearest_executable_support`, `nearest_executable_resistance`, `entry_sweep_risk_15m`, `micro_invalidation_risk`, and `execution_note`"
             ));
-            assert!(contract.contains(
-                "`execution_alignment_15m`, `main_tension`, and `unresolved_factors`"
-            ));
+            assert!(contract
+                .contains("`execution_alignment_15m`, `main_tension`, and `unresolved_factors`"));
             assert!(!contract.contains("flow_map"));
             assert!(!contract.contains("cross_timeframe_map"));
             assert!(!contract.contains("scan_audit"));
@@ -6592,10 +6713,14 @@ mod tests {
                 .and_then(Value::as_str),
             Some("near_flat")
         );
+        assert!(event.get("scan_4h_thesis_floor").is_some());
+        assert!(event.get("scan_4h_thesis_ceiling").is_some());
+        assert!(event.get("scan_1d_thesis_floor").is_some());
+        assert!(event.get("scan_1d_thesis_ceiling").is_some());
     }
 
     #[test]
-    fn parse_entry_scan_output_accepts_scan_v4_0_0_response_and_merges_full_scan() {
+    fn parse_entry_scan_output_accepts_scan_v4_2_0_response_and_merges_full_scan() {
         let raw_text =
             serde_json::to_string(&sample_stage_1_scan_response()).expect("serialize scan");
         let prompt_input = sample_stage_1_scan_prompt_input();
@@ -6604,7 +6729,7 @@ mod tests {
 
         assert_eq!(
             parsed.get("schema_version").and_then(Value::as_str),
-            Some("scan_v4_1_0")
+            Some("scan_v4_2_0")
         );
         assert_eq!(
             parsed
@@ -6612,10 +6737,55 @@ mod tests {
                 .and_then(Value::as_str),
             Some("reentry")
         );
+        assert!(parsed.pointer("/timeframes/4h/thesis_floor").is_some());
+        assert!(parsed.pointer("/timeframes/4h/thesis_ceiling").is_some());
         assert!(parsed
             .pointer("/cross_timeframe_parse/main_tension")
             .and_then(Value::as_str)
             .is_some());
+    }
+
+    #[test]
+    fn parse_entry_scan_output_rejects_thesis_floor_inside_support_ladder() {
+        let mut response = sample_stage_1_scan_response();
+        *response
+            .pointer_mut("/timeframes/4h/thesis_floor")
+            .expect("4h thesis_floor should exist") = json!({
+            "low": 1992.0,
+            "high": 1994.0,
+            "reason": "incorrectly placed inside support ladder"
+        });
+
+        let raw_text = serde_json::to_string(&response).expect("serialize scan");
+        let prompt_input = sample_stage_1_scan_prompt_input();
+        let error = super::parse_entry_scan_output("custom_llm", &raw_text, &prompt_input)
+            .expect_err("inner thesis_floor should be rejected");
+
+        assert!(error.error.to_string().contains(
+            "/timeframes/4h/thesis_floor must sit outside /timeframes/4h/support_ladder"
+        ));
+    }
+
+    #[test]
+    fn parse_entry_scan_output_allows_empty_ladder_with_outer_boundary() {
+        let mut response = sample_stage_1_scan_response();
+        *response
+            .pointer_mut("/timeframes/1d/resistance_ladder")
+            .expect("1d resistance_ladder should exist") = json!([]);
+
+        let raw_text = serde_json::to_string(&response).expect("serialize scan");
+        let prompt_input = sample_stage_1_scan_prompt_input();
+        let parsed = super::parse_entry_scan_output("custom_llm", &raw_text, &prompt_input)
+            .expect("empty resistance ladder with thesis_ceiling should still parse");
+
+        assert_eq!(
+            parsed
+                .pointer("/timeframes/1d/resistance_ladder")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(0)
+        );
+        assert!(parsed.pointer("/timeframes/1d/thesis_ceiling").is_some());
     }
 
     #[test]
@@ -6683,7 +6853,7 @@ mod tests {
         assert!(error
             .error
             .to_string()
-            .contains("scan response schema_version must be scan_v4_1_0_response"));
+            .contains("scan response schema_version must be scan_v4_2_0_response"));
     }
 
     #[test]
@@ -6716,7 +6886,7 @@ mod tests {
 
         assert!(error
             .to_string()
-            .contains("scan schema_version must be scan_v4_1_0"));
+            .contains("scan schema_version must be scan_v4_2_0"));
     }
 
     #[test]

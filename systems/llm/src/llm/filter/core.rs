@@ -128,11 +128,27 @@ fn build_finalize_focus(prior_scan: &Value) -> Value {
         "scan_4h_sponsorship_state": scan_timeframe_state(prior_scan, "4h", "sponsorship_state"),
         "scan_4h_value_location": scan_timeframe_state(prior_scan, "4h", "value_location"),
         "scan_4h_range_state": scan_timeframe_state(prior_scan, "4h", "range_state"),
+        "scan_4h_thesis_floor": prior_scan
+            .pointer("/timeframes/4h/thesis_floor")
+            .cloned()
+            .unwrap_or(Value::Null),
+        "scan_4h_thesis_ceiling": prior_scan
+            .pointer("/timeframes/4h/thesis_ceiling")
+            .cloned()
+            .unwrap_or(Value::Null),
         "scan_1d_control_side": scan_timeframe_state(prior_scan, "1d", "control_side"),
         "scan_1d_control_clarity": scan_timeframe_state(prior_scan, "1d", "control_clarity"),
         "scan_1d_sponsorship_state": scan_timeframe_state(prior_scan, "1d", "sponsorship_state"),
         "scan_1d_value_location": scan_timeframe_state(prior_scan, "1d", "value_location"),
         "scan_1d_range_state": scan_timeframe_state(prior_scan, "1d", "range_state"),
+        "scan_1d_thesis_floor": prior_scan
+            .pointer("/timeframes/1d/thesis_floor")
+            .cloned()
+            .unwrap_or(Value::Null),
+        "scan_1d_thesis_ceiling": prior_scan
+            .pointer("/timeframes/1d/thesis_ceiling")
+            .cloned()
+            .unwrap_or(Value::Null),
         "execution_15m_micro_auction_state": prior_scan
             .pointer("/execution_context_15m/micro_auction_state")
             .and_then(Value::as_str)
@@ -2030,7 +2046,7 @@ mod tests {
             .with_timezone(&Utc);
         let input = sample_input_at(indicators, false, false, ts_bucket);
         let prior_scan = json!({
-            "schema_version": "scan_v4_0_0",
+            "schema_version": "scan_v4_2_0",
             "stage_1_scan_ts_bucket": "2026-03-18T07:00:00+00:00"
         });
 
@@ -2076,6 +2092,10 @@ mod tests {
                 .and_then(Value::as_str),
             Some("balanced")
         );
+        assert!(value.pointer("/finalize_focus/scan_4h_thesis_floor").is_some());
+        assert!(value.pointer("/finalize_focus/scan_4h_thesis_ceiling").is_some());
+        assert!(value.pointer("/finalize_focus/scan_1d_thesis_floor").is_some());
+        assert!(value.pointer("/finalize_focus/scan_1d_thesis_ceiling").is_some());
     }
 
     #[test]
@@ -2087,7 +2107,7 @@ mod tests {
             .with_timezone(&Utc);
         let input = sample_input_at(indicators, true, false, ts_bucket);
         let prior_scan = json!({
-            "schema_version": "scan_v4_0_0",
+            "schema_version": "scan_v4_2_0",
             "stage_1_scan_ts_bucket": "2026-03-18T07:00:00+00:00"
         });
 
