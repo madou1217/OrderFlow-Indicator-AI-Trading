@@ -446,7 +446,42 @@ v1.1 要把“直接跳过”升级为“先 recheck，再决定是否执行”�
 - `live_refs.orderbook_ofi_norm_fut > 0`
 - `live_refs.orderbook_exec_confirm_fut == false` 且 `live_refs.orderbook_spot_confirm == false`
 
-### 6.4 为什么 v1.1 先不用第二轮 LLM recheck
+### 6.4 veto 后的行为
+
+v1.1 中的 `veto` 含义不是：
+
+- 永久放弃这笔交易
+- 推翻 `Stage 1` 的结构判断
+
+而是：
+
+- **本次执行尝试降级为 `SKIP`**
+- **不下单 / 不改单**
+- **记录结构化 veto reason，等待下一次正常 Stage 2 cycle 重新判断**
+
+也就是说，`veto` 只阻止“当前这一次已经过了若干分钟、且最新数据与原决策冲突”的执行动作，
+它本质上是 execution guard，不是 thesis engine。
+
+建议 runtime 侧记录：
+
+- `recheck_result = "confirm" | "veto" | "not_needed"`
+- `recheck_veto_rules_hit = ["rule_a", "rule_c"]`
+- `recheck_veto_snapshot`
+
+其中 `recheck_veto_snapshot` 至少包含：
+
+- `cvd_partial_windows.15m.regime`
+- `since_stage1_increment.delta_fut_sum`
+- `live_refs.orderbook_ofi_norm_fut`
+- `live_refs.orderbook_exec_confirm_fut`
+- `live_refs.orderbook_spot_confirm`
+
+这样 rollout 时可以回溯：
+
+- 哪些 veto 是正确挡掉了追晚 / 逆势执行
+- 哪些 veto 只是短噪音导致的误杀
+
+### 6.5 为什么 v1.1 先不用第二轮 LLM recheck
 
 因为 v1.1 的目标是：
 
@@ -626,6 +661,9 @@ acceleration, or invalidation inside the unfinished 15m / 4h / 1d bar?
 - `rtf_since_stage1_delta_fut_sum`
 - `rtf_recheck_triggered`
 - `rtf_recheck_vetoed`
+- `rtf_recheck_result`
+- `rtf_recheck_veto_rules_hit`
+- `rtf_recheck_veto_snapshot`
 
 ### 10.3 重点看什么
 
