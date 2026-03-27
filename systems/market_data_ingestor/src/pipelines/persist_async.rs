@@ -12,7 +12,7 @@ use crate::sinks::{
 };
 use crate::state::checkpoints;
 use anyhow::{anyhow, Result};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use futures_util::stream::{self, StreamExt};
 use serde_json::{json, Map as JsonMap, Value};
 use std::collections::hash_map::DefaultHasher;
@@ -30,6 +30,8 @@ use tracing::{error, info, warn};
 const PERSIST_SLOW_WARN_MS: u128 = 5_000;
 const PERSIST_BATCH_SLOW_WARN_MS: u128 = 5_000;
 const PERSIST_NON_TRADE_ORDERBOOK_WORKER_SHARDS: usize = 4;
+const PERSIST_NON_TRADE_FUNDING_MARK_WORKER_SHARDS: usize = 2;
+const PERSIST_NON_TRADE_OPTIONS_WORKER_SHARDS: usize = 2;
 const PERSIST_NON_TRADE_OTHER_WORKER_SHARDS: usize = 4;
 const PERSIST_NON_TRADE_BATCH_SIZE: usize = 2_000;
 const PERSIST_NON_TRADE_COALESCE_MS: u64 = 80;
@@ -56,7 +58,8 @@ const PERSIST_TRADE_CHANNEL_CAPACITY: usize = 2_000;
 // Orderbook-heavy non-trade events can burst very hard on bookTicker/depth streams.
 const PERSIST_NON_TRADE_CHANNEL_CAPACITY: usize = 20_000;
 const PERSIST_PENDING_WARN_STEP: usize = 20_000;
-const PERSIST_EVENT_LAG_WARN_SECS: i64 = 5;
+const PERSIST_EVENT_LAG_WARN_SECS: i64 = 10;
+const PERSIST_OPTION_MARK_EVENT_LAG_WARN_SECS: i64 = 30;
 const CHECKPOINT_FLUSH_INTERVAL_MS: u64 = 10_000;
 const CHECKPOINT_FLUSH_SLOW_WARN_MS: u128 = 5_000;
 const CHECKPOINT_PENDING_WARN_STEP: usize = 10_000;
@@ -837,7 +840,25 @@ impl TradeSecondChunk {
 enum PersistLane {
     Trade,
     NonTradeOrderbook,
+    NonTradeFundingMark,
+    NonTradeOptions,
     NonTradeOther,
+}
+
+#[derive(Debug, Clone, Hash, Eq, PartialEq)]
+struct OptionLagSummaryKey {
+    symbol: String,
+    routing_key: String,
+    stream_name: String,
+    bucket_ts: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+struct OptionLagSummary {
+    key: OptionLagSummaryKey,
+    contracts_in_bucket: usize,
+    max_queue_wait_ms: u128,
+    event_lag_secs: i64,
 }
 
 pub fn configure_parquet_sink(sink: Arc<ParquetSink>) {
@@ -1111,6 +1132,8 @@ pub struct AsyncPersistQueue {
     trade_prebatch_senders: Arc<Vec<mpsc::UnboundedSender<PendingTradeEvent>>>,
     non_trade_orderbook_senders: Arc<Vec<mpsc::Sender<PersistJob>>>,
     non_trade_orderbook_prebatch_senders: Arc<Vec<mpsc::UnboundedSender<PendingOrderbookEvent>>>,
+    non_trade_funding_mark_senders: Arc<Vec<mpsc::Sender<PersistJob>>>,
+    non_trade_options_senders: Arc<Vec<mpsc::Sender<PersistJob>>>,
     non_trade_other_senders: Arc<Vec<mpsc::Sender<PersistJob>>>,
     pending: Arc<AtomicUsize>,
     trade_pending: Arc<AtomicUsize>,
@@ -1317,6 +1340,80 @@ impl AsyncPersistQueue {
             non_trade_orderbook_senders.push(worker_tx);
         }
 
+        let mut non_trade_funding_mark_senders =
+            Vec::with_capacity(PERSIST_NON_TRADE_FUNDING_MARK_WORKER_SHARDS);
+        for shard_id in 0..PERSIST_NON_TRADE_FUNDING_MARK_WORKER_SHARDS {
+            let (tx, rx) = mpsc::channel::<PersistJob>(PERSIST_NON_TRADE_CHANNEL_CAPACITY);
+            let pending_total_cloned = Arc::clone(&pending);
+            let lane_pending_cloned = Arc::clone(&non_trade_pending);
+            let db_writer_cloned = Arc::clone(&db_writer);
+            let publisher_cloned = Arc::clone(&publisher);
+            let outbox_writer_cloned = Arc::clone(&outbox_writer);
+            let ops_writer_cloned = Arc::clone(&ops_writer);
+            let metrics_cloned = Arc::clone(&metrics);
+            let checkpoint_queue_cloned = checkpoint_queue.clone();
+
+            tokio::spawn(async move {
+                run_worker(
+                    market,
+                    "non_trade_funding_mark",
+                    shard_id,
+                    rx,
+                    pending_total_cloned,
+                    lane_pending_cloned,
+                    PERSIST_NON_TRADE_BATCH_SIZE,
+                    PERSIST_NON_TRADE_COALESCE_MS,
+                    true,
+                    db_writer_cloned,
+                    publisher_cloned,
+                    outbox_writer_cloned,
+                    ops_writer_cloned,
+                    checkpoint_queue_cloned,
+                    metrics_cloned,
+                )
+                .await;
+            });
+
+            non_trade_funding_mark_senders.push(tx);
+        }
+
+        let mut non_trade_options_senders =
+            Vec::with_capacity(PERSIST_NON_TRADE_OPTIONS_WORKER_SHARDS);
+        for shard_id in 0..PERSIST_NON_TRADE_OPTIONS_WORKER_SHARDS {
+            let (tx, rx) = mpsc::channel::<PersistJob>(PERSIST_NON_TRADE_CHANNEL_CAPACITY);
+            let pending_total_cloned = Arc::clone(&pending);
+            let lane_pending_cloned = Arc::clone(&non_trade_pending);
+            let db_writer_cloned = Arc::clone(&db_writer);
+            let publisher_cloned = Arc::clone(&publisher);
+            let outbox_writer_cloned = Arc::clone(&outbox_writer);
+            let ops_writer_cloned = Arc::clone(&ops_writer);
+            let metrics_cloned = Arc::clone(&metrics);
+            let checkpoint_queue_cloned = checkpoint_queue.clone();
+
+            tokio::spawn(async move {
+                run_worker(
+                    market,
+                    "non_trade_options",
+                    shard_id,
+                    rx,
+                    pending_total_cloned,
+                    lane_pending_cloned,
+                    PERSIST_NON_TRADE_BATCH_SIZE,
+                    PERSIST_NON_TRADE_COALESCE_MS,
+                    true,
+                    db_writer_cloned,
+                    publisher_cloned,
+                    outbox_writer_cloned,
+                    ops_writer_cloned,
+                    checkpoint_queue_cloned,
+                    metrics_cloned,
+                )
+                .await;
+            });
+
+            non_trade_options_senders.push(tx);
+        }
+
         let mut non_trade_other_senders = Vec::with_capacity(PERSIST_NON_TRADE_OTHER_WORKER_SHARDS);
         for shard_id in 0..PERSIST_NON_TRADE_OTHER_WORKER_SHARDS {
             let (tx, rx) = mpsc::channel::<PersistJob>(PERSIST_NON_TRADE_CHANNEL_CAPACITY);
@@ -1359,6 +1456,8 @@ impl AsyncPersistQueue {
             trade_batch_size = PERSIST_TRADE_BATCH_SIZE,
             trade_coalesce_ms = PERSIST_TRADE_COALESCE_MS,
             non_trade_orderbook_shards = PERSIST_NON_TRADE_ORDERBOOK_WORKER_SHARDS,
+            non_trade_funding_mark_shards = PERSIST_NON_TRADE_FUNDING_MARK_WORKER_SHARDS,
+            non_trade_options_shards = PERSIST_NON_TRADE_OPTIONS_WORKER_SHARDS,
             non_trade_other_shards = PERSIST_NON_TRADE_OTHER_WORKER_SHARDS,
             non_trade_batch_size = PERSIST_NON_TRADE_BATCH_SIZE,
             non_trade_coalesce_ms = PERSIST_NON_TRADE_COALESCE_MS,
@@ -1375,6 +1474,8 @@ impl AsyncPersistQueue {
             trade_prebatch_senders: Arc::new(trade_prebatch_senders),
             non_trade_orderbook_senders: Arc::new(non_trade_orderbook_senders),
             non_trade_orderbook_prebatch_senders: Arc::new(non_trade_orderbook_prebatch_senders),
+            non_trade_funding_mark_senders: Arc::new(non_trade_funding_mark_senders),
+            non_trade_options_senders: Arc::new(non_trade_options_senders),
             non_trade_other_senders: Arc::new(non_trade_other_senders),
             pending,
             trade_pending,
@@ -1400,7 +1501,10 @@ impl AsyncPersistQueue {
 
         let lane_pending = match lane {
             PersistLane::Trade => &self.trade_pending,
-            PersistLane::NonTradeOrderbook | PersistLane::NonTradeOther => &self.non_trade_pending,
+            PersistLane::NonTradeOrderbook
+            | PersistLane::NonTradeFundingMark
+            | PersistLane::NonTradeOptions
+            | PersistLane::NonTradeOther => &self.non_trade_pending,
         };
         lane_pending.fetch_add(1, Ordering::Relaxed);
 
@@ -1461,6 +1565,19 @@ impl AsyncPersistQueue {
                 &self.non_trade_orderbook_senders,
                 "non_trade_orderbook_agg",
                 shard_for_non_trade_orderbook_event(&event, self.non_trade_orderbook_senders.len()),
+            ),
+            PersistLane::NonTradeFundingMark => (
+                &self.non_trade_funding_mark_senders,
+                "non_trade_funding_mark",
+                shard_for_non_trade_funding_mark_event(
+                    &event,
+                    self.non_trade_funding_mark_senders.len(),
+                ),
+            ),
+            PersistLane::NonTradeOptions => (
+                &self.non_trade_options_senders,
+                "non_trade_options",
+                shard_for_non_trade_options_event(&event, self.non_trade_options_senders.len()),
             ),
             PersistLane::NonTradeOther => (
                 &self.non_trade_other_senders,
@@ -1719,9 +1836,7 @@ async fn run_worker(
                     }
                 }
 
-                for job in &batch {
-                    emit_lag_log(market, shard_id, job);
-                }
+                emit_lag_logs_for_batch(market, lane, shard_id, &batch);
 
                 if let Err(err) = persist_events_batch(
                     &batch,
@@ -2329,6 +2444,12 @@ fn classify_persist_lane(event: &NormalizedMdEvent) -> PersistLane {
     if is_orderbook_lane_msg(event.msg_type.as_str()) {
         return PersistLane::NonTradeOrderbook;
     }
+    if is_funding_mark_critical_msg(event.msg_type.as_str()) {
+        return PersistLane::NonTradeFundingMark;
+    }
+    if is_options_surface_msg(event.msg_type.as_str()) {
+        return PersistLane::NonTradeOptions;
+    }
     PersistLane::NonTradeOther
 }
 
@@ -2348,6 +2469,14 @@ fn is_raw_orderbook_msg(msg_type: &str) -> bool {
     matches!(msg_type, "md.depth" | "md.bbo" | "md.orderbook_snapshot_l2")
 }
 
+fn is_funding_mark_critical_msg(msg_type: &str) -> bool {
+    matches!(msg_type, "md.mark_price" | "md.funding_rate")
+}
+
+fn is_options_surface_msg(msg_type: &str) -> bool {
+    msg_type == "md.option_mark_greeks_5m"
+}
+
 fn shard_for_non_trade_orderbook_event(event: &NormalizedMdEvent, shard_count: usize) -> usize {
     if shard_count <= 1 {
         return 0;
@@ -2360,12 +2489,35 @@ fn shard_for_non_trade_orderbook_event(event: &NormalizedMdEvent, shard_count: u
     (hasher.finish() as usize) % shard_count
 }
 
+fn shard_for_non_trade_funding_mark_event(
+    event: &NormalizedMdEvent,
+    shard_count: usize,
+) -> usize {
+    if shard_count <= 1 {
+        return 0;
+    }
+    let mut hasher = DefaultHasher::new();
+    event.market.hash(&mut hasher);
+    event.symbol.hash(&mut hasher);
+    (hasher.finish() as usize) % shard_count
+}
+
+fn shard_for_non_trade_options_event(event: &NormalizedMdEvent, shard_count: usize) -> usize {
+    if shard_count <= 1 {
+        return 0;
+    }
+    let mut hasher = DefaultHasher::new();
+    event.market.hash(&mut hasher);
+    event.symbol.hash(&mut hasher);
+    (hasher.finish() as usize) % shard_count
+}
+
 fn shard_for_non_trade_other_event(event: &NormalizedMdEvent, shard_count: usize) -> usize {
     if shard_count <= 1 {
         return 0;
     }
-    // Keep non-orderbook non-trade data for the same market+symbol on one shard so
-    // funding/liquidation minute aggregation remains complete.
+    // Keep remaining non-orderbook non-trade data for the same market+symbol on
+    // one shard so minute aggregation stays deterministic.
     let mut hasher = DefaultHasher::new();
     event.market.hash(&mut hasher);
     event.symbol.hash(&mut hasher);
@@ -2383,6 +2535,22 @@ fn shard_for_trade_event(event: &NormalizedMdEvent, shard_count: usize) -> usize
     (hasher.finish() as usize) % shard_count
 }
 
+fn emit_lag_logs_for_batch(
+    market: &'static str,
+    lane: &'static str,
+    shard_id: usize,
+    jobs: &[PersistJob],
+) {
+    if lane == "non_trade_options" {
+        emit_option_bucket_lag_logs(market, shard_id, jobs);
+        return;
+    }
+
+    for job in jobs {
+        emit_lag_log(market, shard_id, job);
+    }
+}
+
 fn emit_lag_log(market: &'static str, shard_id: usize, job: &PersistJob) {
     let Some(oldest_event) = job.events.iter().min_by_key(|e| e.event_ts) else {
         return;
@@ -2394,7 +2562,8 @@ fn emit_lag_log(market: &'static str, shard_id: usize, job: &PersistJob) {
     }
     let queue_wait_ms = job.enqueued_at.elapsed().as_millis();
     let event_lag_secs = (Utc::now() - oldest_event.event_ts).num_seconds();
-    if event_lag_secs > PERSIST_EVENT_LAG_WARN_SECS {
+    let threshold_secs = event_lag_warn_threshold_secs(oldest_event.msg_type.as_str());
+    if event_lag_secs > threshold_secs {
         if oldest_event.msg_type == "md.trade" {
             error!(
                 market = market,
@@ -2402,6 +2571,7 @@ fn emit_lag_log(market: &'static str, shard_id: usize, job: &PersistJob) {
                 msg_type = %oldest_event.msg_type,
                 routing_key = %oldest_event.routing_key,
                 stream_name = %oldest_event.stream_name,
+                threshold_secs = threshold_secs,
                 event_lag_secs = event_lag_secs,
                 queue_wait_ms = queue_wait_ms,
                 "trade persist lag over 10s"
@@ -2413,11 +2583,78 @@ fn emit_lag_log(market: &'static str, shard_id: usize, job: &PersistJob) {
                 msg_type = %oldest_event.msg_type,
                 routing_key = %oldest_event.routing_key,
                 stream_name = %oldest_event.stream_name,
+                threshold_secs = threshold_secs,
                 event_lag_secs = event_lag_secs,
                 queue_wait_ms = queue_wait_ms,
                 "persist lag over 10s"
             );
         }
+    }
+}
+
+fn event_lag_warn_threshold_secs(msg_type: &str) -> i64 {
+    if msg_type == "md.option_mark_greeks_5m" {
+        return PERSIST_OPTION_MARK_EVENT_LAG_WARN_SECS;
+    }
+    PERSIST_EVENT_LAG_WARN_SECS
+}
+
+fn build_option_lag_summaries(now: DateTime<Utc>, jobs: &[PersistJob]) -> Vec<OptionLagSummary> {
+    let mut grouped: HashMap<OptionLagSummaryKey, (usize, Instant)> = HashMap::new();
+
+    for job in jobs {
+        for event in &job.events {
+            if event.backfill_in_progress || event.msg_type != "md.option_mark_greeks_5m" {
+                continue;
+            }
+            let key = OptionLagSummaryKey {
+                symbol: event.symbol.clone(),
+                routing_key: event.routing_key.clone(),
+                stream_name: event.stream_name.clone(),
+                bucket_ts: event.event_ts,
+            };
+            let entry = grouped.entry(key).or_insert((0, job.enqueued_at));
+            entry.0 = entry.0.saturating_add(1);
+            if job.enqueued_at < entry.1 {
+                entry.1 = job.enqueued_at;
+            }
+        }
+    }
+
+    let mut out = grouped
+        .into_iter()
+        .map(|(key, (contracts_in_bucket, oldest_enqueued_at))| OptionLagSummary {
+            event_lag_secs: (now - key.bucket_ts).num_seconds(),
+            max_queue_wait_ms: oldest_enqueued_at.elapsed().as_millis(),
+            contracts_in_bucket,
+            key,
+        })
+        .collect::<Vec<_>>();
+
+    out.sort_by_key(|summary| (summary.key.bucket_ts, summary.key.symbol.clone()));
+    out
+}
+
+fn emit_option_bucket_lag_logs(market: &'static str, shard_id: usize, jobs: &[PersistJob]) {
+    let threshold_secs = PERSIST_OPTION_MARK_EVENT_LAG_WARN_SECS;
+    for summary in build_option_lag_summaries(Utc::now(), jobs) {
+        if summary.event_lag_secs <= threshold_secs {
+            continue;
+        }
+        warn!(
+            market = market,
+            shard = shard_id,
+            msg_type = "md.option_mark_greeks_5m",
+            symbol = %summary.key.symbol,
+            routing_key = %summary.key.routing_key,
+            stream_name = %summary.key.stream_name,
+            bucket_ts = %summary.key.bucket_ts,
+            contracts_in_bucket = summary.contracts_in_bucket,
+            threshold_secs = threshold_secs,
+            event_lag_secs = summary.event_lag_secs,
+            queue_wait_ms = summary.max_queue_wait_ms,
+            "option mark bucket persist lag over 30s"
+        );
     }
 }
 
@@ -3268,13 +3505,14 @@ fn is_hot_path_md_event(event: &NormalizedMdEvent) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_trade_raw_event, collect_db_passthrough_events,
-        collect_publish_passthrough_events, TradeSecondChunk, TradeVpinState,
+        apply_trade_raw_event, build_option_lag_summaries, classify_persist_lane,
+        collect_db_passthrough_events, collect_publish_passthrough_events, PersistJob,
+        PersistLane, TradeSecondChunk, TradeVpinState,
     };
     use crate::normalize::NormalizedMdEvent;
     use chrono::{TimeZone, Utc};
     use serde_json::json;
-    use tokio::time::Instant;
+    use tokio::time::{Duration, Instant};
 
     #[test]
     fn trade_second_chunk_emits_vpin_snapshot() {
@@ -3404,5 +3642,89 @@ mod tests {
         let publish_passthrough = collect_publish_passthrough_events([&options]);
         assert_eq!(publish_passthrough.len(), 1);
         assert_eq!(publish_passthrough[0].msg_type, "md.option_mark_greeks_5m");
+    }
+
+    #[test]
+    fn classify_persist_lane_splits_funding_mark_and_options() {
+        let ts = Utc.with_ymd_and_hms(2026, 3, 27, 5, 0, 0).single().unwrap();
+        let mark = NormalizedMdEvent {
+            msg_type: "md.mark_price".to_string(),
+            market: "futures".to_string(),
+            symbol: "ETHUSDT".to_string(),
+            source_kind: "rest".to_string(),
+            backfill_in_progress: false,
+            routing_key: "md.futures.mark_price.ethusdt".to_string(),
+            stream_name: "fapi/v1/premiumIndex".to_string(),
+            event_ts: ts,
+            data: json!({}),
+        };
+        let options = NormalizedMdEvent {
+            msg_type: "md.option_mark_greeks_5m".to_string(),
+            market: "futures".to_string(),
+            symbol: "ETHUSDT".to_string(),
+            source_kind: "rest".to_string(),
+            backfill_in_progress: false,
+            routing_key: "md.futures.option_mark_greeks.5m.ethusdt".to_string(),
+            stream_name: "eapi/v1/mark".to_string(),
+            event_ts: ts,
+            data: json!({}),
+        };
+        let ratio = NormalizedMdEvent {
+            msg_type: "md.long_short_ratio_5m".to_string(),
+            market: "futures".to_string(),
+            symbol: "ETHUSDT".to_string(),
+            source_kind: "rest".to_string(),
+            backfill_in_progress: false,
+            routing_key: "md.futures.long_short_ratio.global_account.5m.ethusdt".to_string(),
+            stream_name: "futures/data/globalLongShortAccountRatio".to_string(),
+            event_ts: ts,
+            data: json!({}),
+        };
+
+        assert_eq!(
+            classify_persist_lane(&mark),
+            PersistLane::NonTradeFundingMark
+        );
+        assert_eq!(classify_persist_lane(&options), PersistLane::NonTradeOptions);
+        assert_eq!(classify_persist_lane(&ratio), PersistLane::NonTradeOther);
+    }
+
+    #[test]
+    fn option_lag_summary_groups_one_bucket_once() {
+        let bucket_ts = Utc.with_ymd_and_hms(2026, 3, 27, 5, 0, 0).single().unwrap();
+        let now = bucket_ts + chrono::Duration::seconds(40);
+        let event_a = NormalizedMdEvent {
+            msg_type: "md.option_mark_greeks_5m".to_string(),
+            market: "futures".to_string(),
+            symbol: "ETHUSDT".to_string(),
+            source_kind: "rest".to_string(),
+            backfill_in_progress: false,
+            routing_key: "md.futures.option_mark_greeks.5m.ethusdt".to_string(),
+            stream_name: "eapi/v1/mark".to_string(),
+            event_ts: bucket_ts,
+            data: json!({}),
+        };
+        let event_b = event_a.clone();
+
+        let jobs = vec![
+            PersistJob {
+                events: vec![event_a],
+                source_count: 1,
+                checkpoint_updates: vec![],
+                enqueued_at: Instant::now() - Duration::from_millis(90),
+            },
+            PersistJob {
+                events: vec![event_b],
+                source_count: 1,
+                checkpoint_updates: vec![],
+                enqueued_at: Instant::now() - Duration::from_millis(50),
+            },
+        ];
+
+        let summaries = build_option_lag_summaries(now, &jobs);
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].contracts_in_bucket, 2);
+        assert_eq!(summaries[0].event_lag_secs, 40);
+        assert!(summaries[0].max_queue_wait_ms >= 50);
     }
 }
