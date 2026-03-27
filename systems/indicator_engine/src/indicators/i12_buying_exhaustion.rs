@@ -621,6 +621,8 @@ mod tests {
             global_account_ratio_5m: Vec::new(),
             top_account_ratio_5m: Vec::new(),
             top_position_ratio_5m: Vec::new(),
+            latest_options_surface_bucket: None,
+            options_surface_5m: Vec::new(),
             whale_threshold_usdt: 300_000.0,
             kline_history_bars_1m: 1024,
             kline_history_bars_15m: 120,

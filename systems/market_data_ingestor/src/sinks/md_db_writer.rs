@@ -42,6 +42,7 @@ impl MdDbWriter {
             "md.open_interest_current" => self.insert_open_interest_current_1m(event).await,
             "md.open_interest_hist_5m" => self.insert_open_interest_hist_5m(event).await,
             "md.long_short_ratio_5m" => self.insert_long_short_ratio_5m(event).await,
+            "md.option_mark_greeks_5m" => self.insert_option_mark_greeks_5m(event).await,
             other => Err(anyhow!("unsupported msg_type for md writer: {}", other)),
         }
     }
@@ -255,6 +256,76 @@ impl MdDbWriter {
         .execute(&self.pool)
         .await
         .context("insert md.long_short_ratio_5m")?;
+        Ok(())
+    }
+
+    async fn insert_option_mark_greeks_5m(&self, event: &NormalizedMdEvent) -> Result<()> {
+        let d = &event.data;
+        sqlx::query(
+            r#"
+            INSERT INTO md.option_mark_greeks_5m (
+                ts_event, ts_recv, venue, ts_bucket, market, symbol, option_symbol,
+                underlying_asset, source_kind, stream_name, expiry_ts, strike_price,
+                contract_side, unit, index_price, mark_price, bid_iv, ask_iv, mark_iv,
+                delta, gamma, vega, theta, risk_free_interest, payload_json
+            )
+            VALUES (
+                $1, $2, 'binance', $3, $4::cfg.market_type, $5, $6,
+                $7, $8::cfg.source_type, $9, $10, $11,
+                $12, $13, $14, $15, $16, $17, $18,
+                $19, $20, $21, $22, $23, $24
+            )
+            ON CONFLICT (market, symbol, option_symbol, ts_bucket)
+            DO UPDATE SET
+                ts_event = EXCLUDED.ts_event,
+                ts_recv = EXCLUDED.ts_recv,
+                underlying_asset = EXCLUDED.underlying_asset,
+                source_kind = EXCLUDED.source_kind,
+                stream_name = EXCLUDED.stream_name,
+                expiry_ts = EXCLUDED.expiry_ts,
+                strike_price = EXCLUDED.strike_price,
+                contract_side = EXCLUDED.contract_side,
+                unit = EXCLUDED.unit,
+                index_price = EXCLUDED.index_price,
+                mark_price = EXCLUDED.mark_price,
+                bid_iv = EXCLUDED.bid_iv,
+                ask_iv = EXCLUDED.ask_iv,
+                mark_iv = EXCLUDED.mark_iv,
+                delta = EXCLUDED.delta,
+                gamma = EXCLUDED.gamma,
+                vega = EXCLUDED.vega,
+                theta = EXCLUDED.theta,
+                risk_free_interest = EXCLUDED.risk_free_interest,
+                payload_json = EXCLUDED.payload_json
+            "#,
+        )
+        .bind(event.event_ts)
+        .bind(parse_ts(d, "ts_recv")?)
+        .bind(parse_ts(d, "ts_bucket")?)
+        .bind(event.market.as_str())
+        .bind(event.symbol.as_str())
+        .bind(required_str(d, "option_symbol")?)
+        .bind(required_str(d, "underlying_asset")?)
+        .bind(event.source_kind.as_str())
+        .bind(required_str(d, "stream_name")?)
+        .bind(parse_ts(d, "expiry_ts")?)
+        .bind(required_f64(d, "strike_price")?)
+        .bind(required_str(d, "contract_side")?)
+        .bind(optional_f64(d, "unit"))
+        .bind(optional_f64(d, "index_price"))
+        .bind(optional_f64(d, "mark_price"))
+        .bind(optional_f64(d, "bid_iv"))
+        .bind(optional_f64(d, "ask_iv"))
+        .bind(optional_f64(d, "mark_iv"))
+        .bind(optional_f64(d, "delta"))
+        .bind(optional_f64(d, "gamma"))
+        .bind(optional_f64(d, "vega"))
+        .bind(optional_f64(d, "theta"))
+        .bind(optional_f64(d, "risk_free_interest"))
+        .bind(payload_json(d))
+        .execute(&self.pool)
+        .await
+        .context("insert md.option_mark_greeks_5m")?;
         Ok(())
     }
 

@@ -6,6 +6,9 @@ use crate::exchange::binance::rest::klines::BinanceKlineRow;
 use crate::exchange::binance::rest::long_short_ratio::BinanceLongShortRatioRecord;
 use crate::exchange::binance::rest::open_interest::BinanceOpenInterest;
 use crate::exchange::binance::rest::open_interest_hist::BinanceOpenInterestHistRecord;
+use crate::exchange::binance::rest::options_exchange_info::BinanceOptionsExchangeInfo;
+use crate::exchange::binance::rest::options_index::BinanceOptionIndexPrice;
+use crate::exchange::binance::rest::options_mark::BinanceOptionMarkRecord;
 use crate::exchange::binance::rest::premium_index::BinancePremiumIndex;
 use anyhow::{anyhow, Context, Result};
 use reqwest::{header::CONTENT_TYPE, Client, StatusCode};
@@ -449,6 +452,52 @@ impl BinanceRestClient {
             limit,
         )
         .await
+    }
+
+    pub async fn fetch_options_exchange_info(&self) -> Result<BinanceOptionsExchangeInfo> {
+        let url = "https://eapi.binance.com/eapi/v1/exchangeInfo";
+        self.send_with_retry("request options exchange info", url, || self.client.get(url))
+            .await
+            .context("request options exchange info")?
+            .error_for_status()
+            .context("options exchange info bad status")?
+            .json::<BinanceOptionsExchangeInfo>()
+            .await
+            .context("decode options exchange info")
+    }
+
+    pub async fn fetch_options_index_price(
+        &self,
+        underlying: &str,
+    ) -> Result<BinanceOptionIndexPrice> {
+        let url = "https://eapi.binance.com/eapi/v1/index";
+        self.send_with_retry("request options index price", url, || {
+            self.client.get(url).query(&[("underlying", underlying)])
+        })
+        .await
+        .context("request options index price")?
+        .error_for_status()
+        .context("options index price bad status")?
+        .json::<BinanceOptionIndexPrice>()
+        .await
+        .context("decode options index price")
+    }
+
+    pub async fn fetch_options_mark(
+        &self,
+        underlying: &str,
+    ) -> Result<Vec<BinanceOptionMarkRecord>> {
+        let url = "https://eapi.binance.com/eapi/v1/mark";
+        self.send_with_retry("request options mark", url, || {
+            self.client.get(url).query(&[("underlying", underlying)])
+        })
+        .await
+        .context("request options mark")?
+        .error_for_status()
+        .context("options mark bad status")?
+        .json::<Vec<BinanceOptionMarkRecord>>()
+        .await
+        .context("decode options mark")
     }
 
     async fn send_with_retry<F>(

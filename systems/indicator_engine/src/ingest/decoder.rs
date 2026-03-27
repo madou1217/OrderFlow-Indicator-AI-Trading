@@ -51,6 +51,7 @@ pub enum MdData {
     OpenInterestCurrent(OpenInterestCurrentEvent),
     OpenInterestHist5m(OpenInterestHist5mEvent),
     LongShortRatio5m(LongShortRatio5mEvent),
+    OptionMarkGreeks5m(OptionMarkGreeks5mEvent),
 }
 
 #[derive(Debug, Clone)]
@@ -324,6 +325,27 @@ pub struct LongShortRatio5mEvent {
     pub short_account_ratio: Option<f64>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct OptionMarkGreeks5mEvent {
+    pub ts_bucket: DateTime<Utc>,
+    pub option_symbol: String,
+    pub underlying_asset: String,
+    pub expiry_ts: DateTime<Utc>,
+    pub strike_price: f64,
+    pub contract_side: String,
+    pub unit: Option<f64>,
+    pub index_price: Option<f64>,
+    pub mark_price: Option<f64>,
+    pub bid_iv: Option<f64>,
+    pub ask_iv: Option<f64>,
+    pub mark_iv: Option<f64>,
+    pub delta: Option<f64>,
+    pub gamma: Option<f64>,
+    pub vega: Option<f64>,
+    pub theta: Option<f64>,
+    pub risk_free_interest: Option<f64>,
+}
+
 pub fn decode_contract_body(payload: &[u8]) -> Result<EngineEvent> {
     let root: Value = serde_json::from_slice(payload).context("decode mq body json")?;
 
@@ -364,6 +386,9 @@ pub fn decode_contract_body(payload: &[u8]) -> Result<EngineEvent> {
             MdData::OpenInterestHist5m(parse_open_interest_hist_5m(&data_obj)?)
         }
         "md.long_short_ratio_5m" => MdData::LongShortRatio5m(parse_long_short_ratio_5m(&data_obj)?),
+        "md.option_mark_greeks_5m" => {
+            MdData::OptionMarkGreeks5m(parse_option_mark_greeks_5m(&data_obj)?)
+        }
         other => return Err(anyhow!("unsupported msg_type: {}", other)),
     };
 
@@ -645,6 +670,28 @@ fn parse_long_short_ratio_5m(data: &Value) -> Result<LongShortRatio5mEvent> {
         long_short_ratio: required_f64(data, "long_short_ratio")?,
         long_account_ratio: optional_f64(data, "long_account_ratio")?,
         short_account_ratio: optional_f64(data, "short_account_ratio")?,
+    })
+}
+
+fn parse_option_mark_greeks_5m(data: &Value) -> Result<OptionMarkGreeks5mEvent> {
+    Ok(OptionMarkGreeks5mEvent {
+        ts_bucket: parse_ts(required_str(data, "ts_bucket")?, "ts_bucket")?,
+        option_symbol: required_str(data, "option_symbol")?,
+        underlying_asset: required_str(data, "underlying_asset")?,
+        expiry_ts: parse_ts(required_str(data, "expiry_ts")?, "expiry_ts")?,
+        strike_price: required_f64(data, "strike_price")?,
+        contract_side: required_str(data, "contract_side")?,
+        unit: optional_f64(data, "unit")?,
+        index_price: optional_f64(data, "index_price")?,
+        mark_price: optional_f64(data, "mark_price")?,
+        bid_iv: optional_f64(data, "bid_iv")?,
+        ask_iv: optional_f64(data, "ask_iv")?,
+        mark_iv: optional_f64(data, "mark_iv")?,
+        delta: optional_f64(data, "delta")?,
+        gamma: optional_f64(data, "gamma")?,
+        vega: optional_f64(data, "vega")?,
+        theta: optional_f64(data, "theta")?,
+        risk_free_interest: optional_f64(data, "risk_free_interest")?,
     })
 }
 

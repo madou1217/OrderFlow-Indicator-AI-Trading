@@ -6,6 +6,7 @@ pub mod kline_normalizer;
 pub mod long_short_ratio_normalizer;
 pub mod mark_price_normalizer;
 pub mod open_interest_normalizer;
+pub mod options_surface_normalizer;
 pub mod trade_normalizer;
 
 use anyhow::{anyhow, Context, Result};

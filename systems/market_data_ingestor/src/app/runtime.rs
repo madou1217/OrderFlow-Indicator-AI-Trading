@@ -156,6 +156,20 @@ pub async fn run(ctx: AppContext) -> Result<()> {
         ),
     );
 
+    spawn_critical_task(
+        &mut tasks,
+        "options surface loop",
+        backfill_scheduler::run_options_surface_loop(
+            ctx.clone(),
+            rest_client.clone(),
+            db_writer.clone(),
+            ops_writer.clone(),
+            publisher.clone(),
+            outbox_writer.clone(),
+            metrics.clone(),
+        ),
+    );
+
     info!("market_data_ingestor started; press Ctrl+C to stop");
     let mut shutdown_signal = std::pin::pin!(wait_for_shutdown_signal());
     loop {

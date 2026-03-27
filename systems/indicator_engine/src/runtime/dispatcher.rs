@@ -90,7 +90,11 @@ impl Dispatcher {
                 | "high_volume_pulse"
                 | "ema_trend_regime"
                 | "fvg" => flow_indicators.push(indicator),
-                "liquidation_density" | "funding_rate" | "open_interest" | "long_short_ratios" => {
+                "liquidation_density"
+                | "funding_rate"
+                | "open_interest"
+                | "long_short_ratios"
+                | "options_surface" => {
                     if matches!(indicator.code(), "open_interest" | "long_short_ratios") {
                         oi_ratio_patch_indicators.push(indicator.clone());
                     }

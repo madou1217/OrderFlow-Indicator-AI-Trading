@@ -101,6 +101,8 @@ pub struct IndicatorContext {
     pub global_account_ratio_5m: Vec<LongShortRatioPoint>,
     pub top_account_ratio_5m: Vec<LongShortRatioPoint>,
     pub top_position_ratio_5m: Vec<LongShortRatioPoint>,
+    pub latest_options_surface_bucket: Option<DateTime<Utc>>,
+    pub options_surface_5m: Vec<OptionsSurfacePoint>,
     pub whale_threshold_usdt: f64,
     pub kline_history_bars_1m: usize,
     pub kline_history_bars_15m: usize,
@@ -211,6 +213,42 @@ pub struct LongShortRatioPoint {
     pub short_account_ratio: Option<f64>,
 }
 
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct OptionMarkGreeksPoint {
+    pub ts_bucket: DateTime<Utc>,
+    pub option_symbol: String,
+    pub underlying_asset: String,
+    pub expiry_ts: DateTime<Utc>,
+    pub strike_price: f64,
+    pub contract_side: String,
+    pub unit: Option<f64>,
+    pub index_price: Option<f64>,
+    pub mark_price: Option<f64>,
+    pub bid_iv: Option<f64>,
+    pub ask_iv: Option<f64>,
+    pub mark_iv: Option<f64>,
+    pub delta: Option<f64>,
+    pub gamma: Option<f64>,
+    pub vega: Option<f64>,
+    pub theta: Option<f64>,
+    pub risk_free_interest: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct OptionsSurfacePoint {
+    pub ts_bucket: DateTime<Utc>,
+    pub front_expiry_ts: Option<DateTime<Utc>>,
+    pub second_expiry_ts: Option<DateTime<Utc>>,
+    pub atm_strike_front: Option<f64>,
+    pub atm_iv_front: Option<f64>,
+    pub atm_iv_second: Option<f64>,
+    pub atm_iv_30d_proxy: Option<f64>,
+    pub rr_25d_front: Option<f64>,
+    pub rr_25d_second: Option<f64>,
+    pub skew_state: String,
+    pub term_structure_state: String,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct KlineHistorySupplement {
     pub futures_4h_db: Vec<KlineHistoryBar>,
@@ -223,6 +261,8 @@ pub struct KlineHistorySupplement {
     pub global_account_ratio_5m: Vec<LongShortRatioPoint>,
     pub top_account_ratio_5m: Vec<LongShortRatioPoint>,
     pub top_position_ratio_5m: Vec<LongShortRatioPoint>,
+    pub latest_options_surface_bucket: Option<DateTime<Utc>>,
+    pub options_surface_5m: Vec<OptionsSurfacePoint>,
 }
 
 impl IndicatorContext {
@@ -254,6 +294,8 @@ impl IndicatorContext {
             global_account_ratio_5m: bundle.global_account_ratio_5m.clone(),
             top_account_ratio_5m: bundle.top_account_ratio_5m.clone(),
             top_position_ratio_5m: bundle.top_position_ratio_5m.clone(),
+            latest_options_surface_bucket: bundle.latest_options_surface_bucket,
+            options_surface_5m: bundle.options_surface_5m.clone(),
             whale_threshold_usdt: options.whale_threshold_usdt,
             kline_history_bars_1m: options.kline_history_bars_1m,
             kline_history_bars_15m: options.kline_history_bars_15m,

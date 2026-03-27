@@ -490,6 +490,8 @@ fn build_pvs_context(
         global_account_ratio_5m: Vec::new(),
         top_account_ratio_5m: Vec::new(),
         top_position_ratio_5m: Vec::new(),
+        latest_options_surface_bucket: None,
+        options_surface_5m: Vec::new(),
         whale_threshold_usdt: options.whale_threshold_usdt,
         kline_history_bars_1m: options.kline_history_bars_1m,
         kline_history_bars_15m: options.kline_history_bars_15m,

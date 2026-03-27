@@ -7,5 +7,8 @@ pub mod klines;
 pub mod long_short_ratio;
 pub mod open_interest;
 pub mod open_interest_hist;
+pub mod options_exchange_info;
+pub mod options_index;
+pub mod options_mark;
 pub mod premium_index;
 pub mod rate_limit;

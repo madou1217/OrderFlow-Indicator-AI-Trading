@@ -1,9 +1,11 @@
 use crate::app::bootstrap::AppContext;
 use crate::exchange::binance::rest::client::BinanceRestClient;
 use crate::exchange::binance::rest::long_short_ratio::BinanceLongShortRatioRecord;
+use crate::exchange::binance::rest::options_exchange_info::BinanceOptionSymbolInfo;
 use crate::exchange::binance::rest::open_interest_hist::BinanceOpenInterestHistRecord;
 use crate::normalize::{funding_rate_normalizer, mark_price_normalizer, NormalizedMdEvent};
 use crate::normalize::{long_short_ratio_normalizer, open_interest_normalizer};
+use crate::normalize::options_surface_normalizer;
 use crate::observability::metrics::AppMetrics;
 use crate::pipelines::persist_async;
 use crate::sinks::{
@@ -11,7 +13,7 @@ use crate::sinks::{
     outbox_writer::OutboxWriter,
 };
 use crate::state::checkpoints;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::{DateTime, Duration as ChronoDuration, Timelike, Utc};
 use serde_json::json;
 use sqlx::Row;
@@ -30,6 +32,15 @@ const OI_RATIO_LIVE_READY_GRACE_SECS: i64 = 20;
 const OI_RATIO_TOTAL_RETRY_BUDGET_SECS: i64 = 300;
 const OI_RATIO_BACKFILL_DAYS: i64 = 30;
 const OI_RATIO_FETCH_LIMIT: u16 = 500;
+const OPTIONS_SURFACE_POLL_INTERVAL_SECS: u64 = 15;
+const OPTIONS_SURFACE_LIVE_READY_GRACE_SECS: i64 = 20;
+const OPTIONS_EXCHANGE_INFO_REFRESH_SECS: i64 = 3600;
+
+#[derive(Debug, Clone)]
+struct OptionsUniverseCache {
+    refreshed_at: DateTime<Utc>,
+    contracts: Vec<BinanceOptionSymbolInfo>,
+}
 
 pub async fn run_funding_rate_backfill_loop(
     ctx: Arc<AppContext>,
@@ -238,6 +249,77 @@ pub async fn run_open_interest_ratio_loop(
     }
 }
 
+pub async fn run_options_surface_loop(
+    ctx: Arc<AppContext>,
+    rest_client: Arc<BinanceRestClient>,
+    db_writer: Arc<MdDbWriter>,
+    ops_writer: Arc<OpsDbWriter>,
+    publisher: Arc<MqPublisher>,
+    outbox_writer: Arc<OutboxWriter>,
+    metrics: Arc<AppMetrics>,
+) -> Result<()> {
+    let symbol = ctx.config.market_data.symbol.to_ascii_uppercase();
+    let mut last_bucket = load_latest_option_mark_greeks_bucket(&ctx.md_db_pool, &symbol)
+        .await
+        .unwrap_or(None);
+    let mut universe: Option<OptionsUniverseCache> = None;
+    let mut ticker = interval(Duration::from_secs(OPTIONS_SURFACE_POLL_INTERVAL_SECS));
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+    info!(
+        symbol = symbol,
+        poll_interval_secs = OPTIONS_SURFACE_POLL_INTERVAL_SECS,
+        live_ready_grace_secs = OPTIONS_SURFACE_LIVE_READY_GRACE_SECS,
+        exchange_info_refresh_secs = OPTIONS_EXCHANGE_INFO_REFRESH_SECS,
+        "options surface scheduler started"
+    );
+
+    loop {
+        ticker.tick().await;
+        let target_bucket = floor_to_5m(Utc::now() - ChronoDuration::seconds(OPTIONS_SURFACE_LIVE_READY_GRACE_SECS));
+        if last_bucket == Some(target_bucket) {
+            continue;
+        }
+
+        if let Some(prev) = last_bucket {
+            let expected_next = prev + ChronoDuration::minutes(5);
+            if target_bucket > expected_next {
+                warn!(
+                    symbol = symbol,
+                    previous_bucket = %prev,
+                    target_bucket = %target_bucket,
+                    skipped_buckets = ((target_bucket - prev).num_minutes() / 5).saturating_sub(1),
+                    "options surface loop cannot reconstruct missed historical buckets from live-only endpoint; skipping gap to latest ready bucket"
+                );
+            }
+        }
+
+        if let Err(err) = handle_options_surface_live_bucket(
+            &rest_client,
+            &db_writer,
+            &ops_writer,
+            &publisher,
+            &outbox_writer,
+            &metrics,
+            &symbol,
+            target_bucket,
+            &mut universe,
+        )
+        .await
+        {
+            warn!(
+                error = %err,
+                symbol = symbol,
+                target_bucket = %target_bucket,
+                "options surface live bucket fetch failed"
+            );
+            continue;
+        }
+
+        last_bucket = Some(target_bucket);
+    }
+}
+
 async fn handle_funding_rate(
     rest_client: &Arc<BinanceRestClient>,
     db_writer: &Arc<MdDbWriter>,
@@ -316,6 +398,102 @@ async fn handle_funding_rate(
     }
 
     *last_funding_time = Some(record.funding_time);
+}
+
+async fn handle_options_surface_live_bucket(
+    rest_client: &Arc<BinanceRestClient>,
+    db_writer: &Arc<MdDbWriter>,
+    ops_writer: &Arc<OpsDbWriter>,
+    publisher: &Arc<MqPublisher>,
+    outbox_writer: &Arc<OutboxWriter>,
+    metrics: &Arc<AppMetrics>,
+    symbol: &str,
+    ts_bucket: DateTime<Utc>,
+    universe: &mut Option<OptionsUniverseCache>,
+) -> Result<()> {
+    let contracts = refresh_options_universe_if_needed(rest_client, symbol, universe).await?;
+    if contracts.is_empty() {
+        warn!(symbol = symbol, "options surface universe is empty for symbol");
+        return Ok(());
+    }
+
+    let index = rest_client.fetch_options_index_price(symbol).await?;
+    let index_price = index.index_price.parse::<f64>().with_context(|| {
+        format!("parse options index price {} for {}", index.index_price, symbol)
+    })?;
+    let marks = rest_client.fetch_options_mark(symbol).await?;
+    let mark_map = marks
+        .into_iter()
+        .map(|row| (row.symbol.clone(), row))
+        .collect::<BTreeMap<_, _>>();
+
+    let mut persisted = 0usize;
+    for contract in contracts {
+        let Some(mark) = mark_map.get(&contract.symbol) else {
+            continue;
+        };
+        let event = options_surface_normalizer::normalize_mark_greeks_5m_rest(
+            symbol,
+            ts_bucket,
+            contract,
+            Some(index_price),
+            mark,
+        )?;
+        persist_scheduler_event(
+            &event,
+            db_writer,
+            publisher,
+            outbox_writer,
+            ops_writer,
+            metrics,
+        )
+        .await?;
+        persisted += 1;
+    }
+
+    info!(
+        symbol = symbol,
+        ts_bucket = %ts_bucket,
+        contract_count = contracts.len(),
+        persisted_count = persisted,
+        "options surface live bucket persisted"
+    );
+    Ok(())
+}
+
+async fn refresh_options_universe_if_needed<'a>(
+    rest_client: &Arc<BinanceRestClient>,
+    symbol: &str,
+    cache: &'a mut Option<OptionsUniverseCache>,
+) -> Result<&'a [BinanceOptionSymbolInfo]> {
+    let now = Utc::now();
+    let needs_refresh = cache
+        .as_ref()
+        .map(|cached| (now - cached.refreshed_at).num_seconds() >= OPTIONS_EXCHANGE_INFO_REFRESH_SECS)
+        .unwrap_or(true);
+    if needs_refresh {
+        let exchange_info = rest_client.fetch_options_exchange_info().await?;
+        let contracts = exchange_info
+            .option_symbols
+            .into_iter()
+            .filter(|contract| {
+                contract.underlying.eq_ignore_ascii_case(symbol)
+                    && contract
+                        .status
+                        .as_deref()
+                        .map(|status| status.eq_ignore_ascii_case("trading"))
+                        .unwrap_or(true)
+            })
+            .collect::<Vec<_>>();
+        *cache = Some(OptionsUniverseCache {
+            refreshed_at: now,
+            contracts,
+        });
+    }
+    Ok(cache
+        .as_ref()
+        .map(|cached| cached.contracts.as_slice())
+        .unwrap_or(&[]))
 }
 
 async fn handle_premium_index(
@@ -978,6 +1156,24 @@ async fn load_latest_open_interest_current_ts(
         .map(|value| value as i64))
 }
 
+async fn load_latest_option_mark_greeks_bucket(
+    pool: &sqlx::PgPool,
+    symbol: &str,
+) -> Result<Option<DateTime<Utc>>> {
+    let row = sqlx::query(
+        r#"
+        SELECT MAX(ts_bucket) AS ts_bucket
+        FROM md.option_mark_greeks_5m
+        WHERE market = 'futures'::cfg.market_type
+          AND symbol = $1
+        "#,
+    )
+    .bind(symbol)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.try_get::<Option<DateTime<Utc>>, _>("ts_bucket")?)
+}
+
 async fn load_latest_common_oi_ratio_bucket(
     pool: &sqlx::PgPool,
     symbol: &str,
@@ -1053,7 +1249,10 @@ async fn persist_scheduler_event(
 
     if matches!(
         event.msg_type.as_str(),
-        "md.open_interest_current" | "md.open_interest_hist_5m" | "md.long_short_ratio_5m"
+        "md.open_interest_current"
+            | "md.open_interest_hist_5m"
+            | "md.long_short_ratio_5m"
+            | "md.option_mark_greeks_5m"
     ) {
         persist_async::persist_event(
             event,

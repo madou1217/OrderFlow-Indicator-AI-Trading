@@ -1,6 +1,7 @@
 use crate::indicators::context::{zscore, IndicatorContext};
 use crate::indicators::i25_open_interest::build_open_interest_view;
 use crate::indicators::i26_long_short_ratios::build_long_short_ratio_view;
+use crate::indicators::i27_options_surface::build_options_surface_view;
 use crate::ingest::decoder::MarketKind;
 use crate::runtime::state_store::{MinuteHistory, WhaleStats};
 use anyhow::{Context, Result};
@@ -117,6 +118,7 @@ impl FeatureWriter {
 
         self.insert_open_interest_feature_windows(ctx).await?;
         self.insert_long_short_ratio_feature_windows(ctx).await?;
+        self.insert_options_surface_feature_windows(ctx).await?;
 
         self.insert_orderbook_feature(ctx).await?;
         self.insert_funding_changes(ctx).await?;
@@ -836,6 +838,86 @@ impl FeatureWriter {
             .execute(&self.pool)
             .await
             .with_context(|| format!("insert long_short_ratio_feature {}", metrics.window_label))?;
+        }
+
+        Ok(())
+    }
+
+    async fn insert_options_surface_feature_windows(&self, ctx: &IndicatorContext) -> Result<()> {
+        let view = build_options_surface_view(ctx);
+        let Some(as_of_ts) = view.as_of_ts else {
+            return Ok(());
+        };
+
+        for metrics in &view.by_window {
+            if !metrics.is_ready {
+                continue;
+            }
+            let bar_interval = interval_text(metrics.window_minutes);
+            sqlx::query(
+                r#"
+                INSERT INTO feat.options_surface_feature (
+                    ts_bucket, bar_interval, symbol,
+                    front_expiry_ts, second_expiry_ts, atm_strike_front,
+                    atm_iv_front, atm_iv_second, atm_iv_30d_proxy, atm_iv_regime,
+                    rr_25d_front, rr_25d_second,
+                    atm_iv_front_change, rr_25d_front_change,
+                    skew_state, term_structure_state,
+                    calc_version, extra_json
+                )
+                VALUES (
+                    $1, $2::interval, $3,
+                    $4, $5, $6,
+                    $7, $8, $9, $10,
+                    $11, $12,
+                    $13, $14,
+                    $15, $16,
+                    'indicator_engine.v1', $17
+                )
+                ON CONFLICT (venue, symbol, bar_interval, ts_bucket)
+                DO UPDATE SET
+                    front_expiry_ts = EXCLUDED.front_expiry_ts,
+                    second_expiry_ts = EXCLUDED.second_expiry_ts,
+                    atm_strike_front = EXCLUDED.atm_strike_front,
+                    atm_iv_front = EXCLUDED.atm_iv_front,
+                    atm_iv_second = EXCLUDED.atm_iv_second,
+                    atm_iv_30d_proxy = EXCLUDED.atm_iv_30d_proxy,
+                    atm_iv_regime = EXCLUDED.atm_iv_regime,
+                    rr_25d_front = EXCLUDED.rr_25d_front,
+                    rr_25d_second = EXCLUDED.rr_25d_second,
+                    atm_iv_front_change = EXCLUDED.atm_iv_front_change,
+                    rr_25d_front_change = EXCLUDED.rr_25d_front_change,
+                    skew_state = EXCLUDED.skew_state,
+                    term_structure_state = EXCLUDED.term_structure_state,
+                    calc_version = EXCLUDED.calc_version,
+                    extra_json = EXCLUDED.extra_json
+                "#,
+            )
+            .bind(as_of_ts)
+            .bind(bar_interval)
+            .bind(&ctx.symbol)
+            .bind(metrics.front_expiry_ts)
+            .bind(metrics.second_expiry_ts)
+            .bind(metrics.atm_strike_front)
+            .bind(metrics.atm_iv_front)
+            .bind(metrics.atm_iv_second)
+            .bind(metrics.atm_iv_30d_proxy)
+            .bind(&metrics.atm_iv_regime)
+            .bind(metrics.rr_25d_front)
+            .bind(metrics.rr_25d_second)
+            .bind(metrics.atm_iv_front_change)
+            .bind(metrics.rr_25d_front_change)
+            .bind(&metrics.skew_state)
+            .bind(&metrics.term_structure_state)
+            .bind(json!({
+                "window_code": metrics.window_label,
+                "window_minutes": metrics.window_minutes,
+                "latest_effective_ts": as_of_ts.to_rfc3339(),
+                "source_minute_ts": ctx.ts_bucket.to_rfc3339(),
+            }))
+            .execute(&self.pool)
+            .await
+            .with_context(|| format!("insert options_surface_feature {}", metrics.window_label))?;
         }
 
         Ok(())

@@ -1088,7 +1088,7 @@ async fn shutdown_drain_and_persist(
     Ok(())
 }
 
-const INDICATOR_COVERAGE_ORDER: [(&str, &str); 26] = [
+const INDICATOR_COVERAGE_ORDER: [(&str, &str); 27] = [
     ("i01", "price_volume_structure"),
     ("i02", "footprint"),
     ("i03", "divergence"),
@@ -1115,6 +1115,7 @@ const INDICATOR_COVERAGE_ORDER: [(&str, &str); 26] = [
     ("i24", "fvg"),
     ("i25", "open_interest"),
     ("i26", "long_short_ratios"),
+    ("i27", "options_surface"),
 ];
 
 fn indicator_coverage(snapshots: &[IndicatorSnapshotRow]) -> (Vec<String>, Vec<String>) {
@@ -1991,6 +1992,7 @@ fn logical_event_bucket_ts(event: &EngineEvent) -> DateTime<Utc> {
         MdData::AggFundingMark1m(v) => v.ts_bucket,
         MdData::OpenInterestHist5m(v) => v.ts_bucket,
         MdData::LongShortRatio5m(v) => v.ts_bucket,
+        MdData::OptionMarkGreeks5m(v) => v.ts_bucket,
         MdData::OpenInterestCurrent(v) => floor_minute(v.ts_effective),
         _ => floor_minute(event.event_ts),
     }
@@ -3531,6 +3533,50 @@ fn build_backfill_data_json(row: &PgRow, src: &str) -> Result<Value> {
             "long_account_ratio": row.get::<Option<f64>, _>("lsr_long_account_ratio"),
             "short_account_ratio": row.get::<Option<f64>, _>("lsr_short_account_ratio"),
         })),
+        "option_mark_greeks_5m" => Ok(json!({
+            "ts_effective": require_backfill_field(
+                src,
+                "opt_ts_bucket",
+                row.get::<Option<DateTime<Utc>>, _>("opt_ts_bucket"),
+            )?,
+            "ts_bucket": row.get::<Option<DateTime<Utc>>, _>("opt_ts_bucket"),
+            "option_symbol": require_backfill_field(
+                src,
+                "opt_option_symbol",
+                row.get::<Option<String>, _>("opt_option_symbol"),
+            )?,
+            "underlying_asset": require_backfill_field(
+                src,
+                "opt_underlying_asset",
+                row.get::<Option<String>, _>("opt_underlying_asset"),
+            )?,
+            "expiry_ts": require_backfill_field(
+                src,
+                "opt_expiry_ts",
+                row.get::<Option<DateTime<Utc>>, _>("opt_expiry_ts"),
+            )?,
+            "strike_price": require_backfill_field(
+                src,
+                "opt_strike_price",
+                row.get::<Option<f64>, _>("opt_strike_price"),
+            )?,
+            "contract_side": require_backfill_field(
+                src,
+                "opt_contract_side",
+                row.get::<Option<String>, _>("opt_contract_side"),
+            )?,
+            "unit": row.get::<Option<f64>, _>("opt_unit"),
+            "index_price": row.get::<Option<f64>, _>("opt_index_price"),
+            "mark_price": row.get::<Option<f64>, _>("opt_mark_price"),
+            "bid_iv": row.get::<Option<f64>, _>("opt_bid_iv"),
+            "ask_iv": row.get::<Option<f64>, _>("opt_ask_iv"),
+            "mark_iv": row.get::<Option<f64>, _>("opt_mark_iv"),
+            "delta": row.get::<Option<f64>, _>("opt_delta"),
+            "gamma": row.get::<Option<f64>, _>("opt_gamma"),
+            "vega": row.get::<Option<f64>, _>("opt_vega"),
+            "theta": row.get::<Option<f64>, _>("opt_theta"),
+            "risk_free_interest": row.get::<Option<f64>, _>("opt_risk_free_interest"),
+        })),
         _ => anyhow::bail!("unsupported startup backfill source: {src}"),
     }
 }
@@ -3561,6 +3607,7 @@ async fn fetch_backfill_window(
             oi_current_rows,
             oi_hist_rows,
             long_short_ratio_rows,
+            option_mark_rows,
         ) = tokio::try_join!(
             fetch_backfill_source_rows(
                 pool,
@@ -3625,6 +3672,15 @@ async fn fetch_backfill_window(
                 &symbol_upper,
                 "futures",
             ),
+            fetch_backfill_source_rows(
+                pool,
+                OPTION_MARK_GREEKS_5M_BACKFILL_WINDOW_SQL,
+                "option_mark_greeks_5m",
+                from_ts,
+                to_ts,
+                &symbol_upper,
+                "futures",
+            ),
         )?;
         rows.extend(trade_rows);
         rows.extend(orderbook_rows);
@@ -3633,6 +3689,7 @@ async fn fetch_backfill_window(
         rows.extend(oi_current_rows);
         rows.extend(oi_hist_rows);
         rows.extend(long_short_ratio_rows);
+        rows.extend(option_mark_rows);
     }
 
     if include_spot {
@@ -3911,6 +3968,38 @@ const LONG_SHORT_RATIO_5M_BACKFILL_WINDOW_SQL: &str = r#"
       AND market = $4::cfg.market_type
       AND ratio_type IN ('global_account', 'top_account', 'top_position')
     ORDER BY ts_event ASC, market ASC, symbol ASC, ratio_type ASC
+"#;
+
+const OPTION_MARK_GREEKS_5M_BACKFILL_WINDOW_SQL: &str = r#"
+    SELECT
+        ts_event AS event_ts,
+        'md.option_mark_greeks_5m'::text AS msg_type,
+        'futures'::text AS market,
+        symbol,
+        format('md.futures.option_mark_greeks.5m.%s', lower(symbol)) AS routing_key,
+        ts_bucket AS opt_ts_bucket,
+        option_symbol AS opt_option_symbol,
+        underlying_asset AS opt_underlying_asset,
+        expiry_ts AS opt_expiry_ts,
+        strike_price AS opt_strike_price,
+        contract_side AS opt_contract_side,
+        unit AS opt_unit,
+        index_price AS opt_index_price,
+        mark_price AS opt_mark_price,
+        bid_iv AS opt_bid_iv,
+        ask_iv AS opt_ask_iv,
+        mark_iv AS opt_mark_iv,
+        delta AS opt_delta,
+        gamma AS opt_gamma,
+        vega AS opt_vega,
+        theta AS opt_theta,
+        risk_free_interest AS opt_risk_free_interest
+    FROM md.option_mark_greeks_5m
+    WHERE ts_bucket >= $1
+      AND ts_bucket < $2
+      AND symbol = $3
+      AND market = $4::cfg.market_type
+    ORDER BY ts_event ASC, symbol ASC, option_symbol ASC
 "#;
 
 pub async fn fetch_backfill_batch(
@@ -4284,6 +4373,7 @@ mod tests {
             global_account_ratio_5m: Vec::new(),
             top_account_ratio_5m: Vec::new(),
             top_position_ratio_5m: Vec::new(),
+            option_mark_greeks_5m: Vec::new(),
         }
     }
 

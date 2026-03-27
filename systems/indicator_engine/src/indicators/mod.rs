@@ -25,6 +25,7 @@ pub mod i23_ema_trend_regime;
 pub mod i24_fvg;
 pub mod i25_open_interest;
 pub mod i26_long_short_ratios;
+pub mod i27_options_surface;
 pub mod indicator_trait;
 pub mod registry;
 pub mod shared;

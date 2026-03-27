@@ -1,11 +1,12 @@
 use crate::indicators::context::{
-    LongShortRatioPoint, OpenInterestCurrentSidecar, OpenInterestHistPoint,
+    LongShortRatioPoint, OpenInterestCurrentSidecar, OpenInterestHistPoint, OptionMarkGreeksPoint,
+    OptionsSurfacePoint,
 };
 use crate::ingest::decoder::{
     AggFundingMark1mEvent, AggLiq1mEvent, AggOrderbook1mEvent, AggTrade1mEvent, AggVpinSnapshot,
     BboEvent, DepthDeltaEvent, EngineEvent, ForceOrderEvent, LongShortRatio5mEvent,
     LongShortRatioType, MarketKind, MdData, OpenInterestCurrentEvent, OpenInterestHist5mEvent,
-    OrderbookSnapshotEvent, TradeEvent,
+    OptionMarkGreeks5mEvent, OrderbookSnapshotEvent, TradeEvent,
 };
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -31,6 +32,7 @@ const VPIN_EPS: f64 = 1e-12;
 const CANONICAL_REPLAY_KEEP_MINUTES: i64 = 60 * 24;
 const OI_RATIO_HISTORY_KEEP_5M_BUCKETS: usize = 12 * 24 * 10; // 10 days
 const OI_CURRENT_HISTORY_KEEP_MINUTES: usize = 60 * 24;
+const OPTIONS_SURFACE_HISTORY_KEEP_5M_BUCKETS: usize = 12 * 24 * 5; // 5 days
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct LevelAgg {
@@ -280,6 +282,8 @@ pub struct WindowBundle {
     pub global_account_ratio_5m: Vec<LongShortRatioPoint>,
     pub top_account_ratio_5m: Vec<LongShortRatioPoint>,
     pub top_position_ratio_5m: Vec<LongShortRatioPoint>,
+    pub latest_options_surface_bucket: Option<DateTime<Utc>>,
+    pub options_surface_5m: Vec<OptionsSurfacePoint>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -379,6 +383,12 @@ struct OiRatioWindowView {
     global_account_ratio_5m: Vec<LongShortRatioPoint>,
     top_account_ratio_5m: Vec<LongShortRatioPoint>,
     top_position_ratio_5m: Vec<LongShortRatioPoint>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct OptionsSurfaceWindowView {
+    latest_bucket: Option<DateTime<Utc>>,
+    points: Vec<OptionsSurfacePoint>,
 }
 
 fn canonical_minute_presence(minute: Option<&CanonicalMinuteByMarket>) -> CanonicalMinutePresence {
@@ -1223,6 +1233,7 @@ pub struct StateStore {
     global_account_ratio_5m: VecDeque<LongShortRatioPoint>,
     top_account_ratio_5m: VecDeque<LongShortRatioPoint>,
     top_position_ratio_5m: VecDeque<LongShortRatioPoint>,
+    option_mark_greeks_5m: VecDeque<OptionMarkGreeksPoint>,
     dirty_recompute_from: Option<DateTime<Utc>>,
     // Fixed target end for the current dirty-recompute batch series.
     // Set when dirty is first triggered; extended if later minutes become dirty.
@@ -1271,6 +1282,7 @@ impl StateStore {
             global_account_ratio_5m: VecDeque::new(),
             top_account_ratio_5m: VecDeque::new(),
             top_position_ratio_5m: VecDeque::new(),
+            option_mark_greeks_5m: VecDeque::new(),
             dirty_recompute_from: None,
             dirty_recompute_end: None,
             dirty_recompute_truncated: false,
@@ -1309,6 +1321,7 @@ impl StateStore {
         self.global_account_ratio_5m.clear();
         self.top_account_ratio_5m.clear();
         self.top_position_ratio_5m.clear();
+        self.option_mark_greeks_5m.clear();
         self.dirty_recompute_from = None;
         self.dirty_recompute_end = None;
         self.dirty_recompute_truncated = false;
@@ -1591,6 +1604,9 @@ impl StateStore {
             }
             MdData::LongShortRatio5m(long_short_ratio) => {
                 self.store_long_short_ratio_5m(long_short_ratio);
+            }
+            MdData::OptionMarkGreeks5m(option_mark) => {
+                self.store_option_mark_greeks_5m(option_mark);
             }
         }
     }
@@ -1945,6 +1961,34 @@ impl StateStore {
         }
     }
 
+    fn store_option_mark_greeks_5m(&mut self, event: OptionMarkGreeks5mEvent) {
+        let point = OptionMarkGreeksPoint {
+            ts_bucket: event.ts_bucket,
+            option_symbol: event.option_symbol,
+            underlying_asset: event.underlying_asset,
+            expiry_ts: event.expiry_ts,
+            strike_price: event.strike_price,
+            contract_side: event.contract_side,
+            unit: event.unit,
+            index_price: event.index_price,
+            mark_price: event.mark_price,
+            bid_iv: event.bid_iv,
+            ask_iv: event.ask_iv,
+            mark_iv: event.mark_iv,
+            delta: event.delta,
+            gamma: event.gamma,
+            vega: event.vega,
+            theta: event.theta,
+            risk_free_interest: event.risk_free_interest,
+        };
+        upsert_sorted_point_by(
+            &mut self.option_mark_greeks_5m,
+            point,
+            OPTIONS_SURFACE_HISTORY_KEEP_5M_BUCKETS * 512,
+            |item| (item.ts_bucket, item.option_symbol.clone()),
+        );
+    }
+
     fn mark_oi_ratio_patch_if_finalized(&mut self, ts_bucket: DateTime<Utc>, reason: &'static str) {
         if self
             .last_finalized_minute
@@ -2155,6 +2199,7 @@ impl StateStore {
             .collect::<Vec<_>>();
 
         let oi_ratio_view = self.build_oi_ratio_view_for_minute(ts_bucket);
+        let options_surface_view = self.build_options_surface_view_for_minute(ts_bucket);
 
         WindowBundle {
             ts_bucket,
@@ -2180,12 +2225,15 @@ impl StateStore {
             global_account_ratio_5m: oi_ratio_view.global_account_ratio_5m,
             top_account_ratio_5m: oi_ratio_view.top_account_ratio_5m,
             top_position_ratio_5m: oi_ratio_view.top_position_ratio_5m,
+            latest_options_surface_bucket: options_surface_view.latest_bucket,
+            options_surface_5m: options_surface_view.points,
         }
     }
 
     pub fn build_oi_ratio_patch_bundle_for_minute(&self, ts_bucket: DateTime<Utc>) -> WindowBundle {
         let as_of_ts = ts_bucket + Duration::minutes(1);
         let oi_ratio_view = self.build_oi_ratio_view_for_minute(ts_bucket);
+        let options_surface_view = self.build_options_surface_view_for_minute(ts_bucket);
         let futures = self
             .history_row(MarketKind::Futures, ts_bucket)
             .map(minute_window_from_history_row)
@@ -2219,6 +2267,8 @@ impl StateStore {
             global_account_ratio_5m: oi_ratio_view.global_account_ratio_5m,
             top_account_ratio_5m: oi_ratio_view.top_account_ratio_5m,
             top_position_ratio_5m: oi_ratio_view.top_position_ratio_5m,
+            latest_options_surface_bucket: options_surface_view.latest_bucket,
+            options_surface_5m: options_surface_view.points,
         }
     }
 
@@ -2287,6 +2337,31 @@ impl StateStore {
             global_account_ratio_5m,
             top_account_ratio_5m,
             top_position_ratio_5m,
+        }
+    }
+
+    fn build_options_surface_view_for_minute(
+        &self,
+        ts_bucket: DateTime<Utc>,
+    ) -> OptionsSurfaceWindowView {
+        let as_of_ts = ts_bucket + Duration::minutes(1);
+        let mut by_bucket = BTreeMap::<DateTime<Utc>, Vec<&OptionMarkGreeksPoint>>::new();
+        for point in &self.option_mark_greeks_5m {
+            if point.ts_bucket <= as_of_ts {
+                by_bucket.entry(point.ts_bucket).or_default().push(point);
+            }
+        }
+
+        let mut points = Vec::with_capacity(by_bucket.len());
+        for (bucket, rows) in by_bucket {
+            if let Some(point) = aggregate_options_surface_bucket(bucket, &rows) {
+                points.push(point);
+            }
+        }
+        let latest_bucket = points.last().map(|point| point.ts_bucket);
+        OptionsSurfaceWindowView {
+            latest_bucket,
+            points,
         }
     }
 
@@ -2705,6 +2780,7 @@ impl StateStore {
             global_account_ratio_5m: self.global_account_ratio_5m.iter().cloned().collect(),
             top_account_ratio_5m: self.top_account_ratio_5m.iter().cloned().collect(),
             top_position_ratio_5m: self.top_position_ratio_5m.iter().cloned().collect(),
+            option_mark_greeks_5m: self.option_mark_greeks_5m.iter().cloned().collect(),
         }
     }
 
@@ -2727,6 +2803,7 @@ impl StateStore {
         self.global_account_ratio_5m = snap.global_account_ratio_5m.into_iter().collect();
         self.top_account_ratio_5m = snap.top_account_ratio_5m.into_iter().collect();
         self.top_position_ratio_5m = snap.top_position_ratio_5m.into_iter().collect();
+        self.option_mark_greeks_5m = snap.option_mark_greeks_5m.into_iter().collect();
         // CVD must be derived from history tail (not stored value) to ensure accuracy.
         self.cvd_futures = self.history_futures.back().map(|h| h.cvd).unwrap_or(0.0);
         self.cvd_spot = self.history_spot.back().map(|h| h.cvd).unwrap_or(0.0);
@@ -2735,7 +2812,199 @@ impl StateStore {
     }
 }
 
-pub const STATE_SNAPSHOT_VERSION: u32 = 2;
+#[derive(Debug, Clone)]
+struct DerivedExpirySurface {
+    expiry_ts: DateTime<Utc>,
+    atm_strike: Option<f64>,
+    atm_iv: Option<f64>,
+    rr_25d: Option<f64>,
+}
+
+fn aggregate_options_surface_bucket(
+    ts_bucket: DateTime<Utc>,
+    rows: &[&OptionMarkGreeksPoint],
+) -> Option<OptionsSurfacePoint> {
+    let live_rows = rows
+        .iter()
+        .copied()
+        .filter(|row| row.expiry_ts > ts_bucket)
+        .collect::<Vec<_>>();
+    if live_rows.is_empty() {
+        return None;
+    }
+
+    let mut by_expiry = BTreeMap::<DateTime<Utc>, Vec<&OptionMarkGreeksPoint>>::new();
+    for row in live_rows {
+        by_expiry.entry(row.expiry_ts).or_default().push(row);
+    }
+
+    let mut surfaces = by_expiry
+        .into_iter()
+        .map(|(expiry_ts, expiry_rows)| derive_expiry_surface(ts_bucket, expiry_ts, &expiry_rows))
+        .collect::<Vec<_>>();
+    surfaces.sort_by_key(|surface| surface.expiry_ts);
+
+    let front = surfaces.first();
+    let second = surfaces.get(1);
+    let atm_iv_30d_proxy = derive_atm_iv_30d_proxy(ts_bucket, &surfaces);
+
+    Some(OptionsSurfacePoint {
+        ts_bucket,
+        front_expiry_ts: front.map(|surface| surface.expiry_ts),
+        second_expiry_ts: second.map(|surface| surface.expiry_ts),
+        atm_strike_front: front.and_then(|surface| surface.atm_strike),
+        atm_iv_front: front.and_then(|surface| surface.atm_iv),
+        atm_iv_second: second.and_then(|surface| surface.atm_iv),
+        atm_iv_30d_proxy,
+        rr_25d_front: front.and_then(|surface| surface.rr_25d),
+        rr_25d_second: second.and_then(|surface| surface.rr_25d),
+        skew_state: classify_skew_state(front.and_then(|surface| surface.rr_25d)).to_string(),
+        term_structure_state: classify_term_structure_state(
+            front.and_then(|surface| surface.atm_iv),
+            second.and_then(|surface| surface.atm_iv),
+        )
+        .to_string(),
+    })
+}
+
+fn derive_expiry_surface(
+    ts_bucket: DateTime<Utc>,
+    expiry_ts: DateTime<Utc>,
+    rows: &[&OptionMarkGreeksPoint],
+) -> DerivedExpirySurface {
+    let index_price = rows.iter().find_map(|row| row.index_price);
+    let atm_strike = index_price.and_then(|px| choose_nearest_strike(rows, px));
+    let atm_iv = atm_strike.and_then(|strike| compute_atm_iv(rows, strike));
+    let rr_25d = compute_rr_25d(rows);
+
+    let _ = ts_bucket;
+    DerivedExpirySurface {
+        expiry_ts,
+        atm_strike,
+        atm_iv,
+        rr_25d,
+    }
+}
+
+fn choose_nearest_strike(rows: &[&OptionMarkGreeksPoint], index_price: f64) -> Option<f64> {
+    rows.iter()
+        .filter_map(|row| {
+            let iv_score = if row.mark_iv.is_some() { 0 } else { 1 };
+            Some(((row.strike_price - index_price).abs(), iv_score, row.strike_price))
+        })
+        .min_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)))
+        .map(|tuple| tuple.2)
+}
+
+fn compute_atm_iv(rows: &[&OptionMarkGreeksPoint], strike: f64) -> Option<f64> {
+    let strike_rows = rows
+        .iter()
+        .copied()
+        .filter(|row| (row.strike_price - strike).abs() <= 1e-9)
+        .collect::<Vec<_>>();
+    let call_iv = strike_rows
+        .iter()
+        .find(|row| row.contract_side.eq_ignore_ascii_case("call"))
+        .and_then(|row| row.mark_iv.or(row.bid_iv).or(row.ask_iv));
+    let put_iv = strike_rows
+        .iter()
+        .find(|row| row.contract_side.eq_ignore_ascii_case("put"))
+        .and_then(|row| row.mark_iv.or(row.bid_iv).or(row.ask_iv));
+
+    match (call_iv, put_iv) {
+        (Some(call), Some(put)) => Some((call + put) / 2.0),
+        (Some(call), None) => Some(call),
+        (None, Some(put)) => Some(put),
+        (None, None) => None,
+    }
+}
+
+fn compute_rr_25d(rows: &[&OptionMarkGreeksPoint]) -> Option<f64> {
+    let call = rows
+        .iter()
+        .filter(|row| row.contract_side.eq_ignore_ascii_case("call"))
+        .filter_map(|row| {
+            Some((
+                (row.delta? - 0.25).abs(),
+                row.mark_iv.or(row.bid_iv).or(row.ask_iv)?,
+            ))
+        })
+        .min_by(|a, b| a.0.total_cmp(&b.0))
+        .map(|tuple| tuple.1);
+    let put = rows
+        .iter()
+        .filter(|row| row.contract_side.eq_ignore_ascii_case("put"))
+        .filter_map(|row| {
+            Some((
+                (row.delta? + 0.25).abs(),
+                row.mark_iv.or(row.bid_iv).or(row.ask_iv)?,
+            ))
+        })
+        .min_by(|a, b| a.0.total_cmp(&b.0))
+        .map(|tuple| tuple.1);
+
+    call.zip(put).map(|(call_iv, put_iv)| call_iv - put_iv)
+}
+
+fn derive_atm_iv_30d_proxy(
+    ts_bucket: DateTime<Utc>,
+    surfaces: &[DerivedExpirySurface],
+) -> Option<f64> {
+    let mut points = surfaces
+        .iter()
+        .filter_map(|surface| {
+            let atm_iv = surface.atm_iv?;
+            let days = (surface.expiry_ts - ts_bucket).num_seconds() as f64 / 86_400.0;
+            if days <= 0.0 {
+                None
+            } else {
+                Some((days, atm_iv))
+            }
+        })
+        .collect::<Vec<_>>();
+    if points.is_empty() {
+        return None;
+    }
+    points.sort_by(|a, b| a.0.total_cmp(&b.0));
+
+    let target = 30.0;
+    for window in points.windows(2) {
+        let (d0, iv0) = window[0];
+        let (d1, iv1) = window[1];
+        if d0 <= target && target <= d1 && (d1 - d0).abs() > f64::EPSILON {
+            let w = (target - d0) / (d1 - d0);
+            return Some(iv0 + ((iv1 - iv0) * w));
+        }
+    }
+
+    points
+        .into_iter()
+        .min_by(|a, b| (a.0 - target).abs().total_cmp(&(b.0 - target).abs()))
+        .map(|tuple| tuple.1)
+}
+
+fn classify_skew_state(rr_25d_front: Option<f64>) -> &'static str {
+    match rr_25d_front {
+        Some(value) if value <= -0.02 => "put_skewed",
+        Some(value) if value >= 0.02 => "call_skewed",
+        Some(_) => "neutral",
+        None => "unclear",
+    }
+}
+
+fn classify_term_structure_state(
+    front_iv: Option<f64>,
+    second_iv: Option<f64>,
+) -> &'static str {
+    match front_iv.zip(second_iv) {
+        Some((front, second)) if (front - second) >= 0.01 => "front_rich",
+        Some((front, second)) if (second - front) >= 0.01 => "back_rich",
+        Some(_) => "flat",
+        None => "unclear",
+    }
+}
+
+pub const STATE_SNAPSHOT_VERSION: u32 = 3;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct StateSnapshot {
@@ -2770,6 +3039,8 @@ pub struct StateSnapshot {
     pub top_account_ratio_5m: Vec<LongShortRatioPoint>,
     #[serde(default)]
     pub top_position_ratio_5m: Vec<LongShortRatioPoint>,
+    #[serde(default)]
+    pub option_mark_greeks_5m: Vec<OptionMarkGreeksPoint>,
 }
 
 pub fn floor_minute(ts: DateTime<Utc>) -> DateTime<Utc> {
@@ -2811,6 +3082,38 @@ where
             deque.insert(insert_idx, point);
         }
     }
+
+    while deque.len() > keep_limit {
+        deque.pop_front();
+    }
+    true
+}
+
+fn upsert_sorted_point_by<T, K, F>(
+    deque: &mut VecDeque<T>,
+    point: T,
+    keep_limit: usize,
+    key_of: F,
+) -> bool
+where
+    T: Clone + PartialEq,
+    K: Ord,
+    F: Fn(&T) -> K,
+{
+    let point_key = key_of(&point);
+    if let Some(existing_idx) = deque.iter().position(|item| key_of(item) == point_key) {
+        if deque[existing_idx] == point {
+            return false;
+        }
+        deque[existing_idx] = point;
+        return true;
+    }
+
+    let insert_idx = deque
+        .iter()
+        .position(|item| key_of(item) > point_key)
+        .unwrap_or(deque.len());
+    deque.insert(insert_idx, point);
 
     while deque.len() > keep_limit {
         deque.pop_front();

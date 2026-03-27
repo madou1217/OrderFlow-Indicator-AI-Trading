@@ -20,7 +20,8 @@ pub fn classify(event: &EngineEvent) -> StreamLane {
         MdData::AggFundingMark1m(_)
         | MdData::OpenInterestCurrent(_)
         | MdData::OpenInterestHist5m(_)
-        | MdData::LongShortRatio5m(_) => StreamLane::MarkFunding,
+        | MdData::LongShortRatio5m(_)
+        | MdData::OptionMarkGreeks5m(_) => StreamLane::MarkFunding,
         MdData::ForceOrder(_) | MdData::AggLiq1m(_) => StreamLane::ForceOrder,
     }
 }
