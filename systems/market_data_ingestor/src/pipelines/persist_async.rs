@@ -2705,6 +2705,7 @@ where
                     | "md.open_interest_current"
                     | "md.open_interest_hist_5m"
                     | "md.long_short_ratio_5m"
+                    | "md.option_mark_greeks_5m"
             )
         })
         .cloned()
@@ -2720,7 +2721,10 @@ where
         .filter(|event| {
             matches!(
                 event.msg_type.as_str(),
-                "md.open_interest_current" | "md.open_interest_hist_5m" | "md.long_short_ratio_5m"
+                "md.open_interest_current"
+                    | "md.open_interest_hist_5m"
+                    | "md.long_short_ratio_5m"
+                    | "md.option_mark_greeks_5m"
             )
         })
         .cloned()
@@ -3264,7 +3268,8 @@ fn is_hot_path_md_event(event: &NormalizedMdEvent) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_trade_raw_event, collect_db_passthrough_events, TradeSecondChunk, TradeVpinState,
+        apply_trade_raw_event, collect_db_passthrough_events,
+        collect_publish_passthrough_events, TradeSecondChunk, TradeVpinState,
     };
     use crate::normalize::NormalizedMdEvent;
     use chrono::{TimeZone, Utc};
@@ -3375,5 +3380,29 @@ mod tests {
         assert_eq!(passthrough.len(), 2);
         assert_eq!(passthrough[0].msg_type, "md.open_interest_current");
         assert_eq!(passthrough[1].msg_type, "md.long_short_ratio_5m");
+    }
+
+    #[test]
+    fn db_and_publish_paths_preserve_options_surface_events() {
+        let ts = Utc.with_ymd_and_hms(2026, 3, 27, 5, 0, 0).single().unwrap();
+        let options = NormalizedMdEvent {
+            msg_type: "md.option_mark_greeks_5m".to_string(),
+            market: "futures".to_string(),
+            symbol: "ETHUSDT".to_string(),
+            source_kind: "rest".to_string(),
+            backfill_in_progress: false,
+            routing_key: "md.futures.option_mark_greeks.5m.ethusdt".to_string(),
+            stream_name: "eapi/v1/mark".to_string(),
+            event_ts: ts,
+            data: json!({}),
+        };
+
+        let db_passthrough = collect_db_passthrough_events([&options]);
+        assert_eq!(db_passthrough.len(), 1);
+        assert_eq!(db_passthrough[0].msg_type, "md.option_mark_greeks_5m");
+
+        let publish_passthrough = collect_publish_passthrough_events([&options]);
+        assert_eq!(publish_passthrough.len(), 1);
+        assert_eq!(publish_passthrough[0].msg_type, "md.option_mark_greeks_5m");
     }
 }
