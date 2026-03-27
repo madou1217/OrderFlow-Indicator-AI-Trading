@@ -38,6 +38,7 @@ use uuid::Uuid;
 
 const STARTUP_BACKFILL_FALLBACK_LOOKBACK_MINUTES: i64 = 180;
 const STARTUP_BACKFILL_OVERLAP_MINUTES: i64 = 180;
+const MIN_REUSABLE_SNAPSHOT_HISTORY_MINUTES: i64 = 7 * 24 * 60;
 const STARTUP_BACKFILL_SAFETY_LAG_SECS: i64 = 10;
 const STARTUP_BACKFILL_MARKET: &str = "all";
 const STALE_DROP_REPORT_INTERVAL_SECS: u64 = 10;
@@ -55,6 +56,7 @@ const LIVE_CANONICAL_GAP_REPAIR_RETRY_SECS: u64 = 15;
 const LIVE_CANONICAL_TAIL_RECONCILE_INTERVAL_SECS: u64 = 60;
 const LIVE_CANONICAL_TAIL_RECONCILE_LOOKBACK_MINUTES: i64 = 31;
 const CANONICAL_REPLAY_FETCH_WINDOW_MINUTES: i64 = 360;
+const STARTUP_BACKFILL_YIELD_EVERY_MINUTES: usize = 64;
 
 async fn build_publish_db_pool(config: &Arc<RootConfig>) -> Result<PgPool> {
     let mut publish_cfg = (**config).clone();
@@ -1363,9 +1365,9 @@ fn snapshot_has_required_history(snap: &StateSnapshot) -> bool {
 fn required_snapshot_history_start_ts(snap: &StateSnapshot) -> DateTime<Utc> {
     let retention_floor =
         snap.last_finalized_ts - ChronoDuration::minutes((HISTORY_LIMIT_MINUTES as i64) - 1);
-    snap.effective_history_floor_ts
-        .map(|floor| retention_floor.max(floor))
-        .unwrap_or(retention_floor)
+    let rolling_history_floor = snap.last_finalized_ts
+        - ChronoDuration::minutes(MIN_REUSABLE_SNAPSHOT_HISTORY_MINUTES - 1);
+    retention_floor.max(rolling_history_floor)
 }
 
 fn snapshot_history_reaches_required_start(
@@ -1853,10 +1855,8 @@ fn handle_ingest_event(
                 warn!(
                     cutoff_bucket_ts = %cutoff_bucket_ts,
                     first_live_bucket_ts = %event_bucket_ts,
-                    "startup replay cutover detected continuity gap; dropping pre-gap state and restarting live continuity window"
+                    "startup replay cutover detected continuity gap; preserving warm state and waiting for live gap repair to heal missing minutes"
                 );
-                state_store.reset_for_new_continuous_segment(event_bucket_ts);
-                scheduler.mark_emitted_through(event_bucket_ts - ChronoDuration::minutes(1));
             }
             info!(
                 cutoff_bucket_ts = %cutoff_bucket_ts,
@@ -2409,16 +2409,15 @@ async fn run_startup_backfill(
     // must round up to include the last fully closed bucket before `raw_to_ts`.
     let to_ts = minute_exclusive_upper_bound(raw_to_ts);
     let mut startup_max_catchup_minutes = ctx.config.indicator.startup_max_catchup_minutes;
-    const STRICT_MIN_CATCHUP_MINUTES_7D: i64 = 7 * 24 * 60;
     if startup_max_catchup_minutes > 0
-        && startup_max_catchup_minutes < STRICT_MIN_CATCHUP_MINUTES_7D
+        && startup_max_catchup_minutes < MIN_REUSABLE_SNAPSHOT_HISTORY_MINUTES
     {
         warn!(
             configured_startup_max_catchup_minutes = startup_max_catchup_minutes,
-            enforced_startup_max_catchup_minutes = STRICT_MIN_CATCHUP_MINUTES_7D,
+            enforced_startup_max_catchup_minutes = MIN_REUSABLE_SNAPSHOT_HISTORY_MINUTES,
             "startup catch-up window raised to 7d to satisfy rolling-7d indicators"
         );
-        startup_max_catchup_minutes = STRICT_MIN_CATCHUP_MINUTES_7D;
+        startup_max_catchup_minutes = MIN_REUSABLE_SNAPSHOT_HISTORY_MINUTES;
     }
     if startup_max_catchup_minutes > 0 {
         let catchup_floor = to_ts - ChronoDuration::minutes(startup_max_catchup_minutes);
@@ -2579,6 +2578,9 @@ async fn run_startup_backfill(
         }
         return Ok(None);
     };
+    let (history_continuous_start_ts, history_continuous_end_ts) = state_store
+        .latest_continuous_trade_history_segment()
+        .unwrap_or((continuous_start_ts, continuous_end_ts));
 
     let replay_start_ts = continuous_start_ts.max(from_ts);
     let replay_end_ts = continuous_end_ts.min(to_ts - ChronoDuration::minutes(1));
@@ -2596,13 +2598,12 @@ async fn run_startup_backfill(
         }
         return Ok(None);
     }
+    let history_replay_start_ts = history_continuous_start_ts.max(from_ts);
+    let history_replay_end_ts =
+        history_continuous_end_ts.min(to_ts - ChronoDuration::minutes(1));
 
     if snapshot_was_loaded {
-        if replay_start_ts > from_ts {
-            state_store.reset_finalized_state();
-        } else {
-            state_store.rewind_finalized_state_from(replay_start_ts);
-        }
+        state_store.rewind_finalized_state_from(history_replay_start_ts);
         // Startup replay rows have already been ingested into canonical storage in
         // order to discover the continuity window. When resuming from a snapshot,
         // those overlap rows can temporarily mark the already-finalized snapshot
@@ -2612,7 +2613,7 @@ async fn run_startup_backfill(
         // cleared before we cut over to live processing.
         state_store.clear_dirty_recompute_state();
     }
-    state_store.set_effective_history_floor(Some(replay_start_ts));
+    state_store.set_effective_history_floor(Some(history_replay_start_ts));
 
     let repair_start_candidate = if snapshot_was_loaded {
         from_ts
@@ -2647,19 +2648,28 @@ async fn run_startup_backfill(
     }
 
     info!(
+        history_replay_start_ts = %history_replay_start_ts,
         replay_start_ts = %replay_start_ts,
         repair_start_ts = %repair_start_ts,
+        history_replay_end_ts = %history_replay_end_ts,
         replay_end_ts = %replay_end_ts,
+        history_continuity_start_ts = %history_continuous_start_ts,
+        history_continuity_end_ts = %history_continuous_end_ts,
         continuity_start_ts = %continuous_start_ts,
         continuity_end_ts = %continuous_end_ts,
         snapshot_was_loaded = snapshot_was_loaded,
         "startup backfill replay plan"
     );
 
-    if replay_start_ts <= warm_end_ts {
-        let mut minute = replay_start_ts;
+    if history_replay_start_ts <= warm_end_ts {
+        let mut minute = history_replay_start_ts;
+        let mut warmed_minutes = 0usize;
         while minute <= warm_end_ts {
-            state_store.finalize_minute(minute);
+            state_store.advance_finalized_state(minute);
+            warmed_minutes += 1;
+            if warmed_minutes % STARTUP_BACKFILL_YIELD_EVERY_MINUTES == 0 {
+                tokio::task::yield_now().await;
+            }
             minute += ChronoDuration::minutes(1);
         }
         refresh_runtime_observability_metrics(
@@ -2671,7 +2681,7 @@ async fn run_startup_backfill(
             0,
         );
         info!(
-            warm_start_ts = %replay_start_ts,
+            warm_start_ts = %history_replay_start_ts,
             warm_end_ts = %warm_end_ts,
             "startup warm-state replay completed"
         );
@@ -2682,6 +2692,7 @@ async fn run_startup_backfill(
     let mut missing_union: BTreeSet<String> = BTreeSet::new();
     let mut first_materialized_bucket: Option<DateTime<Utc>> = None;
     let mut last_materialized_bucket: Option<DateTime<Utc>> = None;
+    let mut materialized_since_yield = 0usize;
 
     let mut minute = repair_start_ts;
     while minute <= replay_end_ts {
@@ -2737,6 +2748,10 @@ async fn run_startup_backfill(
                 }
             }
             minute += ChronoDuration::minutes(1);
+            materialized_since_yield += 1;
+            if materialized_since_yield % STARTUP_BACKFILL_YIELD_EVERY_MINUTES == 0 {
+                tokio::task::yield_now().await;
+            }
         }
     }
 
@@ -4204,8 +4219,9 @@ mod tests {
         replay_heatmap_hydration_batch_end, shutdown_ready_through_candidate,
         snapshot_has_required_history, snapshot_null_price_run_reaches_recent_tail,
         LiveCanonicalRepairController, FUNDING_BACKFILL_WINDOW_SQL, LIQ_BACKFILL_WINDOW_SQL,
-        LIVE_CANONICAL_TAIL_RECONCILE_LOOKBACK_MINUTES, ORDERBOOK_BACKFILL_WINDOW_SQL_SCALAR,
-        ORDERBOOK_BACKFILL_WINDOW_SQL_WITH_HEATMAP, TRADE_BACKFILL_WINDOW_SQL,
+        LIVE_CANONICAL_TAIL_RECONCILE_LOOKBACK_MINUTES, MIN_REUSABLE_SNAPSHOT_HISTORY_MINUTES,
+        ORDERBOOK_BACKFILL_WINDOW_SQL_SCALAR, ORDERBOOK_BACKFILL_WINDOW_SQL_WITH_HEATMAP,
+        TRADE_BACKFILL_WINDOW_SQL,
     };
     use crate::ingest::decoder::{
         AggHeatmapLevel, AggOrderbook1mEvent, EngineEvent, MarketKind, MdData, TradeEvent,
@@ -4599,7 +4615,28 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_required_history_accepts_short_history_when_it_starts_at_effective_floor() {
+    fn snapshot_required_history_accepts_reusable_rolling_7d_window() {
+        let last_finalized_ts = Utc.with_ymd_and_hms(2026, 3, 21, 3, 0, 0).single().unwrap();
+        let effective_floor_ts = last_finalized_ts - ChronoDuration::minutes(90);
+        let required_minutes = MIN_REUSABLE_SNAPSHOT_HISTORY_MINUTES - 1;
+        let history_start_ts = last_finalized_ts - ChronoDuration::minutes(required_minutes);
+        let history = (0..=required_minutes)
+            .map(|offset| {
+                priced_history_row(history_start_ts + ChronoDuration::minutes(offset), 2000.0)
+            })
+            .collect::<Vec<_>>();
+        let snap = snapshot_fixture(
+            last_finalized_ts,
+            history.clone(),
+            history,
+            Some(effective_floor_ts),
+        );
+
+        assert!(snapshot_has_required_history(&snap));
+    }
+
+    #[test]
+    fn snapshot_required_history_rejects_short_history_even_if_it_starts_at_effective_floor() {
         let last_finalized_ts = Utc.with_ymd_and_hms(2026, 3, 21, 3, 0, 0).single().unwrap();
         let effective_floor_ts = last_finalized_ts - ChronoDuration::minutes(90);
         let history = (0..=90)
@@ -4614,7 +4651,7 @@ mod tests {
             Some(effective_floor_ts),
         );
 
-        assert!(snapshot_has_required_history(&snap));
+        assert!(!snapshot_has_required_history(&snap));
     }
 
     #[test]
@@ -4633,7 +4670,7 @@ mod tests {
     }
 
     #[test]
-    fn cutover_gap_resets_state_and_scheduler_to_first_live_bucket() {
+    fn cutover_gap_preserves_warm_state_and_waits_for_gap_repair() {
         let cutoff_bucket_ts = Utc.with_ymd_and_hms(2026, 3, 21, 3, 0, 0).single().unwrap();
         let prior_bucket_ts = cutoff_bucket_ts - ChronoDuration::minutes(1);
         let first_live_bucket_ts = cutoff_bucket_ts + ChronoDuration::minutes(5);
@@ -4690,14 +4727,16 @@ mod tests {
         );
 
         assert!(startup_cutover_completed);
-        assert_eq!(state_store.history_futures_len(), 0);
+        assert_eq!(state_store.history_futures_len(), 1);
+        assert_eq!(scheduler.next_minute_to_emit(), Some(cutoff_bucket_ts));
         assert_eq!(
-            state_store.extract_snapshot().effective_history_floor_ts,
-            Some(first_live_bucket_ts)
+            state_store
+                .latest_contiguous_complete_canonical_minute_from(
+                    cutoff_bucket_ts,
+                    first_live_bucket_ts + ChronoDuration::minutes(2)
+                ),
+            None
         );
-
-        let ready = scheduler.ready_minutes(first_live_bucket_ts + ChronoDuration::minutes(2));
-        assert_eq!(ready.first().copied(), Some(first_live_bucket_ts));
     }
 
     #[test]

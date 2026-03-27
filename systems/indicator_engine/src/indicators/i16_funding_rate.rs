@@ -1,6 +1,7 @@
 use crate::indicators::context::{IndicatorComputation, IndicatorContext, IndicatorSnapshotRow};
 use crate::indicators::indicator_trait::Indicator;
-use chrono::{DateTime, Duration, Utc};
+use crate::indicators::shared::funding::{compute_funding_window_metrics, funding_change_json};
+use chrono::Duration;
 use serde_json::{json, Value};
 
 const WINDOWS: [(&str, i64); 5] = [
@@ -24,15 +25,16 @@ impl Indicator for I16FundingRate {
             by_window.insert(label.to_string(), compute_window_metrics(ctx, mins, label));
         }
 
+        let current_metrics = compute_funding_window_metrics(ctx, 1);
+        let funding_current = current_metrics.funding_current;
+        let funding_current_effective_ts = current_metrics
+            .funding_current_effective_ts
+            .map(|ts| ts.to_rfc3339());
+        let funding_twa = current_metrics.funding_twa;
+        let mark_price_last = current_metrics.mark_price_last;
+        let mark_price_last_ts = current_metrics.mark_price_last_ts.map(|ts| ts.to_rfc3339());
+        let mark_price_twap = current_metrics.mark_price_twap;
         let end = ctx.ts_bucket + Duration::minutes(1);
-        let funding_current_pair = ctx.latest_funding_pair_at_or_before(end);
-        let funding_current = funding_current_pair.map(|(_, v)| v);
-        let funding_current_effective_ts = funding_current_pair.map(|(ts, _)| ts.to_rfc3339());
-        let funding_twa = ctx.funding_twa_1m().or(funding_current);
-        let mark_price_last_pair = ctx.latest_mark_pair_at_or_before(end);
-        let mark_price_last = mark_price_last_pair.map(|(_, v)| v);
-        let mark_price_last_ts = mark_price_last_pair.map(|(ts, _)| ts.to_rfc3339());
-        let mark_price_twap = ctx.mark_twap_1m().or(mark_price_last);
         let recent_cutoff = end - Duration::days(7);
         let mut recent_changes = ctx
             .funding_changes_recent
@@ -66,130 +68,28 @@ impl Indicator for I16FundingRate {
 }
 
 fn compute_window_metrics(ctx: &IndicatorContext, mins: i64, label: &str) -> Value {
-    let end = ctx.ts_bucket + Duration::minutes(1);
-    let start = end - Duration::minutes(mins);
-
-    let mut funding_points = ctx
-        .funding_points_recent
-        .iter()
-        .map(|p| (p.ts, p.funding_rate))
-        .collect::<Vec<_>>();
-    funding_points.sort_by_key(|(ts, _)| *ts);
-
-    let mut mark_points = ctx
-        .mark_points_recent
-        .iter()
-        .filter_map(|p| p.mark_price.map(|v| (p.ts, v)))
-        .collect::<Vec<_>>();
-    mark_points.sort_by_key(|(ts, _)| *ts);
-
-    let funding_current = funding_points
-        .iter()
-        .rev()
-        .find(|(ts, _)| *ts <= end)
-        .map(|(_, v)| *v);
-    let funding_current_effective_ts = funding_points
-        .iter()
-        .rev()
-        .find(|(ts, _)| *ts <= end)
-        .map(|(ts, _)| ts.to_rfc3339());
-    let funding_fallback = funding_points
-        .iter()
-        .rev()
-        .find(|(ts, _)| *ts <= start)
-        .map(|(_, v)| *v)
-        .or(funding_current);
-    let funding_twa = time_weighted_avg(start, end, &funding_points, funding_fallback);
-
-    let mark_last_pair = mark_points.iter().rev().find(|(ts, _)| *ts <= end).copied();
-    let mark_price_last = mark_last_pair.map(|(_, v)| v);
-    let mark_price_last_ts = mark_last_pair.map(|(ts, _)| ts.to_rfc3339());
-    let mark_fallback = mark_points
-        .iter()
-        .rev()
-        .find(|(ts, _)| *ts <= start)
-        .map(|(_, v)| *v)
-        .or(mark_price_last);
-    let mark_price_twap = time_weighted_avg(start, end, &mark_points, mark_fallback);
-
-    let mut changes_in_win = ctx
-        .funding_changes_recent
-        .iter()
-        .filter(|c| c.ts_change >= start && c.ts_change < end)
-        .collect::<Vec<_>>();
-    changes_in_win.sort_by_key(|c| c.ts_change);
-    let changes = changes_in_win
-        .iter()
-        .map(|c| funding_change_json(c))
-        .collect::<Vec<_>>();
+    let metrics = compute_funding_window_metrics(ctx, mins);
+    let mut changes = metrics
+        .changes_json
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    changes.sort_by_key(|row| {
+        row.get("change_ts")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .unwrap_or_default()
+    });
 
     json!({
         "window": label,
-        "funding_current": funding_current,
-        "funding_current_effective_ts": funding_current_effective_ts,
-        "funding_twa": funding_twa,
-        "mark_price_last": mark_price_last,
-        "mark_price_last_ts": mark_price_last_ts,
-        "mark_price_twap": mark_price_twap,
+        "funding_current": metrics.funding_current,
+        "funding_current_effective_ts": metrics.funding_current_effective_ts.map(|ts| ts.to_rfc3339()),
+        "funding_twa": metrics.funding_twa,
+        "mark_price_last": metrics.mark_price_last,
+        "mark_price_last_ts": metrics.mark_price_last_ts.map(|ts| ts.to_rfc3339()),
+        "mark_price_twap": metrics.mark_price_twap,
         "change_count": changes.len(),
         "changes": changes
     })
-}
-
-fn funding_change_json(change: &crate::runtime::state_store::FundingChange) -> Value {
-    json!({
-        "change_ts": change.ts_change.to_rfc3339(),
-        "funding_prev": change.prev,
-        "funding_new": change.new,
-        "funding_delta": change.delta,
-        "mark_price_at_change": change.mark_price_at_change
-    })
-}
-
-fn time_weighted_avg(
-    start: DateTime<Utc>,
-    end: DateTime<Utc>,
-    points: &[(DateTime<Utc>, f64)],
-    fallback: Option<f64>,
-) -> Option<f64> {
-    if end <= start {
-        return None;
-    }
-    if points.is_empty() {
-        return fallback;
-    }
-
-    let mut weighted = 0.0;
-    let mut total = 0.0;
-    let mut cursor = start;
-    let mut last_val = fallback.unwrap_or(points[0].1);
-
-    for (ts, v) in points {
-        if *ts <= start {
-            last_val = *v;
-            continue;
-        }
-        if *ts > end {
-            break;
-        }
-        let dt = (*ts - cursor).num_milliseconds().max(0) as f64 / 1000.0;
-        if dt > 0.0 {
-            weighted += last_val * dt;
-            total += dt;
-        }
-        cursor = *ts;
-        last_val = *v;
-    }
-
-    if cursor < end {
-        let dt = (end - cursor).num_milliseconds().max(0) as f64 / 1000.0;
-        weighted += last_val * dt;
-        total += dt;
-    }
-
-    if total <= 0.0 {
-        fallback.or(Some(last_val))
-    } else {
-        Some(weighted / total)
-    }
 }

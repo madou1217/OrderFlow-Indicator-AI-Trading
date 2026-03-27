@@ -2,6 +2,7 @@ pub mod confirm_spot;
 pub mod event_ids;
 pub mod event_lifecycle;
 pub mod event_views;
+pub mod funding;
 pub mod input_views;
 pub mod market_structure;
 pub mod output_mapper;

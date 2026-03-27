@@ -421,6 +421,10 @@ fn canonical_minute_is_complete(minute: &CanonicalMinuteByMarket) -> bool {
         && canonical_spot_minute_is_complete(&minute.spot)
 }
 
+fn canonical_minute_has_trade_history_inputs(minute: &CanonicalMinuteByMarket) -> bool {
+    minute.futures.trade.is_some() && minute.spot.trade.is_some()
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct FinalizedVpinState {
     ts_bucket: DateTime<Utc>,
@@ -1434,6 +1438,22 @@ impl StateStore {
     }
 
     pub fn latest_continuous_canonical_segment(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+        self.latest_continuous_segment_matching(canonical_minute_is_complete)
+    }
+
+    pub fn latest_continuous_trade_history_segment(
+        &self,
+    ) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+        self.latest_continuous_segment_matching(canonical_minute_has_trade_history_inputs)
+    }
+
+    fn latest_continuous_segment_matching<F>(
+        &self,
+        predicate: F,
+    ) -> Option<(DateTime<Utc>, DateTime<Utc>)>
+    where
+        F: Fn(&CanonicalMinuteByMarket) -> bool,
+    {
         let mut current_start: Option<DateTime<Utc>> = None;
         let mut prev_complete: Option<DateTime<Utc>> = None;
         let mut latest_segment: Option<(DateTime<Utc>, DateTime<Utc>)> = None;
@@ -1443,7 +1463,7 @@ impl StateStore {
                 continue;
             };
             let minute = &self.canonical_minutes[minute_sec];
-            if !canonical_minute_is_complete(minute) {
+            if !predicate(minute) {
                 current_start = None;
                 prev_complete = None;
                 continue;
@@ -1619,6 +1639,14 @@ impl StateStore {
         self.last_finalized_minute = Some(ts_bucket);
         self.trim_replay_retention(ts_bucket);
         self.build_window_bundle(ts_bucket, futures, spot)
+    }
+
+    pub fn advance_finalized_state(&mut self, ts_bucket: DateTime<Utc>) {
+        let _ = self.finalize_market(MarketKind::Futures, ts_bucket);
+        let _ = self.finalize_market(MarketKind::Spot, ts_bucket);
+        self.apply_canonical_funding_minute(ts_bucket);
+        self.last_finalized_minute = Some(ts_bucket);
+        self.trim_replay_retention(ts_bucket);
     }
 
     /// Process at most `max_batch` dirty-recompute windows per call, yielding
@@ -3765,6 +3793,167 @@ mod tests {
 
         let latest = store.latest_contiguous_complete_canonical_minute_from(ts_1, ts_2);
         assert_eq!(latest, Some(ts_2));
+    }
+
+    #[test]
+    fn latest_continuous_trade_history_segment_keeps_trade_run_when_orderbook_is_missing() {
+        let mut store = StateStore::new("TESTUSDT".to_string(), 1_000.0);
+        let ts_1 = Utc.with_ymd_and_hms(2026, 3, 6, 5, 0, 0).single().unwrap();
+        let ts_2 = ts_1 + ChronoDuration::minutes(1);
+        let ts_3 = ts_1 + ChronoDuration::minutes(2);
+
+        for ts in [ts_1, ts_2, ts_3] {
+            store.ingest(agg_trade_event(ts, 1.0, 0.5, 0.2));
+            store.ingest(agg_trade_event_spot(ts, 1.0, 0.5, 0.2));
+        }
+        for ts in [ts_2, ts_3] {
+            store.ingest(agg_orderbook_event(ts, 4, 4, 0.1));
+            store.ingest(agg_funding_mark_event(ts, 45, 2000.0, 0.01));
+            store.ingest(agg_orderbook_event_spot(ts, 4, 4, 0.1));
+        }
+
+        let trade_segment = store.latest_continuous_trade_history_segment().unwrap();
+        let complete_segment = store.latest_continuous_canonical_segment().unwrap();
+
+        assert_eq!(trade_segment.0, ts_1);
+        assert_eq!(trade_segment.1, ts_3);
+        assert_eq!(complete_segment.0, ts_2);
+        assert_eq!(complete_segment.1, ts_3);
+    }
+
+    #[test]
+    fn advance_finalized_state_matches_finalize_minute_side_effects() {
+        let ts = Utc.with_ymd_and_hms(2026, 3, 6, 5, 0, 0).single().unwrap();
+        let mut full_store = StateStore::new("TESTUSDT".to_string(), 1_000.0);
+        let mut state_only_store = StateStore::new("TESTUSDT".to_string(), 1_000.0);
+
+        for store in [&mut full_store, &mut state_only_store] {
+            store.ingest(agg_trade_event(ts, 1.0, 0.5, 0.2));
+            store.ingest(agg_trade_event_spot(ts, 1.0, 0.5, 0.2));
+            store.ingest(agg_orderbook_event(ts, 4, 4, 0.1));
+            store.ingest(agg_orderbook_event_spot(ts, 4, 4, 0.1));
+            store.ingest(agg_liq_event(ts, 10.0));
+            store.ingest(agg_funding_mark_event(ts, 45, 2000.0, 0.01));
+        }
+
+        let _ = full_store.finalize_minute(ts);
+        state_only_store.advance_finalized_state(ts);
+
+        assert_eq!(state_only_store.last_finalized_minute, full_store.last_finalized_minute);
+        assert_eq!(state_only_store.cvd_futures, full_store.cvd_futures);
+        assert_eq!(state_only_store.cvd_spot, full_store.cvd_spot);
+        assert_eq!(
+            state_only_store.history_futures.len(),
+            full_store.history_futures.len()
+        );
+        assert_eq!(state_only_store.history_spot.len(), full_store.history_spot.len());
+        assert_eq!(
+            state_only_store
+                .history_futures
+                .back()
+                .map(|h| (h.ts_bucket, h.close_price, h.cvd, h.vpin)),
+            full_store
+                .history_futures
+                .back()
+                .map(|h| (h.ts_bucket, h.close_price, h.cvd, h.vpin))
+        );
+        assert_eq!(
+            state_only_store
+                .history_spot
+                .back()
+                .map(|h| (h.ts_bucket, h.close_price, h.cvd, h.vpin)),
+            full_store
+                .history_spot
+                .back()
+                .map(|h| (h.ts_bucket, h.close_price, h.cvd, h.vpin))
+        );
+        assert_eq!(
+            state_only_store.finalized_vpin_futures.len(),
+            full_store.finalized_vpin_futures.len()
+        );
+        assert_eq!(
+            state_only_store
+                .finalized_vpin_futures
+                .back()
+                .map(|s| (s.ts_bucket, s.snapshot.last_vpin, s.snapshot.imbalances.len())),
+            full_store
+                .finalized_vpin_futures
+                .back()
+                .map(|s| (s.ts_bucket, s.snapshot.last_vpin, s.snapshot.imbalances.len()))
+        );
+        assert_eq!(
+            state_only_store.finalized_vpin_spot.len(),
+            full_store.finalized_vpin_spot.len()
+        );
+        assert_eq!(
+            state_only_store
+                .finalized_vpin_spot
+                .back()
+                .map(|s| (s.ts_bucket, s.snapshot.last_vpin, s.snapshot.imbalances.len())),
+            full_store
+                .finalized_vpin_spot
+                .back()
+                .map(|s| (s.ts_bucket, s.snapshot.last_vpin, s.snapshot.imbalances.len()))
+        );
+        assert_eq!(
+            state_only_store
+                .latest_mark
+                .as_ref()
+                .map(|m| (m.ts, m.mark_price, m.index_price, m.funding_rate)),
+            full_store
+                .latest_mark
+                .as_ref()
+                .map(|m| (m.ts, m.mark_price, m.index_price, m.funding_rate))
+        );
+        assert_eq!(
+            state_only_store
+                .latest_funding
+                .as_ref()
+                .map(|f| (f.ts, f.funding_rate, f.mark_price)),
+            full_store
+                .latest_funding
+                .as_ref()
+                .map(|f| (f.ts, f.funding_rate, f.mark_price))
+        );
+        assert_eq!(
+            state_only_store.funding_changes.len(),
+            full_store.funding_changes.len()
+        );
+        assert_eq!(
+            state_only_store
+                .funding_changes
+                .back()
+                .map(|f| (f.ts_change, f.prev, f.new, f.delta)),
+            full_store
+                .funding_changes
+                .back()
+                .map(|f| (f.ts_change, f.prev, f.new, f.delta))
+        );
+        assert_eq!(state_only_store.mark_timeline.len(), full_store.mark_timeline.len());
+        assert_eq!(
+            state_only_store
+                .mark_timeline
+                .back()
+                .map(|m| (m.ts, m.mark_price, m.index_price, m.funding_rate)),
+            full_store
+                .mark_timeline
+                .back()
+                .map(|m| (m.ts, m.mark_price, m.index_price, m.funding_rate))
+        );
+        assert_eq!(
+            state_only_store.funding_timeline.len(),
+            full_store.funding_timeline.len()
+        );
+        assert_eq!(
+            state_only_store
+                .funding_timeline
+                .back()
+                .map(|f| (f.ts, f.funding_rate, f.mark_price)),
+            full_store
+                .funding_timeline
+                .back()
+                .map(|f| (f.ts, f.funding_rate, f.mark_price))
+        );
     }
 
     #[test]
