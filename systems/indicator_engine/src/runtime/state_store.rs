@@ -33,6 +33,7 @@ const CANONICAL_REPLAY_KEEP_MINUTES: i64 = 60 * 24;
 const OI_RATIO_HISTORY_KEEP_5M_BUCKETS: usize = 12 * 24 * 10; // 10 days
 const OI_CURRENT_HISTORY_KEEP_MINUTES: usize = 60 * 24;
 const OPTIONS_SURFACE_HISTORY_KEEP_5M_BUCKETS: usize = 12 * 24 * 5; // 5 days
+const OPTIONS_SURFACE_BUCKET_SPAN_MINUTES: i64 = 5;
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct LevelAgg {
@@ -1981,11 +1982,14 @@ impl StateStore {
             theta: event.theta,
             risk_free_interest: event.risk_free_interest,
         };
-        upsert_sorted_point_by(
+        // Retain a fixed number of 5m buckets instead of assuming a fixed
+        // contract count per bucket, so universe growth does not shrink history.
+        upsert_sorted_point_by_bucket(
             &mut self.option_mark_greeks_5m,
             point,
-            OPTIONS_SURFACE_HISTORY_KEEP_5M_BUCKETS * 512,
+            OPTIONS_SURFACE_HISTORY_KEEP_5M_BUCKETS,
             |item| (item.ts_bucket, item.option_symbol.clone()),
+            |item| item.ts_bucket,
         );
     }
 
@@ -2889,8 +2893,16 @@ fn derive_expiry_surface(
 fn choose_nearest_strike(rows: &[&OptionMarkGreeksPoint], index_price: f64) -> Option<f64> {
     rows.iter()
         .filter_map(|row| {
-            let iv_score = if row.mark_iv.is_some() { 0 } else { 1 };
-            Some(((row.strike_price - index_price).abs(), iv_score, row.strike_price))
+            let iv_score = if row.mark_iv.or(row.bid_iv).or(row.ask_iv).is_some() {
+                0
+            } else {
+                1
+            };
+            Some((
+                (row.strike_price - index_price).abs(),
+                iv_score,
+                row.strike_price,
+            ))
         })
         .min_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)))
         .map(|tuple| tuple.2)
@@ -2992,10 +3004,7 @@ fn classify_skew_state(rr_25d_front: Option<f64>) -> &'static str {
     }
 }
 
-fn classify_term_structure_state(
-    front_iv: Option<f64>,
-    second_iv: Option<f64>,
-) -> &'static str {
+fn classify_term_structure_state(front_iv: Option<f64>, second_iv: Option<f64>) -> &'static str {
     match front_iv.zip(second_iv) {
         Some((front, second)) if (front - second) >= 0.01 => "front_rich",
         Some((front, second)) if (second - front) >= 0.01 => "back_rich",
@@ -3089,16 +3098,18 @@ where
     true
 }
 
-fn upsert_sorted_point_by<T, K, F>(
+fn upsert_sorted_point_by_bucket<T, K, FK, FB>(
     deque: &mut VecDeque<T>,
     point: T,
-    keep_limit: usize,
-    key_of: F,
+    keep_buckets: usize,
+    key_of: FK,
+    bucket_of: FB,
 ) -> bool
 where
     T: Clone + PartialEq,
     K: Ord,
-    F: Fn(&T) -> K,
+    FK: Fn(&T) -> K,
+    FB: Fn(&T) -> DateTime<Utc>,
 {
     let point_key = key_of(&point);
     if let Some(existing_idx) = deque.iter().position(|item| key_of(item) == point_key) {
@@ -3106,16 +3117,25 @@ where
             return false;
         }
         deque[existing_idx] = point;
-        return true;
+    } else {
+        let insert_idx = deque
+            .iter()
+            .position(|item| key_of(item) > point_key)
+            .unwrap_or(deque.len());
+        deque.insert(insert_idx, point);
     }
 
-    let insert_idx = deque
-        .iter()
-        .position(|item| key_of(item) > point_key)
-        .unwrap_or(deque.len());
-    deque.insert(insert_idx, point);
-
-    while deque.len() > keep_limit {
+    let Some(newest_bucket) = deque.back().map(&bucket_of) else {
+        return true;
+    };
+    let keep_span_minutes =
+        keep_buckets.saturating_sub(1) as i64 * OPTIONS_SURFACE_BUCKET_SPAN_MINUTES;
+    let earliest_bucket = newest_bucket - Duration::minutes(keep_span_minutes);
+    while deque
+        .front()
+        .map(|item| bucket_of(item) < earliest_bucket)
+        .unwrap_or(false)
+    {
         deque.pop_front();
     }
     true
@@ -3317,11 +3337,16 @@ fn collect_heatmap_levels(
 #[cfg(test)]
 mod tests {
     use super::StateStore;
+    use super::{
+        aggregate_options_surface_bucket, choose_nearest_strike,
+        OPTIONS_SURFACE_HISTORY_KEEP_5M_BUCKETS,
+    };
+    use crate::indicators::context::OptionMarkGreeksPoint;
     use crate::ingest::decoder::{
         AggFundingMark1mEvent, AggFundingPoint, AggHeatmapLevel, AggLiq1mEvent, AggLiqLevel,
         AggMarkPoint, AggOrderbook1mEvent, AggProfileLevel, AggTrade1mEvent, AggVpinSnapshot,
         AggWhaleStats, BboEvent, EngineEvent, KlineEvent, LongShortRatio5mEvent,
-        LongShortRatioType, MarketKind, MdData, OpenInterestHist5mEvent,
+        LongShortRatioType, MarketKind, MdData, OpenInterestHist5mEvent, OptionMarkGreeks5mEvent,
     };
     use chrono::{Duration as ChronoDuration, TimeZone, Utc};
     use uuid::Uuid;
@@ -3594,6 +3619,72 @@ mod tests {
                     next_funding_time: None,
                 }],
             }),
+        }
+    }
+
+    fn option_mark_event(
+        ts_bucket: chrono::DateTime<Utc>,
+        option_symbol: &str,
+        expiry_ts: chrono::DateTime<Utc>,
+        strike_price: f64,
+        contract_side: &str,
+        index_price: f64,
+        mark_iv: Option<f64>,
+        bid_iv: Option<f64>,
+        ask_iv: Option<f64>,
+        delta: Option<f64>,
+    ) -> OptionMarkGreeks5mEvent {
+        OptionMarkGreeks5mEvent {
+            ts_bucket,
+            option_symbol: option_symbol.to_string(),
+            underlying_asset: "TEST".to_string(),
+            expiry_ts,
+            strike_price,
+            contract_side: contract_side.to_string(),
+            unit: Some(1.0),
+            index_price: Some(index_price),
+            mark_price: Some(1.0),
+            bid_iv,
+            ask_iv,
+            mark_iv,
+            delta,
+            gamma: None,
+            vega: None,
+            theta: None,
+            risk_free_interest: None,
+        }
+    }
+
+    fn option_mark_point(
+        ts_bucket: chrono::DateTime<Utc>,
+        option_symbol: &str,
+        expiry_ts: chrono::DateTime<Utc>,
+        strike_price: f64,
+        contract_side: &str,
+        index_price: f64,
+        mark_iv: Option<f64>,
+        bid_iv: Option<f64>,
+        ask_iv: Option<f64>,
+        delta: Option<f64>,
+    ) -> OptionMarkGreeksPoint {
+        OptionMarkGreeksPoint {
+            ts_bucket,
+            option_symbol: option_symbol.to_string(),
+            underlying_asset: "TEST".to_string(),
+            expiry_ts,
+            strike_price,
+            contract_side: contract_side.to_string(),
+            unit: Some(1.0),
+            index_price: Some(index_price),
+            mark_price: Some(1.0),
+            bid_iv,
+            ask_iv,
+            mark_iv,
+            delta,
+            gamma: None,
+            vega: None,
+            theta: None,
+            risk_free_interest: None,
         }
     }
 
@@ -4201,6 +4292,247 @@ mod tests {
             .and_then(|h| Some(h.vpin))
             .expect("final vpin");
         assert!((final_vpin - 0.29).abs() < 1e-9);
+    }
+
+    #[test]
+    fn option_mark_greeks_retention_keeps_full_5m_buckets() {
+        let mut store = StateStore::new("TESTUSDT".to_string(), 1_000.0);
+        let start = Utc.with_ymd_and_hms(2026, 3, 1, 0, 0, 0).single().unwrap();
+        let expiry = start + ChronoDuration::days(30);
+
+        for offset in 0..=OPTIONS_SURFACE_HISTORY_KEEP_5M_BUCKETS {
+            let bucket = start + ChronoDuration::minutes((offset as i64) * 5);
+            for side in ["CALL", "PUT"] {
+                store.store_option_mark_greeks_5m(option_mark_event(
+                    bucket,
+                    &format!("TEST-{}-{}", offset, side),
+                    expiry,
+                    100.0,
+                    side,
+                    100.0,
+                    Some(0.50),
+                    None,
+                    None,
+                    Some(if side == "CALL" { 0.25 } else { -0.25 }),
+                ));
+            }
+        }
+
+        let expected_oldest = start + ChronoDuration::minutes(5);
+        let expected_latest =
+            start + ChronoDuration::minutes((OPTIONS_SURFACE_HISTORY_KEEP_5M_BUCKETS as i64) * 5);
+        assert_eq!(
+            store
+                .option_mark_greeks_5m
+                .front()
+                .map(|point| point.ts_bucket),
+            Some(expected_oldest)
+        );
+        assert_eq!(
+            store
+                .option_mark_greeks_5m
+                .back()
+                .map(|point| point.ts_bucket),
+            Some(expected_latest)
+        );
+        assert_eq!(
+            store.option_mark_greeks_5m.len(),
+            OPTIONS_SURFACE_HISTORY_KEEP_5M_BUCKETS * 2
+        );
+        assert_eq!(
+            store
+                .option_mark_greeks_5m
+                .iter()
+                .filter(|point| point.ts_bucket == start)
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn choose_nearest_strike_prefers_any_available_iv_when_distance_ties() {
+        let ts_bucket = Utc
+            .with_ymd_and_hms(2026, 3, 27, 6, 20, 0)
+            .single()
+            .unwrap();
+        let expiry = ts_bucket + ChronoDuration::days(7);
+        let rows = vec![
+            option_mark_point(
+                ts_bucket,
+                "TEST-99-C",
+                expiry,
+                99.0,
+                "CALL",
+                100.0,
+                None,
+                None,
+                None,
+                Some(0.40),
+            ),
+            option_mark_point(
+                ts_bucket,
+                "TEST-99-P",
+                expiry,
+                99.0,
+                "PUT",
+                100.0,
+                None,
+                None,
+                None,
+                Some(-0.40),
+            ),
+            option_mark_point(
+                ts_bucket,
+                "TEST-101-C",
+                expiry,
+                101.0,
+                "CALL",
+                100.0,
+                None,
+                Some(0.38),
+                Some(0.42),
+                Some(0.25),
+            ),
+            option_mark_point(
+                ts_bucket,
+                "TEST-101-P",
+                expiry,
+                101.0,
+                "PUT",
+                100.0,
+                None,
+                Some(0.40),
+                Some(0.44),
+                Some(-0.25),
+            ),
+        ];
+        let refs = rows.iter().collect::<Vec<_>>();
+
+        assert_eq!(choose_nearest_strike(&refs, 100.0), Some(101.0));
+    }
+
+    #[test]
+    fn aggregate_options_surface_bucket_computes_proxy_and_states() {
+        let ts_bucket = Utc
+            .with_ymd_and_hms(2026, 3, 27, 6, 20, 0)
+            .single()
+            .unwrap();
+        let front_expiry = ts_bucket + ChronoDuration::days(10);
+        let second_expiry = ts_bucket + ChronoDuration::days(50);
+        let rows = vec![
+            option_mark_point(
+                ts_bucket,
+                "FRONT-ATM-C",
+                front_expiry,
+                100.0,
+                "CALL",
+                100.0,
+                Some(0.50),
+                None,
+                None,
+                Some(0.50),
+            ),
+            option_mark_point(
+                ts_bucket,
+                "FRONT-ATM-P",
+                front_expiry,
+                100.0,
+                "PUT",
+                100.0,
+                Some(0.50),
+                None,
+                None,
+                Some(-0.50),
+            ),
+            option_mark_point(
+                ts_bucket,
+                "FRONT-RR-C",
+                front_expiry,
+                105.0,
+                "CALL",
+                100.0,
+                Some(0.45),
+                None,
+                None,
+                Some(0.25),
+            ),
+            option_mark_point(
+                ts_bucket,
+                "FRONT-RR-P",
+                front_expiry,
+                95.0,
+                "PUT",
+                100.0,
+                Some(0.55),
+                None,
+                None,
+                Some(-0.25),
+            ),
+            option_mark_point(
+                ts_bucket,
+                "SECOND-ATM-C",
+                second_expiry,
+                100.0,
+                "CALL",
+                100.0,
+                Some(0.70),
+                None,
+                None,
+                Some(0.50),
+            ),
+            option_mark_point(
+                ts_bucket,
+                "SECOND-ATM-P",
+                second_expiry,
+                100.0,
+                "PUT",
+                100.0,
+                Some(0.70),
+                None,
+                None,
+                Some(-0.50),
+            ),
+            option_mark_point(
+                ts_bucket,
+                "SECOND-RR-C",
+                second_expiry,
+                105.0,
+                "CALL",
+                100.0,
+                Some(0.65),
+                None,
+                None,
+                Some(0.25),
+            ),
+            option_mark_point(
+                ts_bucket,
+                "SECOND-RR-P",
+                second_expiry,
+                95.0,
+                "PUT",
+                100.0,
+                Some(0.75),
+                None,
+                None,
+                Some(-0.25),
+            ),
+        ];
+        let refs = rows.iter().collect::<Vec<_>>();
+        let point = aggregate_options_surface_bucket(ts_bucket, &refs).expect("surface point");
+
+        assert_eq!(point.front_expiry_ts, Some(front_expiry));
+        assert_eq!(point.second_expiry_ts, Some(second_expiry));
+        assert_eq!(point.atm_strike_front, Some(100.0));
+        assert_eq!(point.atm_iv_front, Some(0.50));
+        assert_eq!(point.atm_iv_second, Some(0.70));
+        assert!(point.rr_25d_front.is_some());
+        assert!((point.rr_25d_front.unwrap() + 0.10).abs() < 1e-9);
+        assert!(point.rr_25d_second.is_some());
+        assert!((point.rr_25d_second.unwrap() + 0.10).abs() < 1e-9);
+        assert_eq!(point.skew_state, "put_skewed");
+        assert_eq!(point.term_structure_state, "back_rich");
+        assert!(point.atm_iv_30d_proxy.is_some());
+        assert!((point.atm_iv_30d_proxy.unwrap() - 0.60).abs() < 1e-9);
     }
 
     #[test]

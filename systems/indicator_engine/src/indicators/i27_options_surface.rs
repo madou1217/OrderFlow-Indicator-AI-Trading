@@ -99,7 +99,10 @@ pub fn build_options_surface_view(ctx: &IndicatorContext) -> OptionsSurfaceIndic
             compute_options_surface_window(&ctx.options_surface_5m, label, minutes, samples)
         })
         .collect::<Vec<_>>();
-    OptionsSurfaceIndicatorView { as_of_ts, by_window }
+    OptionsSurfaceIndicatorView {
+        as_of_ts,
+        by_window,
+    }
 }
 
 fn compute_options_surface_window(
@@ -167,7 +170,10 @@ fn diff(current: Option<f64>, previous: Option<f64>) -> Option<f64> {
     current.zip(previous).map(|(curr, prev)| curr - prev)
 }
 
-fn classify_atm_iv_regime(atm_iv_front: Option<f64>, atm_iv_30d_proxy: Option<f64>) -> &'static str {
+fn classify_atm_iv_regime(
+    atm_iv_front: Option<f64>,
+    atm_iv_30d_proxy: Option<f64>,
+) -> &'static str {
     match atm_iv_front.zip(atm_iv_30d_proxy) {
         Some((front, proxy)) if (front - proxy) >= 0.02 => "elevated",
         Some((front, proxy)) if (proxy - front) >= 0.02 => "compressed",
@@ -196,4 +202,69 @@ fn options_surface_window_json(metrics: &OptionsSurfaceWindowMetrics) -> Value {
         "skew_state": metrics.skew_state,
         "term_structure_state": metrics.term_structure_state,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compute_options_surface_window;
+    use crate::indicators::context::OptionsSurfacePoint;
+    use chrono::{TimeZone, Utc};
+
+    fn surface_point(
+        ts_bucket: chrono::DateTime<Utc>,
+        atm_iv_front: f64,
+        rr_25d_front: f64,
+    ) -> OptionsSurfacePoint {
+        OptionsSurfacePoint {
+            ts_bucket,
+            front_expiry_ts: Some(ts_bucket + chrono::Duration::days(10)),
+            second_expiry_ts: Some(ts_bucket + chrono::Duration::days(40)),
+            atm_strike_front: Some(100.0),
+            atm_iv_front: Some(atm_iv_front),
+            atm_iv_second: Some(atm_iv_front + 0.10),
+            atm_iv_30d_proxy: Some(atm_iv_front + 0.05),
+            rr_25d_front: Some(rr_25d_front),
+            rr_25d_second: Some(rr_25d_front + 0.02),
+            skew_state: "neutral".to_string(),
+            term_structure_state: "flat".to_string(),
+        }
+    }
+
+    #[test]
+    fn five_minute_window_requires_two_points_and_fifteen_minute_requires_four() {
+        let ts_0 = Utc.with_ymd_and_hms(2026, 3, 27, 6, 5, 0).single().unwrap();
+        let ts_1 = ts_0 + chrono::Duration::minutes(5);
+        let ts_2 = ts_1 + chrono::Duration::minutes(5);
+        let ts_3 = ts_2 + chrono::Duration::minutes(5);
+
+        let one_point = vec![surface_point(ts_0, 0.50, -0.10)];
+        assert!(!compute_options_surface_window(&one_point, "5m", 5, 1).is_ready);
+
+        let two_points = vec![
+            surface_point(ts_0, 0.50, -0.10),
+            surface_point(ts_1, 0.55, -0.08),
+        ];
+        let five_min = compute_options_surface_window(&two_points, "5m", 5, 1);
+        assert!(five_min.is_ready);
+        assert_eq!(five_min.samples_used, 1);
+        assert!(five_min.atm_iv_front_change.is_some());
+        assert!((five_min.atm_iv_front_change.unwrap() - 0.05).abs() < 1e-9);
+        assert!(five_min.rr_25d_front_change.is_some());
+        assert!((five_min.rr_25d_front_change.unwrap() - 0.02).abs() < 1e-9);
+        assert!(!compute_options_surface_window(&two_points, "15m", 15, 3).is_ready);
+
+        let four_points = vec![
+            surface_point(ts_0, 0.50, -0.10),
+            surface_point(ts_1, 0.55, -0.08),
+            surface_point(ts_2, 0.57, -0.06),
+            surface_point(ts_3, 0.60, -0.04),
+        ];
+        let fifteen_min = compute_options_surface_window(&four_points, "15m", 15, 3);
+        assert!(fifteen_min.is_ready);
+        assert_eq!(fifteen_min.samples_used, 3);
+        assert!(fifteen_min.atm_iv_front_change.is_some());
+        assert!((fifteen_min.atm_iv_front_change.unwrap() - 0.10).abs() < 1e-9);
+        assert!(fifteen_min.rr_25d_front_change.is_some());
+        assert!((fifteen_min.rr_25d_front_change.unwrap() - 0.06).abs() < 1e-9);
+    }
 }
