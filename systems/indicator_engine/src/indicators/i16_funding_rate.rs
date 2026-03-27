@@ -69,11 +69,7 @@ impl Indicator for I16FundingRate {
 
 fn compute_window_metrics(ctx: &IndicatorContext, mins: i64, label: &str) -> Value {
     let metrics = compute_funding_window_metrics(ctx, mins);
-    let mut changes = metrics
-        .changes_json
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
+    let mut changes = metrics.changes_json.as_array().cloned().unwrap_or_default();
     changes.sort_by_key(|row| {
         row.get("change_ts")
             .and_then(Value::as_str)

@@ -1365,8 +1365,8 @@ fn snapshot_has_required_history(snap: &StateSnapshot) -> bool {
 fn required_snapshot_history_start_ts(snap: &StateSnapshot) -> DateTime<Utc> {
     let retention_floor =
         snap.last_finalized_ts - ChronoDuration::minutes((HISTORY_LIMIT_MINUTES as i64) - 1);
-    let rolling_history_floor = snap.last_finalized_ts
-        - ChronoDuration::minutes(MIN_REUSABLE_SNAPSHOT_HISTORY_MINUTES - 1);
+    let rolling_history_floor =
+        snap.last_finalized_ts - ChronoDuration::minutes(MIN_REUSABLE_SNAPSHOT_HISTORY_MINUTES - 1);
     retention_floor.max(rolling_history_floor)
 }
 
@@ -2599,8 +2599,7 @@ async fn run_startup_backfill(
         return Ok(None);
     }
     let history_replay_start_ts = history_continuous_start_ts.max(from_ts);
-    let history_replay_end_ts =
-        history_continuous_end_ts.min(to_ts - ChronoDuration::minutes(1));
+    let history_replay_end_ts = history_continuous_end_ts.min(to_ts - ChronoDuration::minutes(1));
 
     if snapshot_was_loaded {
         state_store.rewind_finalized_state_from(history_replay_start_ts);
@@ -4730,11 +4729,10 @@ mod tests {
         assert_eq!(state_store.history_futures_len(), 1);
         assert_eq!(scheduler.next_minute_to_emit(), Some(cutoff_bucket_ts));
         assert_eq!(
-            state_store
-                .latest_contiguous_complete_canonical_minute_from(
-                    cutoff_bucket_ts,
-                    first_live_bucket_ts + ChronoDuration::minutes(2)
-                ),
+            state_store.latest_contiguous_complete_canonical_minute_from(
+                cutoff_bucket_ts,
+                first_live_bucket_ts + ChronoDuration::minutes(2)
+            ),
             None
         );
     }

@@ -1210,7 +1210,6 @@ mod tests {
     }
 }
 
-
 fn delta_slant(delta: f64, high: Option<f64>, low: Option<f64>) -> Option<f64> {
     let range = high.zip(low).map(|(h, l)| h - l)?;
     if range.abs() < 1e-12 {

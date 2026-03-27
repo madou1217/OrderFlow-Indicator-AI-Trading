@@ -42,7 +42,7 @@ fn price_zone_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["low", "high"],
+        "required": ["low", "high", "timeframe", "label", "reason"],
         "properties": {
             "low": {"type": "number"},
             "high": {"type": "number"},
@@ -57,7 +57,7 @@ fn tracked_zone_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["zone_id", "timeframe", "role", "low", "high"],
+        "required": ["zone_id", "timeframe", "role", "low", "high", "reason"],
         "properties": {
             "zone_id": {"type": "string"},
             "timeframe": {"type": "string"},
@@ -103,7 +103,7 @@ fn driver_deterioration_rule_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["driver_signal"],
+        "required": ["driver_signal", "reduce_ratio"],
         "properties": {
             "driver_signal": {"type": "string"},
             "reduce_ratio": {"type": ["number", "null"]}
@@ -140,7 +140,13 @@ fn map_summary_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["market_tradeable", "notes"],
+        "required": [
+            "market_tradeable",
+            "location_bias",
+            "state_summary",
+            "driver_summary",
+            "notes"
+        ],
         "properties": {
             "market_tradeable": {"type": "boolean"},
             "location_bias": {"type": ["string", "null"]},
@@ -155,7 +161,12 @@ fn driver_attribution_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["driver_bias", "supporting_evidence", "conflicting_evidence"],
+        "required": [
+            "driver_bias",
+            "primary_driver",
+            "supporting_evidence",
+            "conflicting_evidence"
+        ],
         "properties": {
             "driver_bias": {"type": "string"},
             "primary_driver": {"type": ["string", "null"]},
@@ -268,13 +279,15 @@ fn execution_intent_schema() -> Value {
             "side",
             "intent_mode",
             "entry_zone",
+            "trigger_price",
             "stop_loss",
             "take_profit_1",
             "take_profit_2",
             "ttl_minutes",
             "max_drift_pct",
             "path_id",
-            "entry_snapshot"
+            "entry_snapshot",
+            "reason"
         ],
         "properties": {
             "side": {"type": "string", "enum": ["LONG", "SHORT"]},
@@ -297,7 +310,16 @@ fn management_action_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["type", "context_key", "path_id"],
+        "required": [
+            "type",
+            "context_key",
+            "path_id",
+            "reduce_ratio",
+            "new_stop_loss",
+            "take_profit_1",
+            "take_profit_2",
+            "reason"
+        ],
         "properties": {
             "type": {
                 "type": "string",
@@ -560,6 +582,48 @@ mod tests {
         let management_action = schema["properties"]["management_actions"]["items"].clone();
         assert_eq!(management_action["type"], "object");
         assert_eq!(management_action["additionalProperties"], false);
+    }
+
+    #[test]
+    fn stage1_schema_marks_nullable_fields_as_required_for_strict_json_schema() {
+        let schema = workflow_stage1_schema();
+        let map_summary = schema["properties"]["map_summary"]["anyOf"][0].clone();
+        let required = map_summary["required"]
+            .as_array()
+            .expect("required array")
+            .iter()
+            .filter_map(|value| value.as_str())
+            .collect::<Vec<_>>();
+        assert!(required.contains(&"location_bias"));
+        assert!(required.contains(&"state_summary"));
+        assert!(required.contains(&"driver_summary"));
+    }
+
+    #[test]
+    fn stage2_schema_marks_nullable_fields_as_required_for_strict_json_schema() {
+        let schema = workflow_stage2_schema();
+        let execution_intent = schema["properties"]["execution_intent"]["anyOf"][0].clone();
+        let execution_required = execution_intent["required"]
+            .as_array()
+            .expect("required array")
+            .iter()
+            .filter_map(|value| value.as_str())
+            .collect::<Vec<_>>();
+        assert!(execution_required.contains(&"trigger_price"));
+        assert!(execution_required.contains(&"reason"));
+
+        let management_action = schema["properties"]["management_actions"]["items"].clone();
+        let management_required = management_action["required"]
+            .as_array()
+            .expect("required array")
+            .iter()
+            .filter_map(|value| value.as_str())
+            .collect::<Vec<_>>();
+        assert!(management_required.contains(&"reduce_ratio"));
+        assert!(management_required.contains(&"new_stop_loss"));
+        assert!(management_required.contains(&"take_profit_1"));
+        assert!(management_required.contains(&"take_profit_2"));
+        assert!(management_required.contains(&"reason"));
     }
 }
 

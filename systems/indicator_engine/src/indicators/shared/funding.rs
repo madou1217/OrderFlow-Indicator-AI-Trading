@@ -161,10 +161,7 @@ mod tests {
 
     #[test]
     fn window_metrics_use_latest_point_within_minute() {
-        let ts_bucket = Utc
-            .with_ymd_and_hms(2026, 3, 27, 8, 0, 0)
-            .single()
-            .unwrap();
+        let ts_bucket = Utc.with_ymd_and_hms(2026, 3, 27, 8, 0, 0).single().unwrap();
         let state_ts = ts_bucket + Duration::seconds(59) + Duration::milliseconds(1);
         let bundle = WindowBundle {
             ts_bucket,
@@ -280,7 +277,8 @@ mod tests {
             divergence_p_value_threshold: 0.05,
             window_codes: vec!["1m".to_string()],
         };
-        let ctx = IndicatorContext::from_bundle(&bundle, &options, KlineHistorySupplement::default());
+        let ctx =
+            IndicatorContext::from_bundle(&bundle, &options, KlineHistorySupplement::default());
 
         let metrics = compute_funding_window_metrics(&ctx, 1);
 

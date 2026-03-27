@@ -3839,29 +3839,39 @@ mod tests {
         let _ = full_store.finalize_minute(ts);
         state_only_store.advance_finalized_state(ts);
 
-        assert_eq!(state_only_store.last_finalized_minute, full_store.last_finalized_minute);
+        assert_eq!(
+            state_only_store.last_finalized_minute,
+            full_store.last_finalized_minute
+        );
         assert_eq!(state_only_store.cvd_futures, full_store.cvd_futures);
         assert_eq!(state_only_store.cvd_spot, full_store.cvd_spot);
         assert_eq!(
             state_only_store.history_futures.len(),
             full_store.history_futures.len()
         );
-        assert_eq!(state_only_store.history_spot.len(), full_store.history_spot.len());
         assert_eq!(
-            state_only_store
-                .history_futures
-                .back()
-                .map(|h| (h.ts_bucket, h.close_price, h.cvd, h.vpin)),
+            state_only_store.history_spot.len(),
+            full_store.history_spot.len()
+        );
+        assert_eq!(
+            state_only_store.history_futures.back().map(|h| (
+                h.ts_bucket,
+                h.close_price,
+                h.cvd,
+                h.vpin
+            )),
             full_store
                 .history_futures
                 .back()
                 .map(|h| (h.ts_bucket, h.close_price, h.cvd, h.vpin))
         );
         assert_eq!(
-            state_only_store
-                .history_spot
-                .back()
-                .map(|h| (h.ts_bucket, h.close_price, h.cvd, h.vpin)),
+            state_only_store.history_spot.back().map(|h| (
+                h.ts_bucket,
+                h.close_price,
+                h.cvd,
+                h.vpin
+            )),
             full_store
                 .history_spot
                 .back()
@@ -3872,38 +3882,46 @@ mod tests {
             full_store.finalized_vpin_futures.len()
         );
         assert_eq!(
-            state_only_store
-                .finalized_vpin_futures
-                .back()
-                .map(|s| (s.ts_bucket, s.snapshot.last_vpin, s.snapshot.imbalances.len())),
-            full_store
-                .finalized_vpin_futures
-                .back()
-                .map(|s| (s.ts_bucket, s.snapshot.last_vpin, s.snapshot.imbalances.len()))
+            state_only_store.finalized_vpin_futures.back().map(|s| (
+                s.ts_bucket,
+                s.snapshot.last_vpin,
+                s.snapshot.imbalances.len()
+            )),
+            full_store.finalized_vpin_futures.back().map(|s| (
+                s.ts_bucket,
+                s.snapshot.last_vpin,
+                s.snapshot.imbalances.len()
+            ))
         );
         assert_eq!(
             state_only_store.finalized_vpin_spot.len(),
             full_store.finalized_vpin_spot.len()
         );
         assert_eq!(
-            state_only_store
-                .finalized_vpin_spot
-                .back()
-                .map(|s| (s.ts_bucket, s.snapshot.last_vpin, s.snapshot.imbalances.len())),
-            full_store
-                .finalized_vpin_spot
-                .back()
-                .map(|s| (s.ts_bucket, s.snapshot.last_vpin, s.snapshot.imbalances.len()))
+            state_only_store.finalized_vpin_spot.back().map(|s| (
+                s.ts_bucket,
+                s.snapshot.last_vpin,
+                s.snapshot.imbalances.len()
+            )),
+            full_store.finalized_vpin_spot.back().map(|s| (
+                s.ts_bucket,
+                s.snapshot.last_vpin,
+                s.snapshot.imbalances.len()
+            ))
         );
         assert_eq!(
-            state_only_store
-                .latest_mark
-                .as_ref()
-                .map(|m| (m.ts, m.mark_price, m.index_price, m.funding_rate)),
-            full_store
-                .latest_mark
-                .as_ref()
-                .map(|m| (m.ts, m.mark_price, m.index_price, m.funding_rate))
+            state_only_store.latest_mark.as_ref().map(|m| (
+                m.ts,
+                m.mark_price,
+                m.index_price,
+                m.funding_rate
+            )),
+            full_store.latest_mark.as_ref().map(|m| (
+                m.ts,
+                m.mark_price,
+                m.index_price,
+                m.funding_rate
+            ))
         );
         assert_eq!(
             state_only_store
@@ -3929,16 +3947,23 @@ mod tests {
                 .back()
                 .map(|f| (f.ts_change, f.prev, f.new, f.delta))
         );
-        assert_eq!(state_only_store.mark_timeline.len(), full_store.mark_timeline.len());
         assert_eq!(
-            state_only_store
-                .mark_timeline
-                .back()
-                .map(|m| (m.ts, m.mark_price, m.index_price, m.funding_rate)),
-            full_store
-                .mark_timeline
-                .back()
-                .map(|m| (m.ts, m.mark_price, m.index_price, m.funding_rate))
+            state_only_store.mark_timeline.len(),
+            full_store.mark_timeline.len()
+        );
+        assert_eq!(
+            state_only_store.mark_timeline.back().map(|m| (
+                m.ts,
+                m.mark_price,
+                m.index_price,
+                m.funding_rate
+            )),
+            full_store.mark_timeline.back().map(|m| (
+                m.ts,
+                m.mark_price,
+                m.index_price,
+                m.funding_rate
+            ))
         );
         assert_eq!(
             state_only_store.funding_timeline.len(),

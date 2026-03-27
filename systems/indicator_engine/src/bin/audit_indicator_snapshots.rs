@@ -107,8 +107,7 @@ fn parse_args() -> Result<CliArgs> {
             }
             "--to" => {
                 let raw = take_arg_value(&mut args, "--to")?;
-                to_ts =
-                    Some(parse_rfc3339_utc(&raw).with_context(|| format!("parse --to {raw}"))?);
+                to_ts = Some(parse_rfc3339_utc(&raw).with_context(|| format!("parse --to {raw}"))?);
             }
             "--warmup-days" => {
                 let raw = take_arg_value(&mut args, "--warmup-days")?;
@@ -454,7 +453,11 @@ async fn main() -> Result<()> {
         .map(ceil_minute)
         .unwrap_or(compare_to - ChronoDuration::minutes(DEFAULT_COMPARE_MINUTES - 1));
     if compare_from > compare_to {
-        bail!("compare window invalid: from {} > to {}", compare_from, compare_to);
+        bail!(
+            "compare window invalid: from {} > to {}",
+            compare_from,
+            compare_to
+        );
     }
     let replay_from = compare_from - ChronoDuration::days(args.warmup_days);
     let replay_to_exclusive = compare_to + ChronoDuration::minutes(1);
@@ -653,7 +656,11 @@ async fn main() -> Result<()> {
         }
     }
 
-    if summaries.values().all(|summary| summary.mismatched_rows == 0) && failures.is_empty() {
+    if summaries
+        .values()
+        .all(|summary| summary.mismatched_rows == 0)
+        && failures.is_empty()
+    {
         Ok(())
     } else {
         bail!("replay audit found mismatches");
