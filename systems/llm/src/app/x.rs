@@ -53,7 +53,7 @@ impl XOperator {
     pub async fn send_trade_signal(
         &self,
         http_client: &Client,
-        signal: &TradeSignalNotification<'_>,
+        signal: &TradeSignalNotification,
     ) -> Result<()> {
         let url = format!("{}/tweets", self.base_api_url);
         let nonce = Uuid::new_v4().simple().to_string();
@@ -220,49 +220,41 @@ fn oauth_percent_encode(input: &str) -> String {
     out
 }
 
-fn build_trade_signal_message(signal: &TradeSignalNotification<'_>) -> String {
-    let direction_emoji = if signal.decision.eq_ignore_ascii_case("LONG") {
-        "📈"
-    } else if signal.decision.eq_ignore_ascii_case("SHORT") {
-        "📉"
-    } else {
-        "ℹ️"
-    };
-    let time_only_utc = signal.ts_bucket.format("%H:%M:%S").to_string();
-    format!(
-        "{} {}\n📌 Symbol: {}\n🟢 Entry: {}\n⚙️ Leverage: {}\n📊 RR: {}\n🎯 TP: {}\n🛑 SL: {}\n🕒 Time: {}",
-        direction_emoji,
-        signal.decision,
-        signal.symbol,
-        format_opt_price(signal.entry_price),
-        format_opt_leverage(signal.leverage),
-        format_opt_ratio(signal.risk_reward_ratio),
-        format_opt_price(signal.take_profit),
-        format_opt_price(signal.stop_loss),
-        format!("{} UTC", time_only_utc),
-    )
+fn build_trade_signal_message(signal: &TradeSignalNotification) -> String {
+    let mut parts = vec![
+        signal.decision.clone(),
+        signal.symbol.clone(),
+        format!("entry {}", format_opt_price(signal.entry_price)),
+        format!("sl {}", format_opt_price(signal.stop_loss)),
+        format!("tp1 {}", format_opt_price(signal.take_profit_1)),
+    ];
+    if signal.take_profit_2.is_some() {
+        parts.push(format!("tp2 {}", format_opt_price(signal.take_profit_2)));
+    }
+    if let Some(context_key) = signal.context_key.as_deref() {
+        parts.push(format!("ctx {}", context_key));
+    }
+    parts.push(format!("t {}", signal.ts_bucket.format("%H:%M UTC")));
+    let mut text = parts.join(" | ");
+    let reason = single_line_text(&signal.reason, 60);
+    if !reason.is_empty() {
+        text.push_str(" | ");
+        text.push_str(&reason);
+    }
+    text
+}
+
+fn single_line_text(input: &str, max_len: usize) -> String {
+    let mut output = input.split_whitespace().collect::<Vec<_>>().join(" ");
+    if output.len() > max_len {
+        output.truncate(max_len);
+        output.push_str("...");
+    }
+    output
 }
 
 fn format_opt_price(value: Option<f64>) -> String {
     value
         .map(|v| v.to_string())
-        .unwrap_or_else(|| "-".to_string())
-}
-
-fn format_opt_ratio(value: Option<f64>) -> String {
-    value
-        .map(|v| format!("{:.2}", v))
-        .unwrap_or_else(|| "-".to_string())
-}
-
-fn format_opt_leverage(value: Option<f64>) -> String {
-    value
-        .map(|v| {
-            if (v - v.round()).abs() < f64::EPSILON {
-                format!("{}", v.round() as i64)
-            } else {
-                format!("{:.2}", v)
-            }
-        })
         .unwrap_or_else(|| "-".to_string())
 }

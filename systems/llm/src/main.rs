@@ -2,6 +2,7 @@ mod app;
 mod execution;
 mod llm;
 mod observability;
+mod workflow;
 
 use anyhow::Result;
 

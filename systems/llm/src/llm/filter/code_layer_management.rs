@@ -17,7 +17,7 @@ const KLINE_LIMITS: &[(&str, usize)] = &[("15m", 16), ("4h", 15), ("1d", 10)];
 const CVD_LIMITS: &[(&str, usize)] = &[("15m", 12), ("4h", 10), ("1d", 6)];
 const MGMT_TOP_LIQUIDITY_LEVELS_LIMIT: usize = 60;
 
-pub(super) fn filter_indicators(
+pub(crate) fn filter_indicators(
     source: &Map<String, Value>,
     ts_bucket: Option<&str>,
     management_snapshot: Option<&Value>,

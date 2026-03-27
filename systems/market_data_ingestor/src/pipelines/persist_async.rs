@@ -2489,10 +2489,7 @@ fn shard_for_non_trade_orderbook_event(event: &NormalizedMdEvent, shard_count: u
     (hasher.finish() as usize) % shard_count
 }
 
-fn shard_for_non_trade_funding_mark_event(
-    event: &NormalizedMdEvent,
-    shard_count: usize,
-) -> usize {
+fn shard_for_non_trade_funding_mark_event(event: &NormalizedMdEvent, shard_count: usize) -> usize {
     if shard_count <= 1 {
         return 0;
     }
@@ -2623,12 +2620,14 @@ fn build_option_lag_summaries(now: DateTime<Utc>, jobs: &[PersistJob]) -> Vec<Op
 
     let mut out = grouped
         .into_iter()
-        .map(|(key, (contracts_in_bucket, oldest_enqueued_at))| OptionLagSummary {
-            event_lag_secs: (now - key.bucket_ts).num_seconds(),
-            max_queue_wait_ms: oldest_enqueued_at.elapsed().as_millis(),
-            contracts_in_bucket,
-            key,
-        })
+        .map(
+            |(key, (contracts_in_bucket, oldest_enqueued_at))| OptionLagSummary {
+                event_lag_secs: (now - key.bucket_ts).num_seconds(),
+                max_queue_wait_ms: oldest_enqueued_at.elapsed().as_millis(),
+                contracts_in_bucket,
+                key,
+            },
+        )
         .collect::<Vec<_>>();
 
     out.sort_by_key(|summary| (summary.key.bucket_ts, summary.key.symbol.clone()));
@@ -3506,8 +3505,8 @@ fn is_hot_path_md_event(event: &NormalizedMdEvent) -> bool {
 mod tests {
     use super::{
         apply_trade_raw_event, build_option_lag_summaries, classify_persist_lane,
-        collect_db_passthrough_events, collect_publish_passthrough_events, PersistJob,
-        PersistLane, TradeSecondChunk, TradeVpinState,
+        collect_db_passthrough_events, collect_publish_passthrough_events, PersistJob, PersistLane,
+        TradeSecondChunk, TradeVpinState,
     };
     use crate::normalize::NormalizedMdEvent;
     use chrono::{TimeZone, Utc};
@@ -3685,7 +3684,10 @@ mod tests {
             classify_persist_lane(&mark),
             PersistLane::NonTradeFundingMark
         );
-        assert_eq!(classify_persist_lane(&options), PersistLane::NonTradeOptions);
+        assert_eq!(
+            classify_persist_lane(&options),
+            PersistLane::NonTradeOptions
+        );
         assert_eq!(classify_persist_lane(&ratio), PersistLane::NonTradeOther);
     }
 

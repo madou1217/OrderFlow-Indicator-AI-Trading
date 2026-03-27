@@ -1,11 +1,11 @@
 use crate::app::bootstrap::AppContext;
 use crate::exchange::binance::rest::client::BinanceRestClient;
 use crate::exchange::binance::rest::long_short_ratio::BinanceLongShortRatioRecord;
-use crate::exchange::binance::rest::options_exchange_info::BinanceOptionSymbolInfo;
 use crate::exchange::binance::rest::open_interest_hist::BinanceOpenInterestHistRecord;
+use crate::exchange::binance::rest::options_exchange_info::BinanceOptionSymbolInfo;
+use crate::normalize::options_surface_normalizer;
 use crate::normalize::{funding_rate_normalizer, mark_price_normalizer, NormalizedMdEvent};
 use crate::normalize::{long_short_ratio_normalizer, open_interest_normalizer};
-use crate::normalize::options_surface_normalizer;
 use crate::observability::metrics::AppMetrics;
 use crate::pipelines::persist_async;
 use crate::sinks::{
@@ -276,7 +276,9 @@ pub async fn run_options_surface_loop(
 
     loop {
         ticker.tick().await;
-        let target_bucket = floor_to_5m(Utc::now() - ChronoDuration::seconds(OPTIONS_SURFACE_LIVE_READY_GRACE_SECS));
+        let target_bucket = floor_to_5m(
+            Utc::now() - ChronoDuration::seconds(OPTIONS_SURFACE_LIVE_READY_GRACE_SECS),
+        );
         if last_bucket == Some(target_bucket) {
             continue;
         }
@@ -413,13 +415,19 @@ async fn handle_options_surface_live_bucket(
 ) -> Result<()> {
     let contracts = refresh_options_universe_if_needed(rest_client, symbol, universe).await?;
     if contracts.is_empty() {
-        warn!(symbol = symbol, "options surface universe is empty for symbol");
+        warn!(
+            symbol = symbol,
+            "options surface universe is empty for symbol"
+        );
         return Ok(());
     }
 
     let index = rest_client.fetch_options_index_price(symbol).await?;
     let index_price = index.index_price.parse::<f64>().with_context(|| {
-        format!("parse options index price {} for {}", index.index_price, symbol)
+        format!(
+            "parse options index price {} for {}",
+            index.index_price, symbol
+        )
     })?;
     let marks = rest_client.fetch_options_mark(symbol).await?;
     let mark_map = marks
@@ -469,7 +477,9 @@ async fn refresh_options_universe_if_needed<'a>(
     let now = Utc::now();
     let needs_refresh = cache
         .as_ref()
-        .map(|cached| (now - cached.refreshed_at).num_seconds() >= OPTIONS_EXCHANGE_INFO_REFRESH_SECS)
+        .map(|cached| {
+            (now - cached.refreshed_at).num_seconds() >= OPTIONS_EXCHANGE_INFO_REFRESH_SECS
+        })
         .unwrap_or(true);
     if needs_refresh {
         let exchange_info = rest_client.fetch_options_exchange_info().await?;

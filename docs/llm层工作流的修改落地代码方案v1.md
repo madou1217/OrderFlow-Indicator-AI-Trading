@@ -1090,7 +1090,6 @@ llm:
     stage1_refresh_hours: [0, 4, 8, 12, 16, 20]
     stage2_refresh_minutes: [0, 15, 30, 45]
     state_dir: "systems/llm/state/workflow"
-    legacy_modes_enabled: false
 ```
 
 ### 10.4 runtime 内部函数重组
@@ -1185,7 +1184,6 @@ llm:
       C_value_return: 2
     state_dir: "systems/llm/state/workflow"
     persist_prompt_inputs: true
-    legacy_modes_enabled: false
 ```
 
 ### 12.3 降级为兼容配置

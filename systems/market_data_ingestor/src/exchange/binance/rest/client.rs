@@ -456,14 +456,16 @@ impl BinanceRestClient {
 
     pub async fn fetch_options_exchange_info(&self) -> Result<BinanceOptionsExchangeInfo> {
         let url = "https://eapi.binance.com/eapi/v1/exchangeInfo";
-        self.send_with_retry("request options exchange info", url, || self.client.get(url))
-            .await
-            .context("request options exchange info")?
-            .error_for_status()
-            .context("options exchange info bad status")?
-            .json::<BinanceOptionsExchangeInfo>()
-            .await
-            .context("decode options exchange info")
+        self.send_with_retry("request options exchange info", url, || {
+            self.client.get(url)
+        })
+        .await
+        .context("request options exchange info")?
+        .error_for_status()
+        .context("options exchange info bad status")?
+        .json::<BinanceOptionsExchangeInfo>()
+        .await
+        .context("decode options exchange info")
     }
 
     pub async fn fetch_options_index_price(

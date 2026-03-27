@@ -41,7 +41,7 @@ const ENTRY_EVENT_SUMMARY_FIELDS: &[(&str, &str)] = &[
     ("divergence", "most_recent_divergence"),
 ];
 
-pub(super) fn filter_indicators(
+pub(crate) fn filter_indicators(
     source: &Map<String, Value>,
     ts_bucket: Option<&str>,
 ) -> Map<String, Value> {

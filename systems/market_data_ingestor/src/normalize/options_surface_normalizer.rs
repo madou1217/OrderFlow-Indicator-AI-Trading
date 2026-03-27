@@ -69,7 +69,10 @@ fn parse_value_f64(value: &Value) -> Result<f64> {
 
 fn parse_optional_num(value: Option<&str>) -> Result<Option<f64>> {
     value
-        .map(|raw| raw.parse::<f64>().with_context(|| format!("parse numeric {}", raw)))
+        .map(|raw| {
+            raw.parse::<f64>()
+                .with_context(|| format!("parse numeric {}", raw))
+        })
         .transpose()
 }
 

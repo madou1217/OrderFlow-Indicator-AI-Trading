@@ -51,23 +51,11 @@ pub struct ClaudeApiConfig {
     pub api_url: String,
     #[serde(default = "default_claude_api_version")]
     pub api_version: String,
-    #[serde(default = "default_claude_api_mode")]
-    pub mode: String,
-    #[serde(default = "default_claude_batch_api_url")]
-    pub batch_api_url: String,
-    #[serde(default = "default_claude_batch_poll_interval_secs")]
-    pub batch_poll_interval_secs: u64,
-    #[serde(default = "default_claude_batch_wait_timeout_secs")]
-    pub batch_wait_timeout_secs: u64,
 }
 
 impl ClaudeApiConfig {
     pub fn resolved_api_key(&self) -> String {
         resolve_secret(&self.api_key)
-    }
-
-    pub fn use_batch_api(&self) -> bool {
-        self.mode.eq_ignore_ascii_case("batch")
     }
 }
 
@@ -125,10 +113,6 @@ pub struct OpenRouterApiConfig {
     pub api_key: String,
     #[serde(default = "default_openrouter_base_api_url")]
     pub base_api_url: String,
-    #[serde(default)]
-    pub site_url: String,
-    #[serde(default)]
-    pub app_name: String,
 }
 
 impl OpenRouterApiConfig {
@@ -478,12 +462,14 @@ pub struct LlmConfig {
     pub telegram_signal_decisions: Vec<String>,
     #[serde(default = "default_x_signal_decisions")]
     pub x_signal_decisions: Vec<String>,
-    #[serde(default = "default_indicator_codes")]
-    pub indicator_codes: Vec<String>,
     #[serde(default = "default_models")]
     pub models: Vec<LlmModelConfig>,
     #[serde(default)]
     pub execution: LlmExecutionConfig,
+    #[serde(default)]
+    pub workflow: WorkflowConfig,
+    #[serde(default)]
+    pub compatibility: LlmCompatibilityConfig,
 }
 
 impl Default for LlmConfig {
@@ -509,9 +495,10 @@ impl Default for LlmConfig {
             print_response: default_print_response(),
             telegram_signal_decisions: default_telegram_signal_decisions(),
             x_signal_decisions: default_x_signal_decisions(),
-            indicator_codes: default_indicator_codes(),
             models: default_models(),
             execution: LlmExecutionConfig::default(),
+            workflow: WorkflowConfig::default(),
+            compatibility: LlmCompatibilityConfig::default(),
         }
     }
 }
@@ -550,12 +537,84 @@ pub struct LlmExecutionConfig {
     pub recv_window_ms: u64,
     #[serde(default = "default_execution_place_exit_orders")]
     pub place_exit_orders: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct WorkflowConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_workflow_stage1_refresh_hours")]
+    pub stage1_refresh_hours: Vec<u8>,
+    #[serde(default = "default_workflow_stage2_refresh_minutes")]
+    pub stage2_refresh_minutes: Vec<u8>,
+    #[serde(default)]
+    pub legacy_modes_enabled: bool,
+    #[serde(default)]
+    pub soft_gate_min_pass: WorkflowSoftGateMinPassConfig,
+    #[serde(default = "default_workflow_state_dir")]
+    pub state_dir: String,
+    #[serde(default = "default_workflow_persist_prompt_inputs")]
+    pub persist_prompt_inputs: bool,
+}
+
+impl Default for WorkflowConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            stage1_refresh_hours: default_workflow_stage1_refresh_hours(),
+            stage2_refresh_minutes: default_workflow_stage2_refresh_minutes(),
+            legacy_modes_enabled: false,
+            soft_gate_min_pass: WorkflowSoftGateMinPassConfig::default(),
+            state_dir: default_workflow_state_dir(),
+            persist_prompt_inputs: default_workflow_persist_prompt_inputs(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct LlmCompatibilityConfig {
+    #[serde(default)]
+    pub execution_policy: LlmCompatibilityExecutionPolicyConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct LlmCompatibilityExecutionPolicyConfig {
     #[serde(default)]
     pub entry_sl_remap: ExecutionEntrySlRemapConfig,
     #[serde(default = "default_execution_min_distance_v")]
     pub min_distance_v: f64,
     #[serde(default = "default_execution_min_rr")]
     pub min_rr: f64,
+}
+
+impl Default for LlmCompatibilityExecutionPolicyConfig {
+    fn default() -> Self {
+        Self {
+            entry_sl_remap: ExecutionEntrySlRemapConfig::default(),
+            min_distance_v: default_execution_min_distance_v(),
+            min_rr: default_execution_min_rr(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct WorkflowSoftGateMinPassConfig {
+    #[serde(default = "default_workflow_soft_gate_a_continuation")]
+    pub a_continuation: u8,
+    #[serde(default = "default_workflow_soft_gate_b_reversal")]
+    pub b_reversal: u8,
+    #[serde(default = "default_workflow_soft_gate_c_value_return")]
+    pub c_value_return: u8,
+}
+
+impl Default for WorkflowSoftGateMinPassConfig {
+    fn default() -> Self {
+        Self {
+            a_continuation: default_workflow_soft_gate_a_continuation(),
+            b_reversal: default_workflow_soft_gate_b_reversal(),
+            c_value_return: default_workflow_soft_gate_c_value_return(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -588,9 +647,6 @@ impl Default for LlmExecutionConfig {
             hedge_mode: default_execution_hedge_mode(),
             recv_window_ms: default_execution_recv_window_ms(),
             place_exit_orders: default_execution_place_exit_orders(),
-            entry_sl_remap: ExecutionEntrySlRemapConfig::default(),
-            min_distance_v: default_execution_min_distance_v(),
-            min_rr: default_execution_min_rr(),
         }
     }
 }
@@ -608,10 +664,7 @@ pub struct LlmModelConfig {
     pub temperature: f64,
     #[serde(default = "default_model_max_tokens")]
     pub max_tokens: u32,
-    /// Qwen only: set to true to enable thinking (extended reasoning) mode.
-    #[serde(default)]
-    pub enable_thinking: Option<bool>,
-    /// Optional stage-1 scan reasoning effort hint for OpenAI-compatible custom_llm backends.
+    /// Optional stage-1 workflow reasoning effort hint for OpenAI-compatible custom_llm backends.
     #[serde(default)]
     pub stage1_reasoning: Option<String>,
     /// Optional stage-2 finalize reasoning effort hint for OpenAI-compatible custom_llm backends.
@@ -662,6 +715,34 @@ fn default_bundle_execution_stale_secs() -> u64 {
     300
 }
 
+fn default_workflow_stage1_refresh_hours() -> Vec<u8> {
+    vec![0, 4, 8, 12, 16, 20]
+}
+
+fn default_workflow_stage2_refresh_minutes() -> Vec<u8> {
+    vec![0, 15, 30, 45]
+}
+
+fn default_workflow_state_dir() -> String {
+    "systems/llm/state/workflow".to_string()
+}
+
+fn default_workflow_persist_prompt_inputs() -> bool {
+    true
+}
+
+fn default_workflow_soft_gate_a_continuation() -> u8 {
+    3
+}
+
+fn default_workflow_soft_gate_b_reversal() -> u8 {
+    2
+}
+
+fn default_workflow_soft_gate_c_value_return() -> u8 {
+    2
+}
+
 fn default_temp_cache_retention_hours() -> u64 {
     12
 }
@@ -692,6 +773,42 @@ fn validate_schedule_minutes(minutes: &[u8], field_name: &str) -> Result<()> {
                 "{} contains duplicate minute {}",
                 field_name,
                 minute
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_schedule_hours(hours: &[u8], field_name: &str) -> Result<()> {
+    if hours.is_empty() {
+        return Err(anyhow!("{} cannot be empty", field_name));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for hour in hours {
+        if *hour > 23 {
+            return Err(anyhow!(
+                "{} contains invalid hour {}; expected 0..=23",
+                field_name,
+                hour
+            ));
+        }
+        if !seen.insert(*hour) {
+            return Err(anyhow!("{} contains duplicate hour {}", field_name, hour));
+        }
+    }
+    Ok(())
+}
+
+fn validate_workflow_soft_gate_min_pass(cfg: &WorkflowSoftGateMinPassConfig) -> Result<()> {
+    for (name, value) in [
+        ("a_continuation", cfg.a_continuation),
+        ("b_reversal", cfg.b_reversal),
+        ("c_value_return", cfg.c_value_return),
+    ] {
+        if value > 4 {
+            return Err(anyhow!(
+                "llm.workflow.soft_gate_min_pass.{} must be between 0 and 4",
+                name
             ));
         }
     }
@@ -802,66 +919,13 @@ fn default_claude_api_version() -> String {
     "2023-06-01".to_string()
 }
 
-fn default_claude_api_mode() -> String {
-    "batch".to_string()
-}
-
-fn default_claude_batch_api_url() -> String {
-    "https://api.anthropic.com/v1/messages/batches".to_string()
-}
-
-fn default_claude_batch_poll_interval_secs() -> u64 {
-    30
-}
-
-fn default_claude_batch_wait_timeout_secs() -> u64 {
-    3600
-}
-
 fn default_binance_futures_rest_api_url() -> String {
     "https://fapi.binance.com".to_string()
 }
 
-fn default_indicator_codes() -> Vec<String> {
-    vec![
-        "price_volume_structure".to_string(),
-        "footprint".to_string(),
-        "divergence".to_string(),
-        "liquidation_density".to_string(),
-        "orderbook_depth".to_string(),
-        "fvg".to_string(),
-        "absorption".to_string(),
-        "initiation".to_string(),
-        "bullish_absorption".to_string(),
-        "bullish_initiation".to_string(),
-        "bearish_absorption".to_string(),
-        "bearish_initiation".to_string(),
-        "buying_exhaustion".to_string(),
-        "selling_exhaustion".to_string(),
-        "cvd_pack".to_string(),
-        "whale_trades".to_string(),
-        "funding_rate".to_string(),
-        "vpin".to_string(),
-        "avwap".to_string(),
-        "kline_history".to_string(),
-        "ema_trend_regime".to_string(),
-        "tpo_market_profile".to_string(),
-        "rvwap_sigma_bands".to_string(),
-        "high_volume_pulse".to_string(),
-    ]
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        default_indicator_codes, validate_temp_cache_retention_config, LlmConfig, LlmModelConfig,
-    };
-
-    #[test]
-    fn default_indicator_codes_include_fvg() {
-        let codes = default_indicator_codes();
-        assert!(codes.iter().any(|code| code == "fvg"));
-    }
+    use super::{validate_temp_cache_retention_config, LlmConfig, LlmModelConfig};
 
     #[test]
     fn default_llm_request_enabled_is_true() {
@@ -908,8 +972,10 @@ mod tests {
     #[test]
     fn default_execution_trade_gates_are_expected_values() {
         let execution = LlmConfig::default().execution;
-        assert!((execution.min_distance_v - 1.0).abs() < f64::EPSILON);
-        assert!((execution.min_rr - 2.0).abs() < f64::EPSILON);
+        let policy = LlmConfig::default().compatibility.execution_policy;
+        assert!(!policy.entry_sl_remap.enabled);
+        assert!((policy.min_distance_v - 0.0).abs() < f64::EPSILON);
+        assert!((policy.min_rr - 0.0).abs() < f64::EPSILON);
         assert!((execution.max_margin_usdt - 0.0).abs() < f64::EPSILON);
     }
 
@@ -923,7 +989,6 @@ mod tests {
             enabled: true,
             temperature: 0.1,
             max_tokens: 1000,
-            enable_thinking: None,
             stage1_reasoning: Some("high".to_string()),
             stage2_reasoning: Some("medium".to_string()),
             reasoning: Some("low".to_string()),
@@ -951,7 +1016,6 @@ fn default_models() -> Vec<LlmModelConfig> {
         enabled: true,
         temperature: default_model_temperature(),
         max_tokens: default_model_max_tokens(),
-        enable_thinking: None,
         stage1_reasoning: None,
         stage2_reasoning: None,
         reasoning: None,
@@ -987,7 +1051,7 @@ fn default_execution_place_exit_orders() -> bool {
 }
 
 fn default_execution_entry_sl_remap_enabled() -> bool {
-    true
+    false
 }
 
 fn default_execution_entry_to_sl_distance_pct() -> f64 {
@@ -995,11 +1059,11 @@ fn default_execution_entry_to_sl_distance_pct() -> f64 {
 }
 
 fn default_execution_min_distance_v() -> f64 {
-    1.0
+    0.0
 }
 
 fn default_execution_min_rr() -> f64 {
-    2.0
+    0.0
 }
 
 pub fn load_config(path: &str) -> Result<RootConfig> {
@@ -1191,6 +1255,23 @@ fn validate_config(cfg: &RootConfig) -> Result<()> {
     }
     validate_temp_cache_retention_config(&cfg.llm)?;
     validate_schedule_minutes(&cfg.llm.call_schedule_minutes, "llm.call_schedule_minutes")?;
+    validate_schedule_hours(
+        &cfg.llm.workflow.stage1_refresh_hours,
+        "llm.workflow.stage1_refresh_hours",
+    )?;
+    validate_schedule_minutes(
+        &cfg.llm.workflow.stage2_refresh_minutes,
+        "llm.workflow.stage2_refresh_minutes",
+    )?;
+    validate_workflow_soft_gate_min_pass(&cfg.llm.workflow.soft_gate_min_pass)?;
+    if cfg.llm.workflow.legacy_modes_enabled {
+        return Err(anyhow!(
+            "llm.workflow.legacy_modes_enabled must remain false; legacy workflow code has been removed"
+        ));
+    }
+    if cfg.llm.workflow.state_dir.trim().is_empty() {
+        return Err(anyhow!("llm.workflow.state_dir is empty"));
+    }
     for (provider, minutes) in &cfg.llm.call_schedule_minutes_by_model {
         let key = provider.trim().to_ascii_lowercase();
         if key != "claude"
@@ -1270,17 +1351,6 @@ fn validate_config(cfg: &RootConfig) -> Result<()> {
     if claude_needed && cfg.api.claude.resolved_api_key().trim().is_empty() {
         return Err(anyhow!("api.claude.api_key is empty"));
     }
-    if claude_needed {
-        if !cfg.api.claude.use_batch_api() {
-            return Err(anyhow!("api.claude.mode must be batch for llm subsystem"));
-        }
-        if cfg.api.claude.batch_poll_interval_secs == 0 {
-            return Err(anyhow!("api.claude.batch_poll_interval_secs must be > 0"));
-        }
-        if cfg.api.claude.batch_wait_timeout_secs == 0 {
-            return Err(anyhow!("api.claude.batch_wait_timeout_secs must be > 0"));
-        }
-    }
 
     if default_provider == "qwen" {
         if cfg.api.qwen.resolved_api_key().trim().is_empty() {
@@ -1348,62 +1418,54 @@ fn validate_config(cfg: &RootConfig) -> Result<()> {
         }
     }
 
-    let telegram_token = cfg.api.telegram.resolved_token();
-    let telegram_chat_id = cfg.api.telegram.resolved_chat_id();
-    if telegram_token.trim().is_empty() != telegram_chat_id.trim().is_empty() {
-        return Err(anyhow!(
-            "api.telegram.token and api.telegram.chat_id must both be set or both empty"
-        ));
-    }
-
-    let x_consumer_key = cfg.api.x.resolved_consumer_key();
-    let x_secret_key = cfg.api.x.resolved_secret_key();
-    let x_access_token = cfg.api.x.resolved_access_token();
-    let x_access_token_secret = cfg.api.x.resolved_access_token_secret();
-    let x_required_values = [
-        x_consumer_key.trim(),
-        x_secret_key.trim(),
-        x_access_token.trim(),
-        x_access_token_secret.trim(),
-    ];
-    let x_all_empty = x_required_values.iter().all(|v| v.is_empty());
-    let x_all_set = x_required_values.iter().all(|v| !v.is_empty());
-    if !x_all_empty && !x_all_set {
-        return Err(anyhow!(
-            "api.x.consumer_key, api.x.secret_key, api.x.access_token and api.x.access_token_secret must all be set or all be empty"
-        ));
-    }
-    if x_all_set && cfg.api.x.base_api_url.trim().is_empty() {
-        return Err(anyhow!("api.x.base_api_url is empty"));
-    }
-
     if !cfg
         .llm
-        .execution
+        .compatibility
+        .execution_policy
         .entry_sl_remap
         .entry_to_sl_distance_pct
         .is_finite()
     {
         return Err(anyhow!(
-            "llm.execution.entry_sl_remap.entry_to_sl_distance_pct must be finite"
+            "llm.compatibility.execution_policy.entry_sl_remap.entry_to_sl_distance_pct must be finite"
         ));
     }
-    if !(0.0..=100.0).contains(&cfg.llm.execution.entry_sl_remap.entry_to_sl_distance_pct) {
+    if !(0.0..=100.0).contains(
+        &cfg.llm
+            .compatibility
+            .execution_policy
+            .entry_sl_remap
+            .entry_to_sl_distance_pct,
+    ) {
         return Err(anyhow!(
-            "llm.execution.entry_sl_remap.entry_to_sl_distance_pct must be between 0 and 100"
+            "llm.compatibility.execution_policy.entry_sl_remap.entry_to_sl_distance_pct must be between 0 and 100"
         ));
     }
-    if !cfg.llm.execution.min_distance_v.is_finite() {
-        return Err(anyhow!("llm.execution.min_distance_v must be finite"));
+    if !cfg
+        .llm
+        .compatibility
+        .execution_policy
+        .min_distance_v
+        .is_finite()
+    {
+        return Err(anyhow!(
+            "llm.compatibility.execution_policy.min_distance_v must be finite"
+        ));
     }
-    if cfg.llm.execution.min_distance_v < 0.0 {
-        return Err(anyhow!("llm.execution.min_distance_v must be >= 0"));
+    if cfg.llm.compatibility.execution_policy.min_distance_v < 0.0 {
+        return Err(anyhow!(
+            "llm.compatibility.execution_policy.min_distance_v must be >= 0"
+        ));
     }
-    if !cfg.llm.execution.min_rr.is_finite() {
-        return Err(anyhow!("llm.execution.min_rr must be finite"));
+    if !cfg.llm.compatibility.execution_policy.min_rr.is_finite() {
+        return Err(anyhow!(
+            "llm.compatibility.execution_policy.min_rr must be finite"
+        ));
     }
-    if cfg.llm.execution.min_rr <= 0.0 {
-        return Err(anyhow!("llm.execution.min_rr must be > 0"));
+    if cfg.llm.compatibility.execution_policy.min_rr < 0.0 {
+        return Err(anyhow!(
+            "llm.compatibility.execution_policy.min_rr must be >= 0"
+        ));
     }
 
     if cfg.llm.execution.enabled {

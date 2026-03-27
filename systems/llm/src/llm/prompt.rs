@@ -1,62 +1,10 @@
-mod entry;
-mod management;
-mod pending_order;
-mod scan;
-
-pub const DECISION_LONG: &str = "LONG";
-pub const DECISION_SHORT: &str = "SHORT";
-pub const DECISION_NO_TRADE: &str = "NO_TRADE";
-pub const DECISION_CLOSE: &str = "CLOSE";
-pub const DECISION_ADD: &str = "ADD";
-pub const DECISION_REDUCE: &str = "REDUCE";
-pub const DECISION_HOLD: &str = "HOLD";
-pub const DECISION_MODIFY_TPSL: &str = "MODIFY_TPSL";
-pub const DECISION_MODIFY_MAKER: &str = "MODIFY_MAKER";
-pub const DECISION_ADJUST: &str = "ADJUST";
+pub mod workflow_stage1;
+pub mod workflow_stage2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EntryPromptStage {
-    Scan,
-    Finalize,
-}
-
-pub fn system_prompt(
-    management_mode: bool,
-    pending_order_mode: bool,
-    prompt_template: &str,
-    entry_stage: EntryPromptStage,
-    symbol: &str,
-) -> String {
-    let template = prompt_template.trim().to_ascii_lowercase();
-    // Scan is shared across all modes — always use the shared scan prompt
-    if matches!(entry_stage, EntryPromptStage::Scan) {
-        return scan::system_prompt(&template, symbol);
-    }
-    // Action stage: route by account state
-    if pending_order_mode {
-        return pending_order::system_prompt(&template, symbol);
-    }
-    if management_mode {
-        return management::system_prompt(&template, symbol);
-    }
-    entry::system_prompt(&template, symbol)
-}
-
-pub fn user_prompt_prefix(
-    management_mode: bool,
-    pending_order_mode: bool,
-    entry_stage: EntryPromptStage,
-) -> &'static str {
-    if matches!(entry_stage, EntryPromptStage::Scan) {
-        return "You are in market scan mode. Analyze the order-flow snapshot and return only a market scan JSON.\n\n";
-    }
-    if pending_order_mode {
-        "You are in pending-order management mode. Analyze the current stage-2 indicators plus the live pending maker-order context from `trading_state` and `management_snapshot` (especially `management_snapshot.pending_order` and `management_snapshot.position_context.entry_context`). Also review the STAGE_1_MARKET_SCAN_JSON provided above as earlier structural context, while treating the current stage-2 prompt input as the authoritative execution-time dataset. Decide whether to keep the pending order, cancel it, or modify the maker entry / TP / SL. Return only a pending-order management decision JSON.\n\n"
-    } else if management_mode {
-        "You are in management mode. Analyze the current stage-2 indicators plus current position/order context from `trading_state` and `management_snapshot` (especially `context_state`, leverage, direction, position quantity, open orders, and last management reason). Also review the STAGE_1_MARKET_SCAN_JSON provided above as earlier structural context, while treating the current stage-2 prompt input as the authoritative execution-time dataset. IMPORTANT: `management_snapshot.positions[].current_tp_price` and `current_sl_price` are the ACTUAL placed TP/SL order trigger prices on the exchange (sourced directly from Binance open orders — not model estimates). Use them as baselines for all MODIFY_TPSL decisions: HC-6 requires new values to differ from these actual current prices; HC-9 requires new_sl to be tighter (more favorable) than current_sl_price. Return only a management decision JSON.\n\n"
-    } else {
-        ""
-    }
+pub enum WorkflowPromptStage {
+    Stage1,
+    Stage2,
 }
 
 fn load_prompt_asset(asset: &'static str, replacements: &[(&str, &str)]) -> String {
@@ -67,4 +15,27 @@ fn load_prompt_asset(asset: &'static str, replacements: &[(&str, &str)]) -> Stri
     replacements
         .iter()
         .fold(base.to_owned(), |text, (from, to)| text.replace(from, to))
+}
+
+pub fn workflow_system_prompt(
+    stage: WorkflowPromptStage,
+    prompt_template: &str,
+    symbol: &str,
+) -> String {
+    let template = prompt_template.trim().to_ascii_lowercase();
+    match stage {
+        WorkflowPromptStage::Stage1 => workflow_stage1::system_prompt(&template, symbol),
+        WorkflowPromptStage::Stage2 => workflow_stage2::system_prompt(&template, symbol),
+    }
+}
+
+pub fn workflow_user_prompt_prefix(stage: WorkflowPromptStage) -> &'static str {
+    match stage {
+        WorkflowPromptStage::Stage1 => {
+            "You are in workflow Stage1 mode. Build exactly one current script and exactly one current path object. Return only the workflow Stage1 JSON.\n\n"
+        }
+        WorkflowPromptStage::Stage2 => {
+            "You are in workflow Stage2 mode. You may only WAIT, EXECUTE the current path, or REQUEST_STAGE1_REEVALUATION. Return only the workflow Stage2 JSON.\n\n"
+        }
+    }
 }

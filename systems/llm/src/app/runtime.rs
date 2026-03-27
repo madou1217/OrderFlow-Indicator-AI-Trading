@@ -3,23 +3,13 @@ use crate::app::config::RootConfig;
 use crate::app::telegram::{TelegramOperator, TradeSignalNotification};
 use crate::app::x::XOperator;
 use crate::execution::binance::{
-    execute_management_intent, execute_pending_order_intent, execute_trade_intent,
-    fetch_pending_order_leverage, fetch_symbol_trading_state,
-    TradeExecutionBlockedByCurrentPriceBeyondStopLoss,
+    execute_workflow_execution_intent, execute_workflow_management_action,
+    fetch_symbol_trading_state, ActivePositionSnapshot, ExecutionReport,
+    TradeExecutionBlockedByCurrentPriceBeyondStopLoss, TradingStateSnapshot,
 };
-use crate::llm::decision::{
-    pending_order_management_intent_from_value_with_context,
-    position_management_intent_from_value_with_context, trade_intent_from_value,
-    PendingOrderContext, PendingOrderManagementDecision, PositionManagementDecision, TradeDecision,
-    TradeIntent,
-};
-use crate::llm::filter::{core::CoreFilter, scan::ScanFilter};
-use crate::llm::helper::PreComputedVHelper;
-use crate::llm::provider::{
-    invoke_models_finalize_stage, invoke_models_scan_stage, EntryContextForLlm,
-    EntryStagePromptInputCapture, FinalizeStageContext, ManagementSnapshotForLlm,
-    ModelInvocationInput, PendingOrderSummaryForLlm, PositionContextForLlm, PositionSummaryForLlm,
-    ReductionHistoryItemForLlm,
+use crate::execution::intent_adapter::{adapt_execution_intent, adapt_management_action};
+use crate::llm::input::{
+    ManagementSnapshotForLlm, ModelInvocationInput, PositionContextForLlm, PositionSummaryForLlm,
 };
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Duration as ChronoDuration, NaiveDateTime, Timelike, Utc};
@@ -30,7 +20,7 @@ use lapin::{
 };
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 use sqlx::{PgPool, Row};
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -48,159 +38,13 @@ const TEMP_MODEL_INPUT_DIR: &str = "systems/llm/temp_model_input";
 const TEMP_MODEL_OUTPUT_DIR: &str = "systems/llm/temp_model_output";
 const LLM_JOURNAL_DIR: &str = "systems/llm/journal";
 const LLM_JOURNAL_FILE: &str = "systems/llm/journal/llm_trade_journal.jsonl";
-const MANAGEMENT_REDUCTION_LEVEL_THRESHOLD: f64 = 0.5;
 const KLINE_DB_BACKFILL_INTERVALS: [(&str, i64); 2] = [("4h", 240), ("1d", 1440)];
 const KLINE_RANGE_CACHE_TTL_MINUTES: i64 = 30;
 const KLINE_RANGE_CACHE_MAX_SERIES: usize = 8;
-const ENTRY_RECHECK_MIN_BUNDLE_UPDATE_MINUTES: i64 = 2;
-const ENTRY_RECHECK_VETO_THRESHOLD: usize = 2;
 
 #[derive(Debug, Default)]
 struct InvokeThrottleState {
     last_invoke_at: Option<Instant>,
-}
-
-#[derive(Debug, Clone)]
-struct ReductionHistoryEntry {
-    time: String,
-    qty_ratio: f64,
-    reason_summary: String,
-    price: f64,
-}
-
-#[derive(Debug, Clone, Default)]
-struct PositionContextState {
-    original_qty: f64,
-    last_management_action: Option<String>,
-    last_management_reason: Option<String>,
-    reduction_history: Vec<ReductionHistoryEntry>,
-    /// Effective entry used by execution path after remap + maker-price resolution.
-    effective_entry_price: Option<f64>,
-    /// Effective stop loss used by execution path after final RR-based recomputation.
-    effective_stop_loss: Option<f64>,
-    /// Effective take profit used by execution path after final quantization.
-    effective_take_profit: Option<f64>,
-    /// Effective leverage used by the execution path.
-    effective_leverage: Option<u32>,
-    /// Captured from the entry model response when the position was opened.
-    entry_context: Option<EntryContextForState>,
-}
-
-#[derive(Debug, Clone, Default)]
-struct SymbolLifecycleState {
-    last_management_reason: Option<String>,
-    contexts: HashMap<String, PositionContextState>,
-}
-
-#[derive(Debug, Default)]
-struct RuntimeLifecycleStore {
-    symbols: HashMap<String, SymbolLifecycleState>,
-}
-
-impl RuntimeLifecycleStore {
-    fn symbol_state(&self, symbol: &str) -> Option<&SymbolLifecycleState> {
-        self.symbols.get(&symbol.to_ascii_uppercase())
-    }
-
-    fn symbol_state_mut(&mut self, symbol: &str) -> &mut SymbolLifecycleState {
-        self.symbols.entry(symbol.to_ascii_uppercase()).or_default()
-    }
-
-    fn last_management_reason(&self, symbol: &str) -> Option<String> {
-        self.symbol_state(symbol)
-            .and_then(|state| state.last_management_reason.clone())
-    }
-
-    fn set_last_management_reason(&mut self, symbol: &str, reason: Option<String>) {
-        let key = symbol.to_ascii_uppercase();
-        let state = self.symbols.entry(key.clone()).or_default();
-        state.last_management_reason = reason;
-        if state.last_management_reason.is_none() && state.contexts.is_empty() {
-            self.symbols.remove(&key);
-        }
-    }
-}
-
-/// Internal (non-serialized) mirror of EntryContextForLlm, stored in memory.
-#[derive(Debug, Clone)]
-struct EntryContextForState {
-    entry_strategy: Option<String>,
-    stop_model: Option<String>,
-    entry_mode: Option<String>,
-    original_tp: Option<f64>,
-    original_sl: Option<f64>,
-    sweep_wick_extreme: Option<f64>,
-    horizon: Option<String>,
-    entry_reason: String,
-    /// Helper-derived V captured at entry time for internal audit/journal continuity.
-    /// This is not serialized into management-mode prompt inputs.
-    entry_v: Option<f64>,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct TradeSignalFields {
-    entry_price: Option<f64>,
-    leverage: Option<f64>,
-    risk_reward_ratio: Option<f64>,
-    take_profit: Option<f64>,
-    stop_loss: Option<f64>,
-}
-
-impl TradeSignalFields {
-    fn from_intent(intent: &TradeIntent) -> Self {
-        Self {
-            entry_price: intent.entry_price,
-            leverage: intent.leverage,
-            risk_reward_ratio: intent.risk_reward_ratio,
-            take_profit: intent.take_profit,
-            stop_loss: intent.stop_loss,
-        }
-    }
-
-    fn from_report(report: &crate::execution::binance::ExecutionReport) -> Self {
-        Self {
-            entry_price: Some(report.maker_entry_price),
-            leverage: Some(report.leverage as f64),
-            risk_reward_ratio: Some(report.actual_risk_reward_ratio),
-            take_profit: Some(report.actual_take_profit),
-            stop_loss: Some(report.actual_stop_loss),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-struct ResolvedEntryV {
-    value: f64,
-    timeframe: &'static str,
-    basis: String,
-}
-
-#[derive(Debug, Clone)]
-struct EntryVGateResult {
-    resolved_v: ResolvedEntryV,
-    take_profit_distance: f64,
-    take_profit_distance_v: f64,
-    min_distance_v: f64,
-    passed: bool,
-}
-
-impl EntryVGateResult {
-    fn required_take_profit_distance(&self) -> f64 {
-        self.resolved_v.value * self.min_distance_v
-    }
-
-    fn take_profit_distance_shortfall(&self) -> f64 {
-        (self.required_take_profit_distance() - self.take_profit_distance).max(0.0)
-    }
-}
-
-#[derive(Debug, Clone)]
-struct EntryRrGateResult {
-    risk_reward_ratio: f64,
-    reward_distance: f64,
-    risk_distance: f64,
-    min_rr: f64,
-    passed: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -221,20 +65,6 @@ struct LatestBundle {
     indicators: Value,
     missing_indicator_codes: Vec<String>,
     received_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone)]
-struct EntryFreshnessRecheckSnapshot {
-    latest_bundle_ts_bucket: DateTime<Utc>,
-    latest_bundle_age_secs: i64,
-    bundle_update_minutes: i64,
-    realtime_flow_context: Value,
-}
-
-#[derive(Debug, Clone)]
-struct EntryFreshnessRecheckEvaluation {
-    result: &'static str,
-    rules_hit: Vec<&'static str>,
 }
 
 pub async fn run(ctx: AppContext) -> Result<()> {
@@ -283,8 +113,6 @@ pub async fn run(ctx: AppContext) -> Result<()> {
 
     let mut pending_invoke_bundle: Option<LatestBundle> = None;
     let mut last_invoked_ts_bucket: Option<DateTime<Utc>> = None;
-    let runtime_lifecycle_state = Arc::new(Mutex::new(RuntimeLifecycleStore::default()));
-    restore_last_management_reasons_from_journal(&runtime_lifecycle_state).await?;
     let invoke_throttle = Arc::new(Mutex::new(InvokeThrottleState::default()));
     let active_provider = ctx.config.active_default_model();
     let schedule_minutes = effective_schedule_minutes(&ctx.config, &active_provider);
@@ -321,7 +149,6 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                     &pending_invoke_bundle,
                     &mut last_invoked_ts_bucket,
                     &invoke_throttle,
-                    &runtime_lifecycle_state,
                     min_invoke_interval,
                     apply_min_invoke_interval_throttle,
                     "scheduled_bundle",
@@ -439,12 +266,8 @@ pub async fn run(ctx: AppContext) -> Result<()> {
 }
 
 fn effective_schedule_minutes(config: &RootConfig, provider: &str) -> Vec<u8> {
-    config
-        .llm
-        .call_schedule_minutes_by_model
-        .iter()
-        .find_map(|(key, v)| key.eq_ignore_ascii_case(provider).then(|| v.clone()))
-        .unwrap_or_else(|| config.llm.call_schedule_minutes.clone())
+    let _ = provider;
+    config.llm.workflow.stage2_refresh_minutes.clone()
 }
 
 fn effective_min_invoke_interval_secs(config: &RootConfig, provider: &str) -> u64 {
@@ -459,36 +282,6 @@ fn effective_min_invoke_interval_secs(config: &RootConfig, provider: &str) -> u6
 fn bundle_matches_call_schedule(bundle: &MinuteBundleEnvelope, schedule_minutes: &[u8]) -> bool {
     let minute = bundle.ts_bucket.minute() as u8;
     schedule_minutes.contains(&minute)
-}
-
-fn build_invocation_input(
-    bundle: &LatestBundle,
-    management_mode: bool,
-    pending_order_mode: bool,
-    trading_state: Option<crate::execution::binance::TradingStateSnapshot>,
-    last_management_reason: Option<String>,
-    position_context: Option<PositionContextForLlm>,
-) -> ModelInvocationInput {
-    let management_snapshot = build_management_snapshot_for_llm(
-        trading_state.as_ref(),
-        last_management_reason,
-        position_context,
-    );
-    ModelInvocationInput {
-        symbol: bundle.raw.symbol.clone(),
-        ts_bucket: bundle.raw.ts_bucket,
-        window_code: bundle.raw.window_code.clone(),
-        indicator_count: bundle.raw.indicator_count,
-        source_routing_key: bundle.raw.routing_key.clone(),
-        source_published_at: bundle.raw.published_at,
-        received_at: bundle.received_at,
-        indicators: bundle.indicators.clone(),
-        missing_indicator_codes: bundle.missing_indicator_codes.clone(),
-        management_mode,
-        pending_order_mode,
-        trading_state,
-        management_snapshot,
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -1283,33 +1076,6 @@ async fn patch_input_kline_history_from_db(
     Ok(())
 }
 
-async fn prepare_live_invocation(
-    config: &RootConfig,
-    http_client: &Client,
-    db_pool: &PgPool,
-    bundle: LatestBundle,
-    runtime_lifecycle_state: &Arc<Mutex<RuntimeLifecycleStore>>,
-    patch_trigger: &str,
-) -> Result<PreparedInvocation> {
-    let routing_context =
-        resolve_invocation_routing_context(config, http_client, &bundle, runtime_lifecycle_state)
-            .await?;
-    let mut input = build_invocation_input(
-        &bundle,
-        routing_context.management_mode,
-        routing_context.pending_order_mode,
-        routing_context.trading_state.clone(),
-        routing_context.invoke_management_reason.clone(),
-        routing_context.position_context.clone(),
-    );
-    patch_input_kline_history_from_db(db_pool, &mut input, patch_trigger).await?;
-    Ok(PreparedInvocation {
-        bundle,
-        routing_context,
-        input,
-    })
-}
-
 fn build_persist_only_input(bundle: &LatestBundle) -> ModelInvocationInput {
     ModelInvocationInput {
         symbol: bundle.raw.symbol.clone(),
@@ -1321,1736 +1087,9 @@ fn build_persist_only_input(bundle: &LatestBundle) -> ModelInvocationInput {
         received_at: bundle.received_at,
         indicators: bundle.indicators.clone(),
         missing_indicator_codes: bundle.missing_indicator_codes.clone(),
-        management_mode: false,
-        pending_order_mode: false,
         trading_state: None,
         management_snapshot: None,
     }
-}
-
-#[derive(Debug, Clone)]
-struct InvocationRoutingContext {
-    trading_state: Option<crate::execution::binance::TradingStateSnapshot>,
-    management_mode: bool,
-    pending_order_mode: bool,
-    active_position_count: usize,
-    open_order_count: usize,
-    context_state: &'static str,
-    invoke_management_reason: Option<String>,
-    position_context: Option<PositionContextForLlm>,
-}
-
-#[derive(Debug, Clone)]
-struct PreparedInvocation {
-    bundle: LatestBundle,
-    routing_context: InvocationRoutingContext,
-    input: ModelInvocationInput,
-}
-
-fn context_state_from_trading_state(
-    trading_state: Option<&crate::execution::binance::TradingStateSnapshot>,
-) -> &'static str {
-    trading_state
-        .map(
-            |state| match (state.has_active_positions, state.has_open_orders) {
-                (true, true) => "POSITION_AND_ORDERS",
-                (true, false) => "POSITION_ACTIVE",
-                (false, true) => "OPEN_ORDERS_ONLY",
-                (false, false) => "NO_ACTIVE_CONTEXT",
-            },
-        )
-        .unwrap_or("NO_ACTIVE_CONTEXT")
-}
-
-fn pending_order_mode_from_trading_state(
-    trading_state: Option<&crate::execution::binance::TradingStateSnapshot>,
-) -> bool {
-    trading_state.is_some_and(|state| {
-        !state.has_active_positions && primary_pending_entry_order(state).is_some()
-    })
-}
-
-async fn resolve_invocation_routing_context(
-    config: &RootConfig,
-    http_client: &Client,
-    bundle: &LatestBundle,
-    runtime_lifecycle_state: &Arc<Mutex<RuntimeLifecycleStore>>,
-) -> Result<InvocationRoutingContext> {
-    let mut trading_state = if config.llm.execution.enabled {
-        Some(
-            fetch_symbol_trading_state(
-                http_client,
-                &config.api.binance,
-                &config.llm.execution,
-                &bundle.raw.symbol,
-            )
-            .await?,
-        )
-    } else {
-        None
-    };
-    if let Some(state) = trading_state.as_ref() {
-        if state.has_open_orders
-            && crate::execution::binance::cleanup_orphan_exit_orders_for_symbol(
-                http_client,
-                &config.api.binance,
-                &config.llm.execution,
-                &bundle.raw.symbol,
-            )
-            .await?
-        {
-            trading_state = Some(
-                fetch_symbol_trading_state(
-                    http_client,
-                    &config.api.binance,
-                    &config.llm.execution,
-                    &bundle.raw.symbol,
-                )
-                .await?,
-            );
-        }
-    }
-
-    let management_mode = trading_state
-        .as_ref()
-        .map(|state| state.has_active_context)
-        .unwrap_or(false);
-    let active_position_count = trading_state
-        .as_ref()
-        .map(|state| state.active_positions.len())
-        .unwrap_or(0);
-    let open_order_count = trading_state
-        .as_ref()
-        .map(|state| state.open_orders.len())
-        .unwrap_or(0);
-    let pending_order_mode = pending_order_mode_from_trading_state(trading_state.as_ref());
-    let context_state = context_state_from_trading_state(trading_state.as_ref());
-    let global_management_reason = {
-        let guard = runtime_lifecycle_state.lock().await;
-        if active_position_count == 0 && open_order_count == 0 {
-            None
-        } else {
-            guard.last_management_reason(&bundle.raw.symbol)
-        }
-    };
-
-    hydrate_position_context_from_live_state(
-        http_client,
-        &config.api.binance,
-        &config.llm.execution,
-        trading_state.as_ref(),
-        runtime_lifecycle_state,
-    )
-    .await;
-    if let Err(err) = restore_position_context_from_journal_for_live_state(
-        trading_state.as_ref(),
-        runtime_lifecycle_state,
-    )
-    .await
-    {
-        warn!(
-            symbol = %bundle.raw.symbol,
-            error = %err,
-            "restore position context from journal failed"
-        );
-    }
-    let position_context =
-        sync_and_build_position_context_snapshot(trading_state.as_ref(), runtime_lifecycle_state)
-            .await;
-    let invoke_management_reason = resolve_invoke_management_reason(
-        active_position_count,
-        open_order_count,
-        global_management_reason,
-        position_context.as_ref(),
-    );
-
-    Ok(InvocationRoutingContext {
-        trading_state,
-        management_mode,
-        pending_order_mode,
-        active_position_count,
-        open_order_count,
-        context_state,
-        invoke_management_reason,
-        position_context,
-    })
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ExitKind {
-    TakeProfit,
-    StopLoss,
-}
-
-fn exit_order_trigger_price(order: &crate::execution::binance::OpenOrderSnapshot) -> Option<f64> {
-    if order.stop_price > 0.0 {
-        Some(order.stop_price)
-    } else if order.price > 0.0 {
-        Some(order.price)
-    } else {
-        None
-    }
-}
-
-fn order_matches_position_side(
-    order: &crate::execution::binance::OpenOrderSnapshot,
-    position_side: &str,
-) -> bool {
-    order.position_side.eq_ignore_ascii_case(position_side)
-        || order.position_side.eq_ignore_ascii_case("BOTH")
-        || order.position_side.trim().is_empty()
-        || order.position_side == "-"
-}
-
-fn exact_order_type_matches_exit_kind(order_type: &str, exit_kind: ExitKind) -> bool {
-    match exit_kind {
-        ExitKind::TakeProfit => {
-            order_type.eq_ignore_ascii_case("TAKE_PROFIT_MARKET")
-                || order_type.eq_ignore_ascii_case("TAKE_PROFIT")
-                || order_type.eq_ignore_ascii_case("TAKE_PROFIT_MARKET_ALGO")
-        }
-        ExitKind::StopLoss => {
-            order_type.eq_ignore_ascii_case("STOP_MARKET")
-                || order_type.eq_ignore_ascii_case("STOP")
-                || order_type.eq_ignore_ascii_case("STOP_MARKET_ALGO")
-        }
-    }
-}
-
-fn inferred_exit_kind(
-    order: &crate::execution::binance::OpenOrderSnapshot,
-    position_side: &str,
-    entry_price: f64,
-) -> Option<ExitKind> {
-    if !(order.reduce_only || order.close_position) {
-        return None;
-    }
-    let trigger = exit_order_trigger_price(order)?;
-    if trigger <= 0.0 {
-        return None;
-    }
-    if position_side.eq_ignore_ascii_case("LONG") {
-        if trigger > entry_price {
-            Some(ExitKind::TakeProfit)
-        } else if trigger < entry_price {
-            Some(ExitKind::StopLoss)
-        } else {
-            None
-        }
-    } else if position_side.eq_ignore_ascii_case("SHORT") {
-        if trigger < entry_price {
-            Some(ExitKind::TakeProfit)
-        } else if trigger > entry_price {
-            Some(ExitKind::StopLoss)
-        } else {
-            None
-        }
-    } else {
-        None
-    }
-}
-
-fn choose_preferred_exit_price(
-    prices: impl IntoIterator<Item = f64>,
-    entry_price: f64,
-    position_side: &str,
-    exit_kind: ExitKind,
-) -> Option<f64> {
-    let mut candidates = prices.into_iter().filter(|v| *v > 0.0).collect::<Vec<_>>();
-    if candidates.is_empty() {
-        return None;
-    }
-    match (position_side.eq_ignore_ascii_case("LONG"), exit_kind) {
-        (true, ExitKind::TakeProfit) => candidates.sort_by(|a, b| a.total_cmp(b)),
-        (true, ExitKind::StopLoss) => candidates.sort_by(|a, b| b.total_cmp(a)),
-        (false, ExitKind::TakeProfit) => candidates.sort_by(|a, b| b.total_cmp(a)),
-        (false, ExitKind::StopLoss) => candidates.sort_by(|a, b| a.total_cmp(b)),
-    }
-    candidates
-        .into_iter()
-        .min_by(|a, b| (a - entry_price).abs().total_cmp(&(b - entry_price).abs()))
-}
-
-/// Returns the actual live TP/SL trigger price from Binance open orders.
-///
-/// Binance may surface live exits as typed orders (`TAKE_PROFIT_MARKET`, `STOP_MARKET`) or as
-/// generic `CONDITIONAL` orders. For the latter we infer TP vs SL from reduce-only semantics and
-/// the trigger's location relative to the live entry price.
-fn find_live_exit_trigger_price(
-    open_orders: &[crate::execution::binance::OpenOrderSnapshot],
-    position_side: &str,
-    entry_price: Option<f64>,
-    exit_kind: ExitKind,
-) -> Option<f64> {
-    let exact_matches = open_orders
-        .iter()
-        .filter(|o| order_matches_position_side(o, position_side))
-        .filter(|o| exact_order_type_matches_exit_kind(&o.order_type, exit_kind))
-        .filter_map(exit_order_trigger_price)
-        .collect::<Vec<_>>();
-    if !exact_matches.is_empty() {
-        return entry_price
-            .and_then(|entry| {
-                choose_preferred_exit_price(
-                    exact_matches.iter().copied(),
-                    entry,
-                    position_side,
-                    exit_kind,
-                )
-            })
-            .or_else(|| exact_matches.into_iter().next());
-    }
-
-    let entry_price = entry_price?;
-    let inferred_matches = open_orders
-        .iter()
-        .filter(|o| order_matches_position_side(o, position_side))
-        .filter_map(|o| {
-            inferred_exit_kind(o, position_side, entry_price)
-                .filter(|kind| *kind == exit_kind)
-                .and_then(|_| exit_order_trigger_price(o))
-        })
-        .collect::<Vec<_>>();
-    choose_preferred_exit_price(inferred_matches, entry_price, position_side, exit_kind)
-}
-
-fn primary_pending_entry_order(
-    state: &crate::execution::binance::TradingStateSnapshot,
-) -> Option<&crate::execution::binance::OpenOrderSnapshot> {
-    state
-        .open_orders
-        .iter()
-        .filter(|o| {
-            !o.close_position
-                && !o.reduce_only
-                && (o.side.eq_ignore_ascii_case("BUY") || o.side.eq_ignore_ascii_case("SELL"))
-        })
-        .max_by(|a, b| {
-            let a_qty = (a.orig_qty - a.executed_qty).max(0.0);
-            let b_qty = (b.orig_qty - b.executed_qty).max(0.0);
-            a_qty.total_cmp(&b_qty)
-        })
-}
-
-fn build_pending_order_summary_for_llm(
-    state: &crate::execution::binance::TradingStateSnapshot,
-    position_context: Option<&PositionContextForLlm>,
-) -> Option<PendingOrderSummaryForLlm> {
-    let order = primary_pending_entry_order(state)?;
-    let direction = if order.side.eq_ignore_ascii_case("BUY") {
-        "LONG".to_string()
-    } else {
-        "SHORT".to_string()
-    };
-    let position_side = {
-        let raw = order.position_side.trim();
-        if raw.is_empty() || raw == "-" || raw.eq_ignore_ascii_case("BOTH") {
-            direction.clone()
-        } else {
-            raw.to_ascii_uppercase()
-        }
-    };
-    let quantity = (order.orig_qty - order.executed_qty).max(0.0);
-    let live_entry_price = if order.price > 0.0 {
-        Some(order.price)
-    } else {
-        position_context.and_then(|ctx| ctx.effective_entry_price)
-    };
-    let live_tp_price = find_live_exit_trigger_price(
-        &state.open_orders,
-        &position_side,
-        live_entry_price,
-        ExitKind::TakeProfit,
-    );
-    let live_sl_price = find_live_exit_trigger_price(
-        &state.open_orders,
-        &position_side,
-        live_entry_price,
-        ExitKind::StopLoss,
-    );
-    let (planned_tp_price, planned_tp_source) =
-        pending_order_shadow_exit_price(position_context, ExitKind::TakeProfit);
-    let (planned_sl_price, planned_sl_source) =
-        pending_order_shadow_exit_price(position_context, ExitKind::StopLoss);
-    Some(PendingOrderSummaryForLlm {
-        position_side: position_side.clone(),
-        direction,
-        quantity,
-        leverage: position_context.and_then(|ctx| ctx.effective_leverage),
-        entry_price: live_entry_price,
-        current_tp_price: live_tp_price,
-        current_sl_price: live_sl_price,
-        planned_tp_price,
-        planned_tp_source: planned_tp_source.map(str::to_string),
-        planned_sl_price,
-        planned_sl_source: planned_sl_source.map(str::to_string),
-    })
-}
-
-fn pending_order_shadow_exit_price(
-    position_context: Option<&PositionContextForLlm>,
-    exit_kind: ExitKind,
-) -> (Option<f64>, Option<&'static str>) {
-    let Some(context) = position_context else {
-        return (None, None);
-    };
-    match exit_kind {
-        ExitKind::TakeProfit => context
-            .effective_take_profit
-            .map(|price| (Some(price), Some("effective_context")))
-            .or_else(|| {
-                context
-                    .entry_context
-                    .as_ref()
-                    .and_then(|entry| entry.original_tp)
-                    .map(|price| (Some(price), Some("original_entry_context")))
-            })
-            .unwrap_or((None, None)),
-        ExitKind::StopLoss => context
-            .effective_stop_loss
-            .map(|price| (Some(price), Some("effective_context")))
-            .or_else(|| {
-                context
-                    .entry_context
-                    .as_ref()
-                    .and_then(|entry| entry.original_sl)
-                    .map(|price| (Some(price), Some("original_entry_context")))
-            })
-            .unwrap_or((None, None)),
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-struct TelegramPositionFields {
-    entry_price: Option<f64>,
-    leverage: Option<f64>,
-    risk_reward_ratio: Option<f64>,
-    take_profit: Option<f64>,
-    stop_loss: Option<f64>,
-}
-
-fn derive_management_telegram_fields(
-    trading_state: Option<&crate::execution::binance::TradingStateSnapshot>,
-) -> TelegramPositionFields {
-    let Some(state) = trading_state else {
-        return TelegramPositionFields::default();
-    };
-    let Some(pos) = state
-        .active_positions
-        .iter()
-        .max_by(|a, b| a.position_amt.abs().total_cmp(&b.position_amt.abs()))
-    else {
-        return TelegramPositionFields::default();
-    };
-    let position_side = effective_active_position_side(pos);
-
-    let take_profit = find_live_exit_trigger_price(
-        &state.open_orders,
-        &position_side,
-        Some(pos.entry_price),
-        ExitKind::TakeProfit,
-    );
-    let stop_loss = find_live_exit_trigger_price(
-        &state.open_orders,
-        &position_side,
-        Some(pos.entry_price),
-        ExitKind::StopLoss,
-    );
-    let risk_reward_ratio = take_profit
-        .zip(stop_loss)
-        .and_then(|(tp, sl)| compute_rr_from_levels(pos.entry_price, tp, sl));
-
-    TelegramPositionFields {
-        entry_price: Some(pos.entry_price),
-        leverage: Some(pos.leverage as f64),
-        risk_reward_ratio,
-        take_profit,
-        stop_loss,
-    }
-}
-
-async fn derive_pending_order_telegram_fields(
-    trading_state: Option<&crate::execution::binance::TradingStateSnapshot>,
-    runtime_lifecycle_state: &Arc<Mutex<RuntimeLifecycleStore>>,
-) -> TelegramPositionFields {
-    let Some(state) = trading_state else {
-        return TelegramPositionFields::default();
-    };
-    let Some(order) = primary_pending_entry_order(state) else {
-        return TelegramPositionFields::default();
-    };
-    let position_side = {
-        let raw = order.position_side.trim();
-        if raw.is_empty() || raw == "-" || raw.eq_ignore_ascii_case("BOTH") {
-            if order.side.eq_ignore_ascii_case("BUY") {
-                "LONG".to_string()
-            } else {
-                "SHORT".to_string()
-            }
-        } else {
-            raw.to_ascii_uppercase()
-        }
-    };
-    let key = format!(
-        "{}:{}",
-        state.symbol.to_ascii_uppercase(),
-        position_side.to_ascii_uppercase()
-    );
-    let guard = runtime_lifecycle_state.lock().await;
-    let ctx = guard
-        .symbol_state(&state.symbol)
-        .and_then(|symbol_state| symbol_state.contexts.get(&key));
-    let entry_price = if order.price > 0.0 {
-        Some(order.price)
-    } else {
-        ctx.and_then(|v| v.effective_entry_price)
-    };
-    let take_profit = find_live_exit_trigger_price(
-        &state.open_orders,
-        &position_side,
-        entry_price,
-        ExitKind::TakeProfit,
-    )
-    .or_else(|| ctx.and_then(|v| v.effective_take_profit));
-    let stop_loss = find_live_exit_trigger_price(
-        &state.open_orders,
-        &position_side,
-        entry_price,
-        ExitKind::StopLoss,
-    )
-    .or_else(|| ctx.and_then(|v| v.effective_stop_loss));
-    let risk_reward_ratio = entry_price
-        .zip(take_profit)
-        .zip(stop_loss)
-        .and_then(|((entry, tp), sl)| compute_rr_from_levels(entry, tp, sl));
-
-    TelegramPositionFields {
-        entry_price,
-        leverage: ctx.and_then(|v| v.effective_leverage.map(|x| x as f64)),
-        risk_reward_ratio,
-        take_profit,
-        stop_loss,
-    }
-}
-
-fn compute_rr_from_levels(entry: f64, tp: f64, sl: f64) -> Option<f64> {
-    let risk = (entry - sl).abs();
-    let reward = (tp - entry).abs();
-    if risk <= f64::EPSILON || reward <= f64::EPSILON {
-        None
-    } else {
-        Some(reward / risk)
-    }
-}
-
-fn pending_direction_to_trade_decision(direction: &str) -> Result<TradeDecision> {
-    let raw = direction.trim();
-    if raw.eq_ignore_ascii_case("LONG") {
-        Ok(TradeDecision::Long)
-    } else if raw.eq_ignore_ascii_case("SHORT") {
-        Ok(TradeDecision::Short)
-    } else {
-        Err(anyhow!(
-            "pending safety gate requires LONG/SHORT direction, got {}",
-            direction
-        ))
-    }
-}
-
-fn build_pending_modify_trade_intent(
-    intent: &crate::llm::decision::PendingOrderManagementIntent,
-    input: &ModelInvocationInput,
-) -> Result<Option<TradeIntent>> {
-    if !matches!(
-        intent.decision,
-        crate::llm::decision::PendingOrderManagementDecision::ModifyMaker
-    ) {
-        return Ok(None);
-    }
-
-    let pending = input
-        .management_snapshot
-        .as_ref()
-        .and_then(|snapshot| snapshot.pending_order.as_ref())
-        .ok_or_else(|| anyhow!("pending safety gate requires pending_order snapshot"))?;
-    let decision = pending_direction_to_trade_decision(&pending.direction)?;
-    let entry_price = intent
-        .new_entry
-        .or(pending.entry_price)
-        .ok_or_else(|| anyhow!("pending safety gate requires entry price"))?;
-    let take_profit = intent
-        .new_tp
-        .or(pending.current_tp_price)
-        .or(pending.planned_tp_price)
-        .ok_or_else(|| anyhow!("pending safety gate requires take profit"))?;
-    let stop_loss = intent
-        .new_sl
-        .or(pending.current_sl_price)
-        .or(pending.planned_sl_price)
-        .ok_or_else(|| anyhow!("pending safety gate requires stop loss"))?;
-    let leverage = intent
-        .new_leverage
-        .or(pending.leverage.map(|value| value as f64))
-        .or_else(|| {
-            input.management_snapshot.as_ref().and_then(|snapshot| {
-                snapshot
-                    .position_context
-                    .as_ref()
-                    .and_then(|ctx| ctx.effective_leverage.map(|value| value as f64))
-            })
-        });
-    let horizon = input.management_snapshot.as_ref().and_then(|snapshot| {
-        snapshot
-            .position_context
-            .as_ref()
-            .and_then(|ctx| ctx.entry_context.as_ref())
-            .and_then(|ctx| ctx.horizon.clone())
-    });
-
-    Ok(Some(TradeIntent {
-        decision,
-        entry_price: Some(entry_price),
-        take_profit: Some(take_profit),
-        stop_loss: Some(stop_loss),
-        leverage,
-        risk_reward_ratio: compute_rr_from_levels(entry_price, take_profit, stop_loss),
-        horizon,
-        swing_logic: None,
-        reason: intent.reason.clone(),
-    }))
-}
-
-fn with_telegram_field_overrides(
-    mut fields: TelegramPositionFields,
-    entry_price: Option<f64>,
-    leverage: Option<f64>,
-    take_profit: Option<f64>,
-    stop_loss: Option<f64>,
-) -> TelegramPositionFields {
-    fields.entry_price = entry_price.or(fields.entry_price);
-    fields.leverage = leverage.or(fields.leverage);
-    if take_profit.is_some() {
-        fields.take_profit = take_profit;
-    }
-    if stop_loss.is_some() {
-        fields.stop_loss = stop_loss;
-    }
-    fields.risk_reward_ratio = fields
-        .entry_price
-        .zip(fields.take_profit)
-        .zip(fields.stop_loss)
-        .and_then(|((entry, tp), sl)| compute_rr_from_levels(entry, tp, sl));
-    fields
-}
-
-fn build_management_snapshot_for_llm(
-    trading_state: Option<&crate::execution::binance::TradingStateSnapshot>,
-    last_management_reason: Option<String>,
-    position_context: Option<PositionContextForLlm>,
-) -> Option<ManagementSnapshotForLlm> {
-    let state = trading_state?;
-    let pending_order = if !state.has_active_positions && state.has_open_orders {
-        build_pending_order_summary_for_llm(state, position_context.as_ref())
-    } else {
-        None
-    };
-    let context_state = match (state.has_active_positions, state.has_open_orders) {
-        (true, true) => "POSITION_AND_ORDERS",
-        (true, false) => "POSITION_ACTIVE",
-        (false, true) => "OPEN_ORDERS_ONLY",
-        (false, false) => "NO_ACTIVE_CONTEXT",
-    }
-    .to_string();
-    let positions = state
-        .active_positions
-        .iter()
-        .map(|p| {
-            let effective_position_side = effective_active_position_side(p);
-            let current_tp_price = find_live_exit_trigger_price(
-                &state.open_orders,
-                &effective_position_side,
-                Some(p.entry_price),
-                ExitKind::TakeProfit,
-            );
-            let current_sl_price = find_live_exit_trigger_price(
-                &state.open_orders,
-                &effective_position_side,
-                Some(p.entry_price),
-                ExitKind::StopLoss,
-            );
-            PositionSummaryForLlm {
-                position_side: p.position_side.clone(),
-                direction: if p.position_amt > 0.0 {
-                    "LONG".to_string()
-                } else if p.position_amt < 0.0 {
-                    "SHORT".to_string()
-                } else {
-                    "FLAT".to_string()
-                },
-                quantity: p.position_amt.abs(),
-                leverage: p.leverage,
-                entry_price: p.entry_price,
-                mark_price: p.mark_price,
-                unrealized_pnl: p.unrealized_pnl,
-                pnl_by_latest_price: compute_pnl_by_latest_price(p),
-                current_tp_price,
-                current_sl_price,
-            }
-        })
-        .collect::<Vec<_>>();
-    Some(ManagementSnapshotForLlm {
-        context_state,
-        has_active_positions: state.has_active_positions,
-        has_open_orders: state.has_open_orders,
-        active_position_count: state.active_positions.len(),
-        open_order_count: state.open_orders.len(),
-        positions,
-        pending_order,
-        last_management_reason,
-        position_context,
-    })
-}
-
-fn compute_pnl_by_latest_price(
-    position: &crate::execution::binance::ActivePositionSnapshot,
-) -> f64 {
-    if position.entry_price > 0.0 && position.mark_price > 0.0 && position.position_amt != 0.0 {
-        (position.mark_price - position.entry_price) * position.position_amt
-    } else {
-        position.unrealized_pnl
-    }
-}
-
-fn effective_active_position_side(
-    position: &crate::execution::binance::ActivePositionSnapshot,
-) -> String {
-    let raw = position.position_side.trim();
-    if raw.is_empty() || raw == "-" || raw.eq_ignore_ascii_case("BOTH") {
-        if position.position_amt > 0.0 {
-            "LONG".to_string()
-        } else if position.position_amt < 0.0 {
-            "SHORT".to_string()
-        } else {
-            "BOTH".to_string()
-        }
-    } else {
-        raw.to_ascii_uppercase()
-    }
-}
-
-fn primary_position_key(
-    state: &crate::execution::binance::TradingStateSnapshot,
-) -> Option<(String, f64, f64)> {
-    let pos = state
-        .active_positions
-        .iter()
-        .max_by(|a, b| a.position_amt.abs().total_cmp(&b.position_amt.abs()))?;
-    let position_side = effective_active_position_side(pos);
-    let key = format!("{}:{}", state.symbol.to_ascii_uppercase(), position_side);
-    Some((key, pos.position_amt.abs(), pos.mark_price))
-}
-
-fn primary_pending_order_key(
-    state: &crate::execution::binance::TradingStateSnapshot,
-) -> Option<(String, f64, f64)> {
-    let order = primary_pending_entry_order(state)?;
-    let position_side = {
-        let raw = order.position_side.trim();
-        if raw.is_empty() || raw == "-" || raw.eq_ignore_ascii_case("BOTH") {
-            if order.side.eq_ignore_ascii_case("BUY") {
-                "LONG".to_string()
-            } else {
-                "SHORT".to_string()
-            }
-        } else {
-            raw.to_ascii_uppercase()
-        }
-    };
-    let key = format!(
-        "{}:{}",
-        state.symbol.to_ascii_uppercase(),
-        position_side.to_ascii_uppercase()
-    );
-    let remaining_qty = (order.orig_qty - order.executed_qty).max(0.0);
-    let entry_price = if order.price > 0.0 { order.price } else { 0.0 };
-    Some((key, remaining_qty, entry_price))
-}
-
-fn directional_context_key(symbol: &str, direction: &str) -> Option<String> {
-    let direction = direction.trim();
-    if direction.eq_ignore_ascii_case("LONG") || direction.eq_ignore_ascii_case("SHORT") {
-        Some(format!(
-            "{}:{}",
-            symbol.to_ascii_uppercase(),
-            direction.to_ascii_uppercase()
-        ))
-    } else {
-        None
-    }
-}
-
-fn directional_context_key_from_trade_decision(
-    symbol: &str,
-    decision: TradeDecision,
-) -> Option<String> {
-    match decision {
-        TradeDecision::Long => directional_context_key(symbol, "LONG"),
-        TradeDecision::Short => directional_context_key(symbol, "SHORT"),
-        TradeDecision::NoTrade => None,
-    }
-}
-
-fn both_context_alias_for_directional_key(key: &str) -> Option<String> {
-    let (symbol, suffix) = key.rsplit_once(':')?;
-    if suffix.eq_ignore_ascii_case("LONG") || suffix.eq_ignore_ascii_case("SHORT") {
-        Some(format!("{}:BOTH", symbol.to_ascii_uppercase()))
-    } else {
-        None
-    }
-}
-
-fn execution_context_keys_for_report(
-    symbol: &str,
-    position_side: &str,
-    decision: TradeDecision,
-) -> Vec<String> {
-    let mut keys = Vec::new();
-    let raw = position_side.trim();
-    if !raw.is_empty() && raw != "-" {
-        keys.push(format!(
-            "{}:{}",
-            symbol.to_ascii_uppercase(),
-            raw.to_ascii_uppercase()
-        ));
-    }
-    if raw.is_empty() || raw == "-" || raw.eq_ignore_ascii_case("BOTH") {
-        if let Some(key) = directional_context_key_from_trade_decision(symbol, decision) {
-            if !keys.contains(&key) {
-                keys.push(key);
-            }
-        }
-    }
-    keys
-}
-
-fn execution_context_keys_for_journal_restore(
-    symbol: &str,
-    position_side: Option<&str>,
-    decision: Option<&str>,
-    active_key: Option<&String>,
-    pending_key: Option<&String>,
-) -> Vec<String> {
-    let mut keys = Vec::new();
-    if let Some(key) = active_key {
-        if !keys.contains(key) {
-            keys.push(key.clone());
-        }
-    }
-    if let Some(key) = pending_key {
-        if !keys.contains(key) {
-            keys.push(key.clone());
-        }
-    }
-    let raw = position_side.unwrap_or_default().trim();
-    if !raw.is_empty() && raw != "-" {
-        let key = format!(
-            "{}:{}",
-            symbol.to_ascii_uppercase(),
-            raw.to_ascii_uppercase()
-        );
-        if !keys.contains(&key) {
-            keys.push(key);
-        }
-    }
-    if raw.is_empty() || raw == "-" || raw.eq_ignore_ascii_case("BOTH") {
-        if let Some(direction) = decision {
-            if let Some(key) = directional_context_key(symbol, direction) {
-                if !keys.contains(&key) {
-                    keys.push(key);
-                }
-            }
-        }
-    }
-    keys
-}
-
-fn remap_trade_entry_and_stop_loss(
-    _provider: &str,
-    execution_config: &crate::app::config::LlmExecutionConfig,
-    intent: &crate::llm::decision::TradeIntent,
-) -> Option<(f64, f64)> {
-    if !execution_config.entry_sl_remap.enabled {
-        return None;
-    }
-    if !matches!(intent.decision, TradeDecision::Long | TradeDecision::Short) {
-        return None;
-    }
-
-    let entry = intent.entry_price?;
-    let take_profit = intent.take_profit?;
-    let stop_loss = intent.stop_loss?;
-    let rr = intent.risk_reward_ratio?;
-    if rr <= f64::EPSILON {
-        return None;
-    }
-
-    let pct = (execution_config.entry_sl_remap.entry_to_sl_distance_pct / 100.0).clamp(0.0, 1.0);
-    // Move entry toward the model stop by the configured percentage:
-    // remapped_entry = entry - (entry - stop_loss) * pct
-    let remapped_entry = entry - (entry - stop_loss) * pct;
-    let reward_distance = (take_profit - remapped_entry).abs();
-    if reward_distance <= f64::EPSILON {
-        return None;
-    }
-    let risk_distance = reward_distance / rr;
-    let remapped_stop_loss = match intent.decision {
-        TradeDecision::Long => remapped_entry - risk_distance,
-        TradeDecision::Short => remapped_entry + risk_distance,
-        TradeDecision::NoTrade => return None,
-    };
-
-    Some((remapped_entry, remapped_stop_loss))
-}
-
-fn resolve_entry_v_from_helper(
-    trace: Option<&[Value]>,
-    input: &ModelInvocationInput,
-    horizon: Option<&str>,
-) -> Option<ResolvedEntryV> {
-    let entry_style = entry_stage_trace_entry_style(trace);
-    let preferred = preferred_v_timeframe(entry_style.as_deref(), horizon);
-    let fallback = if preferred == "1d" { "4h" } else { "1d" };
-
-    PreComputedVHelper::compute_for_timeframe(&input.indicators, preferred)
-        .map(|(value, basis)| ResolvedEntryV {
-            value,
-            timeframe: preferred,
-            basis,
-        })
-        .or_else(|| {
-            PreComputedVHelper::compute_for_timeframe(&input.indicators, fallback).map(
-                |(value, basis)| ResolvedEntryV {
-                    value,
-                    timeframe: fallback,
-                    basis,
-                },
-            )
-        })
-}
-
-fn evaluate_trade_entry_v_gate(
-    execution_config: &crate::app::config::LlmExecutionConfig,
-    intent: &TradeIntent,
-    input: &ModelInvocationInput,
-    trace: Option<&[Value]>,
-) -> Result<Option<EntryVGateResult>> {
-    if !matches!(intent.decision, TradeDecision::Long | TradeDecision::Short) {
-        return Ok(None);
-    }
-
-    let entry = intent
-        .entry_price
-        .ok_or_else(|| anyhow::anyhow!("entry V gate requires entry price"))?;
-    let take_profit = intent
-        .take_profit
-        .ok_or_else(|| anyhow::anyhow!("entry V gate requires take profit"))?;
-    let resolved_v = resolve_entry_v_from_helper(trace, input, intent.horizon.as_deref())
-        .ok_or_else(|| {
-            anyhow::anyhow!("entry V gate could not compute helper V from kline_history")
-        })?;
-    if resolved_v.value <= f64::EPSILON {
-        return Err(anyhow::anyhow!(
-            "entry V gate resolved non-positive helper V={}",
-            resolved_v.value
-        ));
-    }
-
-    let take_profit_distance = (take_profit - entry).abs();
-    let take_profit_distance_v = take_profit_distance / resolved_v.value;
-    let min_distance_v = execution_config.min_distance_v;
-    let passed = take_profit_distance_v + f64::EPSILON >= min_distance_v;
-
-    Ok(Some(EntryVGateResult {
-        resolved_v,
-        take_profit_distance,
-        take_profit_distance_v,
-        min_distance_v,
-        passed,
-    }))
-}
-
-fn evaluate_trade_rr_gate(
-    execution_config: &crate::app::config::LlmExecutionConfig,
-    intent: &TradeIntent,
-) -> Result<Option<EntryRrGateResult>> {
-    if !matches!(intent.decision, TradeDecision::Long | TradeDecision::Short) {
-        return Ok(None);
-    }
-
-    let entry = intent
-        .entry_price
-        .ok_or_else(|| anyhow::anyhow!("entry RR gate requires entry price"))?;
-    let take_profit = intent
-        .take_profit
-        .ok_or_else(|| anyhow::anyhow!("entry RR gate requires take profit"))?;
-    let stop_loss = intent
-        .stop_loss
-        .ok_or_else(|| anyhow::anyhow!("entry RR gate requires stop loss"))?;
-    let reward_distance = (take_profit - entry).abs();
-    let risk_distance = (entry - stop_loss).abs();
-    let risk_reward_ratio =
-        compute_rr_from_levels(entry, take_profit, stop_loss).ok_or_else(|| {
-            anyhow::anyhow!("entry RR gate could not compute risk_reward_ratio from entry/tp/sl")
-        })?;
-    let min_rr = execution_config.min_rr;
-    let passed = risk_reward_ratio + f64::EPSILON >= min_rr;
-
-    Ok(Some(EntryRrGateResult {
-        risk_reward_ratio,
-        reward_distance,
-        risk_distance,
-        min_rr,
-        passed,
-    }))
-}
-
-async fn preview_trade_signal_fields(
-    http_client: &Client,
-    config: &RootConfig,
-    symbol: &str,
-    intent: &TradeIntent,
-) -> TradeSignalFields {
-    let mut preview_exec_config = config.llm.execution.clone();
-    preview_exec_config.dry_run = true;
-    match execute_trade_intent(
-        http_client,
-        &config.api.binance,
-        &preview_exec_config,
-        symbol,
-        intent,
-    )
-    .await
-    {
-        Ok(report) => TradeSignalFields::from_report(&report),
-        Err(err) => {
-            warn!(
-                symbol = %symbol,
-                decision = intent.decision.as_str(),
-                error = %err,
-                "trade signal preview failed, falling back to intent values"
-            );
-            TradeSignalFields::from_intent(intent)
-        }
-    }
-}
-
-async fn enrich_telegram_fields_from_entry_context(
-    mut fields: TelegramPositionFields,
-    trading_state: Option<&crate::execution::binance::TradingStateSnapshot>,
-    runtime_lifecycle_state: &Arc<Mutex<RuntimeLifecycleStore>>,
-) -> TelegramPositionFields {
-    let Some(state) = trading_state else {
-        return fields;
-    };
-    let Some((key, _, _)) = primary_position_key(state) else {
-        return fields;
-    };
-    let guard = runtime_lifecycle_state.lock().await;
-    let Some(ctx) = guard
-        .symbol_state(&state.symbol)
-        .and_then(|symbol_state| symbol_state.contexts.get(&key))
-    else {
-        return fields;
-    };
-    let Some(entry_ctx) = ctx.entry_context.as_ref() else {
-        return fields;
-    };
-
-    fields.entry_price = fields.entry_price.or(ctx.effective_entry_price);
-    fields.take_profit = fields.take_profit.or(entry_ctx.original_tp);
-    fields.stop_loss = fields
-        .stop_loss
-        .or(ctx.effective_stop_loss)
-        .or(entry_ctx.original_sl);
-    if fields.risk_reward_ratio.is_none() {
-        if let (Some(entry), Some(tp), Some(sl)) =
-            (fields.entry_price, fields.take_profit, fields.stop_loss)
-        {
-            fields.risk_reward_ratio = compute_rr_from_levels(entry, tp, sl);
-        }
-    }
-    fields
-}
-
-async fn sync_and_build_position_context_snapshot(
-    trading_state: Option<&crate::execution::binance::TradingStateSnapshot>,
-    runtime_lifecycle_state: &Arc<Mutex<RuntimeLifecycleStore>>,
-) -> Option<PositionContextForLlm> {
-    let state = trading_state?;
-    let (key, current_qty, current_price) =
-        primary_position_key(state).or_else(|| primary_pending_order_key(state))?;
-    if current_qty <= f64::EPSILON {
-        return None;
-    }
-    let mut guard = runtime_lifecycle_state.lock().await;
-    let symbol_state = guard.symbol_state_mut(&state.symbol);
-    let fallback_both_context = both_context_alias_for_directional_key(&key)
-        .and_then(|alias_key| symbol_state.contexts.get(&alias_key).cloned());
-    let entry = symbol_state.contexts.entry(key).or_default();
-    if let Some(fallback) = fallback_both_context.as_ref() {
-        if entry.effective_entry_price.is_none() {
-            entry.effective_entry_price = fallback.effective_entry_price;
-        }
-        if entry.effective_take_profit.is_none() {
-            entry.effective_take_profit = fallback.effective_take_profit;
-        }
-        if entry.effective_stop_loss.is_none() {
-            entry.effective_stop_loss = fallback.effective_stop_loss;
-        }
-        if entry.entry_context.is_none() {
-            entry.entry_context = fallback.entry_context.clone();
-        }
-        if entry.effective_leverage.is_none() {
-            entry.effective_leverage = fallback.effective_leverage;
-        }
-    }
-    if entry.original_qty <= f64::EPSILON {
-        entry.original_qty = current_qty;
-    } else if current_qty > entry.original_qty {
-        entry.original_qty = current_qty;
-    }
-    if entry.last_management_reason.is_none() {
-        entry.last_management_reason = symbol_state.last_management_reason.clone();
-    }
-    let current_pct = if entry.original_qty > f64::EPSILON {
-        current_qty / entry.original_qty * 100.0
-    } else {
-        100.0
-    };
-    let times_reduced_at_current_level = entry
-        .reduction_history
-        .iter()
-        .filter(|h| (h.price - current_price).abs() <= MANAGEMENT_REDUCTION_LEVEL_THRESHOLD)
-        .count();
-
-    Some(PositionContextForLlm {
-        original_qty: entry.original_qty,
-        current_qty,
-        current_pct_of_original: current_pct,
-        effective_leverage: entry.effective_leverage,
-        effective_entry_price: entry.effective_entry_price,
-        effective_take_profit: entry.effective_take_profit,
-        effective_stop_loss: entry.effective_stop_loss,
-        reduction_history: entry
-            .reduction_history
-            .iter()
-            .map(|h| ReductionHistoryItemForLlm {
-                time: h.time.clone(),
-                qty_ratio: h.qty_ratio,
-                reason_summary: h.reason_summary.clone(),
-            })
-            .collect(),
-        times_reduced_at_current_level,
-        last_management_action: entry.last_management_action.clone(),
-        last_management_reason: entry.last_management_reason.clone(),
-        entry_context: entry.entry_context.as_ref().map(|ec| EntryContextForLlm {
-            entry_strategy: ec.entry_strategy.clone(),
-            stop_model: ec.stop_model.clone(),
-            entry_mode: ec.entry_mode.clone(),
-            original_tp: ec.original_tp,
-            original_sl: ec.original_sl,
-            sweep_wick_extreme: ec.sweep_wick_extreme,
-            horizon: ec.horizon.clone(),
-            entry_reason: ec.entry_reason.clone(),
-        }),
-    })
-}
-
-async fn hydrate_position_context_from_live_state(
-    http_client: &Client,
-    api_config: &crate::app::config::BinanceApiConfig,
-    exec_config: &crate::app::config::LlmExecutionConfig,
-    trading_state: Option<&crate::execution::binance::TradingStateSnapshot>,
-    runtime_lifecycle_state: &Arc<Mutex<RuntimeLifecycleStore>>,
-) {
-    let Some(state) = trading_state else {
-        return;
-    };
-
-    let pending_leverage = if !state.has_active_positions && state.has_open_orders {
-        fetch_pending_order_leverage(http_client, api_config, exec_config, &state.symbol)
-            .await
-            .ok()
-    } else {
-        None
-    };
-
-    let mut guard = runtime_lifecycle_state.lock().await;
-    let symbol_state = guard.symbol_state_mut(&state.symbol);
-
-    if let Some(pos) = state
-        .active_positions
-        .iter()
-        .max_by(|a, b| a.position_amt.abs().total_cmp(&b.position_amt.abs()))
-    {
-        let position_side = effective_active_position_side(pos);
-        let key = format!("{}:{}", state.symbol.to_ascii_uppercase(), position_side);
-        let entry = symbol_state.contexts.entry(key).or_default();
-        let qty = pos.position_amt.abs();
-        if entry.original_qty <= f64::EPSILON || qty > entry.original_qty {
-            entry.original_qty = qty;
-        }
-        entry.effective_entry_price = Some(pos.entry_price);
-        entry.effective_leverage = Some(pos.leverage);
-        if let Some(tp) = find_live_exit_trigger_price(
-            &state.open_orders,
-            &position_side,
-            Some(pos.entry_price),
-            ExitKind::TakeProfit,
-        ) {
-            entry.effective_take_profit = Some(tp);
-        }
-        if let Some(sl) = find_live_exit_trigger_price(
-            &state.open_orders,
-            &position_side,
-            Some(pos.entry_price),
-            ExitKind::StopLoss,
-        ) {
-            entry.effective_stop_loss = Some(sl);
-        }
-    }
-
-    if !state.has_active_positions {
-        if let Some(order) = primary_pending_entry_order(state) {
-            let position_side = {
-                let raw = order.position_side.trim();
-                if raw.is_empty() || raw == "-" || raw.eq_ignore_ascii_case("BOTH") {
-                    if order.side.eq_ignore_ascii_case("BUY") {
-                        "LONG".to_string()
-                    } else {
-                        "SHORT".to_string()
-                    }
-                } else {
-                    raw.to_ascii_uppercase()
-                }
-            };
-            let key = format!(
-                "{}:{}",
-                state.symbol.to_ascii_uppercase(),
-                position_side.to_ascii_uppercase()
-            );
-            let entry = symbol_state.contexts.entry(key).or_default();
-            let remaining_qty = (order.orig_qty - order.executed_qty).max(0.0);
-            if entry.original_qty <= f64::EPSILON || remaining_qty > entry.original_qty {
-                entry.original_qty = remaining_qty;
-            }
-            if order.price > 0.0 {
-                entry.effective_entry_price = Some(order.price);
-            }
-            if let Some(leverage) = pending_leverage {
-                entry.effective_leverage = Some(leverage);
-            }
-            if let Some(tp) = find_live_exit_trigger_price(
-                &state.open_orders,
-                &position_side,
-                if order.price > 0.0 {
-                    Some(order.price)
-                } else {
-                    entry.effective_entry_price
-                },
-                ExitKind::TakeProfit,
-            ) {
-                entry.effective_take_profit = Some(tp);
-            }
-            if let Some(sl) = find_live_exit_trigger_price(
-                &state.open_orders,
-                &position_side,
-                if order.price > 0.0 {
-                    Some(order.price)
-                } else {
-                    entry.effective_entry_price
-                },
-                ExitKind::StopLoss,
-            ) {
-                entry.effective_stop_loss = Some(sl);
-            }
-        }
-    }
-}
-
-async fn restore_position_context_from_journal_for_live_state(
-    trading_state: Option<&crate::execution::binance::TradingStateSnapshot>,
-    runtime_lifecycle_state: &Arc<Mutex<RuntimeLifecycleStore>>,
-) -> Result<()> {
-    let Some(state) = trading_state else {
-        return Ok(());
-    };
-    let path = Path::new(LLM_JOURNAL_FILE);
-    if !path.exists() {
-        return Ok(());
-    }
-
-    let active_key = primary_position_key(state).map(|(key, _, _)| key);
-    let pending_key = primary_pending_order_key(state).map(|(key, _, _)| key);
-    if active_key.is_none() && pending_key.is_none() {
-        return Ok(());
-    }
-
-    let symbol = state.symbol.to_ascii_uppercase();
-    let contents = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-    let mut guard = runtime_lifecycle_state.lock().await;
-    let symbol_state = guard.symbol_state_mut(&symbol);
-    for line in contents.lines() {
-        let Ok(value) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        let event_symbol = value
-            .get("symbol")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_ascii_uppercase();
-        if event_symbol != symbol {
-            continue;
-        }
-        let event_type = value
-            .get("event_type")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let reason = value
-            .get("reason")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string());
-        if reason.is_some() {
-            symbol_state.last_management_reason = reason
-                .clone()
-                .or(symbol_state.last_management_reason.clone());
-        }
-        match event_type {
-            "llm_order_execution" => {
-                let keys = execution_context_keys_for_journal_restore(
-                    &symbol,
-                    value.get("position_side").and_then(Value::as_str),
-                    value.get("decision").and_then(Value::as_str),
-                    active_key.as_ref(),
-                    pending_key.as_ref(),
-                );
-                if keys.is_empty() {
-                    continue;
-                }
-                let has_entry_context = value.get("entry_strategy").is_some()
-                    || value.get("stop_model").is_some()
-                    || value.get("horizon").is_some();
-                let restored_entry_context = if has_entry_context {
-                    Some(EntryContextForState {
-                        entry_strategy: value
-                            .get("entry_strategy")
-                            .and_then(Value::as_str)
-                            .map(str::to_string),
-                        stop_model: value
-                            .get("stop_model")
-                            .and_then(Value::as_str)
-                            .map(str::to_string),
-                        entry_mode: value
-                            .get("entry_mode")
-                            .and_then(Value::as_str)
-                            .map(str::to_string),
-                        original_tp: value.get("entry_original_tp").and_then(Value::as_f64),
-                        original_sl: value.get("entry_original_sl").and_then(Value::as_f64),
-                        sweep_wick_extreme: value.get("sweep_wick_extreme").and_then(Value::as_f64),
-                        horizon: value
-                            .get("horizon")
-                            .and_then(Value::as_str)
-                            .map(str::to_string),
-                        entry_reason: reason.clone().unwrap_or_default(),
-                        entry_v: value.get("entry_v").and_then(Value::as_f64),
-                    })
-                } else {
-                    None
-                };
-                for key in keys {
-                    let entry = symbol_state.contexts.entry(key).or_default();
-                    entry.last_management_reason =
-                        reason.clone().or(entry.last_management_reason.clone());
-                    entry.effective_entry_price = value
-                        .get("maker_entry_price")
-                        .and_then(Value::as_f64)
-                        .or(entry.effective_entry_price);
-                    entry.effective_take_profit = value
-                        .get("effective_take_profit")
-                        .and_then(Value::as_f64)
-                        .or(entry.effective_take_profit);
-                    entry.effective_stop_loss = value
-                        .get("effective_stop_loss")
-                        .and_then(Value::as_f64)
-                        .or(entry.effective_stop_loss);
-                    entry.effective_leverage = value
-                        .get("leverage")
-                        .and_then(Value::as_u64)
-                        .map(|v| v as u32)
-                        .or(entry.effective_leverage);
-                    if entry.entry_context.is_none() {
-                        entry.entry_context = restored_entry_context.clone();
-                    }
-                }
-            }
-            "llm_management_execution" | "llm_management_execution_error" => {
-                let Some(key) = active_key.as_ref() else {
-                    continue;
-                };
-                let entry = symbol_state.contexts.entry(key.clone()).or_default();
-                entry.last_management_action = value
-                    .get("action")
-                    .and_then(Value::as_str)
-                    .map(|s| s.to_string())
-                    .or(entry.last_management_action.clone());
-                entry.last_management_reason =
-                    reason.clone().or(entry.last_management_reason.clone());
-                entry.effective_take_profit = value
-                    .get("new_tp")
-                    .and_then(Value::as_f64)
-                    .or(entry.effective_take_profit);
-                entry.effective_stop_loss = value
-                    .get("new_sl")
-                    .and_then(Value::as_f64)
-                    .or(entry.effective_stop_loss);
-            }
-            "llm_pending_order_execution" | "llm_pending_order_execution_error" => {
-                let Some(key) = pending_key.as_ref() else {
-                    continue;
-                };
-                let entry = symbol_state.contexts.entry(key.clone()).or_default();
-                entry.last_management_action = value
-                    .get("action")
-                    .and_then(Value::as_str)
-                    .map(|s| s.to_string())
-                    .or(entry.last_management_action.clone());
-                entry.last_management_reason =
-                    reason.clone().or(entry.last_management_reason.clone());
-                entry.effective_entry_price = value
-                    .get("maker_entry_price")
-                    .and_then(Value::as_f64)
-                    .or_else(|| value.get("new_entry").and_then(Value::as_f64))
-                    .or(entry.effective_entry_price);
-                entry.effective_take_profit = value
-                    .get("effective_take_profit")
-                    .and_then(Value::as_f64)
-                    .or_else(|| value.get("new_tp").and_then(Value::as_f64))
-                    .or(entry.effective_take_profit);
-                entry.effective_stop_loss = value
-                    .get("effective_stop_loss")
-                    .and_then(Value::as_f64)
-                    .or_else(|| value.get("new_sl").and_then(Value::as_f64))
-                    .or(entry.effective_stop_loss);
-                entry.effective_leverage = value
-                    .get("leverage")
-                    .and_then(Value::as_u64)
-                    .map(|v| v as u32)
-                    .or(entry.effective_leverage);
-            }
-            _ => {}
-        }
-    }
-    Ok(())
-}
-
-async fn restore_last_management_reasons_from_journal(
-    runtime_lifecycle_state: &Arc<Mutex<RuntimeLifecycleStore>>,
-) -> Result<()> {
-    let path = Path::new(LLM_JOURNAL_FILE);
-    if !path.exists() {
-        return Ok(());
-    }
-    let contents = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-    let mut guard = runtime_lifecycle_state.lock().await;
-    for line in contents.lines() {
-        let Ok(value) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        let event_type = value
-            .get("event_type")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        if !matches!(
-            event_type,
-            "llm_management_execution"
-                | "llm_pending_order_execution"
-                | "llm_order_execution"
-                | "llm_management_execution_error"
-                | "llm_pending_order_execution_error"
-        ) {
-            continue;
-        }
-        let symbol = value
-            .get("symbol")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|s| !s.is_empty());
-        let Some(symbol) = symbol else {
-            continue;
-        };
-        let reason = value
-            .get("reason")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string());
-        if reason.is_some() {
-            guard.set_last_management_reason(symbol, reason);
-        }
-    }
-    Ok(())
-}
-
-async fn validate_reduce_anti_repetition(
-    symbol: &str,
-    intent: &crate::llm::decision::PositionManagementIntent,
-    trading_state: Option<&crate::execution::binance::TradingStateSnapshot>,
-    runtime_lifecycle_state: &Arc<Mutex<RuntimeLifecycleStore>>,
-) -> Result<()> {
-    if !matches!(
-        intent.decision,
-        crate::llm::decision::PositionManagementDecision::Reduce
-    ) {
-        return Ok(());
-    }
-    let state = trading_state
-        .ok_or_else(|| anyhow::anyhow!("trading_state missing for REDUCE validation"))?;
-    let (key, current_qty, current_price) = primary_position_key(state)
-        .ok_or_else(|| anyhow::anyhow!("REDUCE validation requires active position"))?;
-    if current_qty <= f64::EPSILON {
-        return Err(anyhow::anyhow!(
-            "REDUCE validation failed: current_qty is zero"
-        ));
-    }
-    let guard = runtime_lifecycle_state.lock().await;
-    let ctx = guard
-        .symbol_state(symbol)
-        .and_then(|symbol_state| symbol_state.contexts.get(&key));
-    let original_qty = ctx
-        .map(|c| c.original_qty)
-        .unwrap_or(current_qty)
-        .max(current_qty);
-    let current_pct = if original_qty > f64::EPSILON {
-        current_qty / original_qty * 100.0
-    } else {
-        100.0
-    };
-    if current_pct <= 30.0 {
-        return Err(anyhow::anyhow!(
-            "HC-11 violation: current_pct_of_original={:.2} <= 30, REDUCE is forbidden",
-            current_pct
-        ));
-    }
-    let reduce_ratio = if let Some(r) = intent.qty_ratio {
-        r
-    } else if let Some(q) = intent.qty {
-        (q / current_qty).clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
-    if reduce_ratio > 0.5 {
-        return Err(anyhow::anyhow!(
-            "REDUCE qty_ratio {:.4} exceeds 0.5 single-action cap",
-            reduce_ratio
-        ));
-    }
-    if current_pct < 50.0 && reduce_ratio > 0.25 {
-        return Err(anyhow::anyhow!(
-            "REDUCE qty_ratio {:.4} exceeds 0.25 cap when current_pct_of_original={:.2} < 50",
-            reduce_ratio,
-            current_pct
-        ));
-    }
-    if let Some(ctx) = ctx {
-        if ctx.last_management_action.as_deref() == Some("REDUCE") {
-            if let Some(last) = ctx.reduction_history.last() {
-                if (current_price - last.price).abs() <= MANAGEMENT_REDUCTION_LEVEL_THRESHOLD {
-                    return Err(anyhow::anyhow!(
-                        "HC-10 violation: repeated REDUCE near same level symbol={} current_price={} last_reduce_price={} threshold={}",
-                        symbol,
-                        current_price,
-                        last.price,
-                        MANAGEMENT_REDUCTION_LEVEL_THRESHOLD
-                    ));
-                }
-                let current_reason_summary = summarize_reason(&intent.reason);
-                if current_reason_summary.eq_ignore_ascii_case(&last.reason_summary) {
-                    return Err(anyhow::anyhow!(
-                        "repeated REDUCE reason without new structural justification"
-                    ));
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-async fn update_position_context_after_management_action(
-    symbol: &str,
-    trading_state: Option<&crate::execution::binance::TradingStateSnapshot>,
-    intent: &crate::llm::decision::PositionManagementIntent,
-    runtime_lifecycle_state: &Arc<Mutex<RuntimeLifecycleStore>>,
-) {
-    let Some(state) = trading_state else {
-        return;
-    };
-    let Some((key, current_qty, current_price)) = primary_position_key(state) else {
-        return;
-    };
-    let mut guard = runtime_lifecycle_state.lock().await;
-    let symbol_state = guard.symbol_state_mut(symbol);
-    if matches!(
-        intent.decision,
-        crate::llm::decision::PositionManagementDecision::Close
-    ) {
-        symbol_state.contexts.remove(&key);
-        return;
-    }
-    symbol_state.last_management_reason = Some(intent.reason.clone());
-    let entry = symbol_state.contexts.entry(key).or_default();
-    if entry.original_qty <= f64::EPSILON {
-        entry.original_qty = current_qty;
-    } else if current_qty > entry.original_qty {
-        entry.original_qty = current_qty;
-    }
-    entry.last_management_action = Some(intent.decision.as_str().to_string());
-    entry.last_management_reason = Some(intent.reason.clone());
-    if let Some(new_tp) = intent.new_tp {
-        entry.effective_take_profit = Some(new_tp);
-    }
-    if let Some(new_sl) = intent.new_sl {
-        entry.effective_stop_loss = Some(new_sl);
-    }
-    if matches!(
-        intent.decision,
-        crate::llm::decision::PositionManagementDecision::Reduce
-    ) {
-        let qty_ratio = if let Some(v) = intent.qty_ratio {
-            v
-        } else if let Some(q) = intent.qty {
-            (q / current_qty).clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
-        if qty_ratio > 0.0 {
-            entry.reduction_history.push(ReductionHistoryEntry {
-                time: Utc::now().format("%H:%M").to_string(),
-                qty_ratio,
-                reason_summary: summarize_reason(&intent.reason),
-                price: current_price,
-            });
-            if entry.reduction_history.len() > 30 {
-                let drop = entry.reduction_history.len() - 30;
-                entry.reduction_history.drain(0..drop);
-            }
-            info!(
-                symbol = %symbol,
-                qty_ratio = qty_ratio,
-                current_price = current_price,
-                "recorded_reduce_history_entry"
-            );
-        }
-    }
-}
-
-async fn update_position_context_after_pending_order_action(
-    symbol: &str,
-    trading_state: Option<&crate::execution::binance::TradingStateSnapshot>,
-    intent: &crate::llm::decision::PendingOrderManagementIntent,
-    runtime_lifecycle_state: &Arc<Mutex<RuntimeLifecycleStore>>,
-) {
-    let Some(state) = trading_state else {
-        return;
-    };
-    let Some((key, current_qty, _)) = primary_pending_order_key(state) else {
-        if matches!(
-            intent.decision,
-            crate::llm::decision::PendingOrderManagementDecision::Close
-        ) {
-            let mut guard = runtime_lifecycle_state.lock().await;
-            let prefix = format!("{}:", symbol.to_ascii_uppercase());
-            let symbol_state = guard.symbol_state_mut(symbol);
-            symbol_state
-                .contexts
-                .retain(|existing_key, _| !existing_key.starts_with(&prefix));
-        }
-        return;
-    };
-
-    let mut guard = runtime_lifecycle_state.lock().await;
-    let symbol_state = guard.symbol_state_mut(symbol);
-    let fallback_both_context = both_context_alias_for_directional_key(&key)
-        .and_then(|alias_key| symbol_state.contexts.get(&alias_key).cloned());
-    if matches!(
-        intent.decision,
-        crate::llm::decision::PendingOrderManagementDecision::Close
-    ) {
-        symbol_state.contexts.remove(&key);
-        return;
-    }
-
-    symbol_state.last_management_reason = Some(intent.reason.clone());
-    let entry = symbol_state.contexts.entry(key).or_default();
-    if let Some(fallback) = fallback_both_context.as_ref() {
-        if entry.effective_entry_price.is_none() {
-            entry.effective_entry_price = fallback.effective_entry_price;
-        }
-        if entry.effective_take_profit.is_none() {
-            entry.effective_take_profit = fallback.effective_take_profit;
-        }
-        if entry.effective_stop_loss.is_none() {
-            entry.effective_stop_loss = fallback.effective_stop_loss;
-        }
-        if entry.entry_context.is_none() {
-            entry.entry_context = fallback.entry_context.clone();
-        }
-        if entry.effective_leverage.is_none() {
-            entry.effective_leverage = fallback.effective_leverage;
-        }
-    }
-    if entry.original_qty <= f64::EPSILON {
-        entry.original_qty = current_qty;
-    } else if current_qty > entry.original_qty {
-        entry.original_qty = current_qty;
-    }
-    entry.last_management_action = Some(intent.decision.as_str().to_string());
-    entry.last_management_reason = Some(intent.reason.clone());
-    if let Some(new_entry) = intent.new_entry {
-        entry.effective_entry_price = Some(new_entry);
-    }
-    if let Some(new_tp) = intent.new_tp {
-        entry.effective_take_profit = Some(new_tp);
-    }
-    if let Some(new_sl) = intent.new_sl {
-        entry.effective_stop_loss = Some(new_sl);
-    }
-    if let Some(new_leverage) = intent.new_leverage {
-        entry.effective_leverage = Some(new_leverage as u32);
-    }
-}
-
-fn summarize_reason(reason: &str) -> String {
-    let compact = reason.replace('\n', " ").trim().to_string();
-    if compact.len() <= 80 {
-        return compact;
-    }
-    compact.chars().take(80).collect()
-}
-
-fn resolve_invoke_management_reason(
-    active_position_count: usize,
-    open_order_count: usize,
-    global_reason: Option<String>,
-    position_context: Option<&PositionContextForLlm>,
-) -> Option<String> {
-    if active_position_count == 0 && open_order_count == 0 {
-        return None;
-    }
-    position_context
-        .and_then(|ctx| ctx.last_management_reason.clone())
-        .or(global_reason)
 }
 
 fn queue_latest_bundle_invoke(
@@ -3058,7 +1097,6 @@ fn queue_latest_bundle_invoke(
     latest_bundle: &Option<LatestBundle>,
     last_invoked_ts_bucket: &mut Option<DateTime<Utc>>,
     invoke_throttle: &Arc<Mutex<InvokeThrottleState>>,
-    runtime_lifecycle_state: &Arc<Mutex<RuntimeLifecycleStore>>,
     min_invoke_interval: Duration,
     apply_min_invoke_interval_throttle: bool,
     trigger: &str,
@@ -3098,7 +1136,6 @@ fn queue_latest_bundle_invoke(
     let loopback_http_client = ctx.loopback_http_client.clone();
     let print_response = ctx.config.llm.print_response;
     let invoke_throttle = Arc::clone(invoke_throttle);
-    let runtime_lifecycle_state = Arc::clone(runtime_lifecycle_state);
     let trigger = Arc::<str>::from(trigger.to_string());
     let ts_bucket = bundle.raw.ts_bucket;
     tokio::spawn(async move {
@@ -3131,7 +1168,6 @@ fn queue_latest_bundle_invoke(
                 print_response,
                 bundle,
                 trigger,
-                runtime_lifecycle_state,
             )
             .await;
         } else {
@@ -3153,2919 +1189,1241 @@ async fn invoke_bundle_models(
     print_response: bool,
     bundle: LatestBundle,
     trigger: Arc<str>,
-    runtime_lifecycle_state: Arc<Mutex<RuntimeLifecycleStore>>,
 ) {
-    let mut execution_done = false;
-    let mut execution_blocked_due_to_stale = false;
-    let stage1_bundle = bundle.clone();
-    let stage1_management_mode = false;
-    let stage1_pending_order_mode = false;
-    let stage1_active_position_count = 0usize;
-    let stage1_open_order_count = 0usize;
-    let stage1_context_state = "SCAN_ONLY";
-    let stage1_invoke_management_reason: Option<String> = None;
-    let mut stage1_input = build_persist_only_input(&stage1_bundle);
-    if let Err(err) = patch_input_kline_history_from_db(
-        &db_pool,
-        &mut stage1_input,
-        &format!("{}:stage1_scan", trigger.as_ref()),
+    if !config.llm.workflow.enabled {
+        debug!(
+            symbol = %bundle.raw.symbol,
+            ts_bucket = %bundle.raw.ts_bucket,
+            trigger = %trigger,
+            "workflow invoke skipped because llm.workflow.enabled=false"
+        );
+        return;
+    }
+    if let Err(err) = invoke_workflow_bundle_models(
+        Arc::clone(&config),
+        db_pool,
+        http_client,
+        loopback_http_client,
+        print_response,
+        bundle,
+        trigger,
     )
     .await
     {
-        warn!(
-            symbol = %stage1_bundle.raw.symbol,
-            ts_bucket = %stage1_bundle.raw.ts_bucket,
-            trigger = %trigger,
-            error = %err,
-            "failed to patch missing kline_history bars from db"
+        error!(error = %err, "workflow invoke failed");
+    }
+}
+
+fn workflow_stage1_refresh_reason(
+    config: &RootConfig,
+    bundle: &LatestBundle,
+    workflow_state: &crate::workflow::state::WorkflowState,
+    stage1_output: Option<&crate::workflow::schema::Stage1Output>,
+) -> Option<String> {
+    if let Some(reason) = workflow_state.pending_stage1_refresh_reason.as_ref() {
+        return Some(reason.clone());
+    }
+    if stage1_output.is_none() {
+        return Some("scheduled_4h".to_string());
+    }
+    let hour = bundle.raw.ts_bucket.hour() as u8;
+    let minute = bundle.raw.ts_bucket.minute() as u8;
+    if minute == 0 && config.llm.workflow.stage1_refresh_hours.contains(&hour) {
+        return Some("scheduled_4h".to_string());
+    }
+    None
+}
+
+fn workflow_code_allows_execution(eval: &crate::workflow::stage2::Stage2RuntimeEvaluation) -> bool {
+    eval.monitoring_status == "active"
+        && !eval.no_edge_reentered
+        && !eval.failure_level_breached
+        && !eval.reevaluation_trigger_hit
+        && eval.hard_gate.location_valid
+        && eval.hard_gate.trigger_confirmed
+        && eval.soft_gate.passed_count >= eval.soft_gate_min_required
+}
+
+async fn persist_workflow_prompt_input_to_disk(
+    bundle: &MinuteBundleEnvelope,
+    stage: &str,
+    value: &Value,
+    retention_minutes: u64,
+) -> Result<PathBuf> {
+    ensure_temp_model_output_dir().await?;
+    let path = llm_stage_prompt_output_path(bundle, "workflow", "input", stage);
+    let payload = json!({
+        "ts_bucket": bundle.ts_bucket,
+        "symbol": bundle.symbol,
+        "stage": stage,
+        "captured_at": Utc::now().to_rfc3339(),
+        "prompt_input": value,
+    });
+    write_pretty_json_file(&path, &payload)?;
+    let removed = prune_expired_temp_model_output_files(
+        Path::new(TEMP_MODEL_OUTPUT_DIR),
+        bundle.ts_bucket,
+        retention_minutes_i64(retention_minutes),
+    )?;
+    if removed > 0 {
+        debug!(
+            ts_bucket = %bundle.ts_bucket,
+            removed,
+            retention_minutes = retention_minutes,
+            stage = stage,
+            "pruned expired workflow temp_model_output cache"
         );
     }
-    let stage1_source_file = minute_bundle_path(&stage1_bundle.raw);
-    let stage1_scan_input_path = match persist_scan_input_to_disk(
-        &stage1_bundle.raw,
-        &stage1_input,
-        config.llm.temp_cache_retention_minutes(),
+    Ok(path)
+}
+
+fn append_workflow_journal_event(
+    event_type: &str,
+    symbol: &str,
+    ts_bucket: DateTime<Utc>,
+    payload: Value,
+) {
+    let event = json!({
+        "event_type": event_type,
+        "event_ts": Utc::now().to_rfc3339(),
+        "symbol": symbol,
+        "ts_bucket": ts_bucket.to_rfc3339(),
+        "payload": payload,
+    });
+    if let Err(err) = append_journal_event(event) {
+        warn!(error = %err, event_type = event_type, "append workflow journal failed");
+    }
+}
+
+async fn invoke_workflow_bundle_models(
+    config: Arc<RootConfig>,
+    db_pool: PgPool,
+    http_client: Client,
+    loopback_http_client: Client,
+    print_response: bool,
+    bundle: LatestBundle,
+    trigger: Arc<str>,
+) -> Result<()> {
+    let symbol = bundle.raw.symbol.to_ascii_uppercase();
+    let state_dir = config.llm.workflow.state_dir.clone();
+    let retention_minutes = config.llm.temp_cache_retention_minutes();
+
+    let mut input = build_persist_only_input(&bundle);
+    patch_input_kline_history_from_db(
+        &db_pool,
+        &mut input,
+        &format!("{}:workflow", trigger.as_ref()),
     )
-    .await
-    {
-        Ok(path) => Some(path),
-        Err(err) => {
-            warn!(
-                symbol = %stage1_bundle.raw.symbol,
-                ts_bucket = %stage1_bundle.raw.ts_bucket,
-                trigger = %trigger,
-                error = %err,
-                "persist stage1 scan input to temp_model_input failed"
+    .await?;
+
+    let mut workflow_state = crate::workflow::persistence::load_workflow_state(
+        &state_dir, &symbol,
+    )?
+    .unwrap_or(crate::workflow::state::WorkflowState {
+        symbol: symbol.clone(),
+        pending_stage1_refresh_reason: None,
+        last_stage1_ts: None,
+    });
+    workflow_state.symbol = symbol.clone();
+
+    let mut stage1_output = crate::workflow::persistence::load_stage1_output(&state_dir, &symbol)?;
+    let mut tracked_zones = crate::workflow::persistence::load_tracked_zones(&state_dir, &symbol)?;
+
+    let stage1_refresh_reason =
+        workflow_stage1_refresh_reason(&config, &bundle, &workflow_state, stage1_output.as_ref());
+
+    if let Some(refresh_reason) = stage1_refresh_reason.clone() {
+        let indicator_summary =
+            crate::workflow::code_layer::build_indicator_summary(&input, &tracked_zones)?;
+        let prompt_input = crate::workflow::stage1::build_stage1_prompt_input(
+            indicator_summary,
+            stage1_output.clone(),
+            refresh_reason.clone(),
+        );
+        let prompt_input_value = serde_json::to_value(&prompt_input)
+            .context("serialize workflow stage1 prompt input")?;
+        if config.llm.workflow.persist_prompt_inputs {
+            let path = persist_workflow_prompt_input_to_disk(
+                &bundle.raw,
+                "workflow_stage1",
+                &prompt_input_value,
+                retention_minutes,
+            )
+            .await?;
+            debug!(
+                symbol = %symbol,
+                ts_bucket = %bundle.raw.ts_bucket,
+                path = %path.display(),
+                "persisted workflow stage1 prompt input"
             );
-            None
         }
-    };
-    println!(
-        "LLM_STAGE1_SOURCE ts_bucket={} trigger={} symbol={} source_temp_indicator_file={} source_file_exists={} source_scan_input_file={} scan_input_file_exists={} indicator_count={} missing_count={} management_mode={} pending_order_mode={}",
-        stage1_bundle.raw.ts_bucket,
-        &*trigger,
-        stage1_bundle.raw.symbol,
-        stage1_source_file.display(),
-        stage1_source_file.exists(),
-        stage1_scan_input_path
+
+        if !config.llm.request_enabled {
+            info!(
+                symbol = %symbol,
+                ts_bucket = %bundle.raw.ts_bucket,
+                refresh_reason = %refresh_reason,
+                "workflow stage1 skipped because llm.request_enabled=false"
+            );
+            return Ok(());
+        }
+
+        let outputs = crate::llm::workflow_provider::invoke_stage1_models(
+            &http_client,
+            &loopback_http_client,
+            &config,
+            &prompt_input_value,
+            &symbol,
+        )
+        .await;
+
+        let mut parsed_stage1: Option<crate::workflow::schema::Stage1Output> = None;
+        for out in outputs {
+            let payload = json!({
+                "trigger": &*trigger,
+                "refresh_reason": refresh_reason,
+                "model_name": out.model_name,
+                "provider": out.provider,
+                "model_id": out.model,
+                "latency_ms": out.latency_ms,
+                "raw_response_text": out.raw_response_text,
+                "parsed_value": out.parsed_value,
+                "error": out.error,
+            });
+            append_workflow_journal_event(
+                "workflow_stage1_response",
+                &symbol,
+                bundle.raw.ts_bucket,
+                payload.clone(),
+            );
+            if print_response {
+                println!(
+                    "WORKFLOW_STAGE1_RESPONSE ts_bucket={} trigger={} symbol={} payload={}",
+                    bundle.raw.ts_bucket,
+                    &*trigger,
+                    symbol,
+                    render_pretty_json_value(&payload)
+                );
+            }
+
+            if parsed_stage1.is_some() {
+                continue;
+            }
+            let Some(value) = payload.get("parsed_value").cloned() else {
+                continue;
+            };
+            match crate::workflow::parser::parse_stage1_output(value) {
+                Ok(parsed) => parsed_stage1 = Some(parsed),
+                Err(err) => {
+                    append_workflow_journal_event(
+                        "workflow_stage1_parse_error",
+                        &symbol,
+                        bundle.raw.ts_bucket,
+                        json!({
+                            "trigger": &*trigger,
+                            "refresh_reason": refresh_reason,
+                            "error": format!("{err:#}"),
+                        }),
+                    );
+                }
+            }
+        }
+
+        let parsed_stage1 =
+            parsed_stage1.ok_or_else(|| anyhow!("workflow stage1 produced no valid output"))?;
+        tracked_zones = parsed_stage1
+            .current_path
             .as_ref()
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|| "-".to_string()),
-        stage1_scan_input_path
-            .as_ref()
-            .map(|path| path.exists())
-            .unwrap_or(false),
-        stage1_bundle.raw.indicator_count,
-        stage1_bundle.missing_indicator_codes.len(),
-        stage1_management_mode,
-        stage1_pending_order_mode,
+            .map(|path| path.tracked_zones.clone())
+            .unwrap_or_default();
+        workflow_state.last_stage1_ts = Some(parsed_stage1.meta.stage1_ts);
+        workflow_state.pending_stage1_refresh_reason = None;
+        crate::workflow::persistence::save_stage1_output(&state_dir, &symbol, &parsed_stage1)?;
+        crate::workflow::persistence::save_tracked_zones(&state_dir, &symbol, &tracked_zones)?;
+        crate::workflow::persistence::save_workflow_state(&state_dir, &workflow_state)?;
+        stage1_output = Some(parsed_stage1);
+    }
+
+    let stage1_output =
+        stage1_output.ok_or_else(|| anyhow!("workflow stage1 output missing after refresh"))?;
+
+    let trading_state = fetch_symbol_trading_state(
+        &http_client,
+        &config.api.binance,
+        &config.llm.execution,
+        &symbol,
+    )
+    .await?;
+    let entry_snapshots =
+        crate::workflow::persistence::load_entry_snapshots_for_symbol(&state_dir, &symbol)?
+            .into_iter()
+            .map(|snapshot| (snapshot.context_key.clone(), snapshot))
+            .collect::<HashMap<_, _>>();
+    input.trading_state = Some(trading_state.clone());
+    input.management_snapshot =
+        build_workflow_management_snapshot(&trading_state, &symbol, &entry_snapshots);
+
+    if stage1_output.monitoring_status == "no_edge"
+        && !trading_state.has_active_positions
+        && !trading_state.has_open_orders
+    {
+        append_workflow_journal_event(
+            "workflow_no_edge_skip",
+            &symbol,
+            bundle.raw.ts_bucket,
+            json!({
+                "trigger": &*trigger,
+                "reason": stage1_output.no_trade_reason,
+            }),
+        );
+        return Ok(());
+    }
+
+    let indicator_summary =
+        crate::workflow::code_layer::build_indicator_summary(&input, &tracked_zones)?;
+    let stage2_runtime_eval = crate::workflow::stage2::evaluate_stage2_runtime(
+        &indicator_summary,
+        &stage1_output,
+        &config.llm.workflow.soft_gate_min_pass,
+    )?;
+    append_workflow_journal_event(
+        "workflow_stage2_runtime_eval",
+        &symbol,
+        bundle.raw.ts_bucket,
+        json!({
+            "trigger": &*trigger,
+            "monitoring_status": stage2_runtime_eval.monitoring_status,
+            "latest_price": stage2_runtime_eval.latest_price,
+            "no_edge_reentered": stage2_runtime_eval.no_edge_reentered,
+            "failure_level_breached": stage2_runtime_eval.failure_level_breached,
+            "reevaluation_trigger_hit": stage2_runtime_eval.reevaluation_trigger_hit,
+            "activation_level_active": stage2_runtime_eval.activation_level_active,
+            "setup_confirmed": stage2_runtime_eval.setup_confirmed,
+            "hard_gate": {
+                "location_valid": stage2_runtime_eval.hard_gate.location_valid,
+                "trigger_confirmed": stage2_runtime_eval.hard_gate.trigger_confirmed,
+            },
+            "soft_gate": {
+                "state_clear": stage2_runtime_eval.soft_gate.state_clear,
+                "driver_clear": stage2_runtime_eval.soft_gate.driver_clear,
+                "orderflow_real": stage2_runtime_eval.soft_gate.orderflow_real,
+                "invalidation_clear": stage2_runtime_eval.soft_gate.invalidation_clear,
+                "passed_count": stage2_runtime_eval.soft_gate.passed_count,
+                "min_required": stage2_runtime_eval.soft_gate_min_required,
+            }
+        }),
     );
+    let runtime_contract = crate::workflow::stage2::runtime_contract_from_evaluation(
+        &indicator_summary,
+        &stage1_output,
+        &stage2_runtime_eval,
+    );
+    let mut entry_snapshots = entry_snapshots;
+    let signal_entry_snapshots = entry_snapshots.clone();
+
+    let stage2_prompt_input = crate::workflow::stage2::build_stage2_prompt_input(
+        indicator_summary,
+        stage1_output.clone(),
+        runtime_contract.clone(),
+        &trading_state,
+        &entry_snapshots,
+    );
+    let stage2_prompt_input_value = serde_json::to_value(&stage2_prompt_input)
+        .context("serialize workflow stage2 prompt input")?;
+    if config.llm.workflow.persist_prompt_inputs {
+        let path = persist_workflow_prompt_input_to_disk(
+            &bundle.raw,
+            "workflow_stage2",
+            &stage2_prompt_input_value,
+            retention_minutes,
+        )
+        .await?;
+        debug!(
+            symbol = %symbol,
+            ts_bucket = %bundle.raw.ts_bucket,
+            path = %path.display(),
+            "persisted workflow stage2 prompt input"
+        );
+    }
 
     if !config.llm.request_enabled {
         info!(
-            ts_bucket = %stage1_bundle.raw.ts_bucket,
-            trigger = %trigger,
-            indicator_count = stage1_bundle.raw.indicator_count,
-            missing_count = stage1_bundle.missing_indicator_codes.len(),
-            management_mode = stage1_management_mode,
-            pending_order_mode = stage1_pending_order_mode,
-            "llm request skipped because llm.request_enabled=false; persisted stage1 scan input only"
+            symbol = %symbol,
+            ts_bucket = %bundle.raw.ts_bucket,
+            "workflow stage2 skipped because llm.request_enabled=false"
         );
-        return;
+        return Ok(());
     }
 
-    println!(
-        "LLM_INVOKE_CONTEXT ts_bucket={} trigger={} symbol={} stage=stage1_scan management_mode={} pending_order_mode={} context_state={} active_position_count={} open_order_count={} default_model={} prompt_template={} last_management_reason={}",
-        stage1_bundle.raw.ts_bucket,
-        &*trigger,
-        stage1_bundle.raw.symbol,
-        stage1_management_mode,
-        stage1_pending_order_mode,
-        stage1_context_state,
-        stage1_active_position_count,
-        stage1_open_order_count,
-        config.active_default_model(),
-        config.llm.prompt_template,
-        stage1_invoke_management_reason.as_deref().unwrap_or("-"),
-    );
-    let event = json!({
-        "event_type": "llm_invoke_context",
-        "event_ts": Utc::now().to_rfc3339(),
-        "ts_bucket": stage1_bundle.raw.ts_bucket.to_rfc3339(),
-        "trigger": &*trigger,
-        "symbol": stage1_bundle.raw.symbol,
-        "stage": "stage1_scan",
-        "management_mode": stage1_management_mode,
-        "pending_order_mode": stage1_pending_order_mode,
-        "context_state": stage1_context_state,
-        "active_position_count": stage1_active_position_count,
-        "open_order_count": stage1_open_order_count,
-        "default_model": config.active_default_model(),
-        "prompt_template": config.llm.prompt_template,
-        "last_management_reason": stage1_invoke_management_reason.clone(),
-    });
-    if let Err(err) = append_journal_event(event) {
-        warn!(error = %err, "append llm_invoke_context journal failed");
-    }
-
-    debug!(
-        ts_bucket = %stage1_bundle.raw.ts_bucket,
-        trigger = %trigger,
-        stage = "stage1_scan",
-        management_mode = stage1_management_mode,
-        active_position_count = stage1_active_position_count,
-        open_order_count = stage1_open_order_count,
-        indicator_count = stage1_bundle.raw.indicator_count,
-        missing_count = stage1_bundle.missing_indicator_codes.len(),
-        "llm invoking stage1 market scan"
-    );
-
-    let stage1_outputs =
-        invoke_models_scan_stage(&http_client, &loopback_http_client, &config, &stage1_input).await;
-    let mut successful_stage1_outputs = Vec::new();
-    for out in stage1_outputs {
-        if out.batch_id.is_some() || out.batch_status.is_some() {
-            println!(
-                "LLM_STAGE1_BATCH_INFO ts_bucket={} trigger={} model={} provider={} model_id={} batch_id={} batch_status={}",
-                stage1_bundle.raw.ts_bucket,
-                &*trigger,
-                out.model_name,
-                out.provider,
-                out.model,
-                out.batch_id.as_deref().unwrap_or("-"),
-                out.batch_status.as_deref().unwrap_or("-")
-            );
-        }
-        if out.provider_finish_reason.is_some() || out.provider_usage.is_some() {
-            println!(
-                "LLM_STAGE1_PROVIDER_TRACE ts_bucket={} trigger={} model={} provider={} model_id={} finish_reason={} usage={}",
-                stage1_bundle.raw.ts_bucket,
-                &*trigger,
-                out.model_name,
-                out.provider,
-                out.model,
-                out.provider_finish_reason.as_deref().unwrap_or("-"),
-                out.provider_usage
-                    .as_ref()
-                    .map(Value::to_string)
-                    .unwrap_or_else(|| "-".to_string())
-            );
-        }
-        if let Some(captures) = out.entry_stage_prompt_inputs.as_deref() {
-            match persist_entry_stage_prompt_inputs_to_disk(
-                &stage1_bundle.raw,
-                trigger.as_ref(),
-                stage1_management_mode,
-                stage1_pending_order_mode,
-                &out.model_name,
-                &out.provider,
-                &out.model,
-                captures,
-                config.llm.temp_cache_retention_minutes(),
-            )
-            .await
-            {
-                Ok(files) => {
-                    for (stage, path) in files {
-                        println!(
-                            "LLM_STAGE_INPUT_SOURCE ts_bucket={} trigger={} symbol={} model={} provider={} model_id={} stage={} source_stage_input_file={} stage_input_file_exists={}",
-                            stage1_bundle.raw.ts_bucket,
-                            &*trigger,
-                            stage1_bundle.raw.symbol,
-                            out.model_name,
-                            out.provider,
-                            out.model,
-                            stage,
-                            path.display(),
-                            path.exists(),
-                        );
-                    }
-                }
-                Err(err) => {
-                    warn!(
-                        symbol = %stage1_bundle.raw.symbol,
-                        ts_bucket = %stage1_bundle.raw.ts_bucket,
-                        trigger = %trigger,
-                        model_name = %out.model_name,
-                        provider = %out.provider,
-                        model_id = %out.model,
-                        error = %err,
-                        "persist stage1 prompt inputs to temp_model_output failed"
-                    );
-                }
-            }
-        }
-        if let Some(err) = &out.error {
-            if let Some(stage_trace) = out.entry_stage_trace.as_ref() {
-                print_entry_stage_timing(
-                    &stage1_bundle.raw.ts_bucket,
-                    &trigger,
-                    &out.model_name,
-                    &out.provider,
-                    &out.model,
-                    stage1_management_mode,
-                    stage1_pending_order_mode,
-                    out.latency_ms,
-                    stage_trace,
-                );
-            }
-            if print_response {
-                if let Some(stage_trace) = out.entry_stage_trace.as_ref() {
-                    print_entry_stage_trace(
-                        &stage1_bundle.raw.ts_bucket,
-                        &trigger,
-                        &out.model_name,
-                        &out.provider,
-                        &out.model,
-                        stage_trace,
-                    );
-                }
-                println!(
-                    "LLM_STAGE1_SCAN_ERROR ts_bucket={} trigger={} management_mode={} model={} provider={} model_id={} batch_id={} batch_status={} finish_reason={}:\n{}",
-                    stage1_bundle.raw.ts_bucket,
-                    &*trigger,
-                    stage1_management_mode,
-                    out.model_name,
-                    out.provider,
-                    out.model,
-                    out.batch_id.as_deref().unwrap_or("-"),
-                    out.batch_status.as_deref().unwrap_or("-"),
-                    out.provider_finish_reason.as_deref().unwrap_or("-"),
-                    err
-                );
-            }
-            let event = json!({
-                "event_type": "llm_stage1_scan_error",
-                "event_ts": Utc::now().to_rfc3339(),
-                "ts_bucket": stage1_bundle.raw.ts_bucket.to_rfc3339(),
-                "trigger": &*trigger,
-                "symbol": stage1_bundle.raw.symbol,
-                "management_mode": stage1_management_mode,
-                "pending_order_mode": stage1_pending_order_mode,
-                "model_name": out.model_name.clone(),
-                "provider": out.provider.clone(),
-                "model_id": out.model.clone(),
-                "batch_id": out.batch_id.clone(),
-                "batch_status": out.batch_status.clone(),
-                "provider_finish_reason": out.provider_finish_reason.clone(),
-                "provider_usage": out.provider_usage.clone(),
-                "entry_stage_trace": out.entry_stage_trace.clone(),
-                "error": err,
-            });
-            if let Err(err) = append_journal_event(event) {
-                warn!(error = %err, "append llm_stage1_scan_error journal failed");
-            }
-            continue;
-        }
-        if let Some(stage_trace) = out.entry_stage_trace.as_ref() {
-            print_entry_stage_timing(
-                &stage1_bundle.raw.ts_bucket,
-                &trigger,
-                &out.model_name,
-                &out.provider,
-                &out.model,
-                stage1_management_mode,
-                stage1_pending_order_mode,
-                out.latency_ms,
-                stage_trace,
-            );
-        }
-        if print_response {
-            if let Some(stage_trace) = out.entry_stage_trace.as_ref() {
-                print_entry_stage_trace(
-                    &stage1_bundle.raw.ts_bucket,
-                    &trigger,
-                    &out.model_name,
-                    &out.provider,
-                    &out.model,
-                    stage_trace,
-                );
-            }
-        }
-        let response_event = json!({
-            "event_type": "llm_stage1_scan_response",
-            "event_ts": Utc::now().to_rfc3339(),
-            "ts_bucket": stage1_bundle.raw.ts_bucket.to_rfc3339(),
-            "trigger": &*trigger,
-            "symbol": stage1_bundle.raw.symbol,
-            "management_mode": stage1_management_mode,
-            "pending_order_mode": stage1_pending_order_mode,
-            "model_name": out.model_name.clone(),
-            "provider": out.provider.clone(),
-            "model_id": out.model.clone(),
-            "batch_id": out.batch_id.clone(),
-            "batch_status": out.batch_status.clone(),
-            "provider_finish_reason": out.provider_finish_reason.clone(),
-            "provider_usage": out.provider_usage.clone(),
-            "parsed_scan": out.parsed_decision.clone(),
-            "entry_stage_trace": out.entry_stage_trace.clone(),
-            "raw_response_text": out.raw_response_text.clone(),
-        });
-        if let Err(err) = append_journal_event(response_event) {
-            warn!(error = %err, "append llm_stage1_scan_response journal failed");
-        }
-        if out.parsed_decision.is_some() {
-            successful_stage1_outputs.push(out);
-        }
-    }
-
-    if successful_stage1_outputs.is_empty() {
-        warn!(
-            symbol = %stage1_bundle.raw.symbol,
-            ts_bucket = %stage1_bundle.raw.ts_bucket,
-            trigger = %trigger,
-            "llm stage2 skipped: no successful stage1 scans"
-        );
-        return;
-    }
-
-    let stage2_bundle = match load_latest_temp_indicator_bundle(&stage1_bundle.raw.symbol).await {
-        Ok(bundle) => bundle,
-        Err(err) => {
-            error!(
-                symbol = %stage1_bundle.raw.symbol,
-                stage1_ts_bucket = %stage1_bundle.raw.ts_bucket,
-                trigger = %trigger,
-                error = %err,
-                "llm stage2 aborted: failed to load latest temp_indicator bundle"
-            );
-            return;
-        }
-    };
-    let stage2_prepared = match prepare_live_invocation(
-        &config,
-        &http_client,
-        &db_pool,
-        stage2_bundle,
-        &runtime_lifecycle_state,
-        &format!("{}:stage2_core", trigger.as_ref()),
-    )
-    .await
-    {
-        Ok(prepared) => prepared,
-        Err(err) => {
-            error!(
-                symbol = %stage1_bundle.raw.symbol,
-                stage1_ts_bucket = %stage1_bundle.raw.ts_bucket,
-                trigger = %trigger,
-                error = %err,
-                "llm stage2 aborted: failed to build latest invocation input"
-            );
-            return;
-        }
-    };
-    let stage2_realtime_flow_context = build_runtime_realtime_flow_context_for_input(
-        &stage2_prepared.input,
-        stage1_bundle.raw.ts_bucket,
-    );
-    let stage2_rtf_rollout_fields = build_rtf_rollout_fields(stage2_realtime_flow_context.as_ref());
-    println!(
-        "LLM_INVOKE_CONTEXT ts_bucket={} trigger={} symbol={} stage=stage2_core management_mode={} pending_order_mode={} context_state={} active_position_count={} open_order_count={} default_model={} prompt_template={} last_management_reason={}",
-        stage2_prepared.bundle.raw.ts_bucket,
-        &*trigger,
-        stage2_prepared.bundle.raw.symbol,
-        stage2_prepared.routing_context.management_mode,
-        stage2_prepared.routing_context.pending_order_mode,
-        stage2_prepared.routing_context.context_state,
-        stage2_prepared.routing_context.active_position_count,
-        stage2_prepared.routing_context.open_order_count,
-        config.active_default_model(),
-        config.llm.prompt_template,
-        stage2_prepared
-            .routing_context
-            .invoke_management_reason
-            .as_deref()
-            .unwrap_or("-"),
-    );
-    if let Some(state) = stage2_prepared.routing_context.trading_state.as_ref() {
-        let total_unrealized_pnl: f64 = state
-            .active_positions
-            .iter()
-            .map(|p| p.unrealized_pnl)
-            .sum();
-        let mut event = json!({
-            "event_type": "llm_invoke_context",
-            "event_ts": Utc::now().to_rfc3339(),
-            "ts_bucket": stage2_prepared.bundle.raw.ts_bucket.to_rfc3339(),
-            "trigger": &*trigger,
-            "symbol": stage2_prepared.bundle.raw.symbol,
-            "stage": "stage2_core",
-            "management_mode": stage2_prepared.routing_context.management_mode,
-            "pending_order_mode": stage2_prepared.routing_context.pending_order_mode,
-            "context_state": stage2_prepared.routing_context.context_state,
-            "active_position_count": stage2_prepared.routing_context.active_position_count,
-            "open_order_count": stage2_prepared.routing_context.open_order_count,
-            "default_model": config.active_default_model(),
-            "prompt_template": config.llm.prompt_template,
-            "last_management_reason": stage2_prepared.routing_context.invoke_management_reason.clone(),
-            "total_wallet_balance": state.total_wallet_balance,
-            "available_balance": state.available_balance,
-            "total_unrealized_pnl": total_unrealized_pnl,
-        });
-        if let Some(object) = event.as_object_mut() {
-            for (key, value) in stage2_rtf_rollout_fields.clone() {
-                object.insert(key, value);
-            }
-        }
-        if let Err(err) = append_journal_event(event) {
-            warn!(error = %err, "append llm_invoke_context journal failed");
-        }
-    }
-    let stage2_core_input_path = match persist_core_input_to_disk(
-        &stage2_prepared.bundle.raw,
-        stage2_prepared.routing_context.management_mode,
-        stage2_prepared.routing_context.pending_order_mode,
-        &stage2_prepared.input,
-        config.llm.temp_cache_retention_minutes(),
-    )
-    .await
-    {
-        Ok(path) => Some(path),
-        Err(err) => {
-            warn!(
-                symbol = %stage2_prepared.bundle.raw.symbol,
-                ts_bucket = %stage2_prepared.bundle.raw.ts_bucket,
-                trigger = %trigger,
-                error = %err,
-                "persist stage2 core input to temp_model_input failed"
-            );
-            None
-        }
-    };
-    let stage2_source_file = minute_bundle_path(&stage2_prepared.bundle.raw);
-    let stage_gap_seconds = stage2_prepared
-        .bundle
-        .raw
-        .ts_bucket
-        .signed_duration_since(stage1_bundle.raw.ts_bucket)
-        .num_seconds();
-    let stage_gap_minutes = (stage_gap_seconds as f64) / 60.0;
-    println!(
-        "LLM_STAGE_DATA_SOURCE trigger={} symbol={} stage1_scan_ts_bucket={} stage1_source_temp_indicator_file={} stage1_source_file_exists={} stage1_scan_input_file={} stage1_scan_input_file_exists={} stage1_indicator_count={} stage1_missing_count={} stage1_management_mode={} stage1_pending_order_mode={} stage2_core_ts_bucket={} stage2_source_temp_indicator_file={} stage2_source_file_exists={} stage2_core_input_file={} stage2_core_input_file_exists={} stage2_indicator_count={} stage2_missing_count={} stage2_management_mode={} stage2_pending_order_mode={} stage1_to_stage2_gap_seconds={} stage1_to_stage2_gap_minutes={:.2}",
-        &*trigger,
-        stage1_bundle.raw.symbol,
-        stage1_bundle.raw.ts_bucket,
-        stage1_source_file.display(),
-        stage1_source_file.exists(),
-        stage1_scan_input_path
-            .as_ref()
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|| "-".to_string()),
-        stage1_scan_input_path
-            .as_ref()
-            .map(|path| path.exists())
-            .unwrap_or(false),
-        stage1_bundle.raw.indicator_count,
-        stage1_bundle.missing_indicator_codes.len(),
-        stage1_management_mode,
-        stage1_pending_order_mode,
-        stage2_prepared.bundle.raw.ts_bucket,
-        stage2_source_file.display(),
-        stage2_source_file.exists(),
-        stage2_core_input_path
-            .as_ref()
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|| "-".to_string()),
-        stage2_core_input_path
-            .as_ref()
-            .map(|path| path.exists())
-            .unwrap_or(false),
-        stage2_prepared.bundle.raw.indicator_count,
-        stage2_prepared.bundle.missing_indicator_codes.len(),
-        stage2_prepared.routing_context.management_mode,
-        stage2_prepared.routing_context.pending_order_mode,
-        stage_gap_seconds,
-        stage_gap_minutes,
-    );
-
-    let bundle = stage2_prepared.bundle;
-    let input = stage2_prepared.input;
-    let routing_context = stage2_prepared.routing_context;
-    let trading_state = routing_context.trading_state.clone();
-    let management_mode = routing_context.management_mode;
-    let active_position_count = routing_context.active_position_count;
-    let open_order_count = routing_context.open_order_count;
-    let pending_order_mode = routing_context.pending_order_mode;
-
-    let telegram_operator = TelegramOperator::from_config(&config.api.telegram);
-    let x_operator = XOperator::from_config(&config.api.x);
-
-    let outputs = invoke_models_finalize_stage(
+    let outputs = crate::llm::workflow_provider::invoke_stage2_models(
         &http_client,
         &loopback_http_client,
         &config,
-        &input,
-        &successful_stage1_outputs,
-        FinalizeStageContext {
-            stage1_scan_ts_bucket: stage1_bundle.raw.ts_bucket,
-            stage2_core_ts_bucket: bundle.raw.ts_bucket,
-        },
+        &stage2_prompt_input_value,
+        &symbol,
     )
     .await;
+
+    let mut stage2_decision: Option<crate::workflow::schema::Stage2Decision> = None;
+    let mut selected_stage2_model_name: Option<String> = None;
+    for out in outputs {
+        let payload = json!({
+            "trigger": &*trigger,
+            "model_name": out.model_name,
+            "provider": out.provider,
+            "model_id": out.model,
+            "latency_ms": out.latency_ms,
+            "raw_response_text": out.raw_response_text,
+            "parsed_value": out.parsed_value,
+            "error": out.error,
+        });
+        append_workflow_journal_event(
+            "workflow_stage2_response",
+            &symbol,
+            bundle.raw.ts_bucket,
+            payload.clone(),
+        );
+        if print_response {
+            println!(
+                "WORKFLOW_STAGE2_RESPONSE ts_bucket={} trigger={} symbol={} payload={}",
+                bundle.raw.ts_bucket,
+                &*trigger,
+                symbol,
+                render_pretty_json_value(&payload)
+            );
+        }
+
+        if stage2_decision.is_some() {
+            continue;
+        }
+        let Some(value) = payload.get("parsed_value").cloned() else {
+            continue;
+        };
+        match crate::workflow::parser::parse_stage2_decision(
+            value,
+            &symbol,
+            &stage1_output,
+            &runtime_contract,
+            trading_state.has_active_positions,
+            &entry_snapshots,
+        ) {
+            Ok(parsed) => {
+                selected_stage2_model_name = Some(out.model_name.clone());
+                stage2_decision = Some(parsed);
+            }
+            Err(err) => {
+                append_workflow_journal_event(
+                    "workflow_stage2_parse_error",
+                    &symbol,
+                    bundle.raw.ts_bucket,
+                    json!({
+                        "trigger": &*trigger,
+                        "error": format!("{err:#}"),
+                    }),
+                );
+            }
+        }
+    }
+
+    let stage2_decision =
+        stage2_decision.ok_or_else(|| anyhow!("workflow stage2 produced no valid output"))?;
+
+    if stage2_decision.hard_gate.as_ref() != Some(&stage2_runtime_eval.hard_gate)
+        || stage2_decision.soft_gate.as_ref() != Some(&stage2_runtime_eval.soft_gate)
+    {
+        append_workflow_journal_event(
+            "workflow_stage2_gate_mismatch",
+            &symbol,
+            bundle.raw.ts_bucket,
+            json!({
+                "trigger": &*trigger,
+                "runtime_hard_gate": stage2_runtime_eval.hard_gate,
+                "runtime_soft_gate": stage2_runtime_eval.soft_gate,
+                "model_hard_gate": stage2_decision.hard_gate,
+                "model_soft_gate": stage2_decision.soft_gate,
+            }),
+        );
+    }
+
+    if let Some(request) = stage2_decision.request_stage1_reevaluation.as_ref() {
+        workflow_state.pending_stage1_refresh_reason = Some(request.refresh_reason.clone());
+        crate::workflow::persistence::save_workflow_state(&state_dir, &workflow_state)?;
+        append_workflow_journal_event(
+            "workflow_stage1_reevaluation_requested",
+            &symbol,
+            bundle.raw.ts_bucket,
+            json!({
+                "trigger": &*trigger,
+                "refresh_reason": request.refresh_reason,
+                "trigger_source": request.trigger_source,
+            }),
+        );
+    }
+
+    if stage2_runtime_eval.failure_level_breached || stage2_runtime_eval.reevaluation_trigger_hit {
+        workflow_state.pending_stage1_refresh_reason = Some("thesis_invalidated".to_string());
+        crate::workflow::persistence::save_workflow_state(&state_dir, &workflow_state)?;
+        append_workflow_journal_event(
+            "workflow_stage2_forced_reevaluation",
+            &symbol,
+            bundle.raw.ts_bucket,
+            json!({
+                "trigger": &*trigger,
+                "refresh_reason": "thesis_invalidated",
+                "failure_level_breached": stage2_runtime_eval.failure_level_breached,
+                "reevaluation_trigger_hit": stage2_runtime_eval.reevaluation_trigger_hit,
+            }),
+        );
+    }
 
     let post_invoke_data_age_secs = Utc::now()
         .signed_duration_since(bundle.raw.ts_bucket)
         .num_seconds();
     let max_exec_stale_secs = config.llm.bundle_execution_stale_secs as i64;
-    if config.llm.execution.enabled {
-        if post_invoke_data_age_secs > max_exec_stale_secs {
-            warn!(
-                ts_bucket = %bundle.raw.ts_bucket,
-                stage = "stage2_core",
-                post_invoke_data_age_secs = post_invoke_data_age_secs,
-                max_execution_stale_secs = max_exec_stale_secs,
-                "llm execution skipped: indicator data too stale after model invocation (stage2 latency)"
-            );
-            execution_blocked_due_to_stale = true;
-        } else {
-            debug!(
-                ts_bucket = %bundle.raw.ts_bucket,
-                stage = "stage2_core",
-                post_invoke_data_age_secs = post_invoke_data_age_secs,
-                max_execution_stale_secs = max_exec_stale_secs,
-                "llm post-invoke data freshness ok"
-            );
-        }
-    }
-
-    let entry_recheck_snapshot =
-        if config.llm.execution.enabled && !management_mode && !pending_order_mode {
-            match load_entry_freshness_recheck_snapshot(
-                &bundle.raw.symbol,
-                &input,
-                stage1_bundle.raw.ts_bucket,
-                bundle.raw.ts_bucket,
-            )
-            .await
-            {
-                Ok(snapshot) => {
-                    if let Some(snapshot) = &snapshot {
-                        info!(
-                            symbol = %bundle.raw.symbol,
-                            stage2_core_ts_bucket = %bundle.raw.ts_bucket,
-                            latest_bundle_ts_bucket = %snapshot.latest_bundle_ts_bucket,
-                            bundle_update_minutes = snapshot.bundle_update_minutes,
-                            latest_bundle_age_secs = snapshot.latest_bundle_age_secs,
-                            regime_15m = snapshot
-                                .realtime_flow_context
-                                .pointer("/cvd_partial_windows/15m/regime")
-                                .and_then(|value| value.as_str())
-                                .unwrap_or("unknown"),
-                            since_stage1_delta_fut_sum = snapshot
-                                .realtime_flow_context
-                                .pointer("/since_stage1_increment/delta_fut_sum")
-                                .and_then(|value| value.as_f64())
-                                .unwrap_or_default(),
-                            "loaded entry freshness recheck snapshot"
-                        );
-                    }
-                    snapshot
-                }
-                Err(err) => {
-                    warn!(
-                        symbol = %bundle.raw.symbol,
-                        error = %err,
-                        "load entry freshness recheck snapshot failed"
-                    );
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
-    for out in outputs {
-        if out.batch_id.is_some() || out.batch_status.is_some() {
-            println!(
-                "LLM_BATCH_INFO ts_bucket={} trigger={} model={} provider={} model_id={} batch_id={} batch_status={}",
-                bundle.raw.ts_bucket,
-                &*trigger,
-                out.model_name,
-                out.provider,
-                out.model,
-                out.batch_id.as_deref().unwrap_or("-"),
-                out.batch_status.as_deref().unwrap_or("-")
-            );
-        }
-        if out.provider_finish_reason.is_some() || out.provider_usage.is_some() {
-            println!(
-                "LLM_PROVIDER_TRACE ts_bucket={} trigger={} model={} provider={} model_id={} finish_reason={} usage={}",
-                bundle.raw.ts_bucket,
-                &*trigger,
-                out.model_name,
-                out.provider,
-                out.model,
-                out.provider_finish_reason.as_deref().unwrap_or("-"),
-                out.provider_usage
-                    .as_ref()
-                    .map(Value::to_string)
-                    .unwrap_or_else(|| "-".to_string())
-            );
-        }
-        if let Some(captures) = out.entry_stage_prompt_inputs.as_deref() {
-            match persist_entry_stage_prompt_inputs_to_disk(
-                &bundle.raw,
-                trigger.as_ref(),
-                management_mode,
-                pending_order_mode,
-                &out.model_name,
-                &out.provider,
-                &out.model,
-                captures,
-                config.llm.temp_cache_retention_minutes(),
-            )
-            .await
-            {
-                Ok(files) => {
-                    for (stage, path) in files {
-                        println!(
-                            "LLM_STAGE_INPUT_SOURCE ts_bucket={} trigger={} symbol={} model={} provider={} model_id={} stage={} source_stage_input_file={} stage_input_file_exists={}",
-                            bundle.raw.ts_bucket,
-                            &*trigger,
-                            bundle.raw.symbol,
-                            out.model_name,
-                            out.provider,
-                            out.model,
-                            stage,
-                            path.display(),
-                            path.exists(),
-                        );
-                    }
-                }
-                Err(err) => {
-                    warn!(
-                        symbol = %bundle.raw.symbol,
-                        ts_bucket = %bundle.raw.ts_bucket,
-                        trigger = %trigger,
-                        model_name = %out.model_name,
-                        provider = %out.provider,
-                        model_id = %out.model,
-                        error = %err,
-                        "persist entry stage prompt inputs to temp_model_output failed"
-                    );
-                }
-            }
-        }
-        if let Some(err) = &out.error {
-            error!(
-                model_name = %out.model_name,
-                provider = %out.provider,
-                model = %out.model,
-                batch_id = out.batch_id.as_deref().unwrap_or(""),
-                batch_status = out.batch_status.as_deref().unwrap_or(""),
-                provider_finish_reason = out.provider_finish_reason.as_deref().unwrap_or(""),
-                provider_usage = ?out.provider_usage,
-                error = %err,
-                trigger = %trigger,
-                "llm model call failed"
-            );
-            let text = format!(
-                "model={} provider={} model_id={} batch_id={} batch_status={} finish_reason={} usage={}\nERROR: {}",
-                out.model_name,
-                out.provider,
-                out.model,
-                out.batch_id.as_deref().unwrap_or("-"),
-                out.batch_status.as_deref().unwrap_or("-"),
-                out.provider_finish_reason.as_deref().unwrap_or("-"),
-                out.provider_usage
-                    .as_ref()
-                    .map(Value::to_string)
-                    .unwrap_or_else(|| "-".to_string()),
-                err
-            );
-            if let Some(stage_trace) = out.entry_stage_trace.as_ref() {
-                print_entry_stage_timing(
-                    &bundle.raw.ts_bucket,
-                    &trigger,
-                    &out.model_name,
-                    &out.provider,
-                    &out.model,
-                    management_mode,
-                    pending_order_mode,
-                    out.latency_ms,
-                    stage_trace,
-                );
-            }
-            if print_response {
-                if let Some(stage_trace) = out.entry_stage_trace.as_ref() {
-                    print_entry_stage_trace(
-                        &bundle.raw.ts_bucket,
-                        &trigger,
-                        &out.model_name,
-                        &out.provider,
-                        &out.model,
-                        stage_trace,
-                    );
-                }
-                println!(
-                    "LLM_RESPONSE_ERROR ts_bucket={} trigger={}:\n{}",
-                    bundle.raw.ts_bucket, &*trigger, text
-                );
-            }
-            let event = json!({
-                "event_type": "llm_response_error",
-                "event_ts": Utc::now().to_rfc3339(),
-                "ts_bucket": bundle.raw.ts_bucket.to_rfc3339(),
+    let execution_blocked_due_to_stale =
+        config.llm.execution.enabled && post_invoke_data_age_secs > max_exec_stale_secs;
+    if execution_blocked_due_to_stale {
+        append_workflow_journal_event(
+            "workflow_execution_blocked_stale",
+            &symbol,
+            bundle.raw.ts_bucket,
+            json!({
                 "trigger": &*trigger,
-                "symbol": bundle.raw.symbol,
-                "management_mode": management_mode,
-                "model_name": out.model_name.clone(),
-                "provider": out.provider.clone(),
-                "model_id": out.model.clone(),
-                "batch_id": out.batch_id.clone(),
-                "batch_status": out.batch_status.clone(),
-                "provider_finish_reason": out.provider_finish_reason.clone(),
-                "provider_usage": out.provider_usage.clone(),
-                "entry_stage_trace": out.entry_stage_trace.clone(),
-                "error": err,
-            });
-            if let Err(err) = append_journal_event(event) {
-                warn!(error = %err, "append llm_response_error journal failed");
-            }
-            continue;
-        }
-        debug!(
-            model_name = %out.model_name,
-            provider = %out.provider,
-            model = %out.model,
-            batch_id = out.batch_id.as_deref().unwrap_or(""),
-            batch_status = out.batch_status.as_deref().unwrap_or(""),
-            provider_finish_reason = out.provider_finish_reason.as_deref().unwrap_or(""),
-            provider_usage = ?out.provider_usage,
-            latency_ms = out.latency_ms,
-            validation_warning = ?out.validation_warning,
-            trigger = %trigger,
-            "llm model call completed"
+                "post_invoke_data_age_secs": post_invoke_data_age_secs,
+                "max_execution_stale_secs": max_exec_stale_secs,
+            }),
         );
-        if let Some(stage_trace) = out.entry_stage_trace.as_ref() {
-            print_entry_stage_timing(
-                &bundle.raw.ts_bucket,
-                &trigger,
-                &out.model_name,
-                &out.provider,
-                &out.model,
-                management_mode,
-                pending_order_mode,
-                out.latency_ms,
-                stage_trace,
-            );
-        }
-        let should_print_response = print_response || management_mode;
-        if should_print_response {
-            if let Some(stage_trace) = out.entry_stage_trace.as_ref() {
-                print_entry_stage_trace(
-                    &bundle.raw.ts_bucket,
-                    &trigger,
-                    &out.model_name,
-                    &out.provider,
-                    &out.model,
-                    stage_trace,
-                );
-            }
-            let text = out
-                .raw_response_text
-                .as_deref()
-                .map(render_pretty_json_text)
-                .unwrap_or_default();
-            println!(
-                "LLM_RESPONSE ts_bucket={} trigger={} management_mode={} model={} provider={} model_id={} batch_id={} batch_status={} finish_reason={}:\n{}",
-                bundle.raw.ts_bucket,
-                &*trigger,
-                management_mode,
-                out.model_name,
-                out.provider,
-                out.model,
-                out.batch_id.as_deref().unwrap_or("-"),
-                out.batch_status.as_deref().unwrap_or("-"),
-                out.provider_finish_reason.as_deref().unwrap_or("-"),
-                text
-            );
-        }
-        if let Some(parsed) = out.parsed_decision.as_ref() {
-            println!(
-                "LLM_DECISION_METRICS ts_bucket={} trigger={} model={} provider={} model_id={} decision={} expected_move_m={} volatility_unit_v={} m_over_v={}",
-                bundle.raw.ts_bucket,
-                &*trigger,
-                out.model_name,
-                out.provider,
-                out.model,
-                parsed
-                    .get("decision")
-                    .and_then(Value::as_str)
-                    .unwrap_or("-"),
-                format_metric_number(extract_nested_f64(
-                    parsed,
-                    &["analysis", "expected_move_m"]
-                )),
-                format_metric_number(extract_nested_f64(
-                    parsed,
-                    &["analysis", "volatility_unit_v"]
-                )),
-                format_metric_number(extract_nested_f64(parsed, &["analysis", "m_over_v"])),
-            );
-        } else {
-            println!(
-                "LLM_DECISION_METRICS ts_bucket={} trigger={} model={} provider={} model_id={} decision=- expected_move_m=- volatility_unit_v=- m_over_v=-",
-                bundle.raw.ts_bucket,
-                &*trigger,
-                out.model_name,
-                out.provider,
-                out.model,
-            );
-        }
-        let mut response_event = json!({
-            "event_type": "llm_response",
-            "event_ts": Utc::now().to_rfc3339(),
-            "ts_bucket": bundle.raw.ts_bucket.to_rfc3339(),
-            "trigger": &*trigger,
-            "symbol": bundle.raw.symbol,
-            "management_mode": management_mode,
-            "pending_order_mode": pending_order_mode,
-            "model_name": out.model_name.clone(),
-            "provider": out.provider.clone(),
-            "model_id": out.model.clone(),
-            "batch_id": out.batch_id.clone(),
-            "batch_status": out.batch_status.clone(),
-            "provider_finish_reason": out.provider_finish_reason.clone(),
-            "provider_usage": out.provider_usage.clone(),
-            "parsed_decision": out.parsed_decision.clone(),
-            "validation_warning": out.validation_warning.clone(),
-            "entry_stage_trace": out.entry_stage_trace.clone(),
-            "raw_response_text": out.raw_response_text.clone(),
-        });
-        if let Some(object) = response_event.as_object_mut() {
-            for (key, value) in stage2_rtf_rollout_fields.clone() {
-                object.insert(key, value);
-            }
-        }
-        if let Err(err) = append_journal_event(response_event) {
-            warn!(error = %err, "append llm_response journal failed");
-        }
+    }
 
-        if execution_done || !config.llm.execution.enabled {
-            continue;
-        }
-        if let Some(warning) = &out.validation_warning {
-            warn!(
-                model_name = %out.model_name,
-                symbol = %bundle.raw.symbol,
-                warning = %warning,
-                "skip llm execution: parsed decision failed validation"
-            );
-            println!(
-                "LLM_VALIDATION_FAILED ts_bucket={} trigger={} symbol={} model={} management_mode={} pending_order_mode={} warning={}",
-                bundle.raw.ts_bucket,
-                &*trigger,
-                bundle.raw.symbol,
-                out.model_name,
-                management_mode,
-                pending_order_mode,
-                warning.replace('\n', " "),
-            );
-            let event = json!({
-                "event_type": "llm_validation_failed",
-                "event_ts": Utc::now().to_rfc3339(),
-                "ts_bucket": bundle.raw.ts_bucket.to_rfc3339(),
-                "trigger": &*trigger,
-                "symbol": bundle.raw.symbol,
-                "management_mode": management_mode,
-                "pending_order_mode": pending_order_mode,
-                "model_name": out.model_name.clone(),
-                "provider": out.provider.clone(),
-                "model_id": out.model.clone(),
-                "provider_finish_reason": out.provider_finish_reason.clone(),
-                "provider_usage": out.provider_usage.clone(),
-                "warning": warning,
-            });
-            if let Err(err) = append_journal_event(event) {
-                warn!(error = %err, "append llm_validation_failed journal failed");
-            }
-            continue;
-        }
-        let Some(parsed_decision) = out.parsed_decision.as_ref() else {
-            continue;
-        };
-        if pending_order_mode {
-            let pending_ctx = {
-                let po = input
-                    .management_snapshot
-                    .as_ref()
-                    .and_then(|ms| ms.pending_order.as_ref());
-                PendingOrderContext {
-                    has_open_orders: open_order_count > 0,
-                    current_entry: po.and_then(|p| p.entry_price),
-                    current_tp: po.and_then(|p| p.current_tp_price),
-                    current_sl: po.and_then(|p| p.current_sl_price),
-                    current_leverage: po.and_then(|p| p.leverage.map(|v| v as f64)),
-                }
-            };
-            let mut intent = match pending_order_management_intent_from_value_with_context(
-                parsed_decision,
-                &pending_ctx,
-            ) {
-                Ok(intent) => intent,
-                Err(err) => {
-                    warn!(
-                        model_name = %out.model_name,
-                        symbol = %bundle.raw.symbol,
-                        error = %err,
-                        "skip llm execution: parse pending-order intent failed"
-                    );
-                    println!(
-                        "LLM_PENDING_ORDER_VALIDATION_FAILED ts_bucket={} trigger={} symbol={} model={} error={}",
-                        bundle.raw.ts_bucket,
-                        &*trigger,
-                        bundle.raw.symbol,
-                        out.model_name,
-                        err.to_string().replace('\n', " "),
-                    );
-                    let event = json!({
-                        "event_type": "llm_pending_order_validation_failed",
-                        "event_ts": Utc::now().to_rfc3339(),
-                        "ts_bucket": bundle.raw.ts_bucket.to_rfc3339(),
-                        "trigger": &*trigger,
-                        "symbol": bundle.raw.symbol,
-                        "model_name": out.model_name.clone(),
-                        "error": err.to_string(),
-                        "parsed_decision": parsed_decision.clone(),
-                    });
-                    if let Err(err) = append_journal_event(event) {
-                        warn!(error = %err, "append llm_pending_order_validation_failed journal failed");
-                    }
-                    continue;
-                }
-            };
-            let mut pending_safety_gate_forced_close = false;
-            if matches!(intent.decision, PendingOrderManagementDecision::ModifyMaker) {
-                match build_pending_modify_trade_intent(&intent, &input) {
-                    Ok(Some(candidate)) => {
-                        let mut failure_notes = Vec::new();
-                        match evaluate_trade_entry_v_gate(
-                            &config.llm.execution,
-                            &candidate,
-                            &input,
-                            out.entry_stage_trace.as_deref(),
-                        ) {
-                            Ok(Some(gate)) if !gate.passed => {
-                                failure_notes.push(format!(
-                                    "V gate failed: tp_in_v {:.4} < min_distance_v {:.4} (entry {}, tp {}, sl {}, v {} {})",
-                                    gate.take_profit_distance_v,
-                                    gate.min_distance_v,
-                                    format_metric_number(candidate.entry_price),
-                                    format_metric_number(candidate.take_profit),
-                                    format_metric_number(candidate.stop_loss),
-                                    gate.resolved_v.value,
-                                    gate.resolved_v.timeframe,
-                                ));
-                                println!(
-                                    "LLM_PENDING_ORDER_V_GATE_FAILED ts_bucket={} trigger={} symbol={} model={} decision={} entry={} tp={} sl={} selected_v={} v_timeframe={} tp_in_v={} min_distance_v={} gate_passed=false reason={}",
-                                    bundle.raw.ts_bucket,
-                                    &*trigger,
-                                    bundle.raw.symbol,
-                                    out.model_name,
-                                    candidate.decision.as_str(),
-                                    format_metric_number(candidate.entry_price),
-                                    format_metric_number(candidate.take_profit),
-                                    format_metric_number(candidate.stop_loss),
-                                    gate.resolved_v.value,
-                                    gate.resolved_v.timeframe,
-                                    gate.take_profit_distance_v,
-                                    gate.min_distance_v,
-                                    intent.reason.replace('\n', " "),
-                                );
-                                let event = json!({
-                                    "event_type": "llm_pending_order_v_gate_failed",
-                                    "event_ts": Utc::now().to_rfc3339(),
-                                    "ts_bucket": bundle.raw.ts_bucket.to_rfc3339(),
-                                    "trigger": &*trigger,
-                                    "symbol": bundle.raw.symbol,
-                                    "model_name": out.model_name.clone(),
-                                    "decision": candidate.decision.as_str(),
-                                    "entry_price": candidate.entry_price,
-                                    "take_profit": candidate.take_profit,
-                                    "stop_loss": candidate.stop_loss,
-                                    "selected_v": gate.resolved_v.value,
-                                    "v_timeframe": gate.resolved_v.timeframe,
-                                    "v_basis": gate.resolved_v.basis.clone(),
-                                    "take_profit_distance_v": gate.take_profit_distance_v,
-                                    "min_distance_v": gate.min_distance_v,
-                                    "gate_passed": false,
-                                    "reason": intent.reason.clone(),
-                                });
-                                if let Err(err) = append_journal_event(event) {
-                                    warn!(error = %err, "append llm_pending_order_v_gate_failed journal failed");
-                                }
-                            }
-                            Ok(_) => {}
-                            Err(err) => {
-                                warn!(
-                                    model_name = %out.model_name,
-                                    symbol = %bundle.raw.symbol,
-                                    action = intent.decision.as_str(),
-                                    error = %err,
-                                    "pending safety gate: V gate evaluation failed; keeping original pending intent"
-                                );
-                            }
-                        }
-                        match evaluate_trade_rr_gate(&config.llm.execution, &candidate) {
-                            Ok(Some(gate)) if !gate.passed => {
-                                failure_notes.push(format!(
-                                    "RR gate failed: rr {:.4} < min_rr {:.4} (entry {}, tp {}, sl {})",
-                                    gate.risk_reward_ratio,
-                                    gate.min_rr,
-                                    format_metric_number(candidate.entry_price),
-                                    format_metric_number(candidate.take_profit),
-                                    format_metric_number(candidate.stop_loss),
-                                ));
-                                println!(
-                                    "LLM_PENDING_ORDER_RR_GATE_FAILED ts_bucket={} trigger={} symbol={} model={} decision={} entry={} tp={} sl={} rr={} min_rr={} gate_passed=false reason={}",
-                                    bundle.raw.ts_bucket,
-                                    &*trigger,
-                                    bundle.raw.symbol,
-                                    out.model_name,
-                                    candidate.decision.as_str(),
-                                    format_metric_number(candidate.entry_price),
-                                    format_metric_number(candidate.take_profit),
-                                    format_metric_number(candidate.stop_loss),
-                                    gate.risk_reward_ratio,
-                                    gate.min_rr,
-                                    intent.reason.replace('\n', " "),
-                                );
-                                let event = json!({
-                                    "event_type": "llm_pending_order_rr_gate_failed",
-                                    "event_ts": Utc::now().to_rfc3339(),
-                                    "ts_bucket": bundle.raw.ts_bucket.to_rfc3339(),
-                                    "trigger": &*trigger,
-                                    "symbol": bundle.raw.symbol,
-                                    "model_name": out.model_name.clone(),
-                                    "decision": candidate.decision.as_str(),
-                                    "entry_price": candidate.entry_price,
-                                    "take_profit": candidate.take_profit,
-                                    "stop_loss": candidate.stop_loss,
-                                    "risk_reward_ratio": gate.risk_reward_ratio,
-                                    "reward_distance": gate.reward_distance,
-                                    "risk_distance": gate.risk_distance,
-                                    "min_rr": gate.min_rr,
-                                    "gate_passed": false,
-                                    "reason": intent.reason.clone(),
-                                });
-                                if let Err(err) = append_journal_event(event) {
-                                    warn!(error = %err, "append llm_pending_order_rr_gate_failed journal failed");
-                                }
-                            }
-                            Ok(_) => {}
-                            Err(err) => {
-                                warn!(
-                                    model_name = %out.model_name,
-                                    symbol = %bundle.raw.symbol,
-                                    action = intent.decision.as_str(),
-                                    error = %err,
-                                    "pending safety gate: RR gate evaluation failed; keeping original pending intent"
-                                );
-                            }
-                        }
-                        if !failure_notes.is_empty() {
-                            let safety_reason = format!(
-                                "{} Pending safety gate triggered; canceling pending order because {}.",
-                                intent.reason,
-                                failure_notes.join("; ")
-                            );
-                            println!(
-                                "LLM_PENDING_ORDER_SAFETY_CLOSE ts_bucket={} trigger={} symbol={} model={} requested_action={} requested_entry={} requested_tp={} requested_sl={} resulting_action=CLOSE reason={}",
-                                bundle.raw.ts_bucket,
-                                &*trigger,
-                                bundle.raw.symbol,
-                                out.model_name,
-                                intent.decision.as_str(),
-                                format_metric_number(candidate.entry_price),
-                                format_metric_number(candidate.take_profit),
-                                format_metric_number(candidate.stop_loss),
-                                safety_reason.replace('\n', " "),
-                            );
-                            let event = json!({
-                                "event_type": "llm_pending_order_safety_close",
-                                "event_ts": Utc::now().to_rfc3339(),
-                                "ts_bucket": bundle.raw.ts_bucket.to_rfc3339(),
-                                "trigger": &*trigger,
-                                "symbol": bundle.raw.symbol,
-                                "model_name": out.model_name.clone(),
-                                "requested_action": intent.decision.as_str(),
-                                "requested_entry": candidate.entry_price,
-                                "requested_tp": candidate.take_profit,
-                                "requested_sl": candidate.stop_loss,
-                                "resulting_action": PendingOrderManagementDecision::Close.as_str(),
-                                "reason": safety_reason.clone(),
-                            });
-                            if let Err(err) = append_journal_event(event) {
-                                warn!(error = %err, "append llm_pending_order_safety_close journal failed");
-                            }
-                            intent = crate::llm::decision::PendingOrderManagementIntent {
-                                decision: PendingOrderManagementDecision::Close,
-                                new_entry: None,
-                                new_tp: None,
-                                new_sl: None,
-                                new_leverage: None,
-                                reason: safety_reason,
-                            };
-                            pending_safety_gate_forced_close = true;
-                        }
-                    }
-                    Ok(None) => {}
-                    Err(err) => {
-                        warn!(
-                            model_name = %out.model_name,
-                            symbol = %bundle.raw.symbol,
-                            action = intent.decision.as_str(),
-                            error = %err,
-                            "pending safety gate: could not build trade candidate; keeping original pending intent"
-                        );
-                    }
-                }
-            }
-            if matches!(intent.decision, PendingOrderManagementDecision::Hold) {
+    let mut execution_signal_report: Option<ExecutionReport> = None;
+    if let Some(intent) = stage2_decision.execution_intent.as_ref() {
+        let code_allows_execution = workflow_code_allows_execution(&stage2_runtime_eval);
+        if config.llm.execution.enabled && !execution_blocked_due_to_stale && code_allows_execution
+        {
+            let adapted_intent = adapt_execution_intent(intent);
+            match adapted_intent {
+                Ok(adapted_intent) => match execute_workflow_execution_intent(
+                    &http_client,
+                    &config.api.binance,
+                    &config.llm.execution,
+                    &symbol,
+                    &adapted_intent,
+                )
+                .await
                 {
-                    let mut guard = runtime_lifecycle_state.lock().await;
-                    guard.set_last_management_reason(
-                        &bundle.raw.symbol,
-                        Some(intent.reason.clone()),
-                    );
-                }
-                execution_done = true;
-                let fields = derive_pending_order_telegram_fields(
-                    trading_state.as_ref(),
-                    &runtime_lifecycle_state,
-                )
-                .await;
-                println!(
-                    "LLM_PENDING_ORDER_MANAGEMENT ts_bucket={} trigger={} symbol={} model={} action={} new_entry={} new_tp={} new_sl={} dry_run={} open_order_count={} canceled_open_orders=false replacement_order_id=- reason={}",
-                    bundle.raw.ts_bucket,
-                    &*trigger,
-                    bundle.raw.symbol,
-                    out.model_name,
-                    intent.decision.as_str(),
-                    format_metric_number(intent.new_entry),
-                    format_metric_number(intent.new_tp),
-                    format_metric_number(intent.new_sl),
-                    config.llm.execution.dry_run,
-                    open_order_count,
-                    intent.reason.replace('\n', " "),
-                );
-                let event = json!({
-                    "event_type": "llm_pending_order_execution",
-                    "event_ts": Utc::now().to_rfc3339(),
-                    "ts_bucket": bundle.raw.ts_bucket.to_rfc3339(),
-                    "trigger": &*trigger,
-                    "symbol": bundle.raw.symbol,
-                    "model_name": out.model_name.clone(),
-                    "action": intent.decision.as_str(),
-                    "new_entry": intent.new_entry,
-                    "new_tp": intent.new_tp,
-                    "new_sl": intent.new_sl,
-                    "dry_run": config.llm.execution.dry_run,
-                    "open_order_count": open_order_count,
-                    "canceled_open_orders": false,
-                    "replacement_order_id": Option::<i64>::None,
-                    "reason": intent.reason,
-                });
-                if let Err(err) = append_journal_event(event) {
-                    warn!(error = %err, "append llm_pending_order_execution(HOLD) journal failed");
-                }
-                send_trade_signal_notifications(
-                    telegram_operator.as_ref(),
-                    x_operator.as_ref(),
-                    &config.llm.telegram_signal_decisions,
-                    &config.llm.x_signal_decisions,
-                    &http_client,
-                    TradeSignalNotification {
-                        ts_bucket: bundle.raw.ts_bucket,
-                        trigger: &trigger,
-                        symbol: &bundle.raw.symbol,
-                        model_name: &out.model_name,
-                        decision: intent.decision.as_str(),
-                        entry_price: fields.entry_price,
-                        leverage: fields.leverage,
-                        risk_reward_ratio: fields.risk_reward_ratio,
-                        take_profit: fields.take_profit,
-                        stop_loss: fields.stop_loss,
-                        reason: &intent.reason,
-                    },
-                )
-                .await;
-                update_position_context_after_pending_order_action(
-                    &bundle.raw.symbol,
-                    trading_state.as_ref(),
-                    &intent,
-                    &runtime_lifecycle_state,
-                )
-                .await;
-                continue;
-            }
-            if execution_blocked_due_to_stale && !pending_safety_gate_forced_close {
-                execution_done = true;
-                let fields = with_telegram_field_overrides(
-                    derive_pending_order_telegram_fields(
-                        trading_state.as_ref(),
-                        &runtime_lifecycle_state,
-                    )
-                    .await,
-                    intent.new_entry,
-                    None,
-                    intent.new_tp,
-                    intent.new_sl,
-                );
-                warn!(
-                    model_name = %out.model_name,
-                    symbol = %bundle.raw.symbol,
-                    action = intent.decision.as_str(),
-                    post_invoke_data_age_secs = post_invoke_data_age_secs,
-                    max_execution_stale_secs = max_exec_stale_secs,
-                    reason = %intent.reason,
-                    "llm pending-order execution skipped: indicator data too stale after model invocation"
-                );
-                println!(
-                    "LLM_PENDING_ORDER_SIGNAL_ONLY ts_bucket={} trigger={} symbol={} model={} action={} stale=true post_invoke_data_age_secs={} max_execution_stale_secs={} new_entry={} new_tp={} new_sl={} reason={}",
-                    bundle.raw.ts_bucket,
-                    &*trigger,
-                    bundle.raw.symbol,
-                    out.model_name,
-                    intent.decision.as_str(),
-                    post_invoke_data_age_secs,
-                    max_exec_stale_secs,
-                    format_metric_number(intent.new_entry),
-                    format_metric_number(intent.new_tp),
-                    format_metric_number(intent.new_sl),
-                    intent.reason.replace('\n', " "),
-                );
-                let event = json!({
-                    "event_type": "llm_pending_order_signal_only_stale",
-                    "event_ts": Utc::now().to_rfc3339(),
-                    "ts_bucket": bundle.raw.ts_bucket.to_rfc3339(),
-                    "trigger": &*trigger,
-                    "symbol": bundle.raw.symbol,
-                    "model_name": out.model_name.clone(),
-                    "action": intent.decision.as_str(),
-                    "new_entry": intent.new_entry,
-                    "new_tp": intent.new_tp,
-                    "new_sl": intent.new_sl,
-                    "open_order_count": open_order_count,
-                    "post_invoke_data_age_secs": post_invoke_data_age_secs,
-                    "max_execution_stale_secs": max_exec_stale_secs,
-                    "reason": intent.reason.clone(),
-                });
-                if let Err(err) = append_journal_event(event) {
-                    warn!(error = %err, "append llm_pending_order_signal_only_stale journal failed");
-                }
-                send_trade_signal_notifications(
-                    telegram_operator.as_ref(),
-                    x_operator.as_ref(),
-                    &config.llm.telegram_signal_decisions,
-                    &config.llm.x_signal_decisions,
-                    &http_client,
-                    TradeSignalNotification {
-                        ts_bucket: bundle.raw.ts_bucket,
-                        trigger: &trigger,
-                        symbol: &bundle.raw.symbol,
-                        model_name: &out.model_name,
-                        decision: intent.decision.as_str(),
-                        entry_price: fields.entry_price,
-                        leverage: fields.leverage,
-                        risk_reward_ratio: fields.risk_reward_ratio,
-                        take_profit: fields.take_profit,
-                        stop_loss: fields.stop_loss,
-                        reason: &intent.reason,
-                    },
-                )
-                .await;
-                continue;
-            }
-            {
-                let mut guard = runtime_lifecycle_state.lock().await;
-                let next_reason =
-                    if matches!(intent.decision, PendingOrderManagementDecision::Close) {
-                        None
-                    } else {
-                        Some(intent.reason.clone())
-                    };
-                guard.set_last_management_reason(&bundle.raw.symbol, next_reason);
-            }
-
-            match execute_pending_order_intent(
-                &http_client,
-                &config.api.binance,
-                &config.llm.execution,
-                &bundle.raw.symbol,
-                &intent,
-                input
-                    .management_snapshot
-                    .as_ref()
-                    .and_then(|snapshot| snapshot.pending_order.as_ref())
-                    .and_then(|pending| pending.planned_tp_price),
-                input
-                    .management_snapshot
-                    .as_ref()
-                    .and_then(|snapshot| snapshot.pending_order.as_ref())
-                    .and_then(|pending| pending.planned_sl_price),
-            )
-            .await
-            {
-                Ok(report) => {
-                    execution_done = true;
-                    println!(
-                        "LLM_PENDING_ORDER_MANAGEMENT ts_bucket={} trigger={} symbol={} model={} action={} new_entry={} new_tp={} new_sl={} dry_run={} open_order_count={} canceled_open_orders={} replacement_order_id={} maker_entry_price={} best_bid_price={} best_ask_price={} leverage={} reason={}",
-                        bundle.raw.ts_bucket,
-                        &*trigger,
-                        bundle.raw.symbol,
-                        out.model_name,
-                        report.action,
-                        format_metric_number(intent.new_entry),
-                        format_metric_number(intent.new_tp),
-                        format_metric_number(intent.new_sl),
-                        report.dry_run,
-                        report.open_order_count,
-                        report.canceled_open_orders,
-                        report.replacement_order_id.map(|id| id.to_string()).unwrap_or_else(|| "-".to_string()),
-                        format_metric_number(report.maker_entry_price),
-                        format_metric_number(report.best_bid_price),
-                        format_metric_number(report.best_ask_price),
-                        report.leverage.map(|v| v.to_string()).unwrap_or_else(|| "-".to_string()),
-                        intent.reason.replace('\n', " "),
-                    );
-                    let event = json!({
-                        "event_type": "llm_pending_order_execution",
-                        "event_ts": Utc::now().to_rfc3339(),
-                        "ts_bucket": bundle.raw.ts_bucket.to_rfc3339(),
-                        "trigger": &*trigger,
-                        "symbol": bundle.raw.symbol,
-                        "model_name": out.model_name.clone(),
-                        "action": report.action,
-                        "new_entry": intent.new_entry,
-                        "new_tp": intent.new_tp,
-                        "new_sl": intent.new_sl,
-                        "dry_run": report.dry_run,
-                        "open_order_count": report.open_order_count,
-                        "canceled_open_orders": report.canceled_open_orders,
-                        "replacement_order_id": report.replacement_order_id,
-                        "maker_entry_price": report.maker_entry_price,
-                        "effective_take_profit": report.effective_take_profit,
-                        "effective_stop_loss": report.effective_stop_loss,
-                        "best_bid_price": report.best_bid_price,
-                        "best_ask_price": report.best_ask_price,
-                        "leverage": report.leverage,
-                        "reason": intent.reason,
-                    });
-                    if let Err(err) = append_journal_event(event) {
-                        warn!(error = %err, "append llm_pending_order_execution journal failed");
-                    }
-                    send_trade_signal_notifications(
-                        telegram_operator.as_ref(),
-                        x_operator.as_ref(),
-                        &config.llm.telegram_signal_decisions,
-                        &config.llm.x_signal_decisions,
-                        &http_client,
-                        TradeSignalNotification {
-                            ts_bucket: bundle.raw.ts_bucket,
-                            trigger: &trigger,
-                            symbol: &bundle.raw.symbol,
-                            model_name: &out.model_name,
-                            decision: report.action,
-                            entry_price: report.maker_entry_price,
-                            leverage: report.leverage.map(|v| v as f64),
-                            risk_reward_ratio: report
-                                .maker_entry_price
-                                .zip(report.effective_take_profit)
-                                .zip(report.effective_stop_loss)
-                                .and_then(|((entry, tp), sl)| {
-                                    compute_rr_from_levels(entry, tp, sl)
-                                }),
-                            take_profit: report.effective_take_profit,
-                            stop_loss: report.effective_stop_loss,
-                            reason: &intent.reason,
-                        },
-                    )
-                    .await;
-                    update_position_context_after_pending_order_action(
-                        &bundle.raw.symbol,
-                        trading_state.as_ref(),
-                        &intent,
-                        &runtime_lifecycle_state,
-                    )
-                    .await;
-                }
-                Err(err) => {
-                    if let Some(blocked) =
-                        err.downcast_ref::<TradeExecutionBlockedByCurrentPriceBeyondStopLoss>()
-                    {
-                        warn!(
-                            model_name = %out.model_name,
-                            symbol = %bundle.raw.symbol,
-                            decision = intent.decision.as_str(),
-                            current_reference_price = blocked.current_reference_price,
-                            current_price_source = blocked.current_price_source,
-                            entry_price = blocked.entry_price,
-                            stop_loss = blocked.stop_loss,
-                            best_bid_price = blocked.best_bid_price,
-                            best_ask_price = blocked.best_ask_price,
-                            reason = %intent.reason,
-                            "llm trade execution blocked: current price already beyond stop loss"
-                        );
-                        println!(
-                            "LLM_ORDER_EXECUTION_BLOCKED_STOP_CROSSED ts_bucket={} trigger={} symbol={} model={} decision={} current_price={} current_price_source={} entry={} sl={} best_bid_price={} best_ask_price={} reason={}",
+                    Ok(report) => {
+                        execution_signal_report = Some(report.clone());
+                        append_workflow_journal_event(
+                            "workflow_execution_report",
+                            &symbol,
                             bundle.raw.ts_bucket,
-                            &*trigger,
-                            bundle.raw.symbol,
-                            out.model_name,
-                            intent.decision.as_str(),
-                            blocked.current_reference_price,
-                            blocked.current_price_source,
-                            blocked.entry_price,
-                            blocked.stop_loss,
-                            blocked.best_bid_price,
-                            blocked.best_ask_price,
-                            intent.reason.replace('\n', " "),
+                            json!({
+                                "trigger": &*trigger,
+                                "path_id": intent.path_id,
+                                "context_key": intent.entry_snapshot.context_key,
+                                "report": {
+                                    "decision": report.decision,
+                                    "quantity": report.quantity,
+                                    "leverage": report.leverage,
+                                    "position_side": report.position_side,
+                                    "maker_entry_price": report.maker_entry_price,
+                                    "take_profit": report.actual_take_profit,
+                                    "stop_loss": report.actual_stop_loss,
+                                    "risk_reward_ratio": report.actual_risk_reward_ratio,
+                                    "dry_run": report.dry_run,
+                                }
+                            }),
                         );
-                        let event = json!({
-                            "event_type": "llm_order_execution_blocked_stop_crossed",
-                            "event_ts": Utc::now().to_rfc3339(),
-                            "ts_bucket": bundle.raw.ts_bucket.to_rfc3339(),
-                            "trigger": &*trigger,
-                            "symbol": bundle.raw.symbol,
-                            "model_name": out.model_name.clone(),
-                            "decision": intent.decision.as_str(),
-                            "current_price": blocked.current_reference_price,
-                            "current_price_source": blocked.current_price_source,
-                            "entry_price": blocked.entry_price,
-                            "stop_loss": blocked.stop_loss,
-                            "best_bid_price": blocked.best_bid_price,
-                            "best_ask_price": blocked.best_ask_price,
-                            "reason": intent.reason.clone(),
-                        });
-                        if let Err(err) = append_journal_event(event) {
-                            warn!(error = %err, "append llm_order_execution_blocked_stop_crossed journal failed");
-                        }
-                        continue;
-                    }
-                    execution_done = true;
-                    error!(
-                        model_name = %out.model_name,
-                        symbol = %bundle.raw.symbol,
-                        reason = %intent.reason,
-                        error = %err,
-                        "llm pending-order execution failed"
-                    );
-                    println!(
-                        "LLM_PENDING_ORDER_EXECUTION_ERROR ts_bucket={} trigger={} symbol={} model={} action={} reason={} error={}",
-                        bundle.raw.ts_bucket,
-                        &*trigger,
-                        bundle.raw.symbol,
-                        out.model_name,
-                        intent.decision.as_str(),
-                        intent.reason.replace('\n', " "),
-                        err.to_string().replace('\n', " "),
-                    );
-                }
-            }
-            continue;
-        }
-        if management_mode {
-            let intent = match position_management_intent_from_value_with_context(
-                parsed_decision,
-                active_position_count > 0,
-                open_order_count > 0,
-            ) {
-                Ok(intent) => intent,
-                Err(err) => {
-                    warn!(
-                        model_name = %out.model_name,
-                        symbol = %bundle.raw.symbol,
-                        error = %err,
-                        "skip llm execution: parse management intent failed"
-                    );
-                    println!(
-                        "LLM_POSITION_MANAGEMENT_VALIDATION_FAILED ts_bucket={} trigger={} symbol={} model={} error={}",
-                        bundle.raw.ts_bucket,
-                        &*trigger,
-                        bundle.raw.symbol,
-                        out.model_name,
-                        err.to_string().replace('\n', " "),
-                    );
-                    let event = json!({
-                        "event_type": "llm_management_validation_failed",
-                        "event_ts": Utc::now().to_rfc3339(),
-                        "ts_bucket": bundle.raw.ts_bucket.to_rfc3339(),
-                        "trigger": &*trigger,
-                        "symbol": bundle.raw.symbol,
-                        "model_name": out.model_name.clone(),
-                        "error": err.to_string(),
-                        "parsed_decision": parsed_decision.clone(),
-                    });
-                    if let Err(err) = append_journal_event(event) {
-                        warn!(error = %err, "append llm_management_validation_failed journal failed");
-                    }
-                    continue;
-                }
-            };
-            if let Err(err) = validate_reduce_anti_repetition(
-                &bundle.raw.symbol,
-                &intent,
-                trading_state.as_ref(),
-                &runtime_lifecycle_state,
-            )
-            .await
-            {
-                println!(
-                    "LLM_POSITION_MANAGEMENT_VALIDATION_FAILED ts_bucket={} trigger={} symbol={} model={} error={}",
-                    bundle.raw.ts_bucket,
-                    &*trigger,
-                    bundle.raw.symbol,
-                    out.model_name,
-                    err.to_string().replace('\n', " "),
-                );
-                let event = json!({
-                    "event_type": "llm_management_validation_failed",
-                    "event_ts": Utc::now().to_rfc3339(),
-                    "ts_bucket": bundle.raw.ts_bucket.to_rfc3339(),
-                    "trigger": &*trigger,
-                    "symbol": bundle.raw.symbol,
-                    "model_name": out.model_name.clone(),
-                    "error": err.to_string(),
-                    "parsed_decision": parsed_decision.clone(),
-                });
-                if let Err(err) = append_journal_event(event) {
-                    warn!(error = %err, "append llm_management_validation_failed journal failed");
-                }
-                continue;
-            }
-            if matches!(intent.decision, PositionManagementDecision::Hold) {
-                {
-                    let mut guard = runtime_lifecycle_state.lock().await;
-                    guard.set_last_management_reason(
-                        &bundle.raw.symbol,
-                        Some(intent.reason.clone()),
-                    );
-                }
-                execution_done = true;
-                let fallback_fields = enrich_telegram_fields_from_entry_context(
-                    derive_management_telegram_fields(trading_state.as_ref()),
-                    trading_state.as_ref(),
-                    &runtime_lifecycle_state,
-                )
-                .await;
-                debug!(
-                    model_name = %out.model_name,
-                    symbol = %bundle.raw.symbol,
-                    decision = intent.decision.as_str(),
-                    reason = %intent.reason,
-                    "llm management decision is HOLD, keep current position/order state"
-                );
-                println!(
-                    "LLM_POSITION_MANAGEMENT ts_bucket={} trigger={} symbol={} model={} action={} qty=- qty_ratio=- is_full_exit={} new_tp=- new_sl=- dry_run={} position_count={} open_order_count={} canceled_open_orders=false add_order_id=- reduce_order_ids=- close_order_ids=- modify_take_profit_order_ids=- modify_stop_loss_order_ids=- reason={}",
-                    bundle.raw.ts_bucket,
-                    &*trigger,
-                    bundle.raw.symbol,
-                    out.model_name,
-                    intent.decision.as_str(),
-                    intent
-                        .is_full_exit
-                        .map(|v| v.to_string())
-                        .unwrap_or_else(|| "-".to_string()),
-                    config.llm.execution.dry_run,
-                    active_position_count,
-                    open_order_count,
-                    intent.reason.replace('\n', " "),
-                );
-                let event = json!({
-                    "event_type": "llm_management_execution",
-                    "event_ts": Utc::now().to_rfc3339(),
-                    "ts_bucket": bundle.raw.ts_bucket.to_rfc3339(),
-                    "trigger": &*trigger,
-                    "symbol": bundle.raw.symbol,
-                    "model_name": out.model_name.clone(),
-                    "action": intent.decision.as_str(),
-                    "qty": intent.qty,
-                    "qty_ratio": intent.qty_ratio,
-                    "is_full_exit": intent.is_full_exit,
-                    "new_tp": intent.new_tp,
-                    "new_sl": intent.new_sl,
-                    "dry_run": config.llm.execution.dry_run,
-                    "position_count": active_position_count,
-                    "open_order_count": open_order_count,
-                    "canceled_open_orders": false,
-                    "add_order_id": Option::<i64>::None,
-                    "reduce_order_ids": Vec::<i64>::new(),
-                    "close_order_ids": Vec::<i64>::new(),
-                    "modify_take_profit_order_ids": Vec::<i64>::new(),
-                    "modify_stop_loss_order_ids": Vec::<i64>::new(),
-                    "realized_pnl_usdt": 0.0,
-                    "pnl_outcome": "flat",
-                    "reason": intent.reason,
-                });
-                if let Err(err) = append_journal_event(event) {
-                    warn!(error = %err, "append llm_management_execution(HOLD) journal failed");
-                }
-                send_trade_signal_notifications(
-                    telegram_operator.as_ref(),
-                    x_operator.as_ref(),
-                    &config.llm.telegram_signal_decisions,
-                    &config.llm.x_signal_decisions,
-                    &http_client,
-                    TradeSignalNotification {
-                        ts_bucket: bundle.raw.ts_bucket,
-                        trigger: &trigger,
-                        symbol: &bundle.raw.symbol,
-                        model_name: &out.model_name,
-                        decision: intent.decision.as_str(),
-                        entry_price: fallback_fields.entry_price,
-                        leverage: fallback_fields.leverage,
-                        risk_reward_ratio: fallback_fields.risk_reward_ratio,
-                        take_profit: intent.new_tp.or(fallback_fields.take_profit),
-                        stop_loss: intent.new_sl.or(fallback_fields.stop_loss),
-                        reason: &intent.reason,
-                    },
-                )
-                .await;
-                update_position_context_after_management_action(
-                    &bundle.raw.symbol,
-                    trading_state.as_ref(),
-                    &intent,
-                    &runtime_lifecycle_state,
-                )
-                .await;
-                continue;
-            }
-            if execution_blocked_due_to_stale {
-                execution_done = true;
-                let notification_fields = with_telegram_field_overrides(
-                    enrich_telegram_fields_from_entry_context(
-                        derive_management_telegram_fields(trading_state.as_ref()),
-                        trading_state.as_ref(),
-                        &runtime_lifecycle_state,
-                    )
-                    .await,
-                    None,
-                    None,
-                    intent.new_tp,
-                    intent.new_sl,
-                );
-                warn!(
-                    model_name = %out.model_name,
-                    symbol = %bundle.raw.symbol,
-                    action = intent.decision.as_str(),
-                    post_invoke_data_age_secs = post_invoke_data_age_secs,
-                    max_execution_stale_secs = max_exec_stale_secs,
-                    reason = %intent.reason,
-                    "llm management execution skipped: indicator data too stale after model invocation"
-                );
-                println!(
-                    "LLM_POSITION_SIGNAL_ONLY ts_bucket={} trigger={} symbol={} model={} action={} stale=true post_invoke_data_age_secs={} max_execution_stale_secs={} qty={} qty_ratio={} is_full_exit={} new_tp={} new_sl={} reason={}",
-                    bundle.raw.ts_bucket,
-                    &*trigger,
-                    bundle.raw.symbol,
-                    out.model_name,
-                    intent.decision.as_str(),
-                    post_invoke_data_age_secs,
-                    max_exec_stale_secs,
-                    format_metric_number(intent.qty),
-                    format_metric_number(intent.qty_ratio),
-                    intent
-                        .is_full_exit
-                        .map(|v| v.to_string())
-                        .unwrap_or_else(|| "-".to_string()),
-                    format_metric_number(intent.new_tp),
-                    format_metric_number(intent.new_sl),
-                    intent.reason.replace('\n', " "),
-                );
-                let event = json!({
-                    "event_type": "llm_management_signal_only_stale",
-                    "event_ts": Utc::now().to_rfc3339(),
-                    "ts_bucket": bundle.raw.ts_bucket.to_rfc3339(),
-                    "trigger": &*trigger,
-                    "symbol": bundle.raw.symbol,
-                    "model_name": out.model_name.clone(),
-                    "action": intent.decision.as_str(),
-                    "qty": intent.qty,
-                    "qty_ratio": intent.qty_ratio,
-                    "is_full_exit": intent.is_full_exit,
-                    "new_tp": intent.new_tp,
-                    "new_sl": intent.new_sl,
-                    "position_count": active_position_count,
-                    "open_order_count": open_order_count,
-                    "post_invoke_data_age_secs": post_invoke_data_age_secs,
-                    "max_execution_stale_secs": max_exec_stale_secs,
-                    "reason": intent.reason.clone(),
-                });
-                if let Err(err) = append_journal_event(event) {
-                    warn!(error = %err, "append llm_management_signal_only_stale journal failed");
-                }
-                send_trade_signal_notifications(
-                    telegram_operator.as_ref(),
-                    x_operator.as_ref(),
-                    &config.llm.telegram_signal_decisions,
-                    &config.llm.x_signal_decisions,
-                    &http_client,
-                    TradeSignalNotification {
-                        ts_bucket: bundle.raw.ts_bucket,
-                        trigger: &trigger,
-                        symbol: &bundle.raw.symbol,
-                        model_name: &out.model_name,
-                        decision: intent.decision.as_str(),
-                        entry_price: notification_fields.entry_price,
-                        leverage: notification_fields.leverage,
-                        risk_reward_ratio: notification_fields.risk_reward_ratio,
-                        take_profit: notification_fields.take_profit,
-                        stop_loss: notification_fields.stop_loss,
-                        reason: &intent.reason,
-                    },
-                )
-                .await;
-                continue;
-            }
-            {
-                let mut guard = runtime_lifecycle_state.lock().await;
-                let next_reason = if matches!(intent.decision, PositionManagementDecision::Close) {
-                    None
-                } else {
-                    Some(intent.reason.clone())
-                };
-                guard.set_last_management_reason(&bundle.raw.symbol, next_reason);
-            }
-
-            match execute_management_intent(
-                &http_client,
-                &config.api.binance,
-                &config.llm.execution,
-                &bundle.raw.symbol,
-                &intent,
-            )
-            .await
-            {
-                Ok(report) => {
-                    execution_done = true;
-                    debug!(
-                        model_name = %out.model_name,
-                        symbol = %bundle.raw.symbol,
-                        action = report.action,
-                        qty = intent.qty.unwrap_or_default(),
-                        qty_ratio = intent.qty_ratio.unwrap_or_default(),
-                        new_tp = intent.new_tp.unwrap_or_default(),
-                        new_sl = intent.new_sl.unwrap_or_default(),
-                        dry_run = report.dry_run,
-                        position_count = report.position_count,
-                        open_order_count = report.open_order_count,
-                        canceled_open_orders = report.canceled_open_orders,
-                        add_order_id = report.add_order_id.unwrap_or_default(),
-                        reduce_order_count = report.reduce_order_ids.len(),
-                        close_order_count = report.close_order_ids.len(),
-                        modify_tp_order_count = report.modify_take_profit_order_ids.len(),
-                        modify_sl_order_count = report.modify_stop_loss_order_ids.len(),
-                        reason = %intent.reason,
-                        "llm management execution completed"
-                    );
-                    println!(
-                        "LLM_POSITION_MANAGEMENT ts_bucket={} trigger={} symbol={} model={} action={} qty={} qty_ratio={} is_full_exit={} new_tp={} new_sl={} dry_run={} position_count={} open_order_count={} canceled_open_orders={} add_order_id={} reduce_order_ids={} close_order_ids={} modify_take_profit_order_ids={} modify_stop_loss_order_ids={} realized_pnl_usdt={} pnl_outcome={} reason={}",
-                        bundle.raw.ts_bucket,
-                        &*trigger,
-                        bundle.raw.symbol,
-                        out.model_name,
-                        report.action,
-                        intent.qty.map(|v| v.to_string()).unwrap_or_else(|| "-".to_string()),
-                        intent.qty_ratio.map(|v| v.to_string()).unwrap_or_else(|| "-".to_string()),
-                        intent
-                            .is_full_exit
-                            .map(|v| v.to_string())
-                            .unwrap_or_else(|| "-".to_string()),
-                        intent.new_tp.map(|v| v.to_string()).unwrap_or_else(|| "-".to_string()),
-                        intent.new_sl.map(|v| v.to_string()).unwrap_or_else(|| "-".to_string()),
-                        report.dry_run,
-                        report.position_count,
-                        report.open_order_count,
-                        report.canceled_open_orders,
-                        report
-                            .add_order_id
-                            .map(|id| id.to_string())
-                            .unwrap_or_else(|| "-".to_string()),
-                        if report.reduce_order_ids.is_empty() {
-                            "-".to_string()
-                        } else {
-                            report
-                                .reduce_order_ids
-                                .iter()
-                                .map(|id| id.to_string())
-                                .collect::<Vec<_>>()
-                                .join(",")
-                        },
-                        if report.close_order_ids.is_empty() {
-                            "-".to_string()
-                        } else {
-                            report
-                                .close_order_ids
-                                .iter()
-                                .map(|id| id.to_string())
-                                .collect::<Vec<_>>()
-                                .join(",")
-                        },
-                        if report.modify_take_profit_order_ids.is_empty() {
-                            "-".to_string()
-                        } else {
-                            report
-                                .modify_take_profit_order_ids
-                                .iter()
-                                .map(|id| id.to_string())
-                                .collect::<Vec<_>>()
-                                .join(",")
-                        },
-                        if report.modify_stop_loss_order_ids.is_empty() {
-                            "-".to_string()
-                        } else {
-                            report
-                                .modify_stop_loss_order_ids
-                                .iter()
-                                .map(|id| id.to_string())
-                                .collect::<Vec<_>>()
-                                .join(",")
-                        },
-                        report.realized_pnl_usdt,
-                        pnl_outcome_label(report.realized_pnl_usdt),
-                        intent.reason.replace('\n', " "),
-                    );
-                    let event = json!({
-                        "event_type": "llm_management_execution",
-                        "event_ts": Utc::now().to_rfc3339(),
-                        "ts_bucket": bundle.raw.ts_bucket.to_rfc3339(),
-                        "trigger": &*trigger,
-                        "symbol": bundle.raw.symbol,
-                        "model_name": out.model_name.clone(),
-                        "action": report.action,
-                        "qty": intent.qty,
-                        "qty_ratio": intent.qty_ratio,
-                        "is_full_exit": intent.is_full_exit,
-                        "new_tp": intent.new_tp,
-                        "new_sl": intent.new_sl,
-                        "dry_run": report.dry_run,
-                        "position_count": report.position_count,
-                        "open_order_count": report.open_order_count,
-                        "canceled_open_orders": report.canceled_open_orders,
-                        "add_order_id": report.add_order_id,
-                        "reduce_order_ids": report.reduce_order_ids,
-                        "close_order_ids": report.close_order_ids,
-                        "modify_take_profit_order_ids": report.modify_take_profit_order_ids,
-                        "modify_stop_loss_order_ids": report.modify_stop_loss_order_ids,
-                        "realized_pnl_usdt": report.realized_pnl_usdt,
-                        "pnl_outcome": pnl_outcome_label(report.realized_pnl_usdt),
-                        "reason": intent.reason,
-                    });
-                    if let Err(err) = append_journal_event(event) {
-                        warn!(error = %err, "append llm_management_execution journal failed");
-                    }
-                    let notification_fields = with_telegram_field_overrides(
-                        enrich_telegram_fields_from_entry_context(
-                            derive_management_telegram_fields(trading_state.as_ref()),
-                            trading_state.as_ref(),
-                            &runtime_lifecycle_state,
-                        )
-                        .await,
-                        None,
-                        None,
-                        intent.new_tp,
-                        intent.new_sl,
-                    );
-                    send_trade_signal_notifications(
-                        telegram_operator.as_ref(),
-                        x_operator.as_ref(),
-                        &config.llm.telegram_signal_decisions,
-                        &config.llm.x_signal_decisions,
-                        &http_client,
-                        TradeSignalNotification {
-                            ts_bucket: bundle.raw.ts_bucket,
-                            trigger: &trigger,
-                            symbol: &bundle.raw.symbol,
-                            model_name: &out.model_name,
-                            decision: report.action,
-                            entry_price: notification_fields.entry_price,
-                            leverage: notification_fields.leverage,
-                            risk_reward_ratio: notification_fields.risk_reward_ratio,
-                            take_profit: notification_fields.take_profit,
-                            stop_loss: notification_fields.stop_loss,
-                            reason: &intent.reason,
-                        },
-                    )
-                    .await;
-                    update_position_context_after_management_action(
-                        &bundle.raw.symbol,
-                        trading_state.as_ref(),
-                        &intent,
-                        &runtime_lifecycle_state,
-                    )
-                    .await;
-                    if report.realized_pnl_usdt != 0.0 {
-                        let pnl_event = json!({
-                            "event_type": "llm_trade_pnl",
-                            "event_ts": Utc::now().to_rfc3339(),
-                            "ts_bucket": bundle.raw.ts_bucket.to_rfc3339(),
-                            "trigger": &*trigger,
-                            "symbol": bundle.raw.symbol,
-                            "model_name": out.model_name.clone(),
-                            "action": report.action,
-                            "realized_pnl_usdt": report.realized_pnl_usdt,
-                            "pnl_outcome": pnl_outcome_label(report.realized_pnl_usdt),
-                            "reason": intent.reason.clone(),
-                        });
-                        if let Err(err) = append_journal_event(pnl_event) {
-                            warn!(error = %err, "append llm_trade_pnl journal failed");
+                        if !report.dry_run {
+                            let snapshot = crate::workflow::management::snapshot_from_execution_intent(
+                            &symbol,
+                            intent,
+                            stage1_output
+                                .current_path
+                                .as_ref()
+                                .ok_or_else(|| anyhow!("workflow stage1 current_path missing during snapshot persistence"))?,
+                            Utc::now(),
+                        );
+                            crate::workflow::persistence::save_entry_snapshot(
+                                &state_dir, &snapshot,
+                            )?;
+                            entry_snapshots.insert(snapshot.context_key.clone(), snapshot);
                         }
                     }
-                }
-                Err(err) => {
-                    execution_done = true;
-                    error!(
-                        model_name = %out.model_name,
-                        symbol = %bundle.raw.symbol,
-                        reason = %intent.reason,
-                        error = %err,
-                        "llm management execution failed"
-                    );
-                    println!(
-                        "LLM_POSITION_MANAGEMENT_ERROR ts_bucket={} trigger={} symbol={} model={} action={} qty={} qty_ratio={} is_full_exit={} new_tp={} new_sl={} reason={} error={}",
-                        bundle.raw.ts_bucket,
-                        &*trigger,
-                        bundle.raw.symbol,
-                        out.model_name,
-                        intent.decision.as_str(),
-                        intent.qty.map(|v| v.to_string()).unwrap_or_else(|| "-".to_string()),
-                        intent.qty_ratio.map(|v| v.to_string()).unwrap_or_else(|| "-".to_string()),
-                        intent
-                            .is_full_exit
-                            .map(|v| v.to_string())
-                            .unwrap_or_else(|| "-".to_string()),
-                        intent.new_tp.map(|v| v.to_string()).unwrap_or_else(|| "-".to_string()),
-                        intent.new_sl.map(|v| v.to_string()).unwrap_or_else(|| "-".to_string()),
-                        intent.reason.replace('\n', " "),
-                        err.to_string().replace('\n', " "),
-                    );
-                    let event = json!({
-                        "event_type": "llm_management_execution_error",
-                        "event_ts": Utc::now().to_rfc3339(),
-                        "ts_bucket": bundle.raw.ts_bucket.to_rfc3339(),
-                        "trigger": &*trigger,
-                        "symbol": bundle.raw.symbol,
-                        "model_name": out.model_name.clone(),
-                        "action": intent.decision.as_str(),
-                        "qty": intent.qty,
-                        "qty_ratio": intent.qty_ratio,
-                        "is_full_exit": intent.is_full_exit,
-                        "new_tp": intent.new_tp,
-                        "new_sl": intent.new_sl,
-                        "reason": intent.reason,
-                        "error": err.to_string(),
-                    });
-                    if let Err(err) = append_journal_event(event) {
-                        warn!(error = %err, "append llm_management_execution_error journal failed");
+                    Err(err) => {
+                        let blocked = err
+                            .downcast_ref::<TradeExecutionBlockedByCurrentPriceBeyondStopLoss>()
+                            .map(|item| {
+                                json!({
+                                    "decision": item.decision.as_str(),
+                                    "current_reference_price": item.current_reference_price,
+                                    "current_price_source": item.current_price_source,
+                                    "entry_price": item.entry_price,
+                                    "stop_loss": item.stop_loss,
+                                    "best_bid_price": item.best_bid_price,
+                                    "best_ask_price": item.best_ask_price,
+                                })
+                            });
+                        append_workflow_journal_event(
+                            "workflow_execution_error",
+                            &symbol,
+                            bundle.raw.ts_bucket,
+                            json!({
+                                "trigger": &*trigger,
+                                "path_id": intent.path_id,
+                                "context_key": intent.entry_snapshot.context_key,
+                                "error": format!("{err:#}"),
+                                "blocked": blocked,
+                            }),
+                        );
                     }
-                    let notification_fields = with_telegram_field_overrides(
-                        enrich_telegram_fields_from_entry_context(
-                            derive_management_telegram_fields(trading_state.as_ref()),
-                            trading_state.as_ref(),
-                            &runtime_lifecycle_state,
-                        )
-                        .await,
-                        None,
-                        None,
-                        intent.new_tp,
-                        intent.new_sl,
+                },
+                Err(err) => {
+                    append_workflow_journal_event(
+                        "workflow_execution_error",
+                        &symbol,
+                        bundle.raw.ts_bucket,
+                        json!({
+                            "trigger": &*trigger,
+                            "path_id": intent.path_id,
+                            "context_key": intent.entry_snapshot.context_key,
+                            "error": format!("{err:#}"),
+                            "phase": "intent_adapter",
+                        }),
                     );
-                    send_trade_signal_notifications(
-                        telegram_operator.as_ref(),
-                        x_operator.as_ref(),
-                        &config.llm.telegram_signal_decisions,
-                        &config.llm.x_signal_decisions,
-                        &http_client,
-                        TradeSignalNotification {
-                            ts_bucket: bundle.raw.ts_bucket,
-                            trigger: &trigger,
-                            symbol: &bundle.raw.symbol,
-                            model_name: &out.model_name,
-                            decision: intent.decision.as_str(),
-                            entry_price: notification_fields.entry_price,
-                            leverage: notification_fields.leverage,
-                            risk_reward_ratio: notification_fields.risk_reward_ratio,
-                            take_profit: notification_fields.take_profit,
-                            stop_loss: notification_fields.stop_loss,
-                            reason: &intent.reason,
-                        },
-                    )
-                    .await;
                 }
             }
         } else {
-            let intent = match trade_intent_from_value(parsed_decision) {
-                Ok(intent) => intent,
-                Err(err) => {
-                    warn!(
-                        model_name = %out.model_name,
-                        symbol = %bundle.raw.symbol,
-                        error = %err,
-                        "skip llm execution: parse trade intent failed"
-                    );
-                    println!(
-                        "LLM_ORDER_VALIDATION_FAILED ts_bucket={} trigger={} symbol={} model={} error={}",
-                        bundle.raw.ts_bucket,
-                        &*trigger,
-                        bundle.raw.symbol,
-                        out.model_name,
-                        err.to_string().replace('\n', " "),
-                    );
-                    let event = json!({
-                        "event_type": "llm_trade_validation_failed",
-                        "event_ts": Utc::now().to_rfc3339(),
-                        "ts_bucket": bundle.raw.ts_bucket.to_rfc3339(),
-                        "trigger": &*trigger,
-                        "symbol": bundle.raw.symbol,
-                        "model_name": out.model_name.clone(),
-                        "error": err.to_string(),
-                        "parsed_decision": parsed_decision.clone(),
-                    });
-                    if let Err(err) = append_journal_event(event) {
-                        warn!(error = %err, "append llm_trade_validation_failed journal failed");
-                    }
-                    continue;
-                }
-            };
-            let mut execution_intent = intent.clone();
-            if matches!(
-                execution_intent.decision,
-                TradeDecision::Long | TradeDecision::Short
-            ) {
-                let computed_rr = execution_intent
-                    .entry_price
-                    .zip(execution_intent.take_profit)
-                    .zip(execution_intent.stop_loss)
-                    .and_then(|((entry, tp), sl)| compute_rr_from_levels(entry, tp, sl));
-                if let Some(geometry_rr) = computed_rr {
-                    if execution_intent
-                        .risk_reward_ratio
-                        .map(|model_rr| (model_rr - geometry_rr).abs() > 1e-6)
-                        .unwrap_or(false)
-                    {
-                        info!(
-                            model_name = %out.model_name,
-                            symbol = %bundle.raw.symbol,
-                            decision = execution_intent.decision.as_str(),
-                            model_rr = execution_intent.risk_reward_ratio.unwrap_or_default(),
-                            geometry_rr = geometry_rr,
-                            "overriding model rr with geometry-derived rr from entry/tp/sl"
-                        );
-                    }
-                    execution_intent.risk_reward_ratio = Some(geometry_rr);
-                }
-            }
-            if let Some((remapped_entry, remapped_stop_loss)) = remap_trade_entry_and_stop_loss(
-                &out.provider,
-                &config.llm.execution,
-                &execution_intent,
-            ) {
-                execution_intent.entry_price = Some(remapped_entry);
-                execution_intent.stop_loss = Some(remapped_stop_loss);
-                info!(
-                    model_name = %out.model_name,
-                    provider = %out.provider,
-                    symbol = %bundle.raw.symbol,
-                    decision = execution_intent.decision.as_str(),
-                    entry_to_sl_distance_pct = config.llm.execution.entry_sl_remap.entry_to_sl_distance_pct,
-                    model_entry = intent.entry_price.unwrap_or_default(),
-                    model_stop_loss = intent.stop_loss.unwrap_or_default(),
-                    remapped_entry = remapped_entry,
-                    remapped_stop_loss = remapped_stop_loss,
-                    "applied entry/sl remap for execution"
-                );
-            }
-
-            if matches!(intent.decision, TradeDecision::NoTrade) {
-                debug!(
-                    model_name = %out.model_name,
-                    symbol = %bundle.raw.symbol,
-                    reason = %intent.reason,
-                    "llm decision is NO_TRADE, skip exchange execution"
-                );
-                send_trade_signal_notifications(
-                    telegram_operator.as_ref(),
-                    x_operator.as_ref(),
-                    &config.llm.telegram_signal_decisions,
-                    &config.llm.x_signal_decisions,
-                    &http_client,
-                    TradeSignalNotification {
-                        ts_bucket: bundle.raw.ts_bucket,
-                        trigger: &trigger,
-                        symbol: &bundle.raw.symbol,
-                        model_name: &out.model_name,
-                        decision: intent.decision.as_str(),
-                        entry_price: intent.entry_price,
-                        leverage: intent.leverage,
-                        risk_reward_ratio: intent.risk_reward_ratio,
-                        take_profit: intent.take_profit,
-                        stop_loss: intent.stop_loss,
-                        reason: &intent.reason,
-                    },
-                )
-                .await;
-                execution_done = true;
-                continue;
-            }
-            let entry_recheck_evaluation = if matches!(
-                execution_intent.decision,
-                TradeDecision::Long | TradeDecision::Short
-            ) {
-                entry_recheck_snapshot.as_ref().map(|snapshot| {
-                    evaluate_entry_freshness_recheck(&execution_intent.decision, snapshot)
-                })
-            } else {
-                None
-            };
-            let recheck_result = entry_recheck_evaluation
-                .as_ref()
-                .map(|evaluation| evaluation.result)
-                .unwrap_or("not_needed");
-            let rtf_recheck_triggered = entry_recheck_evaluation.is_some();
-            let rtf_recheck_vetoed = recheck_result == "veto";
-            let recheck_rules_hit = entry_recheck_evaluation
-                .as_ref()
-                .map(|evaluation| {
-                    evaluation
-                        .rules_hit
-                        .iter()
-                        .map(|rule| (*rule).to_string())
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            let recheck_snapshot_value = entry_recheck_snapshot
-                .as_ref()
-                .map(entry_freshness_recheck_snapshot_json)
-                .unwrap_or(Value::Null);
-
-            if let Some(evaluation) = entry_recheck_evaluation.as_ref() {
-                if evaluation.result == "veto" {
-                    let notification_fields = preview_trade_signal_fields(
-                        &http_client,
-                        &config,
-                        &bundle.raw.symbol,
-                        &execution_intent,
-                    )
-                    .await;
-                    execution_done = true;
-                    warn!(
-                        model_name = %out.model_name,
-                        symbol = %bundle.raw.symbol,
-                        decision = execution_intent.decision.as_str(),
-                        recheck_rules_hit = ?recheck_rules_hit,
-                        recheck_snapshot = %recheck_snapshot_value,
-                        reason = %intent.reason,
-                        "llm trade execution skipped: freshness recheck vetoed entry decision"
-                    );
-                    println!(
-                        "LLM_ORDER_SIGNAL_ONLY_RECHECK_VETO ts_bucket={} trigger={} symbol={} model={} decision={} recheck_result=veto latest_bundle_ts_bucket={} rules_hit={} entry={} leverage={} rr={} tp={} sl={} reason={}",
-                        bundle.raw.ts_bucket,
-                        &*trigger,
-                        bundle.raw.symbol,
-                        out.model_name,
-                        execution_intent.decision.as_str(),
-                        entry_recheck_snapshot
-                            .as_ref()
-                            .map(|snapshot| snapshot.latest_bundle_ts_bucket.to_rfc3339())
-                            .unwrap_or_else(|| "-".to_string()),
-                        serde_json::to_string(&recheck_rules_hit).unwrap_or_else(|_| "[]".to_string()),
-                        format_metric_number(notification_fields.entry_price),
-                        format_metric_number(notification_fields.leverage),
-                        format_metric_number(notification_fields.risk_reward_ratio),
-                        format_metric_number(notification_fields.take_profit),
-                        format_metric_number(notification_fields.stop_loss),
-                        intent.reason.replace('\n', " "),
-                    );
-                    let mut event = json!({
-                        "event_type": "llm_order_signal_only_recheck_veto",
-                        "event_ts": Utc::now().to_rfc3339(),
-                        "ts_bucket": bundle.raw.ts_bucket.to_rfc3339(),
-                        "trigger": &*trigger,
-                        "symbol": bundle.raw.symbol,
-                        "model_name": out.model_name.clone(),
-                        "decision": execution_intent.decision.as_str(),
-                        "entry_price": notification_fields.entry_price,
-                        "leverage": notification_fields.leverage,
-                        "risk_reward_ratio": notification_fields.risk_reward_ratio,
-                        "take_profit": notification_fields.take_profit,
-                        "stop_loss": notification_fields.stop_loss,
-                        "reason": intent.reason.clone(),
-                        "rtf_recheck_triggered": rtf_recheck_triggered,
-                        "rtf_recheck_vetoed": rtf_recheck_vetoed,
-                        "rtf_recheck_result": recheck_result,
-                        "rtf_recheck_veto_rules_hit": recheck_rules_hit.clone(),
-                        "rtf_recheck_veto_snapshot": recheck_snapshot_value.clone(),
-                        "recheck_result": recheck_result,
-                        "recheck_veto_rules_hit": recheck_rules_hit,
-                        "recheck_veto_snapshot": recheck_snapshot_value.clone(),
-                    });
-                    if let Some(object) = event.as_object_mut() {
-                        for (key, value) in stage2_rtf_rollout_fields.clone() {
-                            object.insert(key, value);
-                        }
-                    }
-                    if let Err(err) = append_journal_event(event) {
-                        warn!(error = %err, "append llm_order_signal_only_recheck_veto journal failed");
-                    }
-                    continue;
-                }
-            }
-
-            let mut execution_blocked_due_to_stale_after_recheck = execution_blocked_due_to_stale;
-            if execution_blocked_due_to_stale {
-                if let (Some(evaluation), Some(snapshot)) = (
-                    entry_recheck_evaluation.as_ref(),
-                    entry_recheck_snapshot.as_ref(),
-                ) {
-                    if evaluation.result == "confirm"
-                        && snapshot.latest_bundle_age_secs <= max_exec_stale_secs
-                    {
-                        execution_blocked_due_to_stale_after_recheck = false;
-                        info!(
-                            model_name = %out.model_name,
-                            symbol = %bundle.raw.symbol,
-                            decision = execution_intent.decision.as_str(),
-                            original_stage2_core_ts_bucket = %bundle.raw.ts_bucket,
-                            latest_bundle_ts_bucket = %snapshot.latest_bundle_ts_bucket,
-                            latest_bundle_age_secs = snapshot.latest_bundle_age_secs,
-                            "entry freshness recheck confirmed decision and cleared stale execution block"
-                        );
-                    }
-                }
-            }
-
-            if execution_blocked_due_to_stale_after_recheck {
-                let notification_fields = preview_trade_signal_fields(
-                    &http_client,
-                    &config,
-                    &bundle.raw.symbol,
-                    &execution_intent,
-                )
-                .await;
-                execution_done = true;
-                warn!(
-                    model_name = %out.model_name,
-                    symbol = %bundle.raw.symbol,
-                    decision = intent.decision.as_str(),
-                    post_invoke_data_age_secs = post_invoke_data_age_secs,
-                    max_execution_stale_secs = max_exec_stale_secs,
-                    reason = %intent.reason,
-                    "llm trade execution skipped: indicator data too stale after model invocation"
-                );
-                println!(
-                    "LLM_ORDER_SIGNAL_ONLY ts_bucket={} trigger={} symbol={} model={} decision={} stale=true post_invoke_data_age_secs={} max_execution_stale_secs={} entry={} leverage={} rr={} tp={} sl={} reason={}",
-                    bundle.raw.ts_bucket,
-                    &*trigger,
-                    bundle.raw.symbol,
-                    out.model_name,
-                    intent.decision.as_str(),
-                    post_invoke_data_age_secs,
-                    max_exec_stale_secs,
-                    format_metric_number(notification_fields.entry_price),
-                    format_metric_number(notification_fields.leverage),
-                    format_metric_number(notification_fields.risk_reward_ratio),
-                    format_metric_number(notification_fields.take_profit),
-                    format_metric_number(notification_fields.stop_loss),
-                    intent.reason.replace('\n', " "),
-                );
-                let mut event = json!({
-                    "event_type": "llm_order_signal_only_stale",
-                    "event_ts": Utc::now().to_rfc3339(),
-                    "ts_bucket": bundle.raw.ts_bucket.to_rfc3339(),
+            append_workflow_journal_event(
+                "workflow_execution_skipped",
+                &symbol,
+                bundle.raw.ts_bucket,
+                json!({
                     "trigger": &*trigger,
-                    "symbol": bundle.raw.symbol,
-                    "model_name": out.model_name.clone(),
-                    "decision": intent.decision.as_str(),
-                    "entry_price": notification_fields.entry_price,
-                    "leverage": notification_fields.leverage,
-                    "risk_reward_ratio": notification_fields.risk_reward_ratio,
-                    "take_profit": notification_fields.take_profit,
-                    "stop_loss": notification_fields.stop_loss,
-                    "post_invoke_data_age_secs": post_invoke_data_age_secs,
-                    "max_execution_stale_secs": max_exec_stale_secs,
-                    "reason": intent.reason.clone(),
-                    "rtf_recheck_triggered": rtf_recheck_triggered,
-                    "rtf_recheck_vetoed": rtf_recheck_vetoed,
-                    "rtf_recheck_result": recheck_result,
-                    "rtf_recheck_veto_rules_hit": recheck_rules_hit.clone(),
-                    "rtf_recheck_veto_snapshot": recheck_snapshot_value.clone(),
-                    "recheck_result": recheck_result,
-                    "recheck_veto_rules_hit": recheck_rules_hit,
-                    "recheck_veto_snapshot": recheck_snapshot_value.clone(),
-                });
-                if let Some(object) = event.as_object_mut() {
-                    for (key, value) in stage2_rtf_rollout_fields.clone() {
-                        object.insert(key, value);
-                    }
-                }
-                if let Err(err) = append_journal_event(event) {
-                    warn!(error = %err, "append llm_order_signal_only_stale journal failed");
-                }
-                send_trade_signal_notifications(
-                    telegram_operator.as_ref(),
-                    x_operator.as_ref(),
-                    &config.llm.telegram_signal_decisions,
-                    &config.llm.x_signal_decisions,
-                    &http_client,
-                    TradeSignalNotification {
-                        ts_bucket: bundle.raw.ts_bucket,
-                        trigger: &trigger,
-                        symbol: &bundle.raw.symbol,
-                        model_name: &out.model_name,
-                        decision: intent.decision.as_str(),
-                        entry_price: notification_fields.entry_price,
-                        leverage: notification_fields.leverage,
-                        risk_reward_ratio: notification_fields.risk_reward_ratio,
-                        take_profit: notification_fields.take_profit,
-                        stop_loss: notification_fields.stop_loss,
-                        reason: &intent.reason,
-                    },
-                )
-                .await;
-                continue;
-            }
-            let entry_v_gate = match evaluate_trade_entry_v_gate(
-                &config.llm.execution,
-                &execution_intent,
-                &input,
-                out.entry_stage_trace.as_deref(),
-            ) {
-                Ok(result) => result,
-                Err(err) => {
-                    warn!(
-                        model_name = %out.model_name,
-                        symbol = %bundle.raw.symbol,
-                        decision = execution_intent.decision.as_str(),
-                        entry_price = execution_intent.entry_price.unwrap_or_default(),
-                        take_profit = execution_intent.take_profit.unwrap_or_default(),
-                        stop_loss = execution_intent.stop_loss.unwrap_or_default(),
-                        reason = %intent.reason,
-                        error = %err,
-                        "llm trade execution blocked by entry V gate"
-                    );
-                    println!(
-                        "LLM_ORDER_V_GATE_FAILED ts_bucket={} trigger={} symbol={} model={} decision={} entry={} tp={} sl={} min_distance_v={} reason={} error={}",
-                        bundle.raw.ts_bucket,
-                        &*trigger,
-                        bundle.raw.symbol,
-                        out.model_name,
-                        execution_intent.decision.as_str(),
-                        format_metric_number(execution_intent.entry_price),
-                        format_metric_number(execution_intent.take_profit),
-                        format_metric_number(execution_intent.stop_loss),
-                        config.llm.execution.min_distance_v,
-                        intent.reason.replace('\n', " "),
-                        err.to_string().replace('\n', " "),
-                    );
-                    let event = json!({
-                        "event_type": "llm_order_v_gate_failed",
-                        "event_ts": Utc::now().to_rfc3339(),
-                        "ts_bucket": bundle.raw.ts_bucket.to_rfc3339(),
-                        "trigger": &*trigger,
-                        "symbol": bundle.raw.symbol,
-                        "model_name": out.model_name.clone(),
-                        "decision": execution_intent.decision.as_str(),
-                        "entry_price": execution_intent.entry_price,
-                        "take_profit": execution_intent.take_profit,
-                        "stop_loss": execution_intent.stop_loss,
-                        "min_distance_v": config.llm.execution.min_distance_v,
-                        "reason": intent.reason.clone(),
-                        "error": err.to_string(),
-                    });
-                    if let Err(err) = append_journal_event(event) {
-                        warn!(error = %err, "append llm_order_v_gate_failed journal failed");
-                    }
-                    continue;
-                }
-            };
-            if let Some(gate) = entry_v_gate.as_ref() {
-                if !gate.passed {
-                    let required_take_profit_distance = gate.required_take_profit_distance();
-                    let take_profit_distance_shortfall = gate.take_profit_distance_shortfall();
-                    warn!(
-                        model_name = %out.model_name,
-                        symbol = %bundle.raw.symbol,
-                        decision = execution_intent.decision.as_str(),
-                        entry_price = execution_intent.entry_price.unwrap_or_default(),
-                        take_profit = execution_intent.take_profit.unwrap_or_default(),
-                        stop_loss = execution_intent.stop_loss.unwrap_or_default(),
-                        selected_v = gate.resolved_v.value,
-                        computed_v = gate.resolved_v.value,
-                        v_timeframe = gate.resolved_v.timeframe,
-                        v_basis = %gate.resolved_v.basis,
-                        take_profit_distance = gate.take_profit_distance,
-                        take_profit_distance_v = gate.take_profit_distance_v,
-                        min_distance_v = gate.min_distance_v,
-                        config_min_distance_v = gate.min_distance_v,
-                        required_take_profit_distance,
-                        take_profit_distance_shortfall,
-                        reason = %intent.reason,
-                        "llm trade execution blocked by entry V gate"
-                    );
-                    println!(
-                        "LLM_ORDER_V_GATE_FAILED ts_bucket={} trigger={} symbol={} model={} decision={} entry={} tp={} sl={} selected_v={} computed_v={} v_timeframe={} v_basis={} tp_distance={} tp_in_v={} min_distance_v={} config_min_distance_v={} required_tp_distance={} tp_distance_shortfall={} gate_passed=false reason={}",
-                        bundle.raw.ts_bucket,
-                        &*trigger,
-                        bundle.raw.symbol,
-                        out.model_name,
-                        execution_intent.decision.as_str(),
-                        format_metric_number(execution_intent.entry_price),
-                        format_metric_number(execution_intent.take_profit),
-                        format_metric_number(execution_intent.stop_loss),
-                        gate.resolved_v.value,
-                        gate.resolved_v.value,
-                        gate.resolved_v.timeframe,
-                        gate.resolved_v.basis,
-                        gate.take_profit_distance,
-                        gate.take_profit_distance_v,
-                        gate.min_distance_v,
-                        gate.min_distance_v,
-                        required_take_profit_distance,
-                        take_profit_distance_shortfall,
-                        intent.reason.replace('\n', " "),
-                    );
-                    let event = json!({
-                        "event_type": "llm_order_v_gate_failed",
-                        "event_ts": Utc::now().to_rfc3339(),
-                        "ts_bucket": bundle.raw.ts_bucket.to_rfc3339(),
-                        "trigger": &*trigger,
-                        "symbol": bundle.raw.symbol,
-                        "model_name": out.model_name.clone(),
-                        "decision": execution_intent.decision.as_str(),
-                        "entry_price": execution_intent.entry_price,
-                        "take_profit": execution_intent.take_profit,
-                        "stop_loss": execution_intent.stop_loss,
-                        "selected_v": gate.resolved_v.value,
-                        "computed_v": gate.resolved_v.value,
-                        "v_timeframe": gate.resolved_v.timeframe,
-                        "v_basis": gate.resolved_v.basis.clone(),
-                        "take_profit_distance": gate.take_profit_distance,
-                        "take_profit_distance_v": gate.take_profit_distance_v,
-                        "min_distance_v": gate.min_distance_v,
-                        "config_min_distance_v": gate.min_distance_v,
-                        "required_take_profit_distance": required_take_profit_distance,
-                        "take_profit_distance_shortfall": take_profit_distance_shortfall,
-                        "gate_passed": false,
-                        "reason": intent.reason.clone(),
-                    });
-                    if let Err(err) = append_journal_event(event) {
-                        warn!(error = %err, "append llm_order_v_gate_failed journal failed");
-                    }
-                    continue;
-                }
-                let required_take_profit_distance = gate.required_take_profit_distance();
-                let take_profit_distance_shortfall = gate.take_profit_distance_shortfall();
-                info!(
-                    model_name = %out.model_name,
-                    symbol = %bundle.raw.symbol,
-                    decision = execution_intent.decision.as_str(),
-                    selected_v = gate.resolved_v.value,
-                    computed_v = gate.resolved_v.value,
-                    v_timeframe = gate.resolved_v.timeframe,
-                    v_basis = %gate.resolved_v.basis,
-                    take_profit_distance = gate.take_profit_distance,
-                    take_profit_distance_v = gate.take_profit_distance_v,
-                    min_distance_v = gate.min_distance_v,
-                    config_min_distance_v = gate.min_distance_v,
-                    required_take_profit_distance,
-                    take_profit_distance_shortfall,
-                    "llm trade entry V gate passed"
-                );
-                println!(
-                    "LLM_ORDER_V_GATE_PASSED ts_bucket={} trigger={} symbol={} model={} decision={} entry={} tp={} sl={} selected_v={} computed_v={} v_timeframe={} v_basis={} tp_distance={} tp_in_v={} min_distance_v={} config_min_distance_v={} required_tp_distance={} tp_distance_shortfall={} gate_passed=true",
-                    bundle.raw.ts_bucket,
-                    &*trigger,
-                    bundle.raw.symbol,
-                    out.model_name,
-                    execution_intent.decision.as_str(),
-                    format_metric_number(execution_intent.entry_price),
-                    format_metric_number(execution_intent.take_profit),
-                    format_metric_number(execution_intent.stop_loss),
-                    gate.resolved_v.value,
-                    gate.resolved_v.value,
-                    gate.resolved_v.timeframe,
-                    gate.resolved_v.basis,
-                    gate.take_profit_distance,
-                    gate.take_profit_distance_v,
-                    gate.min_distance_v,
-                    gate.min_distance_v,
-                    required_take_profit_distance,
-                    take_profit_distance_shortfall,
-                );
-            }
-            let entry_rr_gate = match evaluate_trade_rr_gate(
-                &config.llm.execution,
-                &execution_intent,
-            ) {
-                Ok(result) => result,
-                Err(err) => {
-                    warn!(
-                        model_name = %out.model_name,
-                        symbol = %bundle.raw.symbol,
-                        decision = execution_intent.decision.as_str(),
-                        entry_price = execution_intent.entry_price.unwrap_or_default(),
-                        take_profit = execution_intent.take_profit.unwrap_or_default(),
-                        stop_loss = execution_intent.stop_loss.unwrap_or_default(),
-                        reason = %intent.reason,
-                        error = %err,
-                        "llm trade execution blocked by entry RR gate"
-                    );
-                    println!(
-                        "LLM_ORDER_RR_GATE_FAILED ts_bucket={} trigger={} symbol={} model={} decision={} entry={} tp={} sl={} min_rr={} reason={} error={}",
-                        bundle.raw.ts_bucket,
-                        &*trigger,
-                        bundle.raw.symbol,
-                        out.model_name,
-                        execution_intent.decision.as_str(),
-                        format_metric_number(execution_intent.entry_price),
-                        format_metric_number(execution_intent.take_profit),
-                        format_metric_number(execution_intent.stop_loss),
-                        config.llm.execution.min_rr,
-                        intent.reason.replace('\n', " "),
-                        err.to_string().replace('\n', " "),
-                    );
-                    let event = json!({
-                        "event_type": "llm_order_rr_gate_failed",
-                        "event_ts": Utc::now().to_rfc3339(),
-                        "ts_bucket": bundle.raw.ts_bucket.to_rfc3339(),
-                        "trigger": &*trigger,
-                        "symbol": bundle.raw.symbol,
-                        "model_name": out.model_name.clone(),
-                        "decision": execution_intent.decision.as_str(),
-                        "entry_price": execution_intent.entry_price,
-                        "take_profit": execution_intent.take_profit,
-                        "stop_loss": execution_intent.stop_loss,
-                        "min_rr": config.llm.execution.min_rr,
-                        "reason": intent.reason.clone(),
-                        "error": err.to_string(),
-                    });
-                    if let Err(err) = append_journal_event(event) {
-                        warn!(error = %err, "append llm_order_rr_gate_failed journal failed");
-                    }
-                    continue;
-                }
-            };
-            if let Some(gate) = entry_rr_gate.as_ref() {
-                if !gate.passed {
-                    warn!(
-                        model_name = %out.model_name,
-                        symbol = %bundle.raw.symbol,
-                        decision = execution_intent.decision.as_str(),
-                        entry_price = execution_intent.entry_price.unwrap_or_default(),
-                        take_profit = execution_intent.take_profit.unwrap_or_default(),
-                        stop_loss = execution_intent.stop_loss.unwrap_or_default(),
-                        risk_reward_ratio = gate.risk_reward_ratio,
-                        reward_distance = gate.reward_distance,
-                        risk_distance = gate.risk_distance,
-                        min_rr = gate.min_rr,
-                        reason = %intent.reason,
-                        "llm trade execution blocked by entry RR gate"
-                    );
-                    println!(
-                        "LLM_ORDER_RR_GATE_FAILED ts_bucket={} trigger={} symbol={} model={} decision={} entry={} tp={} sl={} rr={} reward_distance={} risk_distance={} min_rr={} gate_passed=false reason={}",
-                        bundle.raw.ts_bucket,
-                        &*trigger,
-                        bundle.raw.symbol,
-                        out.model_name,
-                        execution_intent.decision.as_str(),
-                        format_metric_number(execution_intent.entry_price),
-                        format_metric_number(execution_intent.take_profit),
-                        format_metric_number(execution_intent.stop_loss),
-                        gate.risk_reward_ratio,
-                        gate.reward_distance,
-                        gate.risk_distance,
-                        gate.min_rr,
-                        intent.reason.replace('\n', " "),
-                    );
-                    let event = json!({
-                        "event_type": "llm_order_rr_gate_failed",
-                        "event_ts": Utc::now().to_rfc3339(),
-                        "ts_bucket": bundle.raw.ts_bucket.to_rfc3339(),
-                        "trigger": &*trigger,
-                        "symbol": bundle.raw.symbol,
-                        "model_name": out.model_name.clone(),
-                        "decision": execution_intent.decision.as_str(),
-                        "entry_price": execution_intent.entry_price,
-                        "take_profit": execution_intent.take_profit,
-                        "stop_loss": execution_intent.stop_loss,
-                        "risk_reward_ratio": gate.risk_reward_ratio,
-                        "reward_distance": gate.reward_distance,
-                        "risk_distance": gate.risk_distance,
-                        "min_rr": gate.min_rr,
-                        "gate_passed": false,
-                        "reason": intent.reason.clone(),
-                    });
-                    if let Err(err) = append_journal_event(event) {
-                        warn!(error = %err, "append llm_order_rr_gate_failed journal failed");
-                    }
-                    continue;
-                }
-                info!(
-                    model_name = %out.model_name,
-                    symbol = %bundle.raw.symbol,
-                    decision = execution_intent.decision.as_str(),
-                    risk_reward_ratio = gate.risk_reward_ratio,
-                    reward_distance = gate.reward_distance,
-                    risk_distance = gate.risk_distance,
-                    min_rr = gate.min_rr,
-                    "llm trade entry RR gate passed"
-                );
-                println!(
-                    "LLM_ORDER_RR_GATE_PASSED ts_bucket={} trigger={} symbol={} model={} decision={} entry={} tp={} sl={} rr={} reward_distance={} risk_distance={} min_rr={} gate_passed=true",
-                    bundle.raw.ts_bucket,
-                    &*trigger,
-                    bundle.raw.symbol,
-                    out.model_name,
-                    execution_intent.decision.as_str(),
-                    format_metric_number(execution_intent.entry_price),
-                    format_metric_number(execution_intent.take_profit),
-                    format_metric_number(execution_intent.stop_loss),
-                    gate.risk_reward_ratio,
-                    gate.reward_distance,
-                    gate.risk_distance,
-                    gate.min_rr,
-                );
-            }
+                    "execution_enabled": config.llm.execution.enabled,
+                    "execution_blocked_due_to_stale": execution_blocked_due_to_stale,
+                    "code_allows_execution": code_allows_execution,
+                    "failure_level_breached": stage2_runtime_eval.failure_level_breached,
+                    "reevaluation_trigger_hit": stage2_runtime_eval.reevaluation_trigger_hit,
+                    "hard_gate": stage2_runtime_eval.hard_gate,
+                    "soft_gate": stage2_runtime_eval.soft_gate,
+                    "soft_gate_min_required": stage2_runtime_eval.soft_gate_min_required,
+                    "path_id": intent.path_id,
+                    "context_key": intent.entry_snapshot.context_key,
+                }),
+            );
+        }
+    }
 
-            match execute_trade_intent(
+    for action in &stage2_decision.management_actions {
+        let snapshot = entry_snapshots.get(&action.context_key).cloned();
+        if !config.llm.execution.enabled {
+            append_workflow_journal_event(
+                "workflow_management_skipped",
+                &symbol,
+                bundle.raw.ts_bucket,
+                json!({
+                    "trigger": &*trigger,
+                    "execution_enabled": false,
+                    "action": action,
+                }),
+            );
+            continue;
+        }
+        let snapshot = snapshot.ok_or_else(|| {
+            anyhow!(
+                "workflow management snapshot missing for context_key={}",
+                action.context_key
+            )
+        })?;
+        let adapted_action = adapt_management_action(action, &snapshot);
+        match adapted_action {
+            Ok(adapted_action) => match execute_workflow_management_action(
                 &http_client,
                 &config.api.binance,
                 &config.llm.execution,
-                &bundle.raw.symbol,
-                &execution_intent,
+                &symbol,
+                &snapshot,
+                &adapted_action,
             )
             .await
             {
                 Ok(report) => {
-                    execution_done = true;
-                    debug!(
-                        model_name = %out.model_name,
-                        symbol = %bundle.raw.symbol,
-                        decision = report.decision,
-                        quantity = %report.quantity,
-                        leverage = report.leverage,
-                        leverage_source = report.leverage_source,
-                        margin_budget_usdt = report.margin_budget_usdt,
-                        margin_budget_source = report.margin_budget_source,
-                        account_total_wallet_balance = report.account_total_wallet_balance,
-                        account_available_balance = report.account_available_balance,
-                        position_side = report.position_side,
-                        dry_run = report.dry_run,
-                        maker_entry_price = report.maker_entry_price,
-                        best_bid_price = report.best_bid_price,
-                        best_ask_price = report.best_ask_price,
-                        effective_take_profit = report.actual_take_profit,
-                        effective_stop_loss = report.actual_stop_loss,
-                        effective_risk_reward_ratio = report.actual_risk_reward_ratio,
-                        horizon = execution_intent.horizon.as_deref().unwrap_or(""),
-                        risk_reward_ratio = execution_intent.risk_reward_ratio.unwrap_or_default(),
-                        swing_logic = execution_intent.swing_logic.as_deref().unwrap_or(""),
-                        reason = %intent.reason,
-                        entry_order_id = report.entry_order_id.unwrap_or_default(),
-                        take_profit_order_id = report.take_profit_order_id.unwrap_or_default(),
-                        stop_loss_order_id = report.stop_loss_order_id.unwrap_or_default(),
-                        exit_orders_deferred = report.exit_orders_deferred,
-                        "llm execution completed"
-                    );
-                    println!(
-                        "LLM_ORDER_EXECUTION ts_bucket={} trigger={} symbol={} model={} decision={} quantity={} leverage={} leverage_source={} margin_budget_usdt={} margin_budget_source={} account_total_wallet_balance={} account_available_balance={} position_side={} dry_run={} maker_entry_price={} best_bid_price={} best_ask_price={} effective_tp={} effective_sl={} effective_rr={} entry_order_id={} take_profit_order_id={} stop_loss_order_id={} exit_orders_deferred={} reason={}",
+                    append_workflow_journal_event(
+                        "workflow_management_report",
+                        &symbol,
                         bundle.raw.ts_bucket,
-                        &*trigger,
-                        bundle.raw.symbol,
-                        out.model_name,
-                        report.decision,
-                        report.quantity,
-                        report.leverage,
-                        report.leverage_source,
-                        report.margin_budget_usdt,
-                        report.margin_budget_source,
-                        report.account_total_wallet_balance,
-                        report.account_available_balance,
-                        report.position_side,
-                        report.dry_run,
-                        report.maker_entry_price,
-                        report.best_bid_price,
-                        report.best_ask_price,
-                        report.actual_take_profit,
-                        report.actual_stop_loss,
-                        report.actual_risk_reward_ratio,
-                        report.entry_order_id.map(|id| id.to_string()).unwrap_or_else(|| "-".to_string()),
-                        report.take_profit_order_id.map(|id| id.to_string()).unwrap_or_else(|| "-".to_string()),
-                        report.stop_loss_order_id.map(|id| id.to_string()).unwrap_or_else(|| "-".to_string()),
-                        report.exit_orders_deferred,
-                        intent.reason.replace('\n', " "),
+                        json!({
+                            "trigger": &*trigger,
+                            "context_key": action.context_key,
+                            "path_id": action.path_id,
+                            "action_type": action.action_type,
+                            "report": {
+                                "action": report.action,
+                                "dry_run": report.dry_run,
+                                "position_count": report.position_count,
+                                "open_order_count": report.open_order_count,
+                                "canceled_open_orders": report.canceled_open_orders,
+                                "realized_pnl_usdt": report.realized_pnl_usdt,
+                            }
+                        }),
                     );
-                    let captured_entry_context = build_entry_context_from_fallbacks(
-                        parsed_decision,
-                        out.entry_stage_trace.as_deref(),
-                        &input,
-                        intent.horizon.as_deref(),
-                        &intent.reason,
-                    );
-                    let mut event = json!({
-                        "event_type": "llm_order_execution",
-                        "event_ts": Utc::now().to_rfc3339(),
-                        "ts_bucket": bundle.raw.ts_bucket.to_rfc3339(),
-                        "trigger": &*trigger,
-                        "symbol": bundle.raw.symbol,
-                        "model_name": out.model_name.clone(),
-                        "decision": report.decision,
-                        "quantity": report.quantity,
-                        "leverage": report.leverage,
-                        "leverage_source": report.leverage_source,
-                        "margin_budget_usdt": report.margin_budget_usdt,
-                        "margin_budget_source": report.margin_budget_source,
-                        "account_total_wallet_balance": report.account_total_wallet_balance,
-                        "account_available_balance": report.account_available_balance,
-                        "position_side": report.position_side,
-                        "dry_run": report.dry_run,
-                        "maker_entry_price": report.maker_entry_price,
-                        "best_bid_price": report.best_bid_price,
-                        "best_ask_price": report.best_ask_price,
-                        "effective_take_profit": report.actual_take_profit,
-                        "effective_stop_loss": report.actual_stop_loss,
-                        "effective_risk_reward_ratio": report.actual_risk_reward_ratio,
-                        "entry_order_id": report.entry_order_id,
-                        "take_profit_order_id": report.take_profit_order_id,
-                        "stop_loss_order_id": report.stop_loss_order_id,
-                        "exit_orders_deferred": report.exit_orders_deferred,
-                        "reason": intent.reason,
-                        // entry_context fields — persisted for service-restart restoration
-                        "entry_strategy": captured_entry_context.entry_strategy.clone(),
-                        "stop_model": captured_entry_context.stop_model.clone(),
-                        "entry_mode": captured_entry_context.entry_mode.clone(),
-                        "entry_original_tp": captured_entry_context.original_tp,
-                        "entry_original_sl": captured_entry_context.original_sl,
-                        "sweep_wick_extreme": captured_entry_context.sweep_wick_extreme,
-                        "horizon": captured_entry_context.horizon.clone(),
-                        "entry_v": captured_entry_context.entry_v,
-                    });
-                    if let Some(object) = event.as_object_mut() {
-                        object.insert(
-                            "rtf_recheck_triggered".to_string(),
-                            Value::Bool(rtf_recheck_triggered),
-                        );
-                        object.insert(
-                            "rtf_recheck_vetoed".to_string(),
-                            Value::Bool(rtf_recheck_vetoed),
-                        );
-                        object.insert(
-                            "rtf_recheck_result".to_string(),
-                            Value::String(recheck_result.to_string()),
-                        );
-                        object.insert(
-                            "rtf_recheck_veto_rules_hit".to_string(),
-                            Value::Array(
-                                recheck_rules_hit
-                                    .iter()
-                                    .cloned()
-                                    .map(Value::String)
-                                    .collect(),
-                            ),
-                        );
-                        object.insert(
-                            "rtf_recheck_veto_snapshot".to_string(),
-                            recheck_snapshot_value.clone(),
-                        );
-                        object.insert(
-                            "recheck_result".to_string(),
-                            Value::String(recheck_result.to_string()),
-                        );
-                        object.insert(
-                            "recheck_veto_rules_hit".to_string(),
-                            Value::Array(
-                                recheck_rules_hit
-                                    .iter()
-                                    .cloned()
-                                    .map(Value::String)
-                                    .collect(),
-                            ),
-                        );
-                        object.insert(
-                            "recheck_veto_snapshot".to_string(),
-                            recheck_snapshot_value.clone(),
-                        );
-                        for (key, value) in stage2_rtf_rollout_fields.clone() {
-                            object.insert(key, value);
-                        }
-                    }
-                    if let Err(err) = append_journal_event(event) {
-                        warn!(error = %err, "append llm_order_execution journal failed");
-                    }
-                    send_trade_signal_notifications(
-                        telegram_operator.as_ref(),
-                        x_operator.as_ref(),
-                        &config.llm.telegram_signal_decisions,
-                        &config.llm.x_signal_decisions,
-                        &http_client,
-                        TradeSignalNotification {
-                            ts_bucket: bundle.raw.ts_bucket,
-                            trigger: &trigger,
-                            symbol: &bundle.raw.symbol,
-                            model_name: &out.model_name,
-                            decision: report.decision,
-                            entry_price: Some(report.maker_entry_price),
-                            leverage: Some(report.leverage as f64),
-                            risk_reward_ratio: Some(report.actual_risk_reward_ratio),
-                            take_profit: Some(report.actual_take_profit),
-                            stop_loss: Some(report.actual_stop_loss),
-                            reason: &intent.reason,
-                        },
-                    )
-                    .await;
-                    {
-                        let mut guard = runtime_lifecycle_state.lock().await;
-                        guard.set_last_management_reason(
-                            &bundle.raw.symbol,
-                            Some(intent.reason.clone()),
-                        );
-                    }
-                    // Capture entry context so management cycles can continue the strategy.
-                    let context_keys = execution_context_keys_for_report(
-                        &bundle.raw.symbol,
-                        &report.position_side,
-                        intent.decision,
-                    );
-                    if !context_keys.is_empty() {
-                        let mut guard = runtime_lifecycle_state.lock().await;
-                        let symbol_state = guard.symbol_state_mut(&bundle.raw.symbol);
-                        for key in context_keys {
-                            let ctx_entry = symbol_state.contexts.entry(key).or_default();
-                            ctx_entry.effective_entry_price = Some(report.maker_entry_price);
-                            ctx_entry.effective_stop_loss = Some(report.actual_stop_loss);
-                            ctx_entry.effective_take_profit = Some(report.actual_take_profit);
-                            ctx_entry.effective_leverage = Some(report.leverage);
-                            ctx_entry.entry_context = Some(captured_entry_context.clone());
+                    if !report.dry_run {
+                        match crate::workflow::management::apply_management_action(
+                            &snapshot,
+                            action,
+                            Utc::now(),
+                        ) {
+                            Some(next_snapshot) => {
+                                crate::workflow::persistence::save_entry_snapshot(
+                                    &state_dir,
+                                    &next_snapshot,
+                                )?;
+                                entry_snapshots
+                                    .insert(next_snapshot.context_key.clone(), next_snapshot);
+                            }
+                            None => {
+                                crate::workflow::persistence::delete_entry_snapshot(
+                                    &state_dir,
+                                    &symbol,
+                                    &action.context_key,
+                                )?;
+                                entry_snapshots.remove(&action.context_key);
+                            }
                         }
                     }
                 }
                 Err(err) => {
-                    execution_done = true;
-                    error!(
-                        model_name = %out.model_name,
-                        symbol = %bundle.raw.symbol,
-                        reason = %intent.reason,
-                        error = %err,
-                        "llm execution failed"
-                    );
-                    println!(
-                        "LLM_ORDER_EXECUTION_ERROR ts_bucket={} trigger={} symbol={} model={} decision={} reason={} error={}",
+                    append_workflow_journal_event(
+                        "workflow_management_error",
+                        &symbol,
                         bundle.raw.ts_bucket,
-                        &*trigger,
-                        bundle.raw.symbol,
-                        out.model_name,
-                        intent.decision.as_str(),
-                        intent.reason.replace('\n', " "),
-                        err.to_string().replace('\n', " "),
+                        json!({
+                            "trigger": &*trigger,
+                            "context_key": action.context_key,
+                            "path_id": action.path_id,
+                            "action_type": action.action_type,
+                            "error": format!("{err:#}"),
+                        }),
                     );
-                    let event = json!({
-                        "event_type": "llm_order_execution_error",
-                        "event_ts": Utc::now().to_rfc3339(),
-                        "ts_bucket": bundle.raw.ts_bucket.to_rfc3339(),
-                        "trigger": &*trigger,
-                        "symbol": bundle.raw.symbol,
-                        "model_name": out.model_name.clone(),
-                        "decision": intent.decision.as_str(),
-                        "reason": intent.reason,
-                        "error": err.to_string(),
-                    });
-                    if let Err(err) = append_journal_event(event) {
-                        warn!(error = %err, "append llm_order_execution_error journal failed");
-                    }
-                    let notification_fields = preview_trade_signal_fields(
-                        &http_client,
-                        &config,
-                        &bundle.raw.symbol,
-                        &execution_intent,
-                    )
-                    .await;
-                    send_trade_signal_notifications(
-                        telegram_operator.as_ref(),
-                        x_operator.as_ref(),
-                        &config.llm.telegram_signal_decisions,
-                        &config.llm.x_signal_decisions,
-                        &http_client,
-                        TradeSignalNotification {
-                            ts_bucket: bundle.raw.ts_bucket,
-                            trigger: &trigger,
-                            symbol: &bundle.raw.symbol,
-                            model_name: &out.model_name,
-                            decision: intent.decision.as_str(),
-                            entry_price: notification_fields.entry_price,
-                            leverage: notification_fields.leverage,
-                            risk_reward_ratio: notification_fields.risk_reward_ratio,
-                            take_profit: notification_fields.take_profit,
-                            stop_loss: notification_fields.stop_loss,
-                            reason: &intent.reason,
-                        },
-                    )
-                    .await;
                 }
+            },
+            Err(err) => {
+                append_workflow_journal_event(
+                    "workflow_management_error",
+                    &symbol,
+                    bundle.raw.ts_bucket,
+                    json!({
+                        "trigger": &*trigger,
+                        "context_key": action.context_key,
+                        "path_id": action.path_id,
+                        "action_type": action.action_type,
+                        "error": format!("{err:#}"),
+                        "phase": "intent_adapter",
+                    }),
+                );
             }
         }
     }
+
+    let telegram_operator = TelegramOperator::from_config(&config.api.telegram);
+    let x_operator = XOperator::from_config(&config.api.x);
+    let signal_model_name =
+        selected_stage2_model_name.unwrap_or_else(|| "workflow_stage2".to_string());
+    let trade_signals = build_workflow_trade_signal_notifications(
+        bundle.raw.ts_bucket,
+        trigger.as_ref(),
+        &symbol,
+        &signal_model_name,
+        &stage2_decision,
+        &trading_state,
+        &signal_entry_snapshots,
+        execution_signal_report.as_ref(),
+    );
+    for signal in &trade_signals {
+        send_trade_signal_notifications(
+            telegram_operator.as_ref(),
+            x_operator.as_ref(),
+            &config.llm.telegram_signal_decisions,
+            &config.llm.x_signal_decisions,
+            &http_client,
+            signal,
+        )
+        .await;
+    }
+
+    Ok(())
+}
+
+fn build_workflow_trade_signal_notifications(
+    ts_bucket: DateTime<Utc>,
+    trigger: &str,
+    symbol: &str,
+    model_name: &str,
+    stage2_decision: &crate::workflow::schema::Stage2Decision,
+    trading_state: &TradingStateSnapshot,
+    entry_snapshots: &HashMap<String, crate::workflow::schema::EntrySnapshot>,
+    execution_report: Option<&ExecutionReport>,
+) -> Vec<TradeSignalNotification> {
+    let mut signals = Vec::new();
+
+    if let Some(intent) = stage2_decision.execution_intent.as_ref() {
+        signals.push(build_execution_trade_signal(
+            ts_bucket,
+            trigger,
+            symbol,
+            model_name,
+            stage2_decision,
+            trading_state,
+            intent,
+            execution_report,
+        ));
+    }
+
+    for action in &stage2_decision.management_actions {
+        signals.push(build_management_trade_signal(
+            ts_bucket,
+            trigger,
+            symbol,
+            model_name,
+            stage2_decision,
+            trading_state,
+            entry_snapshots,
+            action,
+        ));
+    }
+
+    if signals.is_empty()
+        && stage2_decision.decision == "WAIT"
+        && stage2_decision.request_stage1_reevaluation.is_none()
+    {
+        signals.push(TradeSignalNotification {
+            ts_bucket,
+            trigger: trigger.to_string(),
+            symbol: symbol.to_string(),
+            model_name: model_name.to_string(),
+            decision: "NO_TRADE".to_string(),
+            context_key: None,
+            path_id: None,
+            entry_price: None,
+            leverage: None,
+            risk_reward_ratio: None,
+            take_profit_1: None,
+            take_profit_2: None,
+            stop_loss: None,
+            reason: stage2_decision.reason.clone(),
+        });
+    }
+
+    signals
+}
+
+fn build_execution_trade_signal(
+    ts_bucket: DateTime<Utc>,
+    trigger: &str,
+    symbol: &str,
+    model_name: &str,
+    stage2_decision: &crate::workflow::schema::Stage2Decision,
+    trading_state: &TradingStateSnapshot,
+    intent: &crate::workflow::schema::ExecutionIntent,
+    execution_report: Option<&ExecutionReport>,
+) -> TradeSignalNotification {
+    let decision = if has_active_position_for_side(trading_state, &intent.side) {
+        "ADD".to_string()
+    } else {
+        intent.side.clone()
+    };
+    let entry_price = execution_report
+        .map(|report| report.maker_entry_price)
+        .or(intent.trigger_price)
+        .or(Some(intent.entry_zone.midpoint()));
+    let take_profit_1 = execution_report
+        .map(|report| report.actual_take_profit)
+        .or(Some(intent.take_profit_1));
+    let take_profit_2 = Some(intent.take_profit_2);
+    let stop_loss = execution_report
+        .map(|report| report.actual_stop_loss)
+        .or(Some(intent.stop_loss));
+    let leverage = execution_report.map(|report| report.leverage as f64);
+    let risk_reward_ratio = execution_report
+        .map(|report| report.actual_risk_reward_ratio)
+        .or_else(|| compute_signal_rr(entry_price, stop_loss, take_profit_1));
+
+    TradeSignalNotification {
+        ts_bucket,
+        trigger: trigger.to_string(),
+        symbol: symbol.to_string(),
+        model_name: model_name.to_string(),
+        decision,
+        context_key: Some(intent.entry_snapshot.context_key.clone()),
+        path_id: Some(intent.path_id.clone()),
+        entry_price,
+        leverage,
+        risk_reward_ratio,
+        take_profit_1,
+        take_profit_2,
+        stop_loss,
+        reason: workflow_signal_reason(&stage2_decision.reason, intent.reason.as_deref()),
+    }
+}
+
+fn build_management_trade_signal(
+    ts_bucket: DateTime<Utc>,
+    trigger: &str,
+    symbol: &str,
+    model_name: &str,
+    stage2_decision: &crate::workflow::schema::Stage2Decision,
+    trading_state: &TradingStateSnapshot,
+    entry_snapshots: &HashMap<String, crate::workflow::schema::EntrySnapshot>,
+    action: &crate::workflow::schema::ManagementAction,
+) -> TradeSignalNotification {
+    let decision = match action.action_type.as_str() {
+        "HOLD" => "HOLD",
+        "REDUCE_POSITION" => "REDUCE",
+        "FLATTEN_POSITION" => "CLOSE",
+        "MOVE_STOP" | "UPDATE_TAKE_PROFIT" => "MODIFY_TPSL",
+        other => other,
+    }
+    .to_string();
+    let snapshot = entry_snapshots.get(&action.context_key);
+    let side = snapshot
+        .map(|item| item.side.as_str())
+        .or_else(|| context_key_side(&action.context_key))
+        .unwrap_or("LONG");
+    let active_position = find_active_position_for_side(trading_state, side);
+    let entry_price = active_position.map(|position| position.entry_price);
+    let leverage = active_position.map(|position| position.leverage as f64);
+    let take_profit_1 = action
+        .take_profit_1
+        .or_else(|| snapshot.map(|item| item.take_profit_1));
+    let take_profit_2 = action
+        .take_profit_2
+        .or_else(|| snapshot.map(|item| item.take_profit_2));
+    let stop_loss = action
+        .new_stop_loss
+        .or_else(|| snapshot.map(|item| item.stop_loss));
+    let risk_reward_ratio = compute_signal_rr(entry_price, stop_loss, take_profit_1);
+
+    TradeSignalNotification {
+        ts_bucket,
+        trigger: trigger.to_string(),
+        symbol: symbol.to_string(),
+        model_name: model_name.to_string(),
+        decision,
+        context_key: Some(action.context_key.clone()),
+        path_id: Some(action.path_id.clone()),
+        entry_price,
+        leverage,
+        risk_reward_ratio,
+        take_profit_1,
+        take_profit_2,
+        stop_loss,
+        reason: workflow_signal_reason(&stage2_decision.reason, action.reason.as_deref()),
+    }
+}
+
+fn workflow_signal_reason(primary: &str, secondary: Option<&str>) -> String {
+    let primary = primary.trim();
+    let secondary = secondary.unwrap_or("").trim();
+    if secondary.is_empty() {
+        return primary.to_string();
+    }
+    if primary.eq_ignore_ascii_case(secondary) {
+        return primary.to_string();
+    }
+    format!("{primary} | {secondary}")
+}
+
+fn compute_signal_rr(
+    entry_price: Option<f64>,
+    stop_loss: Option<f64>,
+    take_profit_1: Option<f64>,
+) -> Option<f64> {
+    let entry_price = entry_price?;
+    let stop_loss = stop_loss?;
+    let take_profit_1 = take_profit_1?;
+    let risk = (entry_price - stop_loss).abs();
+    let reward = (take_profit_1 - entry_price).abs();
+    if risk <= f64::EPSILON {
+        None
+    } else {
+        Some(reward / risk)
+    }
+}
+
+fn find_entry_snapshot_for_side<'a>(
+    entry_snapshots: &'a HashMap<String, crate::workflow::schema::EntrySnapshot>,
+    symbol: &str,
+    side: &str,
+) -> Option<&'a crate::workflow::schema::EntrySnapshot> {
+    entry_snapshots.values().find(|snapshot| {
+        snapshot.symbol.eq_ignore_ascii_case(symbol) && snapshot.side.eq_ignore_ascii_case(side)
+    })
+}
+
+fn build_workflow_management_snapshot(
+    trading_state: &TradingStateSnapshot,
+    symbol: &str,
+    entry_snapshots: &HashMap<String, crate::workflow::schema::EntrySnapshot>,
+) -> Option<ManagementSnapshotForLlm> {
+    if !trading_state.has_active_positions && !trading_state.has_open_orders {
+        return None;
+    }
+
+    let positions = trading_state
+        .active_positions
+        .iter()
+        .map(|position| {
+            let side = active_position_side(position).unwrap_or("LONG");
+            let snapshot = find_entry_snapshot_for_side(entry_snapshots, symbol, side);
+            PositionSummaryForLlm {
+                position_side: position.position_side.clone(),
+                direction: side.to_string(),
+                quantity: position.position_amt.abs(),
+                leverage: position.leverage,
+                entry_price: position.entry_price,
+                mark_price: position.mark_price,
+                unrealized_pnl: position.unrealized_pnl,
+                pnl_by_latest_price: position.unrealized_pnl,
+                current_tp_price: snapshot.map(|item| item.take_profit_1),
+                current_sl_price: snapshot.map(|item| item.stop_loss),
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let position_context = trading_state.active_positions.first().map(|position| {
+        let side = active_position_side(position).unwrap_or("LONG");
+        let snapshot = find_entry_snapshot_for_side(entry_snapshots, symbol, side);
+        PositionContextForLlm {
+            original_qty: position.position_amt.abs(),
+            current_qty: position.position_amt.abs(),
+            current_pct_of_original: 1.0,
+            effective_leverage: Some(position.leverage),
+            effective_entry_price: Some(position.entry_price),
+            effective_take_profit: snapshot.map(|item| item.take_profit_1),
+            effective_stop_loss: snapshot.map(|item| item.stop_loss),
+            reduction_history: Vec::new(),
+            times_reduced_at_current_level: 0,
+            last_management_action: None,
+            last_management_reason: None,
+            entry_context: None,
+        }
+    });
+
+    Some(ManagementSnapshotForLlm {
+        context_state: if trading_state.has_active_positions {
+            "active_positions".to_string()
+        } else {
+            "open_orders".to_string()
+        },
+        has_active_positions: trading_state.has_active_positions,
+        has_open_orders: trading_state.has_open_orders,
+        active_position_count: trading_state.active_positions.len(),
+        open_order_count: trading_state.open_orders.len(),
+        positions,
+        pending_order: None,
+        last_management_reason: None,
+        position_context,
+    })
+}
+
+fn has_active_position_for_side(trading_state: &TradingStateSnapshot, side: &str) -> bool {
+    find_active_position_for_side(trading_state, side).is_some()
+}
+
+fn find_active_position_for_side<'a>(
+    trading_state: &'a TradingStateSnapshot,
+    side: &str,
+) -> Option<&'a ActivePositionSnapshot> {
+    trading_state.active_positions.iter().find(|position| {
+        active_position_side(position).is_some_and(|value| value.eq_ignore_ascii_case(side))
+    })
+}
+
+fn active_position_side(position: &ActivePositionSnapshot) -> Option<&'static str> {
+    if position.position_side.eq_ignore_ascii_case("LONG") {
+        Some("LONG")
+    } else if position.position_side.eq_ignore_ascii_case("SHORT") {
+        Some("SHORT")
+    } else if position.position_amt > 0.0 {
+        Some("LONG")
+    } else if position.position_amt < 0.0 {
+        Some("SHORT")
+    } else {
+        None
+    }
+}
+
+fn context_key_side(context_key: &str) -> Option<&str> {
+    let mut parts = context_key.split(':');
+    let _symbol = parts.next()?;
+    parts.next()
+}
+
+async fn send_trade_signal_notifications(
+    telegram_operator: Option<&TelegramOperator>,
+    x_operator: Option<&XOperator>,
+    telegram_allowed_decisions: &[String],
+    x_allowed_decisions: &[String],
+    http_client: &Client,
+    signal: &TradeSignalNotification,
+) {
+    let telegram = send_telegram_signal(
+        telegram_operator,
+        telegram_allowed_decisions,
+        http_client,
+        signal,
+    );
+    let x = send_x_signal(x_operator, x_allowed_decisions, http_client, signal);
+    let _ = tokio::join!(telegram, x);
+}
+
+async fn send_telegram_signal(
+    telegram_operator: Option<&TelegramOperator>,
+    allowed_decisions: &[String],
+    http_client: &Client,
+    signal: &TradeSignalNotification,
+) {
+    if !decision_is_signal_allowed(&signal.decision, allowed_decisions) {
+        debug!(
+            symbol = %signal.symbol,
+            decision = %signal.decision,
+            allowed_decisions = ?allowed_decisions,
+            "telegram signal skipped: decision is not enabled by llm.telegram_signal_decisions"
+        );
+        return;
+    }
+    let Some(operator) = telegram_operator else {
+        debug!(
+            symbol = %signal.symbol,
+            decision = %signal.decision,
+            "telegram signal skipped: telegram not configured"
+        );
+        return;
+    };
+    match operator.send_trade_signal(http_client, signal).await {
+        Ok(()) => {
+            println!(
+                "LLM_TELEGRAM_SIGNAL ts_bucket={} trigger={} symbol={} model={} decision={} rr={} tp1={} tp2={} sl={}",
+                signal.ts_bucket,
+                signal.trigger,
+                signal.symbol,
+                signal.model_name,
+                signal.decision,
+                signal
+                    .risk_reward_ratio
+                    .map(|value| format!("{value:.2}"))
+                    .unwrap_or_else(|| "-".to_string()),
+                signal
+                    .take_profit_1
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+                signal
+                    .take_profit_2
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+                signal
+                    .stop_loss
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+            );
+        }
+        Err(err) => {
+            warn!(
+                symbol = %signal.symbol,
+                model_name = %signal.model_name,
+                decision = %signal.decision,
+                error = %err,
+                "send telegram trade signal failed"
+            );
+            println!(
+                "LLM_TELEGRAM_SIGNAL_ERROR ts_bucket={} trigger={} symbol={} model={} decision={} error={}",
+                signal.ts_bucket,
+                signal.trigger,
+                signal.symbol,
+                signal.model_name,
+                signal.decision,
+                err.to_string().replace('\n', " "),
+            );
+        }
+    }
+}
+
+async fn send_x_signal(
+    x_operator: Option<&XOperator>,
+    allowed_decisions: &[String],
+    http_client: &Client,
+    signal: &TradeSignalNotification,
+) {
+    if !decision_is_signal_allowed(&signal.decision, allowed_decisions) {
+        debug!(
+            symbol = %signal.symbol,
+            decision = %signal.decision,
+            allowed_decisions = ?allowed_decisions,
+            "x signal skipped: decision is not enabled by llm.x_signal_decisions"
+        );
+        return;
+    }
+    let Some(operator) = x_operator else {
+        debug!(
+            symbol = %signal.symbol,
+            decision = %signal.decision,
+            "x signal skipped: x not configured"
+        );
+        return;
+    };
+    match operator.send_trade_signal(http_client, signal).await {
+        Ok(()) => {
+            println!(
+                "LLM_X_SIGNAL ts_bucket={} trigger={} symbol={} model={} decision={} rr={} tp1={} tp2={} sl={}",
+                signal.ts_bucket,
+                signal.trigger,
+                signal.symbol,
+                signal.model_name,
+                signal.decision,
+                signal
+                    .risk_reward_ratio
+                    .map(|value| format!("{value:.2}"))
+                    .unwrap_or_else(|| "-".to_string()),
+                signal
+                    .take_profit_1
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+                signal
+                    .take_profit_2
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+                signal
+                    .stop_loss
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+            );
+        }
+        Err(err) => {
+            warn!(
+                symbol = %signal.symbol,
+                model_name = %signal.model_name,
+                decision = %signal.decision,
+                error = %err,
+                "send x trade signal failed"
+            );
+            println!(
+                "LLM_X_SIGNAL_ERROR ts_bucket={} trigger={} symbol={} model={} decision={} error={}",
+                signal.ts_bucket,
+                signal.trigger,
+                signal.symbol,
+                signal.model_name,
+                signal.decision,
+                err.to_string().replace('\n', " "),
+            );
+        }
+    }
+}
+
+fn decision_is_signal_allowed(decision: &str, allowed_decisions: &[String]) -> bool {
+    allowed_decisions
+        .iter()
+        .any(|value| value.trim().eq_ignore_ascii_case(decision.trim()))
 }
 
 async fn ensure_temp_indicator_dir() -> Result<()> {
@@ -6110,20 +2468,23 @@ fn render_pretty_json_value(value: &Value) -> String {
     serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
 }
 
-fn render_pretty_json_text(text: &str) -> String {
-    serde_json::from_str::<Value>(text)
-        .map(|value| render_pretty_json_value(&value))
-        .unwrap_or_else(|_| text.to_string())
+fn retention_minutes_i64(retention_minutes: u64) -> i64 {
+    retention_minutes.min(i64::MAX as u64) as i64
 }
 
-fn pnl_outcome_label(pnl: f64) -> &'static str {
-    if pnl > 0.0 {
-        "profit"
-    } else if pnl < 0.0 {
-        "loss"
-    } else {
-        "flat"
+fn minute_bundle_path(bundle: &MinuteBundleEnvelope) -> PathBuf {
+    let bucket_ts = bundle.ts_bucket.format("%Y%m%dT%H%M%SZ");
+    let symbol = sanitize_filename_component(&bundle.symbol);
+    Path::new(TEMP_INDICATOR_DIR).join(format!("{bucket_ts}_{symbol}.json"))
+}
+
+fn write_pretty_json_file(path: &Path, value: &Value) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
+    let payload = serde_json::to_vec_pretty(value).context("serialize pretty json")?;
+    fs::write(path, payload).with_context(|| format!("write {}", path.display()))?;
+    Ok(())
 }
 
 async fn persist_bundle_to_disk(
@@ -6155,14 +2516,6 @@ async fn persist_bundle_to_disk(
 }
 
 fn prune_expired_temp_indicator_files(
-    dir: &Path,
-    current_ts_bucket: DateTime<Utc>,
-    retention_minutes: i64,
-) -> Result<usize> {
-    prune_expired_timestamped_json_files(dir, current_ts_bucket, retention_minutes)
-}
-
-fn prune_expired_temp_model_input_files(
     dir: &Path,
     current_ts_bucket: DateTime<Utc>,
     retention_minutes: i64,
@@ -6224,514 +2577,8 @@ fn temp_indicator_ts_bucket_from_path(path: &Path) -> Option<DateTime<Utc>> {
     Some(DateTime::from_naive_utc_and_offset(naive, Utc))
 }
 
-fn temp_indicator_symbol_from_path(path: &Path) -> Option<String> {
-    let file_name = path.file_name()?.to_str()?;
-    let mut parts = file_name.trim_end_matches(".json").splitn(2, '_');
-    let _ts = parts.next()?;
-    parts.next().map(ToString::to_string)
-}
-
-async fn load_latest_temp_indicator_bundle(symbol: &str) -> Result<LatestBundle> {
-    ensure_temp_indicator_dir().await?;
-
-    let expected_symbol = sanitize_filename_component(symbol);
-    let mut latest_path: Option<PathBuf> = None;
-    let mut latest_ts_bucket: Option<DateTime<Utc>> = None;
-
-    for entry in fs::read_dir(TEMP_INDICATOR_DIR)
-        .with_context(|| format!("read temp indicator dir {}", TEMP_INDICATOR_DIR))?
-    {
-        let entry = entry?;
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
-            continue;
-        }
-        let Some(file_symbol) = temp_indicator_symbol_from_path(&path) else {
-            continue;
-        };
-        if file_symbol != expected_symbol {
-            continue;
-        }
-        let Some(file_ts_bucket) = temp_indicator_ts_bucket_from_path(&path) else {
-            continue;
-        };
-        if latest_ts_bucket
-            .map(|current| file_ts_bucket > current)
-            .unwrap_or(true)
-        {
-            latest_ts_bucket = Some(file_ts_bucket);
-            latest_path = Some(path);
-        }
-    }
-
-    let path = latest_path.ok_or_else(|| {
-        anyhow!(
-            "latest temp_indicator bundle not found for symbol {} in {}",
-            symbol,
-            TEMP_INDICATOR_DIR
-        )
-    })?;
-    let raw_text = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-    let raw: MinuteBundleEnvelope =
-        serde_json::from_str(&raw_text).with_context(|| format!("parse {}", path.display()))?;
-
-    Ok(LatestBundle {
-        indicators: raw.indicators.clone(),
-        raw,
-        missing_indicator_codes: Vec::new(),
-        received_at: Utc::now(),
-    })
-}
-
-async fn load_entry_freshness_recheck_snapshot(
-    symbol: &str,
-    base_input: &ModelInvocationInput,
-    stage1_scan_ts_bucket: DateTime<Utc>,
-    stage2_core_ts_bucket: DateTime<Utc>,
-) -> Result<Option<EntryFreshnessRecheckSnapshot>> {
-    let latest_bundle = load_latest_temp_indicator_bundle(symbol).await?;
-    if latest_bundle.raw.ts_bucket <= stage2_core_ts_bucket {
-        return Ok(None);
-    }
-
-    let bundle_update_minutes = latest_bundle
-        .raw
-        .ts_bucket
-        .signed_duration_since(stage2_core_ts_bucket)
-        .num_minutes();
-    if bundle_update_minutes < ENTRY_RECHECK_MIN_BUNDLE_UPDATE_MINUTES {
-        return Ok(None);
-    }
-
-    Ok(Some(build_entry_freshness_recheck_snapshot(
-        &latest_bundle,
-        base_input,
-        stage1_scan_ts_bucket,
-        bundle_update_minutes,
-    )?))
-}
-
-fn build_entry_freshness_recheck_snapshot(
-    latest_bundle: &LatestBundle,
-    base_input: &ModelInvocationInput,
-    stage1_scan_ts_bucket: DateTime<Utc>,
-    bundle_update_minutes: i64,
-) -> Result<EntryFreshnessRecheckSnapshot> {
-    let latest_input = model_input_from_bundle(base_input, latest_bundle);
-    let realtime_flow_context =
-        build_runtime_realtime_flow_context_for_input(&latest_input, stage1_scan_ts_bucket)
-            .ok_or_else(|| anyhow!("build runtime realtime_flow_context for recheck snapshot"))?;
-
-    Ok(EntryFreshnessRecheckSnapshot {
-        latest_bundle_ts_bucket: latest_bundle.raw.ts_bucket,
-        latest_bundle_age_secs: Utc::now()
-            .signed_duration_since(latest_bundle.raw.ts_bucket)
-            .num_seconds()
-            .max(0),
-        bundle_update_minutes,
-        realtime_flow_context,
-    })
-}
-
-fn sum_partial_window_delta_since_scan(
-    recent_series: Option<&Vec<Value>>,
-    stage1_scan_ts_bucket: DateTime<Utc>,
-    current_ts_bucket: DateTime<Utc>,
-) -> f64 {
-    recent_series
-        .into_iter()
-        .flat_map(|series| series.iter())
-        .filter_map(Value::as_object)
-        .filter_map(|minute| {
-            let minute_ts = minute
-                .get("ts")
-                .and_then(Value::as_str)
-                .and_then(parse_rfc3339_utc)?;
-            if minute_ts <= stage1_scan_ts_bucket || minute_ts > current_ts_bucket {
-                return None;
-            }
-            minute.get("delta_fut").and_then(Value::as_f64)
-        })
-        .sum()
-}
-
-fn evaluate_entry_freshness_recheck(
-    decision: &TradeDecision,
-    snapshot: &EntryFreshnessRecheckSnapshot,
-) -> EntryFreshnessRecheckEvaluation {
-    let mut rules_hit = Vec::new();
-    let regime_15m = snapshot
-        .realtime_flow_context
-        .pointer("/cvd_partial_windows/15m/regime")
-        .and_then(Value::as_str);
-    let since_stage1_delta_fut_sum = snapshot
-        .realtime_flow_context
-        .pointer("/since_stage1_increment/delta_fut_sum")
-        .and_then(Value::as_f64)
-        .unwrap_or_default();
-    let orderbook_ofi_norm_fut = snapshot
-        .realtime_flow_context
-        .pointer("/live_refs/orderbook_ofi_norm_fut")
-        .and_then(Value::as_f64);
-    let orderbook_exec_confirm_fut = snapshot
-        .realtime_flow_context
-        .pointer("/live_refs/orderbook_exec_confirm_fut")
-        .and_then(Value::as_bool);
-    let orderbook_spot_confirm = snapshot
-        .realtime_flow_context
-        .pointer("/live_refs/orderbook_spot_confirm")
-        .and_then(Value::as_bool);
-    match decision {
-        TradeDecision::Long => {
-            if regime_15m == Some("reversal_to_selling") {
-                rules_hit.push("cvd_15m_reversal_to_selling");
-            }
-            if since_stage1_delta_fut_sum < 0.0 {
-                rules_hit.push("since_stage1_delta_fut_negative");
-            }
-            if orderbook_ofi_norm_fut
-                .map(|value| value < 0.0)
-                .unwrap_or(false)
-            {
-                rules_hit.push("orderbook_ofi_negative");
-            }
-            if orderbook_exec_confirm_fut == Some(false) && orderbook_spot_confirm == Some(false) {
-                rules_hit.push("execution_and_spot_unconfirmed");
-            }
-        }
-        TradeDecision::Short => {
-            if regime_15m == Some("reversal_to_buying") {
-                rules_hit.push("cvd_15m_reversal_to_buying");
-            }
-            if since_stage1_delta_fut_sum > 0.0 {
-                rules_hit.push("since_stage1_delta_fut_positive");
-            }
-            if orderbook_ofi_norm_fut
-                .map(|value| value > 0.0)
-                .unwrap_or(false)
-            {
-                rules_hit.push("orderbook_ofi_positive");
-            }
-            if orderbook_exec_confirm_fut == Some(false) && orderbook_spot_confirm == Some(false) {
-                rules_hit.push("execution_and_spot_unconfirmed");
-            }
-        }
-        _ => {}
-    }
-
-    EntryFreshnessRecheckEvaluation {
-        result: if rules_hit.len() >= ENTRY_RECHECK_VETO_THRESHOLD {
-            "veto"
-        } else {
-            "confirm"
-        },
-        rules_hit,
-    }
-}
-
-fn entry_freshness_recheck_snapshot_json(snapshot: &EntryFreshnessRecheckSnapshot) -> Value {
-    json!({
-        "latest_bundle_ts_bucket": snapshot.latest_bundle_ts_bucket.to_rfc3339(),
-        "latest_bundle_age_secs": snapshot.latest_bundle_age_secs,
-        "bundle_update_minutes": snapshot.bundle_update_minutes,
-        "realtime_flow_context": snapshot.realtime_flow_context.clone(),
-    })
-}
-
-fn model_input_from_bundle(
-    base_input: &ModelInvocationInput,
-    bundle: &LatestBundle,
-) -> ModelInvocationInput {
-    ModelInvocationInput {
-        symbol: bundle.raw.symbol.clone(),
-        ts_bucket: bundle.raw.ts_bucket,
-        window_code: bundle.raw.window_code.clone(),
-        indicator_count: bundle.raw.indicator_count,
-        source_routing_key: bundle.raw.routing_key.clone(),
-        source_published_at: bundle.raw.published_at,
-        received_at: bundle.received_at,
-        indicators: bundle.indicators.clone(),
-        missing_indicator_codes: bundle.missing_indicator_codes.clone(),
-        management_mode: base_input.management_mode,
-        pending_order_mode: base_input.pending_order_mode,
-        trading_state: base_input.trading_state.clone(),
-        management_snapshot: base_input.management_snapshot.clone(),
-    }
-}
-
-fn realtime_flow_context_settings(input: &ModelInvocationInput) -> (bool, usize) {
-    if input.management_mode {
-        (false, 2)
-    } else {
-        (true, 6)
-    }
-}
-
-fn build_runtime_realtime_flow_context_for_input(
-    input: &ModelInvocationInput,
-    stage1_scan_ts_bucket: DateTime<Utc>,
-) -> Option<Value> {
-    let filtered_root = CoreFilter::build_value(input).ok()?;
-    let filtered_indicators = filtered_root.get("indicators").and_then(Value::as_object)?;
-    let raw_indicators = input.indicators.as_object()?;
-    let (include_15m_series, max_new_events) = realtime_flow_context_settings(input);
-
-    crate::llm::filter::core_shared::build_realtime_flow_context(
-        raw_indicators,
-        filtered_indicators,
-        Some(input.ts_bucket),
-        Some(stage1_scan_ts_bucket),
-        include_15m_series,
-        max_new_events,
-    )
-}
-
-fn build_rtf_rollout_fields(realtime_flow_context: Option<&Value>) -> Map<String, Value> {
-    let mut fields = Map::new();
-    fields.insert(
-        "realtime_flow_context_present".to_string(),
-        Value::Bool(realtime_flow_context.is_some()),
-    );
-    fields.insert(
-        "rtf_stage1_to_stage2_gap_minutes".to_string(),
-        realtime_flow_context
-            .and_then(|ctx| ctx.pointer("/freshness/stage1_to_stage2_gap_minutes"))
-            .cloned()
-            .unwrap_or(Value::Null),
-    );
-    fields.insert(
-        "rtf_15m_regime".to_string(),
-        realtime_flow_context
-            .and_then(|ctx| ctx.pointer("/cvd_partial_windows/15m/regime"))
-            .cloned()
-            .unwrap_or(Value::Null),
-    );
-    fields.insert(
-        "rtf_15m_direction_consistent".to_string(),
-        realtime_flow_context
-            .and_then(|ctx| {
-                ctx.pointer("/cvd_partial_windows/15m/vs_last_closed_bar/direction_consistent")
-            })
-            .cloned()
-            .unwrap_or(Value::Null),
-    );
-    fields.insert(
-        "rtf_since_stage1_delta_fut_sum".to_string(),
-        realtime_flow_context
-            .and_then(|ctx| ctx.pointer("/since_stage1_increment/delta_fut_sum"))
-            .cloned()
-            .unwrap_or(Value::Null),
-    );
-    let new_events = realtime_flow_context
-        .and_then(|ctx| ctx.pointer("/since_stage1_increment/new_events_since_scan"))
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    fields.insert(
-        "rtf_new_events_since_scan_count".to_string(),
-        json!(new_events.len()),
-    );
-    fields.insert(
-        "rtf_new_events_since_scan_types".to_string(),
-        Value::Array(
-            new_events
-                .iter()
-                .filter_map(|event| event.get("type").and_then(Value::as_str))
-                .map(|event_type| Value::String(event_type.to_string()))
-                .collect(),
-        ),
-    );
-    fields
-}
-
-#[cfg(test)]
-async fn persist_model_input_to_disk(
-    bundle: &MinuteBundleEnvelope,
-    _trigger: &str,
-    management_mode: bool,
-    pending_order_mode: bool,
-    input: &ModelInvocationInput,
-    retention_minutes: u64,
-) -> Result<PersistedModelInputFiles> {
-    ensure_temp_model_input_dir().await?;
-
-    let scan_value = ScanFilter::build_value(input).context("build scan model input")?;
-    let core_value = CoreFilter::build_value(input).context("build core model input")?;
-    let core_stage = CoreFilter::stage_label_for_flags(management_mode, pending_order_mode);
-    let scan_path =
-        persist_filtered_model_input_value_to_disk(bundle, "scan", &scan_value, retention_minutes)
-            .await?;
-    let core_path = persist_filtered_model_input_value_to_disk(
-        bundle,
-        core_stage,
-        &core_value,
-        retention_minutes,
-    )
-    .await?;
-
-    Ok(PersistedModelInputFiles {
-        scan: scan_path,
-        core: core_path,
-    })
-}
-
-async fn persist_filtered_model_input_value_to_disk(
-    bundle: &MinuteBundleEnvelope,
-    stage: &str,
-    value: &Value,
-    retention_minutes: u64,
-) -> Result<PathBuf> {
-    ensure_temp_model_input_dir().await?;
-
-    let path = llm_filtered_model_input_path(bundle, stage);
-    write_pretty_json_file(&path, value).with_context(|| format!("write {}", path.display()))?;
-    let removed = prune_expired_temp_model_input_files(
-        Path::new(TEMP_MODEL_INPUT_DIR),
-        bundle.ts_bucket,
-        retention_minutes_i64(retention_minutes),
-    )
-    .context("prune expired temp_model_input cache")?;
-    if removed > 0 {
-        debug!(
-            ts_bucket = %bundle.ts_bucket,
-            removed,
-            retention_minutes = retention_minutes,
-            "pruned expired temp_model_input cache"
-        );
-    }
-    Ok(path)
-}
-
-async fn persist_scan_input_to_disk(
-    bundle: &MinuteBundleEnvelope,
-    input: &ModelInvocationInput,
-    retention_minutes: u64,
-) -> Result<PathBuf> {
-    let scan_value = ScanFilter::build_value(input).context("build scan model input")?;
-    persist_filtered_model_input_value_to_disk(bundle, "scan", &scan_value, retention_minutes).await
-}
-
-async fn persist_core_input_to_disk(
-    bundle: &MinuteBundleEnvelope,
-    management_mode: bool,
-    pending_order_mode: bool,
-    input: &ModelInvocationInput,
-    retention_minutes: u64,
-) -> Result<PathBuf> {
-    let core_value = CoreFilter::build_value(input).context("build core model input")?;
-    let stage = CoreFilter::stage_label_for_flags(management_mode, pending_order_mode);
-    persist_filtered_model_input_value_to_disk(bundle, stage, &core_value, retention_minutes).await
-}
-
-async fn persist_entry_stage_prompt_inputs_to_disk(
-    bundle: &MinuteBundleEnvelope,
-    trigger: &str,
-    management_mode: bool,
-    pending_order_mode: bool,
-    model_name: &str,
-    provider: &str,
-    model_id: &str,
-    captures: &[EntryStagePromptInputCapture],
-    retention_minutes: u64,
-) -> Result<Vec<(String, PathBuf)>> {
-    ensure_temp_model_output_dir().await?;
-
-    let mut files = Vec::with_capacity(captures.len());
-    for capture in captures {
-        let path = llm_stage_prompt_output_path(
-            bundle,
-            trigger,
-            management_mode,
-            pending_order_mode,
-            provider,
-            model_name,
-            &capture.stage,
-        );
-        let value = json!({
-            "ts_bucket": bundle.ts_bucket,
-            "symbol": &bundle.symbol,
-            "trigger": trigger,
-            "management_mode": management_mode,
-            "pending_order_mode": pending_order_mode,
-            "model_name": model_name,
-            "provider": provider,
-            "model_id": model_id,
-            "stage": &capture.stage,
-            "captured_at": Utc::now().to_rfc3339(),
-            "prompt_input": &capture.prompt_input,
-            "stage_1_setup_scan_json": &capture.stage_1_setup_scan_json,
-        });
-        write_pretty_json_file(&path, &value)?;
-        files.push((capture.stage.clone(), path));
-    }
-
-    let removed = prune_expired_temp_model_output_files(
-        Path::new(TEMP_MODEL_OUTPUT_DIR),
-        bundle.ts_bucket,
-        retention_minutes_i64(retention_minutes),
-    )
-    .context("prune expired temp_model_output cache")?;
-    if removed > 0 {
-        debug!(
-            ts_bucket = %bundle.ts_bucket,
-            removed,
-            retention_minutes = retention_minutes,
-            "pruned expired temp_model_output cache"
-        );
-    }
-
-    Ok(files)
-}
-
-fn retention_minutes_i64(retention_minutes: u64) -> i64 {
-    i64::try_from(retention_minutes).unwrap_or(i64::MAX)
-}
-
-fn minute_bundle_path(bundle: &MinuteBundleEnvelope) -> PathBuf {
-    let ts = bundle.ts_bucket.format("%Y%m%dT%H%M%SZ").to_string();
-    let symbol = sanitize_filename_component(&bundle.symbol);
-    Path::new(TEMP_INDICATOR_DIR).join(format!("{}_{}.json", ts, symbol))
-}
-
-#[cfg(test)]
-#[derive(Debug, Clone)]
-struct PersistedModelInputFiles {
-    scan: PathBuf,
-    core: PathBuf,
-}
-
-fn write_pretty_json_file(path: &Path, value: &Value) -> Result<()> {
-    let pretty = serde_json::to_vec_pretty(value).context("serialize pretty json")?;
-    let mut file = fs::File::create(path).with_context(|| format!("create {}", path.display()))?;
-    file.write_all(&pretty)
-        .with_context(|| format!("write {}", path.display()))?;
-    file.flush()
-        .with_context(|| format!("flush {}", path.display()))?;
-    Ok(())
-}
-
-fn llm_filtered_model_input_path(bundle: &MinuteBundleEnvelope, stage: &str) -> PathBuf {
-    let bucket_ts = bundle.ts_bucket.format("%Y%m%dT%H%M%SZ").to_string();
-    let invoke_ts = Utc::now()
-        .format("%Y%m%dT%H%M%S%.3fZ")
-        .to_string()
-        .replace('.', "");
-    let symbol = sanitize_filename_component(&bundle.symbol);
-    let stage = sanitize_filename_component(stage);
-    Path::new(TEMP_MODEL_INPUT_DIR).join(format!(
-        "{}_{}_{}_{}.json",
-        bucket_ts, symbol, stage, invoke_ts
-    ))
-}
-
 fn llm_stage_prompt_output_path(
     bundle: &MinuteBundleEnvelope,
-    _trigger: &str,
-    management_mode: bool,
-    pending_order_mode: bool,
     provider: &str,
     model_name: &str,
     stage: &str,
@@ -6745,16 +2592,9 @@ fn llm_stage_prompt_output_path(
     let provider = sanitize_filename_component(provider);
     let model_name = sanitize_filename_component(model_name);
     let stage = sanitize_filename_component(stage);
-    let mode = if pending_order_mode {
-        "pending_management"
-    } else if management_mode {
-        "management"
-    } else {
-        "entry"
-    };
     Path::new(TEMP_MODEL_OUTPUT_DIR).join(format!(
         "{}_{}_{}_{}_{}_{}_prompt_input_{}.json",
-        bucket_ts, symbol, mode, provider, model_name, stage, invoke_ts
+        bucket_ts, symbol, "workflow", provider, model_name, stage, invoke_ts
     ))
 }
 
@@ -6776,471 +2616,15 @@ fn sanitize_filename_component(raw: &str) -> String {
     }
 }
 
-fn extract_nested_f64(value: &Value, path: &[&str]) -> Option<f64> {
-    let mut current = value;
-    for key in path {
-        current = current.get(*key)?;
-    }
-    current.as_f64()
-}
-
-fn extract_nested_str(value: &Value, path: &[&str]) -> Option<String> {
-    let mut current = value;
-    for key in path {
-        current = current.get(*key)?;
-    }
-    current.as_str().map(|s| s.to_string())
-}
-
-fn entry_stage_event<'a>(trace: Option<&'a [Value]>, stage: &str) -> Option<&'a Value> {
-    trace?.iter().rev().find(|event| {
-        event
-            .get("stage")
-            .and_then(Value::as_str)
-            .map(|value| value.eq_ignore_ascii_case(stage))
-            .unwrap_or(false)
-    })
-}
-
-fn entry_stage_latency_ms(trace: Option<&[Value]>, stage: &str) -> Option<u64> {
-    entry_stage_event(trace, stage)
-        .and_then(|event| event.get("latency_ms"))
-        .and_then(Value::as_u64)
-}
-
-fn print_entry_stage_timing(
-    ts_bucket: &DateTime<Utc>,
-    trigger: &str,
-    model_name: &str,
-    provider: &str,
-    model_id: &str,
-    management_mode: bool,
-    pending_order_mode: bool,
-    total_latency_ms: u128,
-    stage_trace: &[Value],
-) {
-    let scan_latency_ms = entry_stage_latency_ms(Some(stage_trace), "scan")
-        .map(|v| v.to_string())
-        .unwrap_or_else(|| "-".to_string());
-    let finalize_latency_ms = entry_stage_latency_ms(Some(stage_trace), "finalize")
-        .map(|v| v.to_string())
-        .unwrap_or_else(|| "-".to_string());
-    let stage2_mode = if pending_order_mode {
-        "pending_order"
-    } else if management_mode {
-        "management"
-    } else {
-        "entry"
-    };
-    println!(
-        "LLM_STAGE_TIMING ts_bucket={} trigger={} model={} provider={} model_id={} stage2_mode={} scan_latency_ms={} finalize_latency_ms={} total_latency_ms={}",
-        ts_bucket,
-        trigger,
-        model_name,
-        provider,
-        model_id,
-        stage2_mode,
-        scan_latency_ms,
-        finalize_latency_ms,
-        total_latency_ms,
-    );
-}
-
-fn entry_stage_trace_str(
-    trace: Option<&[Value]>,
-    finalize_pointer: &str,
-    scan_pointer: &str,
-) -> Option<String> {
-    entry_stage_event(trace, "finalize")
-        .and_then(|event| event.pointer(finalize_pointer))
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .or_else(|| {
-            entry_stage_event(trace, "scan")
-                .and_then(|event| event.pointer(scan_pointer))
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-}
-
-fn entry_stage_trace_primary_strategy(trace: Option<&[Value]>) -> Option<String> {
-    entry_stage_trace_str(
-        trace,
-        "/primary_strategy",
-        "/parsed_scan/scan/primary_strategy",
-    )
-}
-
-fn entry_stage_trace_entry_style(trace: Option<&[Value]>) -> Option<String> {
-    entry_stage_trace_str(trace, "/entry_style", "/parsed_scan/scan/entry_style")
-}
-
-fn entry_stage_trace_stop_model_hint(trace: Option<&[Value]>) -> Option<String> {
-    entry_stage_trace_str(
-        trace,
-        "/stop_model_hint",
-        "/parsed_scan/scan/stop_model_hint",
-    )
-}
-
-fn normalize_entry_style(value: &str) -> String {
-    value
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() {
-                ch.to_ascii_lowercase()
-            } else {
-                '_'
-            }
-        })
-        .collect::<String>()
-}
-
-fn preferred_v_timeframe(entry_style: Option<&str>, horizon: Option<&str>) -> &'static str {
-    if let Some(style) = entry_style {
-        match normalize_entry_style(style).as_str() {
-            "patient_retest" | "post_sweep_reclaim" | "market_after_flip" | "reversal"
-            | "mean_reversion" | "value_area_refill" | "reversal_sequence" => return "4h",
-            "trend_continuation"
-            | "spot_led_continuation"
-            | "hidden_divergence_continuation"
-            | "htf_expansion" => return "1d",
-            _ => {}
-        }
-    }
-
-    match horizon.map(|value| value.to_ascii_lowercase()) {
-        Some(value) if value.contains("1d") || value.contains("3d") => "1d",
-        _ => "4h",
-    }
-}
-
-fn resolve_entry_v_from_sources(
-    trace: Option<&[Value]>,
-    input: &ModelInvocationInput,
-    horizon: Option<&str>,
-) -> Option<f64> {
-    resolve_entry_v_from_helper(trace, input, horizon).map(|resolved| resolved.value)
-}
-
-fn build_entry_context_from_fallbacks(
-    parsed_decision: &Value,
-    trace: Option<&[Value]>,
-    input: &ModelInvocationInput,
-    horizon: Option<&str>,
-    entry_reason: &str,
-) -> EntryContextForState {
-    EntryContextForState {
-        entry_strategy: extract_nested_str(parsed_decision, &["analysis", "entry_strategy"])
-            .or_else(|| entry_stage_trace_primary_strategy(trace)),
-        stop_model: extract_nested_str(parsed_decision, &["analysis", "stop_model"])
-            .or_else(|| entry_stage_trace_stop_model_hint(trace)),
-        entry_mode: extract_nested_str(parsed_decision, &["params", "entry_mode"])
-            .or_else(|| entry_stage_trace_entry_style(trace)),
-        original_tp: extract_nested_f64(parsed_decision, &["params", "tp"]),
-        original_sl: extract_nested_f64(parsed_decision, &["params", "sl"]),
-        sweep_wick_extreme: extract_nested_f64(parsed_decision, &["params", "sweep_wick_extreme"]),
-        horizon: horizon.map(str::to_string),
-        entry_reason: entry_reason.to_string(),
-        entry_v: resolve_entry_v_from_sources(trace, input, horizon),
-    }
-}
-
-async fn send_trade_signal_notifications(
-    telegram_operator: Option<&TelegramOperator>,
-    x_operator: Option<&XOperator>,
-    telegram_allowed_decisions: &[String],
-    x_allowed_decisions: &[String],
-    http_client: &Client,
-    signal: TradeSignalNotification<'_>,
-) {
-    send_telegram_signal(
-        telegram_operator,
-        telegram_allowed_decisions,
-        http_client,
-        &signal,
-    )
-    .await;
-    send_x_signal(x_operator, x_allowed_decisions, http_client, &signal).await;
-}
-
-async fn send_telegram_signal(
-    telegram_operator: Option<&TelegramOperator>,
-    allowed_decisions: &[String],
-    http_client: &Client,
-    signal: &TradeSignalNotification<'_>,
-) {
-    if !decision_is_signal_allowed(signal.decision, allowed_decisions) {
-        debug!(
-            symbol = %signal.symbol,
-            decision = %signal.decision,
-            allowed_decisions = ?allowed_decisions,
-            "telegram signal skipped: decision is not enabled by llm.telegram_signal_decisions"
-        );
-        return;
-    }
-    let Some(operator) = telegram_operator else {
-        debug!(
-            symbol = %signal.symbol,
-            decision = %signal.decision,
-            "telegram signal skipped: telegram not configured"
-        );
-        return;
-    };
-    match operator.send_trade_signal(http_client, signal).await {
-        Ok(()) => {
-            println!(
-                "LLM_TELEGRAM_SIGNAL ts_bucket={} trigger={} symbol={} model={} decision={} leverage(model)={} rr={} tp={} sl={}",
-                signal.ts_bucket,
-                signal.trigger,
-                signal.symbol,
-                signal.model_name,
-                signal.decision,
-                signal
-                    .leverage
-                    .map(|v| {
-                        if (v - v.round()).abs() < f64::EPSILON {
-                            format!("{}", v.round() as i64)
-                        } else {
-                            format!("{:.2}", v)
-                        }
-                    })
-                    .unwrap_or_else(|| "-".to_string()),
-                signal
-                    .risk_reward_ratio
-                    .map(|v| format!("{:.2}", v))
-                    .unwrap_or_else(|| "-".to_string()),
-                signal
-                    .take_profit
-                    .map(|v| v.to_string())
-                    .unwrap_or_else(|| "-".to_string()),
-                signal
-                    .stop_loss
-                    .map(|v| v.to_string())
-                    .unwrap_or_else(|| "-".to_string()),
-            );
-        }
-        Err(err) => {
-            warn!(
-                symbol = %signal.symbol,
-                model_name = %signal.model_name,
-                decision = signal.decision,
-                error = %err,
-                "send telegram trade signal failed"
-            );
-            println!(
-                "LLM_TELEGRAM_SIGNAL_ERROR ts_bucket={} trigger={} symbol={} model={} decision={} error={}",
-                signal.ts_bucket,
-                signal.trigger,
-                signal.symbol,
-                signal.model_name,
-                signal.decision,
-                err.to_string().replace('\n', " "),
-            );
-        }
-    }
-}
-
-async fn send_x_signal(
-    x_operator: Option<&XOperator>,
-    allowed_decisions: &[String],
-    http_client: &Client,
-    signal: &TradeSignalNotification<'_>,
-) {
-    if !decision_is_signal_allowed(signal.decision, allowed_decisions) {
-        debug!(
-            symbol = %signal.symbol,
-            decision = %signal.decision,
-            allowed_decisions = ?allowed_decisions,
-            "x signal skipped: decision is not enabled by llm.x_signal_decisions"
-        );
-        return;
-    }
-    let Some(operator) = x_operator else {
-        debug!(
-            symbol = %signal.symbol,
-            decision = %signal.decision,
-            "x signal skipped: x not configured"
-        );
-        return;
-    };
-    match operator.send_trade_signal(http_client, signal).await {
-        Ok(()) => {
-            println!(
-                "LLM_X_SIGNAL ts_bucket={} trigger={} symbol={} model={} decision={} leverage(model)={} rr={} tp={} sl={}",
-                signal.ts_bucket,
-                signal.trigger,
-                signal.symbol,
-                signal.model_name,
-                signal.decision,
-                signal
-                    .leverage
-                    .map(|v| {
-                        if (v - v.round()).abs() < f64::EPSILON {
-                            format!("{}", v.round() as i64)
-                        } else {
-                            format!("{:.2}", v)
-                        }
-                    })
-                    .unwrap_or_else(|| "-".to_string()),
-                signal
-                    .risk_reward_ratio
-                    .map(|v| format!("{:.2}", v))
-                    .unwrap_or_else(|| "-".to_string()),
-                signal
-                    .take_profit
-                    .map(|v| v.to_string())
-                    .unwrap_or_else(|| "-".to_string()),
-                signal
-                    .stop_loss
-                    .map(|v| v.to_string())
-                    .unwrap_or_else(|| "-".to_string()),
-            );
-        }
-        Err(err) => {
-            warn!(
-                symbol = %signal.symbol,
-                model_name = %signal.model_name,
-                decision = signal.decision,
-                error = %err,
-                "send x trade signal failed"
-            );
-            println!(
-                "LLM_X_SIGNAL_ERROR ts_bucket={} trigger={} symbol={} model={} decision={} error={}",
-                signal.ts_bucket,
-                signal.trigger,
-                signal.symbol,
-                signal.model_name,
-                signal.decision,
-                err.to_string().replace('\n', " "),
-            );
-        }
-    }
-}
-
-fn decision_is_signal_allowed(decision: &str, allowed_decisions: &[String]) -> bool {
-    allowed_decisions
-        .iter()
-        .any(|v| v.trim().eq_ignore_ascii_case(decision.trim()))
-}
-
-fn format_metric_number(value: Option<f64>) -> String {
-    match value {
-        Some(v) if v.is_finite() => format!("{:.6}", v),
-        _ => "-".to_string(),
-    }
-}
-
-fn print_entry_stage_trace(
-    ts_bucket: &DateTime<Utc>,
-    trigger: &str,
-    model_name: &str,
-    provider: &str,
-    model_id: &str,
-    stage_trace: &[Value],
-) {
-    for event in stage_trace {
-        let label = match event.get("stage").and_then(Value::as_str) {
-            Some("scan") => "ENTRY_SCAN",
-            Some("finalize") => "ENTRY_FINALIZE",
-            Some("finalize_skipped") => "ENTRY_FINALIZE_SKIPPED",
-            _ => "ENTRY_STAGE",
-        };
-        println!(
-            "{} ts_bucket={} trigger={} model={} provider={} model_id={}:\n{}",
-            label,
-            ts_bucket,
-            trigger,
-            model_name,
-            provider,
-            model_id,
-            render_pretty_json_value(event)
-        );
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::config::LlmExecutionConfig;
-    use crate::execution::binance::{
-        ActivePositionSnapshot, OpenOrderSnapshot, TradingStateSnapshot,
-    };
-    use crate::llm::decision::{TradeDecision, TradeIntent};
-    use crate::llm::provider::{
-        serialize_llm_input_minified, EntryContextForLlm, ManagementSnapshotForLlm,
-        PendingOrderSummaryForLlm, PositionContextForLlm,
-    };
+    use crate::app::config::load_config;
+    use crate::workflow::schema::{Stage1Meta, Stage1Output};
+    use crate::workflow::state::WorkflowState;
 
-    fn sample_model_input(indicators: Value) -> ModelInvocationInput {
-        ModelInvocationInput {
-            symbol: "TESTUSDT".to_string(),
-            ts_bucket: Utc::now(),
-            window_code: "1m".to_string(),
-            indicator_count: indicators.as_object().map(|obj| obj.len()).unwrap_or(0),
-            source_routing_key: "test.route".to_string(),
-            source_published_at: None,
-            received_at: Utc::now(),
-            indicators,
-            missing_indicator_codes: vec![],
-            management_mode: false,
-            pending_order_mode: false,
-            trading_state: None,
-            management_snapshot: None,
-        }
-    }
-
-    fn sample_pending_model_input(indicators: Value) -> ModelInvocationInput {
-        ModelInvocationInput {
-            management_mode: false,
-            pending_order_mode: true,
-            management_snapshot: Some(ManagementSnapshotForLlm {
-                context_state: "OPEN_ORDERS_ONLY".to_string(),
-                has_active_positions: false,
-                has_open_orders: true,
-                active_position_count: 0,
-                open_order_count: 1,
-                positions: vec![],
-                pending_order: Some(PendingOrderSummaryForLlm {
-                    position_side: "SHORT".to_string(),
-                    direction: "SHORT".to_string(),
-                    quantity: 0.2,
-                    leverage: Some(4),
-                    entry_price: Some(2100.0),
-                    current_tp_price: None,
-                    current_sl_price: None,
-                    planned_tp_price: Some(2050.0),
-                    planned_tp_source: Some("shadow".to_string()),
-                    planned_sl_price: Some(2120.0),
-                    planned_sl_source: Some("shadow".to_string()),
-                }),
-                last_management_reason: None,
-                position_context: Some(PositionContextForLlm {
-                    original_qty: 0.2,
-                    current_qty: 0.2,
-                    current_pct_of_original: 1.0,
-                    effective_leverage: Some(4),
-                    effective_entry_price: Some(2100.0),
-                    effective_take_profit: Some(2050.0),
-                    effective_stop_loss: Some(2120.0),
-                    reduction_history: vec![],
-                    times_reduced_at_current_level: 0,
-                    last_management_action: None,
-                    last_management_reason: None,
-                    entry_context: Some(EntryContextForLlm {
-                        entry_strategy: None,
-                        stop_model: None,
-                        entry_mode: None,
-                        original_tp: Some(2050.0),
-                        original_sl: Some(2120.0),
-                        sweep_wick_extreme: None,
-                        horizon: Some("1d".to_string()),
-                        entry_reason: String::new(),
-                    }),
-                }),
-            }),
-            ..sample_model_input(indicators)
-        }
+    fn workflow_test_config() -> RootConfig {
+        load_config("/data/config/config.yaml").expect("load workflow test config")
     }
 
     fn empty_kline_bar(open_time: &str, close_time: &str) -> Value {
@@ -7273,145 +2657,6 @@ mod tests {
             "minutes_covered": 1,
             "expected_minutes": 1
         })
-    }
-
-    fn sample_trading_state() -> TradingStateSnapshot {
-        TradingStateSnapshot {
-            symbol: "TESTUSDT".to_string(),
-            has_active_context: true,
-            has_active_positions: true,
-            has_open_orders: true,
-            active_positions: vec![ActivePositionSnapshot {
-                position_side: "LONG".to_string(),
-                position_amt: 1.0,
-                entry_price: 2010.0,
-                mark_price: 2025.0,
-                unrealized_pnl: 15.0,
-                leverage: 10,
-            }],
-            open_orders: vec![OpenOrderSnapshot {
-                order_id: 1,
-                side: "BUY".to_string(),
-                position_side: "LONG".to_string(),
-                order_type: "LIMIT".to_string(),
-                status: "NEW".to_string(),
-                orig_qty: 1.0,
-                executed_qty: 0.0,
-                price: 2005.0,
-                stop_price: 0.0,
-                close_position: false,
-                reduce_only: false,
-                is_algo_order: false,
-            }],
-            total_wallet_balance: 1000.0,
-            available_balance: 900.0,
-        }
-    }
-
-    #[test]
-    fn sum_partial_window_delta_since_scan_uses_only_post_scan_minutes() {
-        let series = vec![
-            json!({"ts": "2026-03-18T07:00:00Z", "delta_fut": 100.0}),
-            json!({"ts": "2026-03-18T07:01:00Z", "delta_fut": -40.0}),
-            json!({"ts": "2026-03-18T07:02:00Z", "delta_fut": 25.0}),
-        ];
-        let stage1_scan_ts_bucket = DateTime::parse_from_rfc3339("2026-03-18T07:00:00Z")
-            .expect("parse stage1 ts")
-            .with_timezone(&Utc);
-        let current_ts_bucket = DateTime::parse_from_rfc3339("2026-03-18T07:02:00Z")
-            .expect("parse current ts")
-            .with_timezone(&Utc);
-
-        let sum = sum_partial_window_delta_since_scan(
-            Some(&series),
-            stage1_scan_ts_bucket,
-            current_ts_bucket,
-        );
-
-        assert_eq!(sum, -15.0);
-    }
-
-    #[test]
-    fn evaluate_entry_freshness_recheck_vetoes_long_on_two_or_more_hits() {
-        let snapshot = EntryFreshnessRecheckSnapshot {
-            latest_bundle_ts_bucket: DateTime::parse_from_rfc3339("2026-03-18T07:09:00Z")
-                .expect("parse latest ts")
-                .with_timezone(&Utc),
-            latest_bundle_age_secs: 8,
-            bundle_update_minutes: 4,
-            realtime_flow_context: json!({
-                "cvd_partial_windows": {
-                    "15m": {
-                        "regime": "reversal_to_selling"
-                    }
-                },
-                "since_stage1_increment": {
-                    "delta_fut_sum": -120.0
-                },
-                "live_refs": {
-                    "orderbook_ofi_norm_fut": -0.8,
-                    "orderbook_exec_confirm_fut": false,
-                    "orderbook_spot_confirm": false
-                }
-            }),
-        };
-
-        let evaluation = evaluate_entry_freshness_recheck(&TradeDecision::Long, &snapshot);
-
-        assert_eq!(evaluation.result, "veto");
-        assert!(evaluation.rules_hit.len() >= 2);
-        assert!(evaluation
-            .rules_hit
-            .contains(&"cvd_15m_reversal_to_selling"));
-    }
-
-    #[test]
-    fn build_rtf_rollout_fields_extracts_summary_metrics() {
-        let realtime_flow_context = json!({
-            "cvd_partial_windows": {
-                "15m": {
-                    "regime": "reversal_to_selling",
-                    "vs_last_closed_bar": {
-                        "direction_consistent": false
-                    }
-                }
-            },
-            "since_stage1_increment": {
-                "delta_fut_sum": -62.5,
-                "new_events_since_scan": [
-                    {"type": "absorption"},
-                    {"type": "initiation"}
-                ]
-            },
-            "freshness": {
-                "stage1_to_stage2_gap_minutes": 9.0
-            }
-        });
-
-        let fields = build_rtf_rollout_fields(Some(&realtime_flow_context));
-
-        assert_eq!(
-            fields
-                .get("realtime_flow_context_present")
-                .and_then(Value::as_bool),
-            Some(true)
-        );
-        assert_eq!(
-            fields
-                .get("rtf_stage1_to_stage2_gap_minutes")
-                .and_then(Value::as_f64),
-            Some(9.0)
-        );
-        assert_eq!(
-            fields.get("rtf_15m_regime").and_then(Value::as_str),
-            Some("reversal_to_selling")
-        );
-        assert_eq!(
-            fields
-                .get("rtf_new_events_since_scan_count")
-                .and_then(Value::as_u64),
-            Some(2)
-        );
     }
 
     #[test]
@@ -7534,1455 +2779,178 @@ mod tests {
         assert_eq!(subset[1].get("close"), Some(&json!(2303.0)));
     }
 
-    fn sample_indicators_with_known_v() -> Value {
-        json!({
-            "kline_history": {
-                "payload": {
-                    "intervals": {
-                        "4h": {
-                            "futures": {
-                                "bars": [
-                                    {"open_time": "2026-03-13T00:00:00Z", "high": 110.0, "low": 100.0, "is_closed": true},
-                                    {"open_time": "2026-03-13T04:00:00Z", "high": 118.73, "low": 100.0, "is_closed": true},
-                                    {"open_time": "2026-03-13T08:00:00Z", "high": 122.0, "low": 100.0, "is_closed": true},
-                                    {"open_time": "2026-03-13T12:00:00Z", "high": 117.0, "low": 100.0, "is_closed": true},
-                                    {"open_time": "2026-03-13T16:00:00Z", "high": 121.0, "low": 100.0, "is_closed": true}
-                                ]
-                            }
-                        },
-                        "1d": {
-                            "futures": {
-                                "bars": [
-                                    {"open_time": "2026-03-10T00:00:00Z", "high": 160.0, "low": 100.0, "is_closed": true},
-                                    {"open_time": "2026-03-11T00:00:00Z", "high": 172.83, "low": 100.0, "is_closed": true},
-                                    {"open_time": "2026-03-12T00:00:00Z", "high": 180.0, "low": 100.0, "is_closed": true},
-                                    {"open_time": "2026-03-13T00:00:00Z", "high": 170.0, "low": 100.0, "is_closed": true},
-                                    {"open_time": "2026-03-14T00:00:00Z", "high": 190.0, "low": 100.0, "is_closed": true}
-                                ]
-                            }
-                        }
-                    }
-                }
-            }
-        })
-    }
-
     #[test]
-    fn compact_sample_input_size_snapshot() {
-        let path = Path::new("/data/systems/llm/temp_indicator/20260304T055500Z_TESTUSDT.json");
-        if !path.exists() {
-            return;
-        }
-
-        let raw = fs::read_to_string(path).expect("read sample indicator file");
-        let root: Value = serde_json::from_str(&raw).expect("parse sample indicator json");
-        let indicators = root.get("indicators").cloned().expect("indicators field");
-        let input = sample_model_input(indicators);
-        let compact_minified = serialize_llm_input_minified(&input)
-            .expect("serialize prompt input")
-            .into_bytes();
-        eprintln!("compact_minified_bytes={}", compact_minified.len());
-        assert!(!compact_minified.is_empty());
-    }
-
-    #[test]
-    fn persist_model_input_to_disk_writes_scan_and_mode_specific_core_files() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("build tokio runtime");
-
-        runtime.block_on(async {
-            let ts_bucket = DateTime::parse_from_rfc3339("2026-03-14T06:29:00Z")
-                .expect("parse ts bucket")
-                .with_timezone(&Utc);
-            let indicators = json!({
-                "funding_rate": {
-                    "payload": {
-                        "funding_current": -0.00004527,
-                        "recent_7d": [
-                            {
-                                "change_ts": "2026-03-14T06:00:00Z",
-                                "funding_delta": -0.00000063
-                            },
-                            {
-                                "change_ts": "2026-03-14T06:15:00Z",
-                                "funding_delta": -0.00000011
-                            }
-                        ]
-                    }
-                },
-                "avwap": {
-                    "payload": {
-                        "fut_mark_price": 2001.5678,
-                        "series_by_window": {
-                            "15m": [
-                                {"ts": "2026-03-14T06:00:00Z", "avwap_fut": 2000.1234},
-                                {"ts": "2026-03-14T06:15:00Z", "avwap_fut": 2000.9876}
-                            ]
-                        }
-                    }
-                }
-            });
-            let bundle = MinuteBundleEnvelope {
-                msg_type: "indicator_bundle".to_string(),
-                routing_key: "test.route".to_string(),
-                symbol: "TESTUSDT".to_string(),
-                ts_bucket,
-                window_code: "15m".to_string(),
-                indicator_count: indicators.as_object().map(|obj| obj.len()).unwrap_or(0),
-                published_at: None,
-                indicators: indicators.clone(),
-            };
-            let input = sample_model_input(indicators);
-
-            let persisted =
-                persist_model_input_to_disk(&bundle, "unit_test", false, false, &input, 5)
-                    .await
-                    .expect("persist filtered model input");
-
-            assert!(persisted.scan.exists());
-            assert!(persisted.core.exists());
-            assert!(persisted
-                .scan
-                .file_name()
-                .and_then(|name| name.to_str())
-                .map(|name| name.contains("_scan_"))
-                .unwrap_or(false));
-            assert!(persisted
-                .core
-                .file_name()
-                .and_then(|name| name.to_str())
-                .map(|name| name.contains("_entry_core_"))
-                .unwrap_or(false));
-
-            let scan_value: Value = serde_json::from_str(
-                &fs::read_to_string(&persisted.scan).expect("read scan model input"),
-            )
-            .expect("parse scan model input");
-            let core_value: Value = serde_json::from_str(
-                &fs::read_to_string(&persisted.core).expect("read core model input"),
-            )
-            .expect("parse core model input");
-
-            assert_eq!(
-                scan_value.pointer(
-                    "/supporting_context/indicator_snapshots/funding_rate/funding_current"
-                ),
-                Some(&json!(-0.00004527))
-            );
-            assert_eq!(
-                scan_value.pointer("/now/price_anchor/futures_mark_price"),
-                Some(&json!(2001.57))
-            );
-            assert_eq!(
-                core_value
-                    .pointer("/indicators/avwap/payload/series_by_window/15m/0/ts")
-                    .and_then(Value::as_str),
-                Some("2026-03-14T06:15:00Z")
-            );
-            assert_eq!(scan_value.pointer("/version"), Some(&json!("scan_v6_2")));
-            assert!(scan_value.pointer("/indicator_count").is_none());
-            assert!(scan_value.pointer("/indicators").is_none());
-            assert!(scan_value.pointer("/indicators/pre_computed_v").is_none());
-            assert!(core_value.pointer("/indicators/pre_computed_v").is_none());
-
-            fs::remove_file(&persisted.scan).expect("cleanup scan model input");
-            fs::remove_file(&persisted.core).expect("cleanup core model input");
-
-            let management_input = ModelInvocationInput {
-                management_mode: true,
-                pending_order_mode: false,
-                trading_state: Some(sample_trading_state()),
-                management_snapshot: Some(
-                    build_management_snapshot_for_llm(Some(&sample_trading_state()), None, None)
-                        .expect("management snapshot"),
-                ),
-                ..sample_model_input(json!({
-                    "avwap": {
-                        "payload": {
-                            "fut_mark_price": 2001.5678,
-                            "series_by_window": {
-                                "15m": [
-                                    {"ts": "2026-03-14T06:00:00Z", "avwap_fut": 2000.1234}
-                                ]
-                            }
-                        }
-                    }
-                }))
-            };
-            let management_persisted = persist_model_input_to_disk(
-                &bundle,
-                "unit_test",
-                true,
-                false,
-                &management_input,
-                5,
-            )
-            .await
-            .expect("persist management model input");
-            assert!(management_persisted
-                .scan
-                .file_name()
-                .and_then(|name| name.to_str())
-                .map(|name| name.contains("_scan_"))
-                .unwrap_or(false));
-            assert!(management_persisted
-                .core
-                .file_name()
-                .and_then(|name| name.to_str())
-                .map(|name| name.contains("_management_core_"))
-                .unwrap_or(false));
-            fs::remove_file(&management_persisted.scan)
-                .expect("cleanup management scan model input");
-            fs::remove_file(&management_persisted.core)
-                .expect("cleanup management core model input");
-
-            let pending_input = ModelInvocationInput {
-                management_mode: false,
-                pending_order_mode: true,
-                trading_state: Some(sample_trading_state()),
-                management_snapshot: Some(
-                    build_management_snapshot_for_llm(Some(&sample_trading_state()), None, None)
-                        .expect("pending snapshot"),
-                ),
-                ..sample_model_input(json!({
-                    "avwap": {
-                        "payload": {
-                            "fut_mark_price": 2001.5678,
-                            "series_by_window": {
-                                "15m": [
-                                    {"ts": "2026-03-14T06:00:00Z", "avwap_fut": 2000.1234}
-                                ]
-                            }
-                        }
-                    }
-                }))
-            };
-            let pending_persisted =
-                persist_model_input_to_disk(&bundle, "unit_test", false, true, &pending_input, 5)
-                    .await
-                    .expect("persist pending model input");
-            assert!(pending_persisted
-                .scan
-                .file_name()
-                .and_then(|name| name.to_str())
-                .map(|name| name.contains("_scan_"))
-                .unwrap_or(false));
-            assert!(pending_persisted
-                .core
-                .file_name()
-                .and_then(|name| name.to_str())
-                .map(|name| name.contains("_pending_core_"))
-                .unwrap_or(false));
-            fs::remove_file(&pending_persisted.scan).expect("cleanup pending scan model input");
-            fs::remove_file(&pending_persisted.core).expect("cleanup pending core model input");
-        });
-    }
-
-    #[test]
-    fn persist_entry_stage_prompt_inputs_to_disk_writes_to_temp_model_output() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("build tokio runtime");
-
-        runtime.block_on(async {
-            let ts_bucket = DateTime::parse_from_rfc3339("2026-03-14T11:15:00Z")
-                .expect("parse ts bucket")
-                .with_timezone(&Utc);
-            let bundle = MinuteBundleEnvelope {
-                msg_type: "indicator_bundle".to_string(),
-                routing_key: "test.route".to_string(),
-                symbol: "TESTUSDT".to_string(),
-                ts_bucket,
-                window_code: "15m".to_string(),
-                indicator_count: 1,
-                published_at: None,
-                indicators: json!({
-                    "kline_history": {
-                        "payload": {
-                            "intervals": {
-                                "15m": {
-                                    "futures": {
-                                        "bars": [
-                                            {"open_time": "2026-03-14T11:00:00Z", "high": 2010.0, "low": 2000.0, "is_closed": true}
-                                        ]
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }),
-            };
-            let captures = vec![
-                EntryStagePromptInputCapture {
-                    stage: "scan".to_string(),
-                    prompt_input: json!({"symbol": "TESTUSDT", "stage": "scan"}),
-                    stage_1_setup_scan_json: None,
-                },
-                EntryStagePromptInputCapture {
-                    stage: "finalize".to_string(),
-                    prompt_input: json!({"symbol": "TESTUSDT", "stage": "finalize"}),
-                    stage_1_setup_scan_json: Some(json!({"scan_bias": "bullish"})),
-                },
-            ];
-
-            let files = persist_entry_stage_prompt_inputs_to_disk(
-                &bundle,
-                "unit_test",
-                false,
-                false,
-                "custom_llm",
-                "custom_llm",
-                "custom_llm",
-                &captures,
-                5,
-            )
-            .await
-            .expect("persist entry stage prompt inputs");
-
-            assert_eq!(files.len(), 2);
-            for (stage, path) in files {
-                assert!(path.exists(), "expected {stage} prompt input file to exist");
-                assert!(path.starts_with(TEMP_MODEL_OUTPUT_DIR));
-                assert!(!path.starts_with(TEMP_MODEL_INPUT_DIR));
-                assert!(path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .map(|name| name.contains("_prompt_input_"))
-                    .unwrap_or(false));
-
-                let saved: Value = serde_json::from_str(
-                    &fs::read_to_string(&path).expect("read prompt input artifact"),
-                )
-                .expect("parse prompt input artifact");
-                assert_eq!(
-                    saved.get("stage").and_then(Value::as_str),
-                    Some(stage.as_str())
-                );
-
-                fs::remove_file(&path).expect("cleanup prompt input artifact");
-            }
-        });
-    }
-
-    #[test]
-    fn hold_telegram_fields_use_live_position_and_exit_orders() {
-        let state = TradingStateSnapshot {
-            symbol: "TESTUSDT".to_string(),
-            has_active_context: true,
-            has_active_positions: true,
-            has_open_orders: true,
-            active_positions: vec![ActivePositionSnapshot {
-                position_side: "SHORT".to_string(),
-                position_amt: -0.2,
-                entry_price: 2100.0,
-                mark_price: 2095.0,
-                unrealized_pnl: 1.0,
-                leverage: 50,
-            }],
-            open_orders: vec![
-                OpenOrderSnapshot {
-                    order_id: 1,
-                    side: "BUY".to_string(),
-                    position_side: "SHORT".to_string(),
-                    order_type: "TAKE_PROFIT_MARKET".to_string(),
-                    status: "NEW".to_string(),
-                    orig_qty: 0.2,
-                    executed_qty: 0.0,
-                    price: 0.0,
-                    stop_price: 2050.0,
-                    close_position: true,
-                    reduce_only: true,
-                    is_algo_order: false,
-                },
-                OpenOrderSnapshot {
-                    order_id: 2,
-                    side: "BUY".to_string(),
-                    position_side: "SHORT".to_string(),
-                    order_type: "STOP_MARKET".to_string(),
-                    status: "NEW".to_string(),
-                    orig_qty: 0.2,
-                    executed_qty: 0.0,
-                    price: 0.0,
-                    stop_price: 2125.0,
-                    close_position: true,
-                    reduce_only: true,
-                    is_algo_order: false,
-                },
-            ],
-            total_wallet_balance: 1000.0,
-            available_balance: 800.0,
-        };
-
-        let fields = derive_management_telegram_fields(Some(&state));
-        assert_eq!(fields.entry_price, Some(2100.0));
-        assert_eq!(fields.leverage, Some(50.0));
-        assert_eq!(fields.take_profit, Some(2050.0));
-        assert_eq!(fields.stop_loss, Some(2125.0));
-        assert_eq!(fields.risk_reward_ratio, Some(2.0));
-    }
-
-    #[test]
-    fn hold_telegram_fields_use_conditional_live_exit_orders() {
-        let state = TradingStateSnapshot {
-            symbol: "TESTUSDT".to_string(),
-            has_active_context: true,
-            has_active_positions: true,
-            has_open_orders: true,
-            active_positions: vec![ActivePositionSnapshot {
-                position_side: "SHORT".to_string(),
-                position_amt: -0.07,
-                entry_price: 2271.45,
-                mark_price: 2259.13,
-                unrealized_pnl: 0.86,
-                leverage: 32,
-            }],
-            open_orders: vec![
-                OpenOrderSnapshot {
-                    order_id: 1,
-                    side: "BUY".to_string(),
-                    position_side: "BOTH".to_string(),
-                    order_type: "CONDITIONAL".to_string(),
-                    status: "NEW".to_string(),
-                    orig_qty: 0.07,
-                    executed_qty: 0.0,
-                    price: 0.0,
-                    stop_price: 2235.63,
-                    close_position: false,
-                    reduce_only: true,
-                    is_algo_order: false,
-                },
-                OpenOrderSnapshot {
-                    order_id: 2,
-                    side: "BUY".to_string(),
-                    position_side: "BOTH".to_string(),
-                    order_type: "CONDITIONAL".to_string(),
-                    status: "NEW".to_string(),
-                    orig_qty: 0.07,
-                    executed_qty: 0.0,
-                    price: 0.0,
-                    stop_price: 2287.22,
-                    close_position: false,
-                    reduce_only: true,
-                    is_algo_order: false,
-                },
-            ],
-            total_wallet_balance: 1000.0,
-            available_balance: 800.0,
-        };
-
-        let fields = derive_management_telegram_fields(Some(&state));
-        assert_eq!(fields.entry_price, Some(2271.45));
-        assert_eq!(fields.leverage, Some(32.0));
-        assert_eq!(fields.take_profit, Some(2235.63));
-        assert_eq!(fields.stop_loss, Some(2287.22));
-        assert_eq!(
-            fields.risk_reward_ratio,
-            Some((2271.45 - 2235.63) / (2287.22 - 2271.45))
-        );
-    }
-
-    #[test]
-    fn hold_telegram_fields_use_both_side_limit_tp_and_conditional_sl() {
-        let state = TradingStateSnapshot {
-            symbol: "TESTUSDT".to_string(),
-            has_active_context: true,
-            has_active_positions: true,
-            has_open_orders: true,
-            active_positions: vec![ActivePositionSnapshot {
-                position_side: "BOTH".to_string(),
-                position_amt: -0.05,
-                entry_price: 2244.54,
-                mark_price: 2233.10,
-                unrealized_pnl: 0.53,
-                leverage: 15,
-            }],
-            open_orders: vec![
-                OpenOrderSnapshot {
-                    order_id: 1,
-                    side: "BUY".to_string(),
-                    position_side: "BOTH".to_string(),
-                    order_type: "LIMIT".to_string(),
-                    status: "NEW".to_string(),
-                    orig_qty: 0.05,
-                    executed_qty: 0.0,
-                    price: 2202.86,
-                    stop_price: 0.0,
-                    close_position: false,
-                    reduce_only: true,
-                    is_algo_order: false,
-                },
-                OpenOrderSnapshot {
-                    order_id: 2,
-                    side: "BUY".to_string(),
-                    position_side: "BOTH".to_string(),
-                    order_type: "CONDITIONAL".to_string(),
-                    status: "NEW".to_string(),
-                    orig_qty: 0.05,
-                    executed_qty: 0.0,
-                    price: 0.0,
-                    stop_price: 2253.07,
-                    close_position: false,
-                    reduce_only: true,
-                    is_algo_order: false,
-                },
-            ],
-            total_wallet_balance: 1000.0,
-            available_balance: 800.0,
-        };
-
-        let fields = derive_management_telegram_fields(Some(&state));
-        assert_eq!(fields.entry_price, Some(2244.54));
-        assert_eq!(fields.leverage, Some(15.0));
-        assert_eq!(fields.take_profit, Some(2202.86));
-        assert_eq!(fields.stop_loss, Some(2253.07));
-        assert_eq!(
-            fields.risk_reward_ratio,
-            Some((2244.54 - 2202.86) / (2253.07 - 2244.54))
-        );
-    }
-
-    #[test]
-    fn hold_telegram_fields_are_empty_without_active_position() {
-        let state = TradingStateSnapshot {
-            symbol: "TESTUSDT".to_string(),
-            has_active_context: false,
-            has_active_positions: false,
-            has_open_orders: true,
-            active_positions: Vec::new(),
-            open_orders: Vec::new(),
-            total_wallet_balance: 1000.0,
-            available_balance: 800.0,
-        };
-
-        let fields = derive_management_telegram_fields(Some(&state));
-        assert!(fields.entry_price.is_none());
-        assert!(fields.leverage.is_none());
-        assert!(fields.risk_reward_ratio.is_none());
-        assert!(fields.take_profit.is_none());
-        assert!(fields.stop_loss.is_none());
-    }
-
-    #[test]
-    fn remap_trade_entry_and_stop_loss_follows_configured_pct() {
-        let mut execution_config = LlmExecutionConfig::default();
-        execution_config.entry_sl_remap.enabled = true;
-        execution_config.entry_sl_remap.entry_to_sl_distance_pct = 50.0;
-        let intent = TradeIntent {
-            decision: TradeDecision::Short,
-            entry_price: Some(100.0),
-            take_profit: Some(90.0),
-            stop_loss: Some(110.0),
-            leverage: Some(5.0),
-            risk_reward_ratio: Some(2.0),
-            horizon: Some("4h".to_string()),
-            swing_logic: Some("test".to_string()),
-            reason: "test".to_string(),
-        };
-        let (entry, sl) = remap_trade_entry_and_stop_loss("qwen", &execution_config, &intent)
-            .expect("should remap");
-        assert!((entry - 105.0).abs() < 1e-9);
-        assert!((sl - 112.5).abs() < 1e-9);
-
-        execution_config.entry_sl_remap.entry_to_sl_distance_pct = 100.0;
-        let (entry_full, sl_full) =
-            remap_trade_entry_and_stop_loss("qwen", &execution_config, &intent)
-                .expect("should remap at 100%");
-        assert!((entry_full - 110.0).abs() < 1e-9);
-        assert!((sl_full - 120.0).abs() < 1e-9);
-
-        let (entry_other_provider, sl_other_provider) =
-            remap_trade_entry_and_stop_loss("claude", &execution_config, &intent)
-                .expect("all providers should remap");
-        assert!((entry_other_provider - 110.0).abs() < 1e-9);
-        assert!((sl_other_provider - 120.0).abs() < 1e-9);
-
-        execution_config.entry_sl_remap.entry_to_sl_distance_pct = 20.0;
-        let long_example = TradeIntent {
-            decision: TradeDecision::Long,
-            entry_price: Some(2039.3),
-            take_profit: Some(2080.0),
-            stop_loss: Some(2020.0),
-            leverage: Some(2.0),
-            risk_reward_ratio: Some(2.11),
-            horizon: Some("4h".to_string()),
-            swing_logic: Some("test".to_string()),
-            reason: "test".to_string(),
-        };
-        let (example_entry, _) =
-            remap_trade_entry_and_stop_loss("custom_llm", &execution_config, &long_example)
-                .expect("20 pct long example should remap");
-        assert!((example_entry - 2035.44).abs() < 1e-9);
-    }
-
-    #[test]
-    fn trade_signal_fields_from_intent_use_model_values() {
-        let intent = TradeIntent {
-            decision: TradeDecision::Long,
-            entry_price: Some(2039.3),
-            take_profit: Some(2080.0),
-            stop_loss: Some(2020.0),
-            leverage: Some(2.0),
-            risk_reward_ratio: Some(2.11),
-            horizon: Some("4h".to_string()),
-            swing_logic: Some("test".to_string()),
-            reason: "test".to_string(),
-        };
-
-        let fields = TradeSignalFields::from_intent(&intent);
-        assert_eq!(fields.entry_price, Some(2039.3));
-        assert_eq!(fields.leverage, Some(2.0));
-        assert_eq!(fields.risk_reward_ratio, Some(2.11));
-        assert_eq!(fields.take_profit, Some(2080.0));
-        assert_eq!(fields.stop_loss, Some(2020.0));
-    }
-
-    #[test]
-    fn trade_signal_fields_from_report_use_effective_execution_values() {
-        let report = crate::execution::binance::ExecutionReport {
-            decision: "LONG",
-            quantity: "0.100".to_string(),
-            leverage: 16,
-            leverage_source: "model_ratio",
-            margin_budget_usdt: 50.0,
-            margin_budget_source: "fixed_usdt",
-            account_total_wallet_balance: 1000.0,
-            account_available_balance: 900.0,
-            position_side: "LONG",
-            dry_run: true,
-            entry_order_id: None,
-            take_profit_order_id: None,
-            stop_loss_order_id: None,
-            exit_orders_deferred: false,
-            maker_entry_price: 2020.0,
-            actual_take_profit: 2080.0,
-            actual_stop_loss: 1991.56,
-            actual_risk_reward_ratio: 2.1108647450110867,
-            best_bid_price: 2020.12,
-            best_ask_price: 2020.13,
-        };
-
-        let fields = TradeSignalFields::from_report(&report);
-        assert_eq!(fields.entry_price, Some(2020.0));
-        assert_eq!(fields.leverage, Some(16.0));
-        assert_eq!(fields.take_profit, Some(2080.0));
-        assert_eq!(fields.stop_loss, Some(1991.56));
-        assert_eq!(fields.risk_reward_ratio, Some(2.1108647450110867));
-    }
-
-    #[test]
-    fn management_snapshot_uses_live_binance_entry_and_exit_levels() {
-        let state = TradingStateSnapshot {
-            symbol: "TESTUSDT".to_string(),
-            has_active_context: true,
-            has_active_positions: true,
-            has_open_orders: true,
-            active_positions: vec![ActivePositionSnapshot {
-                position_side: "SHORT".to_string(),
-                position_amt: -0.2,
-                entry_price: 2100.0,
-                mark_price: 2095.0,
-                unrealized_pnl: 1.0,
-                leverage: 50,
-            }],
-            open_orders: vec![
-                OpenOrderSnapshot {
-                    order_id: 1,
-                    side: "BUY".to_string(),
-                    position_side: "SHORT".to_string(),
-                    order_type: "TAKE_PROFIT_MARKET".to_string(),
-                    status: "NEW".to_string(),
-                    orig_qty: 0.2,
-                    executed_qty: 0.0,
-                    price: 0.0,
-                    stop_price: 2050.0,
-                    close_position: true,
-                    reduce_only: true,
-                    is_algo_order: false,
-                },
-                OpenOrderSnapshot {
-                    order_id: 2,
-                    side: "BUY".to_string(),
-                    position_side: "SHORT".to_string(),
-                    order_type: "STOP_MARKET".to_string(),
-                    status: "NEW".to_string(),
-                    orig_qty: 0.2,
-                    executed_qty: 0.0,
-                    price: 0.0,
-                    stop_price: 2125.0,
-                    close_position: true,
-                    reduce_only: true,
-                    is_algo_order: false,
-                },
-            ],
-            total_wallet_balance: 1000.0,
-            available_balance: 800.0,
-        };
-
-        let snapshot =
-            build_management_snapshot_for_llm(Some(&state), None, None).expect("snapshot exists");
-        assert_eq!(snapshot.positions.len(), 1);
-        let position = &snapshot.positions[0];
-        assert_eq!(position.entry_price, 2100.0);
-        assert_eq!(position.pnl_by_latest_price, 1.0);
-        assert_eq!(position.current_tp_price, Some(2050.0));
-        assert_eq!(position.current_sl_price, Some(2125.0));
-    }
-
-    #[test]
-    fn management_snapshot_uses_conditional_live_binance_exit_levels() {
-        let state = TradingStateSnapshot {
-            symbol: "TESTUSDT".to_string(),
-            has_active_context: true,
-            has_active_positions: true,
-            has_open_orders: true,
-            active_positions: vec![ActivePositionSnapshot {
-                position_side: "SHORT".to_string(),
-                position_amt: -0.07,
-                entry_price: 2271.45,
-                mark_price: 2259.13,
-                unrealized_pnl: 0.86,
-                leverage: 32,
-            }],
-            open_orders: vec![
-                OpenOrderSnapshot {
-                    order_id: 1,
-                    side: "BUY".to_string(),
-                    position_side: "BOTH".to_string(),
-                    order_type: "CONDITIONAL".to_string(),
-                    status: "NEW".to_string(),
-                    orig_qty: 0.07,
-                    executed_qty: 0.0,
-                    price: 0.0,
-                    stop_price: 2235.63,
-                    close_position: false,
-                    reduce_only: true,
-                    is_algo_order: false,
-                },
-                OpenOrderSnapshot {
-                    order_id: 2,
-                    side: "BUY".to_string(),
-                    position_side: "BOTH".to_string(),
-                    order_type: "CONDITIONAL".to_string(),
-                    status: "NEW".to_string(),
-                    orig_qty: 0.07,
-                    executed_qty: 0.0,
-                    price: 0.0,
-                    stop_price: 2287.22,
-                    close_position: false,
-                    reduce_only: true,
-                    is_algo_order: false,
-                },
-            ],
-            total_wallet_balance: 1000.0,
-            available_balance: 800.0,
-        };
-
-        let snapshot =
-            build_management_snapshot_for_llm(Some(&state), None, None).expect("snapshot exists");
-        assert_eq!(snapshot.positions.len(), 1);
-        let position = &snapshot.positions[0];
-        assert_eq!(position.current_tp_price, Some(2235.63));
-        assert_eq!(position.current_sl_price, Some(2287.22));
-    }
-
-    #[test]
-    fn management_snapshot_uses_both_side_limit_tp_and_conditional_sl() {
-        let state = TradingStateSnapshot {
-            symbol: "TESTUSDT".to_string(),
-            has_active_context: true,
-            has_active_positions: true,
-            has_open_orders: true,
-            active_positions: vec![ActivePositionSnapshot {
-                position_side: "BOTH".to_string(),
-                position_amt: -0.05,
-                entry_price: 2244.54,
-                mark_price: 2233.10,
-                unrealized_pnl: 0.53,
-                leverage: 15,
-            }],
-            open_orders: vec![
-                OpenOrderSnapshot {
-                    order_id: 1,
-                    side: "BUY".to_string(),
-                    position_side: "BOTH".to_string(),
-                    order_type: "LIMIT".to_string(),
-                    status: "NEW".to_string(),
-                    orig_qty: 0.05,
-                    executed_qty: 0.0,
-                    price: 2202.86,
-                    stop_price: 0.0,
-                    close_position: false,
-                    reduce_only: true,
-                    is_algo_order: false,
-                },
-                OpenOrderSnapshot {
-                    order_id: 2,
-                    side: "BUY".to_string(),
-                    position_side: "BOTH".to_string(),
-                    order_type: "CONDITIONAL".to_string(),
-                    status: "NEW".to_string(),
-                    orig_qty: 0.05,
-                    executed_qty: 0.0,
-                    price: 0.0,
-                    stop_price: 2253.07,
-                    close_position: false,
-                    reduce_only: true,
-                    is_algo_order: false,
-                },
-            ],
-            total_wallet_balance: 1000.0,
-            available_balance: 800.0,
-        };
-
-        let snapshot =
-            build_management_snapshot_for_llm(Some(&state), None, None).expect("snapshot exists");
-        assert_eq!(snapshot.positions.len(), 1);
-        let position = &snapshot.positions[0];
-        assert_eq!(position.current_tp_price, Some(2202.86));
-        assert_eq!(position.current_sl_price, Some(2253.07));
-    }
-
-    #[test]
-    fn management_snapshot_includes_pending_order_context_for_open_orders_only() {
-        let state = TradingStateSnapshot {
-            symbol: "TESTUSDT".to_string(),
-            has_active_context: true,
-            has_active_positions: false,
-            has_open_orders: true,
-            active_positions: vec![],
-            open_orders: vec![
-                OpenOrderSnapshot {
-                    order_id: 11,
-                    side: "BUY".to_string(),
-                    position_side: "LONG".to_string(),
-                    order_type: "LIMIT".to_string(),
-                    status: "NEW".to_string(),
-                    orig_qty: 0.06,
-                    executed_qty: 0.0,
-                    price: 1965.5,
-                    stop_price: 0.0,
-                    close_position: false,
-                    reduce_only: false,
-                    is_algo_order: false,
-                },
-                OpenOrderSnapshot {
-                    order_id: 12,
-                    side: "SELL".to_string(),
-                    position_side: "LONG".to_string(),
-                    order_type: "TAKE_PROFIT_MARKET".to_string(),
-                    status: "NEW".to_string(),
-                    orig_qty: 0.06,
-                    executed_qty: 0.0,
-                    price: 0.0,
-                    stop_price: 1974.0,
-                    close_position: true,
-                    reduce_only: true,
-                    is_algo_order: false,
-                },
-                OpenOrderSnapshot {
-                    order_id: 13,
-                    side: "SELL".to_string(),
-                    position_side: "LONG".to_string(),
-                    order_type: "STOP_MARKET".to_string(),
-                    status: "NEW".to_string(),
-                    orig_qty: 0.06,
-                    executed_qty: 0.0,
-                    price: 0.0,
-                    stop_price: 1961.2,
-                    close_position: true,
-                    reduce_only: true,
-                    is_algo_order: false,
-                },
-            ],
-            total_wallet_balance: 1000.0,
-            available_balance: 800.0,
-        };
-
-        let position_context = PositionContextForLlm {
-            original_qty: 0.06,
-            current_qty: 0.06,
-            current_pct_of_original: 100.0,
-            effective_leverage: Some(20),
-            effective_entry_price: Some(1965.5),
-            effective_take_profit: Some(1974.0),
-            effective_stop_loss: Some(1961.2),
-            reduction_history: vec![],
-            times_reduced_at_current_level: 0,
-            last_management_action: Some("MODIFY_MAKER".to_string()),
-            last_management_reason: Some("same strategy, better maker price".to_string()),
-            entry_context: Some(EntryContextForLlm {
-                entry_strategy: Some("Dual-Market AVWAP Z-Score".to_string()),
-                stop_model: Some("Sweep & Flip Stop".to_string()),
-                entry_mode: Some("limit_below_zone".to_string()),
-                original_tp: Some(1974.0),
-                original_sl: Some(1961.2),
-                sweep_wick_extreme: None,
-                horizon: Some("4h".to_string()),
-                entry_reason: "rvwap extreme, keep pending long".to_string(),
-            }),
-        };
-
-        let snapshot = build_management_snapshot_for_llm(
-            Some(&state),
-            Some("same strategy, better maker price".to_string()),
-            Some(position_context),
-        )
-        .expect("snapshot exists");
-
-        let pending = snapshot.pending_order.expect("pending order exists");
-        assert_eq!(pending.direction, "LONG");
-        assert_eq!(pending.entry_price, Some(1965.5));
-        assert_eq!(pending.current_tp_price, Some(1974.0));
-        assert_eq!(pending.current_sl_price, Some(1961.2));
-        assert_eq!(pending.planned_tp_price, Some(1974.0));
-        assert_eq!(
-            pending.planned_tp_source.as_deref(),
-            Some("effective_context")
-        );
-        assert_eq!(pending.planned_sl_price, Some(1961.2));
-        assert_eq!(
-            pending.planned_sl_source.as_deref(),
-            Some("effective_context")
-        );
-        assert_eq!(pending.leverage, Some(20));
-        assert!(snapshot.positions.is_empty());
-        assert!(snapshot.position_context.is_some());
-    }
-
-    #[test]
-    fn pending_summary_keeps_live_and_shadow_exit_prices_separate() {
-        let state = TradingStateSnapshot {
-            symbol: "TESTUSDT".to_string(),
-            has_active_context: true,
-            has_active_positions: false,
-            has_open_orders: true,
-            active_positions: vec![],
-            open_orders: vec![OpenOrderSnapshot {
-                order_id: 11,
-                side: "BUY".to_string(),
-                position_side: "LONG".to_string(),
-                order_type: "LIMIT".to_string(),
-                status: "NEW".to_string(),
-                orig_qty: 0.06,
-                executed_qty: 0.0,
-                price: 1965.5,
-                stop_price: 0.0,
-                close_position: false,
-                reduce_only: false,
-                is_algo_order: false,
-            }],
-            total_wallet_balance: 1000.0,
-            available_balance: 800.0,
-        };
-
-        let position_context = PositionContextForLlm {
-            original_qty: 0.06,
-            current_qty: 0.06,
-            current_pct_of_original: 100.0,
-            effective_leverage: Some(20),
-            effective_entry_price: Some(1965.5),
-            effective_take_profit: Some(1974.0),
-            effective_stop_loss: Some(1961.2),
-            reduction_history: vec![],
-            times_reduced_at_current_level: 0,
-            last_management_action: Some("MODIFY_MAKER".to_string()),
-            last_management_reason: Some("same strategy, better maker price".to_string()),
-            entry_context: Some(EntryContextForLlm {
-                entry_strategy: Some("Dual-Market AVWAP Z-Score".to_string()),
-                stop_model: Some("Sweep & Flip Stop".to_string()),
-                entry_mode: Some("limit_below_zone".to_string()),
-                original_tp: Some(1974.0),
-                original_sl: Some(1961.2),
-                sweep_wick_extreme: None,
-                horizon: Some("4h".to_string()),
-                entry_reason: "rvwap extreme, keep pending long".to_string(),
-            }),
-        };
-
-        let snapshot = build_management_snapshot_for_llm(
-            Some(&state),
-            Some("same strategy, better maker price".to_string()),
-            Some(position_context),
-        )
-        .expect("snapshot exists");
-
-        let pending = snapshot.pending_order.expect("pending order exists");
-        assert_eq!(pending.current_tp_price, None);
-        assert_eq!(pending.current_sl_price, None);
-        assert_eq!(pending.planned_tp_price, Some(1974.0));
-        assert_eq!(
-            pending.planned_tp_source.as_deref(),
-            Some("effective_context")
-        );
-        assert_eq!(pending.planned_sl_price, Some(1961.2));
-        assert_eq!(
-            pending.planned_sl_source.as_deref(),
-            Some("effective_context")
-        );
-    }
-
-    #[test]
-    fn pending_order_mode_requires_entry_like_open_order() {
-        let state = TradingStateSnapshot {
-            symbol: "TESTUSDT".to_string(),
-            has_active_context: true,
-            has_active_positions: false,
-            has_open_orders: true,
-            active_positions: vec![],
-            open_orders: vec![
-                OpenOrderSnapshot {
-                    order_id: 21,
-                    side: "BUY".to_string(),
-                    position_side: "BOTH".to_string(),
-                    order_type: "TAKE_PROFIT_MARKET".to_string(),
-                    status: "NEW".to_string(),
-                    orig_qty: 0.0,
-                    executed_qty: 0.0,
-                    price: 0.0,
-                    stop_price: 2162.25,
-                    close_position: true,
-                    reduce_only: true,
-                    is_algo_order: false,
-                },
-                OpenOrderSnapshot {
-                    order_id: 22,
-                    side: "BUY".to_string(),
-                    position_side: "BOTH".to_string(),
-                    order_type: "STOP_MARKET".to_string(),
-                    status: "NEW".to_string(),
-                    orig_qty: 0.0,
-                    executed_qty: 0.0,
-                    price: 0.0,
-                    stop_price: 2219.0,
-                    close_position: true,
-                    reduce_only: true,
-                    is_algo_order: false,
-                },
-            ],
-            total_wallet_balance: 1000.0,
-            available_balance: 800.0,
-        };
-
-        assert!(!pending_order_mode_from_trading_state(Some(&state)));
-    }
-
-    #[test]
-    fn pending_order_mode_detects_entry_like_open_order() {
-        let state = TradingStateSnapshot {
-            symbol: "TESTUSDT".to_string(),
-            has_active_context: true,
-            has_active_positions: false,
-            has_open_orders: true,
-            active_positions: vec![],
-            open_orders: vec![
-                OpenOrderSnapshot {
-                    order_id: 31,
-                    side: "SELL".to_string(),
-                    position_side: "SHORT".to_string(),
-                    order_type: "LIMIT".to_string(),
-                    status: "NEW".to_string(),
-                    orig_qty: 0.07,
-                    executed_qty: 0.0,
-                    price: 2202.87,
-                    stop_price: 0.0,
-                    close_position: false,
-                    reduce_only: false,
-                    is_algo_order: false,
-                },
-                OpenOrderSnapshot {
-                    order_id: 32,
-                    side: "BUY".to_string(),
-                    position_side: "SHORT".to_string(),
-                    order_type: "TAKE_PROFIT_MARKET".to_string(),
-                    status: "NEW".to_string(),
-                    orig_qty: 0.07,
-                    executed_qty: 0.0,
-                    price: 0.0,
-                    stop_price: 2162.25,
-                    close_position: true,
-                    reduce_only: true,
-                    is_algo_order: false,
-                },
-            ],
-            total_wallet_balance: 1000.0,
-            available_balance: 800.0,
-        };
-
-        assert!(pending_order_mode_from_trading_state(Some(&state)));
-    }
-
-    #[test]
-    fn execution_context_keys_for_report_include_directional_alias_for_both() {
-        let keys = execution_context_keys_for_report("TESTUSDT", "BOTH", TradeDecision::Long);
-        assert_eq!(
-            keys,
-            vec!["TESTUSDT:BOTH".to_string(), "TESTUSDT:LONG".to_string()]
-        );
-    }
-
-    #[test]
-    fn resolve_invoke_management_reason_drops_stale_global_reason_when_flat() {
-        let resolved =
-            resolve_invoke_management_reason(0, 0, Some("stale old reason".to_string()), None);
-        assert!(resolved.is_none());
-    }
-
-    #[test]
-    fn resolve_invoke_management_reason_prefers_position_context_reason() {
-        let position_context = PositionContextForLlm {
-            original_qty: 0.11,
-            current_qty: 0.11,
-            current_pct_of_original: 100.0,
-            effective_leverage: Some(42),
-            effective_entry_price: Some(2122.33),
-            effective_take_profit: Some(2148.0),
-            effective_stop_loss: Some(2109.63),
-            reduction_history: vec![],
-            times_reduced_at_current_level: 0,
-            last_management_action: Some("HOLD".to_string()),
-            last_management_reason: Some("current context reason".to_string()),
-            entry_context: None,
-        };
-        let resolved = resolve_invoke_management_reason(
-            0,
-            3,
-            Some("stale old reason".to_string()),
-            Some(&position_context),
-        );
-        assert_eq!(resolved.as_deref(), Some("current context reason"));
-    }
-
-    #[test]
-    fn build_entry_context_from_fallbacks_uses_stage_trace_and_helper_v() {
-        let parsed_decision = json!({
-            "decision": "LONG",
-            "params": {
-                "tp": 2148.0,
-                "sl": 2106.91
-            }
-        });
-        let stage_trace = vec![
-            json!({
-                "stage": "scan",
-                "parsed_scan": {
-                    "scan": {
-                        "primary_strategy": "Absorption Re-test Continuation",
-                        "entry_style": "patient_retest",
-                        "stop_model_hint": "Value Area Invalidation Stop"
-                    }
-                }
-            }),
-            json!({
-                "stage": "finalize",
-                "primary_strategy": "Absorption Re-test Continuation",
-                "entry_style": "patient_retest",
-                "stop_model_hint": "Value Area Invalidation Stop"
-            }),
-        ];
-        let input = sample_model_input(sample_indicators_with_known_v());
-
-        let captured = build_entry_context_from_fallbacks(
-            &parsed_decision,
-            Some(&stage_trace),
-            &input,
-            Some("4h"),
-            "fallback reason",
-        );
-
-        assert_eq!(
-            captured.entry_strategy.as_deref(),
-            Some("Absorption Re-test Continuation")
-        );
-        assert_eq!(captured.entry_mode.as_deref(), Some("patient_retest"));
-        assert_eq!(
-            captured.stop_model.as_deref(),
-            Some("Value Area Invalidation Stop")
-        );
-        assert_eq!(captured.original_tp, Some(2148.0));
-        assert_eq!(captured.original_sl, Some(2106.91));
-        assert!(captured
-            .entry_v
-            .map(|value| (value - 18.73).abs() < 1e-9)
-            .unwrap_or(false));
-        assert_eq!(captured.horizon.as_deref(), Some("4h"));
-    }
-
-    #[test]
-    fn resolve_entry_v_from_sources_uses_entry_style_to_pick_1d_v() {
-        let stage_trace = vec![json!({
-            "stage": "scan",
-            "parsed_scan": {
-                "scan": {
-                    "entry_style": "trend_continuation"
-                }
-            }
-        })];
-        let input = sample_model_input(sample_indicators_with_known_v());
-
-        let entry_v = resolve_entry_v_from_sources(Some(&stage_trace), &input, Some("4h"));
-
-        assert!(entry_v
-            .map(|value| (value - 72.83).abs() < 1e-9)
-            .unwrap_or(false));
-    }
-
-    #[test]
-    fn build_entry_context_from_fallbacks_prefers_helper_v_over_model_output() {
-        let parsed_decision = json!({
-            "decision": "LONG",
-            "analysis": {
-                "entry_strategy": "Model Strategy",
-                "stop_model": "Model Stop",
-                "volatility_unit_v": 55.5
-            },
-            "params": {
-                "entry_mode": "market_after_flip",
-                "tp": 2148.0,
-                "sl": 2106.91
-            }
-        });
-        let stage_trace = vec![json!({
-            "stage": "finalize",
-            "primary_strategy": "Fallback Strategy",
-            "entry_style": "patient_retest",
-            "stop_model_hint": "Fallback Stop"
-        })];
-        let input = sample_model_input(sample_indicators_with_known_v());
-
-        let captured = build_entry_context_from_fallbacks(
-            &parsed_decision,
-            Some(&stage_trace),
-            &input,
-            Some("4h"),
-            "model reason",
-        );
-
-        assert_eq!(captured.entry_strategy.as_deref(), Some("Model Strategy"));
-        assert_eq!(captured.stop_model.as_deref(), Some("Model Stop"));
-        assert_eq!(captured.entry_mode.as_deref(), Some("market_after_flip"));
-        assert!(captured
-            .entry_v
-            .map(|value| (value - 18.73).abs() < 1e-9)
-            .unwrap_or(false));
-    }
-
-    #[test]
-    fn evaluate_trade_entry_v_gate_blocks_when_distances_are_below_threshold() {
-        let mut execution_config = LlmExecutionConfig::default();
-        execution_config.min_distance_v = 1.0;
-        let intent = TradeIntent {
-            decision: TradeDecision::Long,
-            entry_price: Some(2000.0),
-            take_profit: Some(2015.0),
-            stop_loss: Some(1990.0),
-            leverage: Some(5.0),
-            risk_reward_ratio: Some(1.5),
-            horizon: Some("4h".to_string()),
-            swing_logic: Some("test".to_string()),
-            reason: "test".to_string(),
-        };
-        let stage_trace = vec![json!({
-            "stage": "scan",
-            "parsed_scan": {
-                "scan": {
-                    "entry_style": "patient_retest"
-                }
-            }
-        })];
-        let input = sample_model_input(sample_indicators_with_known_v());
-
-        let gate =
-            evaluate_trade_entry_v_gate(&execution_config, &intent, &input, Some(&stage_trace))
-                .expect("gate should evaluate")
-                .expect("gate should apply");
-
-        assert!(!gate.passed);
-        assert!((gate.take_profit_distance_v - (15.0 / 18.73)).abs() < 1e-9);
-        assert!((gate.min_distance_v - 1.0).abs() < 1e-9);
-    }
-
-    #[test]
-    fn evaluate_trade_entry_v_gate_passes_with_helper_based_v() {
-        let mut execution_config = LlmExecutionConfig::default();
-        execution_config.min_distance_v = 1.0;
-        let intent = TradeIntent {
-            decision: TradeDecision::Long,
-            entry_price: Some(2000.0),
-            take_profit: Some(2025.0),
-            stop_loss: Some(1990.0),
-            leverage: Some(5.0),
-            risk_reward_ratio: Some(2.5),
-            horizon: Some("4h".to_string()),
-            swing_logic: Some("test".to_string()),
-            reason: "test".to_string(),
-        };
-        let stage_trace = vec![json!({
-            "stage": "scan",
-            "parsed_scan": {
-                "scan": {
-                    "entry_style": "patient_retest"
-                }
-            }
-        })];
-        let input = sample_model_input(sample_indicators_with_known_v());
-
-        let gate =
-            evaluate_trade_entry_v_gate(&execution_config, &intent, &input, Some(&stage_trace))
-                .expect("gate should evaluate")
-                .expect("gate should be enabled");
-
-        assert!(gate.passed);
-        assert!((gate.resolved_v.value - 18.73).abs() < 1e-9);
-        assert_eq!(gate.resolved_v.timeframe, "4h");
-        assert!(gate.take_profit_distance_v > 1.0);
-    }
-
-    #[test]
-    fn evaluate_trade_rr_gate_blocks_when_rr_is_below_threshold() {
-        let mut execution_config = LlmExecutionConfig::default();
-        execution_config.min_rr = 2.0;
-        let intent = TradeIntent {
-            decision: TradeDecision::Long,
-            entry_price: Some(2000.0),
-            take_profit: Some(2015.0),
-            stop_loss: Some(1990.0),
-            leverage: Some(5.0),
-            risk_reward_ratio: Some(1.5),
-            horizon: Some("4h".to_string()),
-            swing_logic: Some("test".to_string()),
-            reason: "test".to_string(),
-        };
-
-        let gate = evaluate_trade_rr_gate(&execution_config, &intent)
-            .expect("rr gate should evaluate")
-            .expect("rr gate should apply");
-
-        assert!(!gate.passed);
-        assert!((gate.risk_reward_ratio - 1.5).abs() < 1e-9);
-        assert!((gate.min_rr - 2.0).abs() < 1e-9);
-    }
-
-    #[test]
-    fn evaluate_trade_rr_gate_passes_when_rr_meets_threshold() {
-        let mut execution_config = LlmExecutionConfig::default();
-        execution_config.min_rr = 2.0;
-        let intent = TradeIntent {
-            decision: TradeDecision::Long,
-            entry_price: Some(2000.0),
-            take_profit: Some(2020.0),
-            stop_loss: Some(1990.0),
-            leverage: Some(5.0),
-            risk_reward_ratio: Some(2.0),
-            horizon: Some("4h".to_string()),
-            swing_logic: Some("test".to_string()),
-            reason: "test".to_string(),
-        };
-
-        let gate = evaluate_trade_rr_gate(&execution_config, &intent)
-            .expect("rr gate should evaluate")
-            .expect("rr gate should apply");
-
-        assert!(gate.passed);
-        assert!((gate.risk_reward_ratio - 2.0).abs() < 1e-9);
-        assert!((gate.reward_distance - 20.0).abs() < 1e-9);
-        assert!((gate.risk_distance - 10.0).abs() < 1e-9);
-    }
-
-    #[test]
-    fn build_pending_modify_trade_intent_uses_pending_direction_and_shadow_levels() {
-        let intent = crate::llm::decision::PendingOrderManagementIntent {
-            decision: crate::llm::decision::PendingOrderManagementDecision::ModifyMaker,
-            new_entry: Some(2095.0),
-            new_tp: None,
-            new_sl: None,
-            new_leverage: None,
-            reason: "pending test".to_string(),
-        };
-        let input = sample_pending_model_input(sample_indicators_with_known_v());
-
-        let candidate = build_pending_modify_trade_intent(&intent, &input)
-            .expect("candidate should build")
-            .expect("candidate should exist");
-
-        assert_eq!(candidate.decision, TradeDecision::Short);
-        assert_eq!(candidate.entry_price, Some(2095.0));
-        assert_eq!(candidate.take_profit, Some(2050.0));
-        assert_eq!(candidate.stop_loss, Some(2120.0));
-        assert_eq!(candidate.horizon.as_deref(), Some("1d"));
-        assert!(candidate
-            .risk_reward_ratio
-            .map(|value| (value - (45.0 / 25.0)).abs() < 1e-9)
-            .unwrap_or(false));
-    }
-
-    #[test]
-    fn build_pending_modify_trade_intent_returns_none_for_non_modify_actions() {
-        let intent = crate::llm::decision::PendingOrderManagementIntent {
-            decision: crate::llm::decision::PendingOrderManagementDecision::Hold,
-            new_entry: None,
-            new_tp: None,
-            new_sl: None,
-            new_leverage: None,
-            reason: "pending test".to_string(),
-        };
-        let input = sample_pending_model_input(sample_indicators_with_known_v());
-
-        let candidate =
-            build_pending_modify_trade_intent(&intent, &input).expect("helper should evaluate");
-
-        assert!(candidate.is_none());
-    }
-
-    #[test]
-    fn build_invocation_input_preserves_raw_indicators_without_injection() {
+    fn workflow_stage1_refresh_reason_prefers_pending_reason() {
+        let config = workflow_test_config();
         let bundle = LatestBundle {
             raw: MinuteBundleEnvelope {
                 msg_type: "bundle".to_string(),
                 routing_key: "test.route".to_string(),
-                symbol: "TESTUSDT".to_string(),
+                symbol: "ETHUSDT".to_string(),
                 ts_bucket: Utc::now(),
-                window_code: "1m".to_string(),
-                indicator_count: 1,
+                window_code: "15m".to_string(),
+                indicator_count: 0,
                 published_at: None,
                 indicators: json!({}),
             },
-            indicators: json!({
-                "kline_history": {
-                    "payload": {
-                        "intervals": {
-                            "4h": {
-                                "futures": {
-                                    "bars": [
-                                        {"open_time": "2026-03-13T08:00:00Z", "high": 110.0, "low": 100.0, "is_closed": true},
-                                        {"open_time": "2026-03-13T04:00:00Z", "high": 108.0, "low": 100.0, "is_closed": true},
-                                        {"open_time": "2026-03-13T00:00:00Z", "high": 112.0, "low": 101.0, "is_closed": true}
-                                    ]
-                                }
-                            },
-                            "1d": {
-                                "futures": {
-                                    "bars": [
-                                        {"open_time": "2026-03-12T00:00:00Z", "high": 140.0, "low": 100.0, "is_closed": true},
-                                        {"open_time": "2026-03-11T00:00:00Z", "high": 138.0, "low": 102.0, "is_closed": true},
-                                        {"open_time": "2026-03-10T00:00:00Z", "high": 142.0, "low": 101.0, "is_closed": true}
-                                    ]
-                                }
-                            }
-                        }
-                    }
-                }
-            }),
+            indicators: json!({}),
             missing_indicator_codes: vec![],
             received_at: Utc::now(),
         };
+        let state = WorkflowState {
+            symbol: "ETHUSDT".to_string(),
+            pending_stage1_refresh_reason: Some("thesis_invalidated".to_string()),
+            last_stage1_ts: None,
+        };
+        assert_eq!(
+            workflow_stage1_refresh_reason(&config, &bundle, &state, None).as_deref(),
+            Some("thesis_invalidated")
+        );
+    }
 
-        let input = build_invocation_input(&bundle, false, false, None, None, None);
+    #[test]
+    fn workflow_stage1_refresh_reason_triggers_on_scheduled_boundary() {
+        let config = workflow_test_config();
+        let ts_bucket = DateTime::parse_from_rfc3339("2026-03-28T04:00:00Z")
+            .expect("ts")
+            .with_timezone(&Utc);
+        let bundle = LatestBundle {
+            raw: MinuteBundleEnvelope {
+                msg_type: "bundle".to_string(),
+                routing_key: "test.route".to_string(),
+                symbol: "ETHUSDT".to_string(),
+                ts_bucket,
+                window_code: "15m".to_string(),
+                indicator_count: 0,
+                published_at: None,
+                indicators: json!({}),
+            },
+            indicators: json!({}),
+            missing_indicator_codes: vec![],
+            received_at: ts_bucket,
+        };
+        let state = WorkflowState {
+            symbol: "ETHUSDT".to_string(),
+            pending_stage1_refresh_reason: None,
+            last_stage1_ts: Some(ts_bucket - ChronoDuration::hours(4)),
+        };
+        let stage1_output = Stage1Output {
+            meta: Stage1Meta {
+                stage1_ts: ts_bucket - ChronoDuration::hours(4),
+            },
+            monitoring_status: "active".to_string(),
+            no_trade_reason: None,
+            refresh_hints: vec![],
+            map_summary: None,
+            current_script: None,
+            driver_attribution: None,
+            current_path: None,
+        };
+        assert_eq!(
+            workflow_stage1_refresh_reason(&config, &bundle, &state, Some(&stage1_output))
+                .as_deref(),
+            Some("scheduled_4h")
+        );
+    }
 
-        assert!(input.indicators.get("pre_computed_v").is_none());
-        assert_eq!(input.indicators, bundle.indicators);
+    #[test]
+    fn workflow_stage1_refresh_reason_is_none_off_schedule_with_existing_stage1() {
+        let config = workflow_test_config();
+        let ts_bucket = DateTime::parse_from_rfc3339("2026-03-28T05:15:00Z")
+            .expect("ts")
+            .with_timezone(&Utc);
+        let bundle = LatestBundle {
+            raw: MinuteBundleEnvelope {
+                msg_type: "bundle".to_string(),
+                routing_key: "test.route".to_string(),
+                symbol: "ETHUSDT".to_string(),
+                ts_bucket,
+                window_code: "15m".to_string(),
+                indicator_count: 0,
+                published_at: None,
+                indicators: json!({}),
+            },
+            indicators: json!({}),
+            missing_indicator_codes: vec![],
+            received_at: ts_bucket,
+        };
+        let state = WorkflowState {
+            symbol: "ETHUSDT".to_string(),
+            pending_stage1_refresh_reason: None,
+            last_stage1_ts: Some(ts_bucket - ChronoDuration::minutes(15)),
+        };
+        let stage1_output = Stage1Output {
+            meta: Stage1Meta {
+                stage1_ts: ts_bucket - ChronoDuration::minutes(15),
+            },
+            monitoring_status: "active".to_string(),
+            no_trade_reason: None,
+            refresh_hints: vec![],
+            map_summary: None,
+            current_script: None,
+            driver_attribution: None,
+            current_path: None,
+        };
+        assert!(
+            workflow_stage1_refresh_reason(&config, &bundle, &state, Some(&stage1_output))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn workflow_stage2_schedule_follows_15m_refresh_minutes() {
+        let config = workflow_test_config();
+        let schedule = effective_schedule_minutes(&config, "custom_llm");
+        assert_eq!(schedule, vec![0, 15, 30, 45]);
+
+        let matching = MinuteBundleEnvelope {
+            msg_type: "bundle".to_string(),
+            routing_key: "test.route".to_string(),
+            symbol: "ETHUSDT".to_string(),
+            ts_bucket: DateTime::parse_from_rfc3339("2026-03-28T05:15:00Z")
+                .expect("ts")
+                .with_timezone(&Utc),
+            window_code: "15m".to_string(),
+            indicator_count: 0,
+            published_at: None,
+            indicators: json!({}),
+        };
+        let non_matching = MinuteBundleEnvelope {
+            ts_bucket: DateTime::parse_from_rfc3339("2026-03-28T05:10:00Z")
+                .expect("ts")
+                .with_timezone(&Utc),
+            ..matching.clone()
+        };
+
+        assert!(bundle_matches_call_schedule(&matching, &schedule));
+        assert!(!bundle_matches_call_schedule(&non_matching, &schedule));
+    }
+
+    #[test]
+    fn workflow_execution_is_blocked_when_reevaluation_trigger_hits() {
+        let eval = crate::workflow::stage2::Stage2RuntimeEvaluation {
+            monitoring_status: "active".to_string(),
+            latest_price: 2000.0,
+            no_edge_reentered: false,
+            failure_level_breached: false,
+            reevaluation_trigger_hit: true,
+            activation_level_active: true,
+            setup_confirmed: true,
+            hard_gate: crate::workflow::schema::HardGateEvaluation {
+                location_valid: true,
+                trigger_confirmed: true,
+            },
+            soft_gate: crate::workflow::schema::SoftGateEvaluation {
+                state_clear: true,
+                driver_clear: true,
+                orderflow_real: true,
+                invalidation_clear: true,
+                passed_count: 4,
+            },
+            soft_gate_min_required: 3,
+        };
+
+        assert!(!workflow_code_allows_execution(&eval));
     }
 
     #[test]
@@ -9033,8 +3001,6 @@ mod tests {
             Some(true)
         );
         assert!(input.missing_indicator_codes.is_empty());
-        assert!(!input.management_mode);
-        assert!(!input.pending_order_mode);
         assert!(input.trading_state.is_none());
         assert!(input.management_snapshot.is_none());
     }
@@ -9212,86 +3178,6 @@ mod tests {
     }
 
     #[test]
-    fn sync_snapshot_backfills_pending_entry_context_from_both_alias() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("build tokio runtime");
-        runtime.block_on(async {
-            let state = TradingStateSnapshot {
-                symbol: "TESTUSDT".to_string(),
-                has_active_context: false,
-                has_active_positions: false,
-                has_open_orders: true,
-                active_positions: vec![],
-                open_orders: vec![OpenOrderSnapshot {
-                    order_id: 1,
-                    side: "BUY".to_string(),
-                    position_side: "BOTH".to_string(),
-                    order_type: "LIMIT".to_string(),
-                    status: "NEW".to_string(),
-                    orig_qty: 0.05,
-                    executed_qty: 0.0,
-                    price: 2109.94,
-                    stop_price: 0.0,
-                    close_position: false,
-                    reduce_only: false,
-                    is_algo_order: false,
-                }],
-                total_wallet_balance: 1000.0,
-                available_balance: 800.0,
-            };
-
-            let runtime_lifecycle_state = Arc::new(Mutex::new(RuntimeLifecycleStore::default()));
-            {
-                let mut guard = runtime_lifecycle_state.lock().await;
-                let symbol_state = guard.symbol_state_mut("TESTUSDT");
-                symbol_state.last_management_reason = Some("keep pending".to_string());
-                symbol_state.contexts.insert(
-                    "TESTUSDT:BOTH".to_string(),
-                    PositionContextState {
-                        original_qty: 0.05,
-                        last_management_action: None,
-                        last_management_reason: Some("keep pending".to_string()),
-                        reduction_history: vec![],
-                        effective_entry_price: Some(2109.94),
-                        effective_stop_loss: Some(2098.55),
-                        effective_take_profit: Some(2148.0),
-                        effective_leverage: Some(42),
-                        entry_context: Some(EntryContextForState {
-                            entry_strategy: Some("Break-Retest".to_string()),
-                            stop_model: None,
-                            entry_mode: Some("patient_retest".to_string()),
-                            original_tp: Some(2148.0),
-                            original_sl: Some(2106.91),
-                            sweep_wick_extreme: None,
-                            horizon: Some("4h".to_string()),
-                            entry_reason: "original entry contract".to_string(),
-                            entry_v: Some(39.13),
-                        }),
-                    },
-                );
-            }
-
-            let snapshot =
-                sync_and_build_position_context_snapshot(Some(&state), &runtime_lifecycle_state)
-                    .await
-                    .expect("position context snapshot");
-
-            let entry_context = snapshot.entry_context.expect("backfilled entry_context");
-            assert_eq!(
-                entry_context.entry_strategy.as_deref(),
-                Some("Break-Retest")
-            );
-            assert_eq!(entry_context.horizon.as_deref(), Some("4h"));
-            assert_eq!(snapshot.effective_entry_price, Some(2109.94));
-            assert_eq!(snapshot.effective_take_profit, Some(2148.0));
-            assert_eq!(snapshot.effective_stop_loss, Some(2098.55));
-            assert_eq!(snapshot.effective_leverage, Some(42));
-        });
-    }
-
-    #[test]
     fn prune_temp_indicator_dir_removes_files_older_than_configured_minutes() {
         let dir = std::env::temp_dir().join(format!("llm-temp-indicator-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).expect("create temp indicator dir");
@@ -9321,134 +3207,228 @@ mod tests {
     }
 
     #[test]
-    fn load_latest_temp_indicator_bundle_selects_newest_file_for_symbol() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("build tokio runtime");
-
-        runtime.block_on(async {
-            let symbol = format!("ATEST{}", uuid::Uuid::new_v4().simple())
-                .chars()
-                .take(12)
-                .collect::<String>()
-                .to_ascii_uppercase();
-            let older = MinuteBundleEnvelope {
-                msg_type: "ind.minute_bundle".to_string(),
-                routing_key: "test.route".to_string(),
-                symbol: symbol.clone(),
-                ts_bucket: DateTime::parse_from_rfc3339("2026-03-18T07:00:00Z")
-                    .expect("parse older ts")
-                    .with_timezone(&Utc),
-                window_code: "1m".to_string(),
-                indicator_count: 1,
-                published_at: None,
-                indicators: json!({"older": true}),
-            };
-            let newer = MinuteBundleEnvelope {
-                msg_type: "ind.minute_bundle".to_string(),
-                routing_key: "test.route".to_string(),
-                symbol: symbol.clone(),
-                ts_bucket: DateTime::parse_from_rfc3339("2026-03-18T07:05:00Z")
-                    .expect("parse newer ts")
-                    .with_timezone(&Utc),
-                window_code: "1m".to_string(),
-                indicator_count: 1,
-                published_at: None,
-                indicators: json!({"newer": true}),
-            };
-
-            let older_raw = serde_json::to_vec(&older).expect("serialize older bundle");
-            let newer_raw = serde_json::to_vec(&newer).expect("serialize newer bundle");
-            persist_bundle_to_disk(&older, &older_raw, 5)
-                .await
-                .expect("persist older bundle");
-            persist_bundle_to_disk(&newer, &newer_raw, 5)
-                .await
-                .expect("persist newer bundle");
-
-            let loaded = load_latest_temp_indicator_bundle(&symbol)
-                .await
-                .expect("load latest temp indicator bundle");
-            assert_eq!(loaded.raw.ts_bucket, newer.ts_bucket);
-            assert_eq!(
-                loaded.indicators.get("newer").and_then(Value::as_bool),
-                Some(true)
-            );
-
-            let older_path = minute_bundle_path(&older);
-            let newer_path = minute_bundle_path(&newer);
-            let _ = fs::remove_file(older_path);
-            let _ = fs::remove_file(newer_path);
-        });
-    }
-
-    #[test]
-    fn prune_temp_model_input_dir_removes_files_older_than_configured_minutes() {
-        let dir =
-            std::env::temp_dir().join(format!("llm-temp-model-input-{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&dir).expect("create temp model input dir");
-        fs::write(dir.join(".gitignore"), "").expect("write .gitignore");
-        fs::write(
-            dir.join("20260307T105900Z_TESTUSDT_entry_20260307T110001000Z.json"),
-            "{}",
-        )
-        .expect("write old file");
-        fs::write(
-            dir.join("20260307T110000Z_TESTUSDT_management_20260307T110101000Z.json"),
-            "{}",
-        )
-        .expect("write edge file");
-        fs::write(
-            dir.join("20260307T111500Z_TESTUSDT_pending_management_20260307T111601000Z.json"),
-            "{}",
-        )
-        .expect("write fresh file");
-        fs::write(dir.join("not_a_model_input.json"), "{}").expect("write invalid file");
-
-        let removed = prune_expired_temp_model_input_files(
-            &dir,
-            DateTime::parse_from_rfc3339("2026-03-07T11:30:00Z")
-                .expect("parse current ts")
-                .with_timezone(&Utc),
-            30,
-        )
-        .expect("prune temp model input dir");
-
-        assert_eq!(removed, 1);
-        assert!(!dir
-            .join("20260307T105900Z_TESTUSDT_entry_20260307T110001000Z.json")
-            .exists());
-        assert!(dir
-            .join("20260307T110000Z_TESTUSDT_management_20260307T110101000Z.json")
-            .exists());
-        assert!(dir
-            .join("20260307T111500Z_TESTUSDT_pending_management_20260307T111601000Z.json")
-            .exists());
-        assert!(dir.join("not_a_model_input.json").exists());
-        assert!(dir.join(".gitignore").exists());
-
-        fs::remove_dir_all(&dir).expect("cleanup temp model input dir");
-    }
-
-    #[test]
-    fn render_pretty_json_text_formats_single_line_json() {
-        let rendered =
-            render_pretty_json_text("{\"decision\":\"NO_TRADE\",\"params\":{\"entry\":null}}");
-        assert!(rendered.contains('\n'));
-        assert!(rendered.contains("\"decision\": \"NO_TRADE\""));
-    }
-
-    #[test]
     fn render_pretty_json_value_formats_stage_trace_objects() {
         let rendered = render_pretty_json_value(&json!({
-            "stage": "scan",
-            "parsed_scan": {
-                "15m": {"trend": "Sideways"}
+            "stage": "workflow_stage1",
+            "parsed_output": {
+                "monitoring_status": "active"
             }
         }));
         assert!(rendered.contains('\n'));
-        assert!(rendered.contains("\"stage\": \"scan\""));
-        assert!(rendered.contains("\"trend\": \"Sideways\""));
+        assert!(rendered.contains("\"stage\": \"workflow_stage1\""));
+        assert!(rendered.contains("\"monitoring_status\": \"active\""));
+    }
+
+    #[test]
+    fn workflow_trade_signal_notifications_mark_same_side_execution_as_add() {
+        let ts_bucket = DateTime::parse_from_rfc3339("2026-03-28T05:15:00Z")
+            .expect("ts")
+            .with_timezone(&Utc);
+        let decision = crate::workflow::schema::Stage2Decision {
+            decision: "EXECUTE".to_string(),
+            reason: "confirmed".to_string(),
+            request_stage1_reevaluation: None,
+            execution_intent: Some(crate::workflow::schema::ExecutionIntent {
+                side: "LONG".to_string(),
+                intent_mode: "immediate".to_string(),
+                entry_zone: crate::workflow::schema::PriceZone {
+                    low: 1999.0,
+                    high: 2001.0,
+                    timeframe: Some("15m".to_string()),
+                    label: Some("entry".to_string()),
+                    reason: None,
+                },
+                trigger_price: Some(2000.0),
+                stop_loss: 1980.0,
+                take_profit_1: 2040.0,
+                take_profit_2: 2080.0,
+                ttl_minutes: 15,
+                max_drift_pct: 0.2,
+                path_id: "path_a".to_string(),
+                entry_snapshot: crate::workflow::schema::EntrySnapshotRef {
+                    context_key: "ETHUSDT:LONG:path_a".to_string(),
+                    path_id: "path_a".to_string(),
+                },
+                reason: Some("driver aligned".to_string()),
+            }),
+            management_actions: Vec::new(),
+            hard_gate: None,
+            soft_gate: None,
+        };
+        let trading_state = TradingStateSnapshot {
+            symbol: "ETHUSDT".to_string(),
+            has_active_context: true,
+            has_active_positions: true,
+            has_open_orders: false,
+            active_positions: vec![ActivePositionSnapshot {
+                position_side: "LONG".to_string(),
+                position_amt: 1.0,
+                entry_price: 1900.0,
+                mark_price: 2000.0,
+                unrealized_pnl: 100.0,
+                leverage: 5,
+            }],
+            open_orders: Vec::new(),
+            total_wallet_balance: 1000.0,
+            available_balance: 500.0,
+        };
+
+        let signals = build_workflow_trade_signal_notifications(
+            ts_bucket,
+            "schedule",
+            "ETHUSDT",
+            "custom_llm",
+            &decision,
+            &trading_state,
+            &HashMap::new(),
+            None,
+        );
+
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].decision, "ADD");
+        assert_eq!(signals[0].entry_price, Some(2000.0));
+        assert_eq!(signals[0].take_profit_1, Some(2040.0));
+        assert_eq!(signals[0].take_profit_2, Some(2080.0));
+        assert_eq!(signals[0].stop_loss, Some(1980.0));
+        assert_eq!(signals[0].risk_reward_ratio, Some(2.0));
+    }
+
+    #[test]
+    fn workflow_trade_signal_notifications_map_move_stop_to_modify_tpsl() {
+        let ts_bucket = DateTime::parse_from_rfc3339("2026-03-28T05:15:00Z")
+            .expect("ts")
+            .with_timezone(&Utc);
+        let decision = crate::workflow::schema::Stage2Decision {
+            decision: "WAIT".to_string(),
+            reason: "manage open context".to_string(),
+            request_stage1_reevaluation: None,
+            execution_intent: None,
+            management_actions: vec![crate::workflow::schema::ManagementAction {
+                action_type: "MOVE_STOP".to_string(),
+                context_key: "ETHUSDT:LONG:path_a".to_string(),
+                path_id: "path_a".to_string(),
+                reduce_ratio: None,
+                new_stop_loss: Some(2010.0),
+                take_profit_1: None,
+                take_profit_2: None,
+                reason: Some("lock gains".to_string()),
+            }],
+            hard_gate: None,
+            soft_gate: None,
+        };
+        let trading_state = TradingStateSnapshot {
+            symbol: "ETHUSDT".to_string(),
+            has_active_context: true,
+            has_active_positions: true,
+            has_open_orders: true,
+            active_positions: vec![ActivePositionSnapshot {
+                position_side: "LONG".to_string(),
+                position_amt: 1.0,
+                entry_price: 2000.0,
+                mark_price: 2020.0,
+                unrealized_pnl: 20.0,
+                leverage: 8,
+            }],
+            open_orders: Vec::new(),
+            total_wallet_balance: 1000.0,
+            available_balance: 500.0,
+        };
+        let mut entry_snapshots = HashMap::new();
+        entry_snapshots.insert(
+            "ETHUSDT:LONG:path_a".to_string(),
+            crate::workflow::schema::EntrySnapshot {
+                symbol: "ETHUSDT".to_string(),
+                context_key: "ETHUSDT:LONG:path_a".to_string(),
+                path_id: "path_a".to_string(),
+                side: "LONG".to_string(),
+                stop_loss: 1980.0,
+                take_profit_1: 2040.0,
+                take_profit_2: 2080.0,
+                allowed_stop_loss_levels: vec![1980.0, 2010.0],
+                allowed_take_profit_levels: vec![2040.0, 2080.0],
+                created_at: ts_bucket,
+                updated_at: ts_bucket,
+            },
+        );
+
+        let signals = build_workflow_trade_signal_notifications(
+            ts_bucket,
+            "schedule",
+            "ETHUSDT",
+            "custom_llm",
+            &decision,
+            &trading_state,
+            &entry_snapshots,
+            None,
+        );
+
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].decision, "MODIFY_TPSL");
+        assert_eq!(signals[0].entry_price, Some(2000.0));
+        assert_eq!(signals[0].stop_loss, Some(2010.0));
+        assert_eq!(signals[0].take_profit_1, Some(2040.0));
+        assert_eq!(signals[0].take_profit_2, Some(2080.0));
+    }
+
+    #[test]
+    fn workflow_management_snapshot_uses_live_position_and_entry_snapshot_contract() {
+        let trading_state = TradingStateSnapshot {
+            symbol: "ETHUSDT".to_string(),
+            has_active_context: true,
+            has_active_positions: true,
+            has_open_orders: true,
+            active_positions: vec![ActivePositionSnapshot {
+                position_side: "LONG".to_string(),
+                position_amt: 1.25,
+                entry_price: 2000.0,
+                mark_price: 2015.0,
+                unrealized_pnl: 18.75,
+                leverage: 8,
+            }],
+            open_orders: Vec::new(),
+            total_wallet_balance: 1000.0,
+            available_balance: 500.0,
+        };
+        let mut entry_snapshots = HashMap::new();
+        entry_snapshots.insert(
+            "ETHUSDT:LONG:path_a".to_string(),
+            crate::workflow::schema::EntrySnapshot {
+                symbol: "ETHUSDT".to_string(),
+                context_key: "ETHUSDT:LONG:path_a".to_string(),
+                path_id: "path_a".to_string(),
+                side: "LONG".to_string(),
+                stop_loss: 1980.0,
+                take_profit_1: 2040.0,
+                take_profit_2: 2080.0,
+                allowed_stop_loss_levels: vec![1980.0, 2010.0],
+                allowed_take_profit_levels: vec![2040.0, 2080.0],
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            },
+        );
+
+        let snapshot =
+            build_workflow_management_snapshot(&trading_state, "ETHUSDT", &entry_snapshots)
+                .expect("management snapshot");
+
+        assert_eq!(snapshot.context_state, "active_positions");
+        assert_eq!(snapshot.active_position_count, 1);
+        assert_eq!(snapshot.positions[0].direction, "LONG");
+        assert_eq!(snapshot.positions[0].current_tp_price, Some(2040.0));
+        assert_eq!(snapshot.positions[0].current_sl_price, Some(1980.0));
+        assert_eq!(
+            snapshot
+                .position_context
+                .as_ref()
+                .and_then(|item| item.effective_take_profit),
+            Some(2040.0)
+        );
+        assert_eq!(
+            snapshot
+                .position_context
+                .as_ref()
+                .and_then(|item| item.effective_stop_loss),
+            Some(1980.0)
+        );
     }
 }

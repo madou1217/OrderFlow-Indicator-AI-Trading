@@ -12,18 +12,21 @@ pub struct TelegramOperator {
 }
 
 #[derive(Debug, Clone)]
-pub struct TradeSignalNotification<'a> {
+pub struct TradeSignalNotification {
     pub ts_bucket: DateTime<Utc>,
-    pub trigger: &'a str,
-    pub symbol: &'a str,
-    pub model_name: &'a str,
-    pub decision: &'a str,
+    pub trigger: String,
+    pub symbol: String,
+    pub model_name: String,
+    pub decision: String,
+    pub context_key: Option<String>,
+    pub path_id: Option<String>,
     pub entry_price: Option<f64>,
     pub leverage: Option<f64>,
     pub risk_reward_ratio: Option<f64>,
-    pub take_profit: Option<f64>,
+    pub take_profit_1: Option<f64>,
+    pub take_profit_2: Option<f64>,
     pub stop_loss: Option<f64>,
-    pub reason: &'a str,
+    pub reason: String,
 }
 
 impl TelegramOperator {
@@ -48,13 +51,12 @@ impl TelegramOperator {
     pub async fn send_trade_signal(
         &self,
         http_client: &Client,
-        signal: &TradeSignalNotification<'_>,
+        signal: &TradeSignalNotification,
     ) -> Result<()> {
         let url = format!("{}/bot{}/sendMessage", self.base_api_url, self.token);
-        let text = build_trade_signal_message(signal);
         let payload = json!({
             "chat_id": self.chat_id,
-            "text": text,
+            "text": build_trade_signal_message(signal),
             "disable_web_page_preview": true,
         });
 
@@ -93,17 +95,13 @@ fn normalize_chat_id(raw: &str) -> String {
     if trimmed.is_empty() {
         return String::new();
     }
-
-    // Numeric channel/group IDs are passed through directly.
     if trimmed.starts_with('-') || trimmed.chars().all(|c| c.is_ascii_digit()) {
         return trimmed.to_string();
     }
-
     if trimmed.starts_with('@') {
         return trimmed.to_string();
     }
 
-    // Accept links like t.me/<username> and normalize them to @<username>.
     let mut candidate = trimmed
         .trim_start_matches("https://")
         .trim_start_matches("http://")
@@ -125,28 +123,44 @@ fn normalize_chat_id(raw: &str) -> String {
     }
 }
 
-fn build_trade_signal_message(signal: &TradeSignalNotification<'_>) -> String {
-    let direction_emoji = if signal.decision.eq_ignore_ascii_case("LONG") {
-        "📈"
-    } else if signal.decision.eq_ignore_ascii_case("SHORT") {
-        "📉"
-    } else {
-        "ℹ️"
-    };
-    let time_only_utc = signal.ts_bucket.format("%H:%M:%S").to_string();
-    format!(
-        "🚨 黄大发 Trade Signal\n{} {}\n📌 Symbol: {}\n🟢 Entry: {}\n⚙️ Leverage: {}\n📊 RR: {}\n🎯 TP: {}\n🛑 SL: {}\n🕒 Time: {}\n🧠 reason: {}",
-        direction_emoji,
-        signal.decision,
-        signal.symbol,
-        format_opt_price(signal.entry_price),
-        format_opt_leverage(signal.leverage),
-        format_opt_ratio(signal.risk_reward_ratio),
-        format_opt_price(signal.take_profit),
-        format_opt_price(signal.stop_loss),
-        format!("{} UTC", time_only_utc),
-        signal.reason.replace('\n', " "),
-    )
+fn build_trade_signal_message(signal: &TradeSignalNotification) -> String {
+    let mut lines = vec![
+        "Workflow Trade Signal".to_string(),
+        format!("Decision: {}", signal.decision),
+        format!("Symbol: {}", signal.symbol),
+    ];
+    if let Some(context_key) = signal.context_key.as_deref() {
+        lines.push(format!("Context: {}", context_key));
+    }
+    if let Some(path_id) = signal.path_id.as_deref() {
+        lines.push(format!("Path: {}", path_id));
+    }
+    lines.push(format!("Entry: {}", format_opt_price(signal.entry_price)));
+    lines.push(format!("TP1: {}", format_opt_price(signal.take_profit_1)));
+    lines.push(format!("TP2: {}", format_opt_price(signal.take_profit_2)));
+    lines.push(format!("SL: {}", format_opt_price(signal.stop_loss)));
+    lines.push(format!(
+        "Leverage: {}",
+        format_opt_leverage(signal.leverage)
+    ));
+    lines.push(format!(
+        "RR: {}",
+        format_opt_ratio(signal.risk_reward_ratio)
+    ));
+    lines.push(format!("Time: {} UTC", signal.ts_bucket.format("%H:%M:%S")));
+    lines.push(format!("Trigger: {}", signal.trigger));
+    lines.push(format!("Model: {}", signal.model_name));
+    lines.push(format!("Reason: {}", single_line_text(&signal.reason, 800)));
+    lines.join("\n")
+}
+
+fn single_line_text(input: &str, max_len: usize) -> String {
+    let mut output = input.split_whitespace().collect::<Vec<_>>().join(" ");
+    if output.len() > max_len {
+        output.truncate(max_len);
+        output.push_str("...");
+    }
+    output
 }
 
 fn format_opt_price(value: Option<f64>) -> String {
