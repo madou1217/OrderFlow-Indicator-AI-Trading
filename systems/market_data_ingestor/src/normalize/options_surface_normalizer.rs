@@ -42,9 +42,9 @@ pub fn normalize_mark_greeks_5m_rest(
             "unit": unit,
             "index_price": index_price,
             "mark_price": parse_optional_num(mark.mark_price.as_deref())?,
-            "bid_iv": parse_optional_num(mark.bid_iv.as_deref())?,
-            "ask_iv": parse_optional_num(mark.ask_iv.as_deref())?,
-            "mark_iv": parse_optional_num(mark.mark_iv.as_deref())?,
+            "bid_iv": parse_optional_iv(mark.bid_iv.as_deref())?,
+            "ask_iv": parse_optional_iv(mark.ask_iv.as_deref())?,
+            "mark_iv": parse_optional_iv(mark.mark_iv.as_deref())?,
             "delta": parse_optional_num(mark.delta.as_deref())?,
             "gamma": parse_optional_num(mark.gamma.as_deref())?,
             "vega": parse_optional_num(mark.vega.as_deref())?,
@@ -73,10 +73,29 @@ fn parse_optional_num(value: Option<&str>) -> Result<Option<f64>> {
         .transpose()
 }
 
+fn parse_optional_iv(value: Option<&str>) -> Result<Option<f64>> {
+    match parse_optional_num(value)? {
+        Some(v) if v < 0.0 => Ok(None),
+        other => Ok(other),
+    }
+}
+
 fn underlying_asset_from_symbol(underlying: &str) -> String {
     underlying
         .strip_suffix("USDT")
         .or_else(|| underlying.strip_suffix("USD"))
         .unwrap_or(underlying)
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_optional_iv;
+
+    #[test]
+    fn negative_iv_sentinel_is_treated_as_missing() {
+        assert_eq!(parse_optional_iv(Some("-1.0")).unwrap(), None);
+        assert_eq!(parse_optional_iv(Some("1.131")).unwrap(), Some(1.131));
+        assert_eq!(parse_optional_iv(None).unwrap(), None);
+    }
 }
