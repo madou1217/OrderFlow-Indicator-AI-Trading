@@ -1,5 +1,7 @@
 use crate::indicators::context::{IndicatorContext, KlineHistoryBar};
-use crate::indicators::i19_kline_history::build_interval_bar_records;
+use crate::indicators::i19_kline_history::{
+    build_interval_bar_records, build_interval_bar_records_from_records,
+};
 use crate::indicators::indicator_trait::Indicator;
 use crate::indicators::shared::output_mapper::snapshot_only;
 use chrono::{DateTime, Duration, Utc};
@@ -58,19 +60,7 @@ impl Indicator for I23EmaTrendRegime {
         let mut htf_series_by_tf: BTreeMap<String, Vec<HtfRegimePoint>> = BTreeMap::new();
 
         for tf_code in &ctx.ema_htf_windows {
-            let Some(tf_minutes) = window_to_minutes(tf_code) else {
-                continue;
-            };
-
-            let mut merged = merge_htf_bars(
-                build_interval_bar_records(
-                    &ctx.history_futures,
-                    tf_minutes,
-                    usize::MAX,
-                    current_minute_close,
-                ),
-                htf_db_bars(ctx, tf_code),
-            );
+            let mut merged = build_htf_input_bars(ctx, tf_code, current_minute_close);
             merged.sort_by_key(|bar| bar.open_time);
 
             let series = build_htf_regime_series(&merged, period_fast, period_slow);
@@ -174,6 +164,46 @@ impl Indicator for I23EmaTrendRegime {
                 "ffill_series_by_output_window": ffill_series_by_output_window,
             }),
         )
+    }
+}
+
+fn build_htf_input_bars(
+    ctx: &IndicatorContext,
+    tf_code: &str,
+    current_minute_close: DateTime<Utc>,
+) -> Vec<KlineHistoryBar> {
+    match tf_code {
+        "3d" => {
+            let merged_daily = merge_htf_bars(
+                build_interval_bar_records(
+                    &ctx.history_futures,
+                    1440,
+                    usize::MAX,
+                    current_minute_close,
+                ),
+                &ctx.kline_history_futures_1d_db,
+            );
+            build_interval_bar_records_from_records(
+                &merged_daily,
+                4320,
+                usize::MAX,
+                current_minute_close,
+            )
+        }
+        _ => {
+            let Some(tf_minutes) = window_to_minutes(tf_code) else {
+                return Vec::new();
+            };
+            merge_htf_bars(
+                build_interval_bar_records(
+                    &ctx.history_futures,
+                    tf_minutes,
+                    usize::MAX,
+                    current_minute_close,
+                ),
+                htf_db_bars(ctx, tf_code),
+            )
+        }
     }
 }
 
@@ -301,13 +331,16 @@ fn window_to_minutes(code: &str) -> Option<i64> {
         "1h" => Some(60),
         "4h" => Some(240),
         "1d" => Some(1440),
+        "3d" => Some(4320),
         _ => None,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{combine_regimes, ema_last, htf_state_at, regime_of_pair, HtfRegimePoint};
+    use super::{
+        combine_regimes, ema_last, htf_state_at, regime_of_pair, window_to_minutes, HtfRegimePoint,
+    };
     use chrono::{Duration, TimeZone, Utc};
 
     #[test]
@@ -357,5 +390,10 @@ mod tests {
         assert_eq!(combine_regimes(&["bull", "bull"]), "bull");
         assert_eq!(combine_regimes(&["bear", "bear"]), "bear");
         assert_eq!(combine_regimes(&["bull", "bear"]), "neutral");
+    }
+
+    #[test]
+    fn window_to_minutes_supports_3d() {
+        assert_eq!(window_to_minutes("3d"), Some(4320));
     }
 }

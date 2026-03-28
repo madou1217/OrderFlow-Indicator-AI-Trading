@@ -497,6 +497,7 @@ fn build_pvs_context(
         kline_history_bars_15m: options.kline_history_bars_15m,
         kline_history_bars_4h: options.kline_history_bars_4h,
         kline_history_bars_1d: options.kline_history_bars_1d,
+        kline_history_bars_3d: options.kline_history_bars_3d,
         kline_history_fill_1d_from_db: options.kline_history_fill_1d_from_db,
         fvg_windows: options.fvg_windows.clone(),
         fvg_fill_from_db: options.fvg_fill_from_db,
@@ -532,6 +533,7 @@ fn build_pvs_context(
         ema_fill_from_db: options.ema_fill_from_db,
         ema_db_bars_4h: options.ema_db_bars_4h,
         ema_db_bars_1d: options.ema_db_bars_1d,
+        ema_db_bars_3d: options.ema_db_bars_3d,
         divergence_sig_test_mode: match options.divergence_sig_test_mode {
             DivergenceSigTestMode::Threshold => DivergenceSigTestMode::Threshold,
             DivergenceSigTestMode::BlockBootstrap => DivergenceSigTestMode::BlockBootstrap,

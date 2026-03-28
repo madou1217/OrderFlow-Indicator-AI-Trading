@@ -1036,6 +1036,7 @@ mod tests {
             kline_history_bars_15m: 120,
             kline_history_bars_4h: 120,
             kline_history_bars_1d: 120,
+            kline_history_bars_3d: 120,
             kline_history_fill_1d_from_db: true,
             fvg_windows: vec![
                 "15m".to_string(),
@@ -1076,6 +1077,7 @@ mod tests {
             ema_fill_from_db: true,
             ema_db_bars_4h: 256,
             ema_db_bars_1d: 256,
+            ema_db_bars_3d: 256,
             divergence_sig_test_mode: DivergenceSigTestMode::Threshold,
             divergence_bootstrap_b: 200,
             divergence_bootstrap_block_len: 5,
@@ -1272,6 +1274,7 @@ mod tests {
             kline_history_bars_15m: 120,
             kline_history_bars_4h: 120,
             kline_history_bars_1d: 120,
+            kline_history_bars_3d: 120,
             kline_history_fill_1d_from_db: true,
             fvg_windows: vec![
                 "15m".to_string(),
@@ -1312,6 +1315,7 @@ mod tests {
             ema_fill_from_db: true,
             ema_db_bars_4h: 256,
             ema_db_bars_1d: 256,
+            ema_db_bars_3d: 256,
             divergence_sig_test_mode: DivergenceSigTestMode::Threshold,
             divergence_bootstrap_b: 200,
             divergence_bootstrap_block_len: 5,
@@ -1401,6 +1405,7 @@ mod tests {
             kline_history_bars_15m: 120,
             kline_history_bars_4h: 120,
             kline_history_bars_1d: 120,
+            kline_history_bars_3d: 120,
             kline_history_fill_1d_from_db: true,
             fvg_windows: vec![
                 "15m".to_string(),
@@ -1441,6 +1446,7 @@ mod tests {
             ema_fill_from_db: true,
             ema_db_bars_4h: 256,
             ema_db_bars_1d: 256,
+            ema_db_bars_3d: 256,
             divergence_sig_test_mode: DivergenceSigTestMode::Threshold,
             divergence_bootstrap_b: 200,
             divergence_bootstrap_block_len: 5,
@@ -1598,6 +1604,7 @@ mod tests {
             kline_history_bars_15m: 120,
             kline_history_bars_4h: 120,
             kline_history_bars_1d: 120,
+            kline_history_bars_3d: 120,
             kline_history_fill_1d_from_db: true,
             fvg_windows: vec![
                 "15m".to_string(),
@@ -1638,6 +1645,7 @@ mod tests {
             ema_fill_from_db: true,
             ema_db_bars_4h: 256,
             ema_db_bars_1d: 256,
+            ema_db_bars_3d: 256,
             divergence_sig_test_mode: DivergenceSigTestMode::Threshold,
             divergence_bootstrap_b: 200,
             divergence_bootstrap_block_len: 5,
