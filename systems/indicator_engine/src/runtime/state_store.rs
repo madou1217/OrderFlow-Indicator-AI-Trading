@@ -25,6 +25,7 @@ const TICK_SIZE: f64 = 1.0 / PRICE_SCALE;
 const VPIN_BUCKET_SIZE_BASE: f64 = 50.0;
 const VPIN_ROLLING_BUCKETS: usize = 50;
 const VPIN_EPS: f64 = 1e-12;
+const MATERIAL_CHANGE_EPS: f64 = 1e-9;
 // Keep one full day of finalized canonical 1m inputs so late trade corrections
 // can still recompute indicators that depend on 1h/4h/1d rolling trade history.
 // This retention also keeps the paired VPIN snapshots long enough to restore the
@@ -39,6 +40,13 @@ const OPTIONS_SURFACE_BUCKET_SPAN_MINUTES: i64 = 5;
 pub struct LevelAgg {
     pub buy_qty: f64,
     pub sell_qty: f64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct IngestOutcome {
+    pub material_change: bool,
+    pub dirty_recompute_marked: bool,
+    pub oi_ratio_patch_marked: bool,
 }
 
 impl LevelAgg {
@@ -1484,9 +1492,10 @@ impl StateStore {
         latest_segment
     }
 
-    pub fn ingest(&mut self, event: EngineEvent) {
+    pub fn ingest(&mut self, event: EngineEvent) -> IngestOutcome {
         let bucket_ts = floor_minute(event.event_ts);
         let whale_threshold_usdt = self.whale_threshold_usdt;
+        let mut outcome = IngestOutcome::default();
 
         match event.data {
             MdData::Trade(trade) => {
@@ -1504,7 +1513,7 @@ impl StateStore {
                 self.bucket_mut(event.market, bucket_ts).vpin_close = Some(vpin);
             }
             MdData::AggTrade1m(trade) => {
-                self.store_canonical_trade(event.market, trade);
+                outcome = self.store_canonical_trade(event.market, trade);
             }
             MdData::Depth(depth) => {
                 let sample = if let Some(book) = self.orderbooks.get_mut(&event.market) {
@@ -1551,7 +1560,7 @@ impl StateStore {
                 }
             }
             MdData::AggOrderbook1m(orderbook) => {
-                self.store_canonical_orderbook(event.market, orderbook);
+                outcome = self.store_canonical_orderbook(event.market, orderbook);
             }
             MdData::Kline(kline) => {
                 // Only 1m klines update the current-minute OHLC.
@@ -1612,24 +1621,26 @@ impl StateStore {
                 bucket.apply_force_order(&force_order);
             }
             MdData::AggLiq1m(liq) => {
-                self.store_canonical_liq(event.market, liq);
+                outcome = self.store_canonical_liq(event.market, liq);
             }
             MdData::AggFundingMark1m(funding_mark) => {
-                self.store_canonical_funding_mark(event.market, funding_mark);
+                outcome = self.store_canonical_funding_mark(event.market, funding_mark);
             }
             MdData::OpenInterestCurrent(open_interest) => {
-                self.store_current_open_interest(open_interest);
+                outcome.material_change = self.store_current_open_interest(open_interest);
             }
             MdData::OpenInterestHist5m(open_interest_hist) => {
-                self.store_open_interest_hist_5m(open_interest_hist);
+                outcome = self.store_open_interest_hist_5m(open_interest_hist);
             }
             MdData::LongShortRatio5m(long_short_ratio) => {
-                self.store_long_short_ratio_5m(long_short_ratio);
+                outcome = self.store_long_short_ratio_5m(long_short_ratio);
             }
             MdData::OptionMarkGreeks5m(option_mark) => {
-                self.store_option_mark_greeks_5m(option_mark);
+                outcome.material_change = self.store_option_mark_greeks_5m(option_mark);
             }
         }
+
+        outcome
     }
 
     pub fn finalize_minute(&mut self, ts_bucket: DateTime<Utc>) -> WindowBundle {
@@ -1854,67 +1865,105 @@ impl StateStore {
         }
     }
 
-    fn store_canonical_trade(&mut self, market: MarketKind, trade: AggTrade1mEvent) {
+    fn store_canonical_trade(
+        &mut self,
+        market: MarketKind,
+        trade: AggTrade1mEvent,
+    ) -> IngestOutcome {
         let changed = {
             let slot = self.canonical_slot_mut(market, trade.ts_bucket);
-            slot.trade.as_ref() != Some(&trade)
+            slot.trade
+                .as_ref()
+                .map(|existing| !agg_trade_materially_eq(existing, &trade))
+                .unwrap_or(true)
         };
         if changed {
             self.canonical_slot_mut(market, trade.ts_bucket).trade = Some(trade.clone());
-            self.mark_dirty_recompute_if_finalized(trade.ts_bucket);
+            return IngestOutcome {
+                material_change: true,
+                dirty_recompute_marked: self.mark_dirty_recompute_if_finalized(trade.ts_bucket),
+                ..IngestOutcome::default()
+            };
         }
+        IngestOutcome::default()
     }
 
-    fn store_canonical_orderbook(&mut self, market: MarketKind, orderbook: AggOrderbook1mEvent) {
+    fn store_canonical_orderbook(
+        &mut self,
+        market: MarketKind,
+        orderbook: AggOrderbook1mEvent,
+    ) -> IngestOutcome {
         let changed = {
             let slot = self.canonical_slot_mut(market, orderbook.ts_bucket);
             match slot.orderbook.as_ref() {
                 Some(existing)
                     if existing.heatmap_loaded
                         && !orderbook.heatmap_loaded
-                        && existing.scalar_eq(&orderbook) =>
+                        && agg_orderbook_scalar_material_eq(existing, &orderbook) =>
                 {
                     false
                 }
-                Some(existing) => existing != &orderbook,
+                Some(existing) => !agg_orderbook_materially_eq(existing, &orderbook),
                 None => true,
             }
         };
         if changed {
             self.canonical_slot_mut(market, orderbook.ts_bucket)
                 .orderbook = Some(orderbook.clone());
-            self.mark_dirty_recompute_if_finalized(orderbook.ts_bucket);
+            return IngestOutcome {
+                material_change: true,
+                dirty_recompute_marked: self.mark_dirty_recompute_if_finalized(orderbook.ts_bucket),
+                ..IngestOutcome::default()
+            };
         }
+        IngestOutcome::default()
     }
 
-    fn store_canonical_liq(&mut self, market: MarketKind, liq: AggLiq1mEvent) {
+    fn store_canonical_liq(&mut self, market: MarketKind, liq: AggLiq1mEvent) -> IngestOutcome {
         let changed = {
             let slot = self.canonical_slot_mut(market, liq.ts_bucket);
-            slot.liq.as_ref() != Some(&liq)
+            slot.liq
+                .as_ref()
+                .map(|existing| !agg_liq_materially_eq(existing, &liq))
+                .unwrap_or(true)
         };
         if changed {
             self.canonical_slot_mut(market, liq.ts_bucket).liq = Some(liq.clone());
-            self.mark_dirty_recompute_if_finalized(liq.ts_bucket);
+            return IngestOutcome {
+                material_change: true,
+                dirty_recompute_marked: self.mark_dirty_recompute_if_finalized(liq.ts_bucket),
+                ..IngestOutcome::default()
+            };
         }
+        IngestOutcome::default()
     }
 
     fn store_canonical_funding_mark(
         &mut self,
         market: MarketKind,
         funding_mark: AggFundingMark1mEvent,
-    ) {
+    ) -> IngestOutcome {
         let changed = {
             let slot = self.canonical_slot_mut(market, funding_mark.ts_bucket);
-            slot.funding_mark.as_ref() != Some(&funding_mark)
+            slot.funding_mark
+                .as_ref()
+                .map(|existing| !agg_funding_mark_materially_eq(existing, &funding_mark))
+                .unwrap_or(true)
         };
         if changed {
             self.canonical_slot_mut(market, funding_mark.ts_bucket)
                 .funding_mark = Some(funding_mark.clone());
-            self.mark_dirty_recompute_if_finalized(funding_mark.ts_bucket);
+            return IngestOutcome {
+                material_change: true,
+                dirty_recompute_marked: self
+                    .mark_dirty_recompute_if_finalized(funding_mark.ts_bucket),
+                ..IngestOutcome::default()
+            };
         }
+        IngestOutcome::default()
     }
 
-    fn store_current_open_interest(&mut self, open_interest: OpenInterestCurrentEvent) {
+    fn store_current_open_interest(&mut self, open_interest: OpenInterestCurrentEvent) -> bool {
         let point = OpenInterestCurrentSidecar {
             ts_effective: open_interest.ts_effective,
             open_interest_contracts: open_interest.open_interest_contracts,
@@ -1927,32 +1976,44 @@ impl StateStore {
             point,
             OI_CURRENT_HISTORY_KEEP_MINUTES,
             |item| item.ts_effective,
-        );
+        )
     }
 
-    fn store_open_interest_hist_5m(&mut self, open_interest_hist: OpenInterestHist5mEvent) {
+    fn store_open_interest_hist_5m(
+        &mut self,
+        open_interest_hist: OpenInterestHist5mEvent,
+    ) -> IngestOutcome {
         let point = OpenInterestHistPoint {
             ts_bucket: open_interest_hist.ts_bucket,
             open_interest_contracts: open_interest_hist.open_interest_contracts,
             open_interest_value_usdt: open_interest_hist.open_interest_value_usdt,
             reference_price: open_interest_hist.reference_price,
         };
-        let changed = upsert_sorted_point(
+        let changed = upsert_sorted_point_with_eq(
             &mut self.open_interest_hist_5m,
             point.ts_bucket,
             point,
             OI_RATIO_HISTORY_KEEP_5M_BUCKETS,
             |item| item.ts_bucket,
+            open_interest_hist_point_materially_eq,
         );
         if changed {
-            self.mark_oi_ratio_patch_if_finalized(
-                open_interest_hist.ts_bucket,
-                "open_interest_hist_5m_changed",
-            );
+            return IngestOutcome {
+                material_change: true,
+                oi_ratio_patch_marked: self.mark_oi_ratio_patch_if_finalized(
+                    open_interest_hist.ts_bucket,
+                    "open_interest_hist_5m_changed",
+                ),
+                ..IngestOutcome::default()
+            };
         }
+        IngestOutcome::default()
     }
 
-    fn store_long_short_ratio_5m(&mut self, long_short_ratio: LongShortRatio5mEvent) {
+    fn store_long_short_ratio_5m(
+        &mut self,
+        long_short_ratio: LongShortRatio5mEvent,
+    ) -> IngestOutcome {
         let point = LongShortRatioPoint {
             ts_bucket: long_short_ratio.ts_bucket,
             long_short_ratio: long_short_ratio.long_short_ratio,
@@ -1960,37 +2021,45 @@ impl StateStore {
             short_account_ratio: long_short_ratio.short_account_ratio,
         };
         let changed = match long_short_ratio.ratio_type {
-            LongShortRatioType::GlobalAccount => upsert_sorted_point(
+            LongShortRatioType::GlobalAccount => upsert_sorted_point_with_eq(
                 &mut self.global_account_ratio_5m,
                 point.ts_bucket,
                 point,
                 OI_RATIO_HISTORY_KEEP_5M_BUCKETS,
                 |item| item.ts_bucket,
+                long_short_ratio_point_materially_eq,
             ),
-            LongShortRatioType::TopAccount => upsert_sorted_point(
+            LongShortRatioType::TopAccount => upsert_sorted_point_with_eq(
                 &mut self.top_account_ratio_5m,
                 point.ts_bucket,
                 point,
                 OI_RATIO_HISTORY_KEEP_5M_BUCKETS,
                 |item| item.ts_bucket,
+                long_short_ratio_point_materially_eq,
             ),
-            LongShortRatioType::TopPosition => upsert_sorted_point(
+            LongShortRatioType::TopPosition => upsert_sorted_point_with_eq(
                 &mut self.top_position_ratio_5m,
                 point.ts_bucket,
                 point,
                 OI_RATIO_HISTORY_KEEP_5M_BUCKETS,
                 |item| item.ts_bucket,
+                long_short_ratio_point_materially_eq,
             ),
         };
         if changed {
-            self.mark_oi_ratio_patch_if_finalized(
-                long_short_ratio.ts_bucket,
-                "long_short_ratio_5m_changed",
-            );
+            return IngestOutcome {
+                material_change: true,
+                oi_ratio_patch_marked: self.mark_oi_ratio_patch_if_finalized(
+                    long_short_ratio.ts_bucket,
+                    "long_short_ratio_5m_changed",
+                ),
+                ..IngestOutcome::default()
+            };
         }
+        IngestOutcome::default()
     }
 
-    fn store_option_mark_greeks_5m(&mut self, event: OptionMarkGreeks5mEvent) {
+    fn store_option_mark_greeks_5m(&mut self, event: OptionMarkGreeks5mEvent) -> bool {
         let point = OptionMarkGreeksPoint {
             ts_bucket: event.ts_bucket,
             option_symbol: event.option_symbol,
@@ -2018,16 +2087,21 @@ impl StateStore {
             OPTIONS_SURFACE_HISTORY_KEEP_5M_BUCKETS,
             |item| (item.ts_bucket, item.option_symbol.clone()),
             |item| item.ts_bucket,
-        );
+        )
     }
 
-    fn mark_oi_ratio_patch_if_finalized(&mut self, ts_bucket: DateTime<Utc>, reason: &'static str) {
+    fn mark_oi_ratio_patch_if_finalized(
+        &mut self,
+        ts_bucket: DateTime<Utc>,
+        reason: &'static str,
+    ) -> bool {
         if self
             .last_finalized_minute
             .map(|last| ts_bucket <= last)
             .unwrap_or(false)
         {
             let old_from = self.oi_ratio_patch_from;
+            let old_end = self.oi_ratio_patch_end;
             let extends_backward = old_from.map(|prev| ts_bucket < prev).unwrap_or(true);
             self.oi_ratio_patch_from = Some(
                 self.oi_ratio_patch_from
@@ -2056,7 +2130,9 @@ impl StateStore {
                 last_finalized_minute = ?self.last_finalized_minute,
                 "oi_ratio patch minute marked"
             );
+            return self.oi_ratio_patch_from != old_from || self.oi_ratio_patch_end != old_end;
         }
+        false
     }
 
     fn canonical_slot_mut(
@@ -2080,12 +2156,15 @@ impl StateStore {
             .map(|v| v.for_market(market))
     }
 
-    fn mark_dirty_recompute_if_finalized(&mut self, ts_bucket: DateTime<Utc>) {
+    fn mark_dirty_recompute_if_finalized(&mut self, ts_bucket: DateTime<Utc>) -> bool {
         if self
             .last_finalized_minute
             .map(|last| ts_bucket <= last)
             .unwrap_or(false)
         {
+            let old_from = self.dirty_recompute_from;
+            let old_end = self.dirty_recompute_end;
+            let old_truncated = self.dirty_recompute_truncated;
             // If the new dirty point is earlier than the current batch start,
             // the history truncation must be redone from the new start.
             let extends_backward = self
@@ -2115,7 +2194,11 @@ impl StateStore {
                     );
                 }
             }
+            return self.dirty_recompute_from != old_from
+                || self.dirty_recompute_end != old_end
+                || self.dirty_recompute_truncated != old_truncated;
         }
+        false
     }
 
     fn build_bucket_for_minute(
@@ -3097,8 +3180,24 @@ where
     T: Clone + PartialEq,
     F: Fn(&T) -> DateTime<Utc>,
 {
+    upsert_sorted_point_with_eq(deque, point_ts, point, keep_limit, ts_of, |a, b| a == b)
+}
+
+fn upsert_sorted_point_with_eq<T, F, EQ>(
+    deque: &mut VecDeque<T>,
+    point_ts: DateTime<Utc>,
+    point: T,
+    keep_limit: usize,
+    ts_of: F,
+    eq: EQ,
+) -> bool
+where
+    T: Clone,
+    F: Fn(&T) -> DateTime<Utc>,
+    EQ: Fn(&T, &T) -> bool,
+{
     if let Some(existing_idx) = deque.iter().position(|item| ts_of(item) == point_ts) {
-        if deque[existing_idx] == point {
+        if eq(&deque[existing_idx], &point) {
             return false;
         }
         deque[existing_idx] = point;
@@ -3124,6 +3223,172 @@ where
         deque.pop_front();
     }
     true
+}
+
+fn materially_equal_f64(lhs: f64, rhs: f64) -> bool {
+    let scale = lhs.abs().max(rhs.abs()).max(1.0);
+    (lhs - rhs).abs() <= MATERIAL_CHANGE_EPS * scale
+}
+
+fn materially_equal_option_f64(lhs: Option<f64>, rhs: Option<f64>) -> bool {
+    match (lhs, rhs) {
+        (Some(a), Some(b)) => materially_equal_f64(a, b),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+fn agg_profile_levels_materially_eq(
+    lhs: &[crate::ingest::decoder::AggProfileLevel],
+    rhs: &[crate::ingest::decoder::AggProfileLevel],
+) -> bool {
+    lhs.len() == rhs.len()
+        && lhs.iter().zip(rhs.iter()).all(|(a, b)| {
+            materially_equal_f64(a.price, b.price)
+                && materially_equal_f64(a.buy_qty, b.buy_qty)
+                && materially_equal_f64(a.sell_qty, b.sell_qty)
+        })
+}
+
+fn agg_heatmap_levels_materially_eq(
+    lhs: &[crate::ingest::decoder::AggHeatmapLevel],
+    rhs: &[crate::ingest::decoder::AggHeatmapLevel],
+) -> bool {
+    lhs.len() == rhs.len()
+        && lhs.iter().zip(rhs.iter()).all(|(a, b)| {
+            materially_equal_f64(a.price, b.price)
+                && materially_equal_f64(a.bid_liquidity, b.bid_liquidity)
+                && materially_equal_f64(a.ask_liquidity, b.ask_liquidity)
+        })
+}
+
+fn agg_liq_levels_materially_eq(
+    lhs: &[crate::ingest::decoder::AggLiqLevel],
+    rhs: &[crate::ingest::decoder::AggLiqLevel],
+) -> bool {
+    lhs.len() == rhs.len()
+        && lhs.iter().zip(rhs.iter()).all(|(a, b)| {
+            materially_equal_f64(a.price, b.price)
+                && materially_equal_f64(a.long_liq, b.long_liq)
+                && materially_equal_f64(a.short_liq, b.short_liq)
+        })
+}
+
+fn agg_mark_points_materially_eq(
+    lhs: &[crate::ingest::decoder::AggMarkPoint],
+    rhs: &[crate::ingest::decoder::AggMarkPoint],
+) -> bool {
+    lhs.len() == rhs.len()
+        && lhs.iter().zip(rhs.iter()).all(|(a, b)| {
+            a.ts == b.ts
+                && materially_equal_option_f64(a.mark_price, b.mark_price)
+                && materially_equal_option_f64(a.index_price, b.index_price)
+                && materially_equal_option_f64(a.estimated_settle_price, b.estimated_settle_price)
+                && materially_equal_option_f64(a.funding_rate, b.funding_rate)
+                && a.next_funding_time == b.next_funding_time
+        })
+}
+
+fn agg_funding_points_materially_eq(
+    lhs: &[crate::ingest::decoder::AggFundingPoint],
+    rhs: &[crate::ingest::decoder::AggFundingPoint],
+) -> bool {
+    lhs.len() == rhs.len()
+        && lhs.iter().zip(rhs.iter()).all(|(a, b)| {
+            a.ts == b.ts
+                && a.funding_time == b.funding_time
+                && materially_equal_f64(a.funding_rate, b.funding_rate)
+                && materially_equal_option_f64(a.mark_price, b.mark_price)
+                && a.next_funding_time == b.next_funding_time
+        })
+}
+
+fn agg_trade_materially_eq(lhs: &AggTrade1mEvent, rhs: &AggTrade1mEvent) -> bool {
+    lhs.ts_bucket == rhs.ts_bucket
+        && lhs.chunk_start_ts == rhs.chunk_start_ts
+        && lhs.chunk_end_ts == rhs.chunk_end_ts
+        && lhs.source_event_count == rhs.source_event_count
+        && lhs.trade_count == rhs.trade_count
+        && materially_equal_f64(lhs.buy_qty, rhs.buy_qty)
+        && materially_equal_f64(lhs.sell_qty, rhs.sell_qty)
+        && materially_equal_f64(lhs.buy_notional, rhs.buy_notional)
+        && materially_equal_f64(lhs.sell_notional, rhs.sell_notional)
+        && materially_equal_option_f64(lhs.first_price, rhs.first_price)
+        && materially_equal_option_f64(lhs.last_price, rhs.last_price)
+        && materially_equal_option_f64(lhs.high_price, rhs.high_price)
+        && materially_equal_option_f64(lhs.low_price, rhs.low_price)
+        && agg_profile_levels_materially_eq(&lhs.profile_levels, &rhs.profile_levels)
+        && lhs.whale == rhs.whale
+        && lhs.vpin_snapshot == rhs.vpin_snapshot
+}
+
+fn agg_orderbook_scalar_material_eq(lhs: &AggOrderbook1mEvent, rhs: &AggOrderbook1mEvent) -> bool {
+    lhs.ts_bucket == rhs.ts_bucket
+        && lhs.chunk_start_ts == rhs.chunk_start_ts
+        && lhs.chunk_end_ts == rhs.chunk_end_ts
+        && lhs.source_event_count == rhs.source_event_count
+        && lhs.sample_count == rhs.sample_count
+        && lhs.bbo_updates == rhs.bbo_updates
+        && materially_equal_f64(lhs.spread_sum, rhs.spread_sum)
+        && materially_equal_f64(lhs.topk_depth_sum, rhs.topk_depth_sum)
+        && materially_equal_f64(lhs.obi_sum, rhs.obi_sum)
+        && materially_equal_f64(lhs.obi_l1_sum, rhs.obi_l1_sum)
+        && materially_equal_f64(lhs.obi_k_sum, rhs.obi_k_sum)
+        && materially_equal_f64(lhs.obi_k_dw_sum, rhs.obi_k_dw_sum)
+        && materially_equal_f64(lhs.obi_k_dw_change_sum, rhs.obi_k_dw_change_sum)
+        && materially_equal_f64(lhs.obi_k_dw_adj_sum, rhs.obi_k_dw_adj_sum)
+        && materially_equal_f64(lhs.microprice_sum, rhs.microprice_sum)
+        && materially_equal_f64(lhs.microprice_classic_sum, rhs.microprice_classic_sum)
+        && materially_equal_f64(lhs.microprice_kappa_sum, rhs.microprice_kappa_sum)
+        && materially_equal_f64(lhs.microprice_adj_sum, rhs.microprice_adj_sum)
+        && materially_equal_f64(lhs.ofi_sum, rhs.ofi_sum)
+        && materially_equal_option_f64(lhs.obi_k_dw_close, rhs.obi_k_dw_close)
+}
+
+fn agg_orderbook_materially_eq(lhs: &AggOrderbook1mEvent, rhs: &AggOrderbook1mEvent) -> bool {
+    agg_orderbook_scalar_material_eq(lhs, rhs)
+        && lhs.heatmap_loaded == rhs.heatmap_loaded
+        && agg_heatmap_levels_materially_eq(&lhs.heatmap_levels, &rhs.heatmap_levels)
+}
+
+fn agg_liq_materially_eq(lhs: &AggLiq1mEvent, rhs: &AggLiq1mEvent) -> bool {
+    lhs.ts_bucket == rhs.ts_bucket
+        && lhs.chunk_start_ts == rhs.chunk_start_ts
+        && lhs.chunk_end_ts == rhs.chunk_end_ts
+        && lhs.source_event_count == rhs.source_event_count
+        && agg_liq_levels_materially_eq(&lhs.levels, &rhs.levels)
+}
+
+fn agg_funding_mark_materially_eq(
+    lhs: &AggFundingMark1mEvent,
+    rhs: &AggFundingMark1mEvent,
+) -> bool {
+    lhs.ts_bucket == rhs.ts_bucket
+        && lhs.chunk_start_ts == rhs.chunk_start_ts
+        && lhs.chunk_end_ts == rhs.chunk_end_ts
+        && lhs.source_event_count == rhs.source_event_count
+        && agg_mark_points_materially_eq(&lhs.mark_points, &rhs.mark_points)
+        && agg_funding_points_materially_eq(&lhs.funding_points, &rhs.funding_points)
+}
+
+fn open_interest_hist_point_materially_eq(
+    lhs: &OpenInterestHistPoint,
+    rhs: &OpenInterestHistPoint,
+) -> bool {
+    lhs.ts_bucket == rhs.ts_bucket
+        && materially_equal_f64(lhs.open_interest_contracts, rhs.open_interest_contracts)
+        && materially_equal_f64(lhs.open_interest_value_usdt, rhs.open_interest_value_usdt)
+        && materially_equal_option_f64(lhs.reference_price, rhs.reference_price)
+}
+
+fn long_short_ratio_point_materially_eq(
+    lhs: &LongShortRatioPoint,
+    rhs: &LongShortRatioPoint,
+) -> bool {
+    lhs.ts_bucket == rhs.ts_bucket
+        && materially_equal_f64(lhs.long_short_ratio, rhs.long_short_ratio)
+        && materially_equal_option_f64(lhs.long_account_ratio, rhs.long_account_ratio)
+        && materially_equal_option_f64(lhs.short_account_ratio, rhs.short_account_ratio)
 }
 
 fn upsert_sorted_point_by_bucket<T, K, FK, FB>(
@@ -4449,6 +4714,61 @@ mod tests {
         assert!(store.has_pending_oi_ratio_patch());
         assert!(!store.has_pending_dirty_recompute());
         assert_eq!(store.pending_oi_ratio_patch_batch_range(10), Some((ts, ts)));
+    }
+
+    #[test]
+    fn tiny_oi_hist_replay_noise_does_not_mark_patch() {
+        let mut store = StateStore::new("TESTUSDT".to_string(), 1_000.0);
+        let ts = Utc.with_ymd_and_hms(2026, 3, 6, 9, 10, 0).single().unwrap();
+        store.finalize_minute(ts);
+
+        store.ingest(oi_hist_event(ts, 1_000_000.0));
+        store.clear_oi_ratio_patch_state();
+
+        let mut noisy = oi_hist_event(ts, 1_000_000.0);
+        if let MdData::OpenInterestHist5m(ref mut point) = noisy.data {
+            point.open_interest_value_usdt += 0.0001;
+        }
+        let outcome = store.ingest(noisy);
+
+        assert!(!outcome.oi_ratio_patch_marked);
+        assert!(!store.has_pending_oi_ratio_patch());
+    }
+
+    #[test]
+    fn tiny_ratio_replay_noise_does_not_mark_patch() {
+        let mut store = StateStore::new("TESTUSDT".to_string(), 1_000.0);
+        let ts = Utc.with_ymd_and_hms(2026, 3, 6, 9, 15, 0).single().unwrap();
+        store.finalize_minute(ts);
+
+        store.ingest(ratio_event(ts, LongShortRatioType::GlobalAccount, 1.2));
+        store.clear_oi_ratio_patch_state();
+
+        let mut noisy = ratio_event(ts, LongShortRatioType::GlobalAccount, 1.2);
+        if let MdData::LongShortRatio5m(ref mut point) = noisy.data {
+            point.long_short_ratio += 1e-10;
+        }
+        let outcome = store.ingest(noisy);
+
+        assert!(!outcome.oi_ratio_patch_marked);
+        assert!(!store.has_pending_oi_ratio_patch());
+    }
+
+    #[test]
+    fn tiny_funding_replay_noise_does_not_mark_dirty() {
+        let mut store = StateStore::new("TESTUSDT".to_string(), 1_000.0);
+        let ts = Utc.with_ymd_and_hms(2026, 3, 6, 9, 20, 0).single().unwrap();
+        store.ingest(agg_funding_mark_event(ts, 30, 2000.0, -0.0010));
+        store.finalize_minute(ts);
+
+        let mut noisy = agg_funding_mark_event(ts, 30, 2000.0, -0.0010);
+        if let MdData::AggFundingMark1m(ref mut event) = noisy.data {
+            event.mark_points[0].mark_price = Some(2000.0 + 1e-7);
+        }
+        let outcome = store.ingest(noisy);
+
+        assert!(!outcome.dirty_recompute_marked);
+        assert!(!store.has_pending_dirty_recompute());
     }
 
     #[test]

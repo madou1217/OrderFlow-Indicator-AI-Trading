@@ -14,8 +14,8 @@ use crate::publish::outbox_dispatcher::OutboxDispatcher;
 use crate::publish::snapshot_fanout_projector::SnapshotFanoutProjector;
 use crate::runtime::dispatcher::{DispatchMode, Dispatcher};
 use crate::runtime::state_store::{
-    CanonicalFrontierSnapshot, CanonicalMinutePresence, MinuteHistory, StateSnapshot, StateStore,
-    HISTORY_LIMIT_MINUTES, STATE_SNAPSHOT_VERSION,
+    CanonicalFrontierSnapshot, CanonicalMinutePresence, IngestOutcome, MinuteHistory,
+    StateSnapshot, StateStore, HISTORY_LIMIT_MINUTES, STATE_SNAPSHOT_VERSION,
 };
 use crate::runtime::window_scheduler::WindowScheduler;
 use crate::storage::event_writer::EventWriter;
@@ -50,6 +50,8 @@ const DIRTY_RECOMPUTE_WINDOW_BUDGET_PER_TICK: usize = 50;
 const OI_RATIO_PATCH_BATCH_SIZE: usize = 6;
 const OI_RATIO_PATCH_WINDOW_BUDGET_PER_TICK: usize = 24;
 const PROCESS_READY_MINUTES_WARN_MS: u128 = 2_000;
+const LIVE_TAIL_RECONCILE_MAX_BACKLOG_MINUTES: i64 = 5;
+const OI_RATIO_PATCH_MAX_BACKLOG_MINUTES: i64 = 5;
 const STUCK_PROGRESS_IDLE_SECS: u64 = 60;
 const STUCK_WARN_INTERVAL_SECS: u64 = 60;
 const LIVE_CANONICAL_GAP_REPAIR_RETRY_SECS: u64 = 15;
@@ -156,6 +158,10 @@ struct CanonicalRepairStats {
     fetched_rows: usize,
     ingested_rows: usize,
     touched_minutes: HashSet<i64>,
+    changed_rows: usize,
+    dirty_recompute_marked_rows: usize,
+    oi_ratio_patch_marked_rows: usize,
+    changed_minutes: HashSet<i64>,
     first_bucket: Option<DateTime<Utc>>,
     last_bucket: Option<DateTime<Utc>>,
 }
@@ -178,6 +184,24 @@ impl CanonicalRepairStats {
 
     fn touched_minute_count(&self) -> usize {
         self.touched_minutes.len()
+    }
+
+    fn record_material_change(&mut self, bucket: DateTime<Utc>, outcome: IngestOutcome) {
+        if !outcome.material_change {
+            return;
+        }
+        self.changed_rows += 1;
+        if outcome.dirty_recompute_marked {
+            self.dirty_recompute_marked_rows += 1;
+        }
+        if outcome.oi_ratio_patch_marked {
+            self.oi_ratio_patch_marked_rows += 1;
+        }
+        self.changed_minutes.insert(bucket.timestamp());
+    }
+
+    fn changed_minute_count(&self) -> usize {
+        self.changed_minutes.len()
     }
 }
 
@@ -212,6 +236,30 @@ impl RuntimeStallDetector {
         }
         allow
     }
+}
+
+fn live_backlog_minutes(next_minute: Option<DateTime<Utc>>, latest_closed: DateTime<Utc>) -> i64 {
+    next_minute
+        .map(|minute| (latest_closed - minute).num_minutes().max(0))
+        .unwrap_or(0)
+}
+
+fn allow_live_tail_reconcile(
+    state_store: &StateStore,
+    next_minute: Option<DateTime<Utc>>,
+    latest_closed: DateTime<Utc>,
+) -> bool {
+    !state_store.has_pending_dirty_recompute()
+        && !state_store.has_pending_oi_ratio_patch()
+        && live_backlog_minutes(next_minute, latest_closed)
+            <= LIVE_TAIL_RECONCILE_MAX_BACKLOG_MINUTES
+}
+
+fn allow_oi_ratio_patch_processing(
+    next_minute: Option<DateTime<Utc>>,
+    latest_closed: DateTime<Utc>,
+) -> bool {
+    live_backlog_minutes(next_minute, latest_closed) <= OI_RATIO_PATCH_MAX_BACKLOG_MINUTES
 }
 
 pub fn build_indicator_runtime_options(
@@ -578,8 +626,9 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                 }
 
                 let latest_closed = scheduler.closed_minute(Utc::now());
+                let next_minute_before_repairs = scheduler.next_minute_to_emit();
                 if startup_cutover_completed {
-                    if let Some(next_minute) = scheduler.next_minute_to_emit() {
+                    if let Some(next_minute) = next_minute_before_repairs {
                         let next_minute_presence = state_store.canonical_minute_presence(next_minute);
                         if next_minute <= latest_closed
                             && !next_minute_presence.complete_under_current_policy()
@@ -659,7 +708,13 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                     }
 
                     if let Some(last_finalized_minute) = state_store.last_finalized_minute() {
-                        if live_repair_controller.tail_reconcile_due() {
+                        if live_repair_controller.tail_reconcile_due()
+                            && allow_live_tail_reconcile(
+                                &state_store,
+                                next_minute_before_repairs,
+                                latest_closed,
+                            )
+                        {
                             live_repair_controller.mark_tail_reconcile_attempt();
                             let effective_history_floor_ts = state_store
                                 .canonical_frontier_snapshot()
@@ -683,7 +738,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                             .await
                             {
                                 Ok(stats) => {
-                                    if stats.ingested_rows > 0 {
+                                    if stats.changed_rows > 0 {
                                         info!(
                                             reason = "live_tail_reconcile",
                                             from_ts = %tail_start_ts,
@@ -692,6 +747,10 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                                             fetched_rows = stats.fetched_rows,
                                             ingested_rows = stats.ingested_rows,
                                             touched_minutes = stats.touched_minute_count(),
+                                            changed_rows = stats.changed_rows,
+                                            changed_minutes = stats.changed_minute_count(),
+                                            dirty_recompute_marked_rows = stats.dirty_recompute_marked_rows,
+                                            oi_ratio_patch_marked_rows = stats.oi_ratio_patch_marked_rows,
                                             first_bucket = ?stats.first_bucket,
                                             last_bucket = ?stats.last_bucket,
                                             dirty_recompute_pending = state_store.has_pending_dirty_recompute(),
@@ -719,6 +778,8 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                 let ready_through_ts = next_minute.and_then(|minute| {
                     state_store.latest_contiguous_complete_canonical_minute_from(minute, latest_closed)
                 });
+                let allow_oi_ratio_patches =
+                    allow_oi_ratio_patch_processing(next_minute, latest_closed);
                 let frontier_snapshot = refresh_runtime_observability_metrics(
                     &metrics,
                     &state_store,
@@ -742,7 +803,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                 );
 
                 let Some(_next_minute) = next_minute else {
-                    if state_store.has_pending_oi_ratio_patch() {
+                    if state_store.has_pending_oi_ratio_patch() && allow_oi_ratio_patches {
                         process_pending_oi_ratio_patches(
                             &dispatcher,
                             &mut state_store,
@@ -755,7 +816,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                     continue;
                 };
                 let Some(ready_through_ts) = ready_through_ts else {
-                    if state_store.has_pending_oi_ratio_patch() {
+                    if state_store.has_pending_oi_ratio_patch() && allow_oi_ratio_patches {
                         process_pending_oi_ratio_patches(
                             &dispatcher,
                             &mut state_store,
@@ -776,6 +837,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                     &runtime_options,
                     ready_through_ts,
                     DispatchMode::Live,
+                    allow_oi_ratio_patches,
                 )
                 .await
                 {
@@ -1045,6 +1107,7 @@ async fn shutdown_drain_and_persist(
                 runtime_options,
                 ready_through,
                 DispatchMode::ShutdownFlush,
+                true,
             )
             .await?;
         }
@@ -1951,6 +2014,7 @@ async fn ingest_canonical_range_from_db(
         for row in rows {
             match replay_row_to_engine_event(row) {
                 Ok(event) => {
+                    let bucket = logical_event_bucket_ts(&event);
                     metrics.inc_processed(event.event_ts.timestamp_millis());
                     if matches!(
                         &event.data,
@@ -1959,11 +2023,12 @@ async fn ingest_canonical_range_from_db(
                             | MdData::AggLiq1m(_)
                             | MdData::AggFundingMark1m(_)
                     ) {
-                        scheduler.prime_start_from(logical_event_bucket_ts(&event));
+                        scheduler.prime_start_from(bucket);
                     }
                     stats.record_event(&event);
-                    state_store.ingest(event);
+                    let outcome = state_store.ingest(event);
                     stats.ingested_rows += 1;
+                    stats.record_material_change(bucket, outcome);
                 }
                 Err(err) => {
                     metrics.inc_decode_error();
@@ -2027,6 +2092,7 @@ async fn process_ready_minutes(
     runtime_options: &IndicatorRuntimeOptions,
     ready_through_ts: DateTime<Utc>,
     dispatch_mode: DispatchMode,
+    allow_oi_ratio_patches: bool,
 ) -> Result<()> {
     let batch_started_at = Instant::now();
     let batch_start_minute = scheduler.next_minute_to_emit();
@@ -2176,9 +2242,11 @@ async fn process_ready_minutes(
         }
     }
 
-    let oi_ratio_patch_windows_processed =
-        process_pending_oi_ratio_patches(dispatcher, state_store, runtime_options, &metrics)
-            .await?;
+    let oi_ratio_patch_windows_processed = if allow_oi_ratio_patches {
+        process_pending_oi_ratio_patches(dispatcher, state_store, runtime_options, &metrics).await?
+    } else {
+        0
+    };
 
     if let Some(last_bucket) = last_bucket {
         let first_bucket = first_bucket.unwrap_or(last_bucket);
@@ -4212,7 +4280,8 @@ async fn export_snapshots(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_backfill_sql, find_long_null_price_run, handle_ingest_event,
+        allow_live_tail_reconcile, allow_oi_ratio_patch_processing, build_backfill_sql,
+        find_long_null_price_run, handle_ingest_event,
         hydrate_futures_orderbook_heatmaps_for_range_with_fetch, live_tail_reconcile_start_ts,
         minute_exclusive_upper_bound, minute_history_is_strictly_contiguous,
         replay_heatmap_hydration_batch_end, shutdown_ready_through_candidate,
@@ -4508,6 +4577,68 @@ mod tests {
             .unwrap();
         let to_ts_exclusive = minute_exclusive_upper_bound(raw_to_ts);
         assert_eq!(to_ts_exclusive, raw_to_ts);
+    }
+
+    #[test]
+    fn tail_reconcile_yields_to_live_backlog_and_patch_backlog() {
+        let latest_closed = Utc.with_ymd_and_hms(2026, 3, 28, 3, 0, 0).single().unwrap();
+        let near_live = latest_closed - ChronoDuration::minutes(3);
+        let far_behind = latest_closed - ChronoDuration::minutes(20);
+        let mut state_store = StateStore::new("TESTUSDT".to_string(), 1_000.0);
+
+        assert!(allow_live_tail_reconcile(
+            &state_store,
+            Some(near_live),
+            latest_closed
+        ));
+        assert!(!allow_live_tail_reconcile(
+            &state_store,
+            Some(far_behind),
+            latest_closed
+        ));
+
+        state_store.finalize_minute(near_live);
+        state_store.ingest(EngineEvent {
+            schema_version: 1,
+            msg_type: "md.open_interest.hist.5m".to_string(),
+            message_id: Uuid::new_v4(),
+            trace_id: Uuid::new_v4(),
+            routing_key: "md.futures.open_interest.hist.5m.testusdt".to_string(),
+            market: MarketKind::Futures,
+            symbol: "TESTUSDT".to_string(),
+            source_kind: "test".to_string(),
+            backfill_in_progress: false,
+            event_ts: near_live + ChronoDuration::minutes(5),
+            published_at: near_live + ChronoDuration::minutes(5),
+            data: MdData::OpenInterestHist5m(crate::ingest::decoder::OpenInterestHist5mEvent {
+                ts_bucket: near_live,
+                open_interest_contracts: 100.0,
+                open_interest_value_usdt: 1_000_000.0,
+                reference_price: Some(2000.0),
+            }),
+        });
+        assert!(!allow_live_tail_reconcile(
+            &state_store,
+            Some(near_live),
+            latest_closed
+        ));
+    }
+
+    #[test]
+    fn oi_ratio_patch_processing_yields_when_live_backlog_is_large() {
+        let latest_closed = Utc.with_ymd_and_hms(2026, 3, 28, 3, 0, 0).single().unwrap();
+        let near_live = latest_closed - ChronoDuration::minutes(2);
+        let far_behind = latest_closed - ChronoDuration::minutes(18);
+
+        assert!(allow_oi_ratio_patch_processing(
+            Some(near_live),
+            latest_closed
+        ));
+        assert!(!allow_oi_ratio_patch_processing(
+            Some(far_behind),
+            latest_closed
+        ));
+        assert!(allow_oi_ratio_patch_processing(None, latest_closed));
     }
 
     #[test]
