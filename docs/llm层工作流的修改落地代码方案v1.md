@@ -1,1414 +1,1454 @@
 # LLM层工作流的修改落地代码方案 v1
 
-#此次修改是对llm层的大幅重构，重构要求：默认删除与本次重构无关的代码，只保留必要的helper。一切以本文档要求为准。重构时各个功能最好实现文件级别的职责明确的分离。不要把多个功能，逻辑混在一个文件内。
+基于 [llm层工作流的修改方案v2.0.0.md](/data/docs/llm层工作流的修改方案v2.0.0.md) 与当前 `systems/llm` 真实代码链路的逐段 review 形成。
 
-基于以下两类输入生成：
-- [llm层工作流的修改方案v1.3.1.md](/data/docs/llm层工作流的修改方案v1.3.1.md)
-- 当前 `systems/llm` 的真实代码结构
+这是一份代码实施蓝图，不是交易逻辑讨论稿。
 
-本文档的目标不是继续讨论交易逻辑，而是给出一份可以直接开工的代码实施方案。
+本次改造的第一导向只有一个：
 
-本文档必须严格服从 [llm层工作流的修改方案v1.3.1.md](/data/docs/llm层工作流的修改方案v1.3.1.md)。
-如果当前代码的实现习惯与 v1.3.1 冲突，以 v1.3.1 为准。
+**让系统更接近顶级订单流交易员的真实工作流，从而做出更高质量的交易。**
 
----
+因此本方案明确拒绝以下取向：
+- 以减少工作量为导向保留旧链路
+- 为了兼容旧 schema 而牺牲新工作流边界
+- 把本该由 watcher 或执行层做的机械监测，继续塞给 Stage2
+- 把本该由 Stage1 做的战略判断，下放给 15m 临场组件
 
-## 1. 目标与硬约束
-
-本次改造的唯一目标是把当前 `systems/llm` 从旧的：
-
-`Stage1 scan + Stage2 core(entry/pending/management) + Binance execution`
-
-改造成 v1.3.1 规定的：
-
-`代码层 + Stage1 + Stage2 + 执行引擎`
-
-必须严格遵守以下硬约束：
-
-1. 工作流内核只能是：
-   `位置 → 状态 → 驱动 → 触发 → 执行`
-2. Stage1 只能输出一个当前主剧本和一个当前 `path object`
-3. Stage2 不能自己切换到另一个 path 并直接交易
-4. `failure_switch` 只能表示“旧剧本失效后的下一优先重评方向”
-5. 15m 只能做 setup 确认，不重写剧本
-6. 1m / 100ms 只负责执行优化，不负责方向判断
-7. 管理逻辑必须围绕“驱动是否恶化”展开
-8. 不得把以下内容重新写回内核主链：
-   - 多 path 并行激活
-   - `position_policy / position_transition`
-   - 固定 RR 门槛
-   - `options_surface` 权重化 gate
-   - `market_tradeable=false` 的固定阈值块
-   - Stage2 的 freshness veto 二次交易判断
+如果当前代码与 [llm层工作流的修改方案v2.0.0.md](/data/docs/llm层工作流的修改方案v2.0.0.md) 冲突，以 `v2.0.0` 为准。
 
 ---
 
-## 1.1 开工前需求确认（第一轮答复已收到，仍有阻塞项）
+## 1. 第一性原理与硬约束
 
-以下问题不是实现细节，而是会直接决定“什么叫做高质量交易”和“哪些规则属于内核、哪些只能放在执行/风险层”的前提问题。
+本次重构必须服从以下内核，不允许实现层偷换：
 
-这些问题在正式开工前必须由需求方明确回答。
+1. 唯一允许的决策顺序是：
+   `位置 -> 状态 -> 驱动 -> 触发 -> 执行`
 
-如果回答与 [订单流交易员交易流程V1.md](/data/docs/订单流交易员交易流程V1.md) 冲突，以原始工作流内核为准；如果回答属于账户约束、执行约束、风控约束，则必须放在执行层或风险层，不能反写进工作流内核。
+2. `Stage1` 只负责：
+   - `3D / 1D / 4H` 地图
+   - 唯一战略主剧本
+   - 唯一战略 path
+   - `4H / 1D` 驱动归因
 
-### 1.1.1 关于“高质量交易”的定义
+3. `Stage2` 只负责两件事：
+   - 先审计当前战略 path 是否还活着
+   - 再在 path 不变前提下，设计更好的 tactical entry plan
 
-1. 如果系统严格遵守原始工作流，但因此长时间 `NO_TRADE`，你认为这是成功还是失败？
-   这个问题决定系统是“流程正确优先”还是“出手频率优先”。
+4. `Stage2` 绝不允许：
+   - 重选主剧本
+   - 改主方向
+   - 放宽 `Stage1.failure_level`
+   - 激活 `failure_switch`
+   - 输出 `WAIT`
 
-2. 当“错过一笔本来能赚钱的单”和“做了一笔不符合工作流的烂单”发生冲突时，你认为哪一种错误更严重？
-   这里请你给出明确优先级。
+5. watcher 必须接管：
+   - 持续监测
+   - 候选事件生成
+   - 初筛
+   - 主 entry / 备选 re-entry 的执行边际
+   - 同一 `15m` 窗口内的二次入场次数控制
 
-3. 你要的“像人类顶级订单流交易员”里，排序第一的是：
-   - 严格按流程判断
-   - 稳定过滤低质量单
-   - 最终收益结果
-   请你明确三者优先顺序。
+6. `Stage2` 的软否决必须收紧到原始内核：
+   - `extreme_location`
+   - `reverse_confirmation`
+   - `driver_change`
+   只有三者同时成立，才允许在硬失效前请求 `Stage1` 重评
 
-### 1.1.2 关于交易范围与运行边界
+7. 只要 `Stage2` 认可 path 还活着，后续“等、盯、试、复试、执行”的边际必须交回 watcher。
 
-4. v1 的实际交易范围是什么？
-   请明确：
-   - 交易所/账户
-   - 合约类型
-   - 首批交易 symbol
-   - 是先单 symbol 试点，还是从一开始就多 symbol 并行
+8. 仓位管理默认转回代码层，围绕 `Stage1.management_plan` 与结构化驱动恶化信号执行，不再与 `Stage2` 混在一起。
 
-5. 同一 `symbol` 下，v1 是否需要真实支持多个并发上下文？
-   这里不是问你是否把“单 symbol 单仓”写进策略内核，而是问：
-   - 账户/执行层是否允许这种约束作为外部运行限制
-   - 还是必须从 v1 开始就支持同 symbol 多上下文并发
+9. `telegram / x` 通知保留，但不得再绑在旧 Stage2 `WAIT/EXECUTE` 语义上。
 
-6. 这个系统的 v1 目标是：
-   - 全自动实盘决策与执行
-   - 先做高质量决策引擎，允许人工复核
-   - 先做影子决策但不执行
-   这个答案会影响运行时保护、日志、失败处理和回退策略。
+10. 这是一次重构，不是打补丁。
+    与新链路冲突的旧代码必须删除，不做“逻辑已经绕过所以先留着”的妥协保留。
 
-### 1.1.3 关于数据缺失与异常处理
-
-7. 如果 `spot_confirm / OI / funding / ratio / VPIN` 中有一部分缺失、延迟或晚到，Stage2 默认应该怎么处理？
-   请明确：
-   - 一律降级为 `NO_TRADE`
-   - 允许在部分证据缺失时继续判断
-   - 仅某些字段缺失时阻断
-
-8. 如果 Stage1 地图仍有效，但 Stage2 当前 15m 证据和 `driver_attribution` 出现冲突，你希望系统：
-   - 直接等待，不开仓
-   - 立刻请求 Stage1 重评
-   - 允许在 soft gate 里继续通过
-   这个问题决定“驱动冲突”在系统里是等待条件、重评条件还是可容忍噪音。
-
-### 1.1.4 关于剧本失效与持仓处理
-
-9. 当 `failure_level` 被触发且当前已有持仓时，你希望默认行为是什么？
-   目前文档允许：
-   - `REQUEST_STAGE1_REEVALUATION`
-   - 必要时并发 `FLATTEN_POSITION`
-   但这里还需要你明确：`failure_level` 命中时，平仓应该是默认动作，还是可选动作。
-
-10. 当 `take_profit_1` 已兑现，但驱动继续强化时，v1 是否允许“超出 `next_path_target` 的延展持仓”？
-   如果允许，就意味着需要新的 re-anchor/extend 合同；
-   如果不允许，就意味着 v1 必须严格停留在 Stage1 已定义的路径目标内，超出部分只能通过下一轮 Stage1 重评获得。
-
-11. 当驱动恶化但 `failure_level` 尚未命中时，你希望管理默认偏向哪一边？
-   - 更激进地减仓/退出
-   - 更保守地等待 failure_level
-   - 按 setup_type 区分
-   这个问题决定 `management_plan` 的默认管理哲学。
-
-### 1.1.5 关于 gate 与执行层自由度
-
-12. `soft gate = 3/4` 在你的理解里，是不是 v1 必须严格固定执行的规则？
-   如果不是，请说明哪些 setup_type 允许例外，为什么。
-
-13. 执行层的 `immediate / pullback / breakout` 三类 `intent_mode`，是否已经覆盖你对“1m / 100ms 只负责怎么进”的全部预期？
-   如果不够，请说明缺的不是策略，而是哪种执行行为模式。
-
-14. 执行层是否允许加入纯账户级/风险级约束，例如：
-   - 最大日内亏损
-   - 单 symbol 冷却时间
-   - 最大同时持仓数
-   - 账户级熔断
-   如果允许，这些必须被视为外部风险层，而不是工作流内核的一部分。
-
-### 1.1.6 关于验收标准
-
-15. 对理论回放的“通过标准”你希望怎么定义？
-   当前文档只保留了 5 类行情回放，但还没有定义“回放通过”到底是指：
-   - 剧本选择正确
-   - path object 完整且方向正确
-   - setup 等待与放弃点正确
-   - 管理动作正确
-   - 以上全部
-
-16. 在正式开工前，你是否要求先冻结一份“需求已确认版”文档？
-   如果要，这一版应当把：
-   - 你的问题答案
-   - 不属于内核的账户/风险约束
-   - v1 明确不做的范围
-   一次性写死，后续代码实现只允许在该版本内执行，不再口头追加。
-
-### 1.1.7 第一轮已确认答案（2026-03-27）
-
-以下内容视为已确认需求，除非后续明确推翻，否则直接进入冻结版实施文档：
-
-1. `NO_TRADE` 本身可以是成功结果。
-   只要系统严格遵守 [订单流交易员交易流程V1.md](/data/docs/订单流交易员交易流程V1.md) 的工作流，不交易不是失败。
-   但需求方同时明确要求：系统不能因为状态滞后、刷新不及时或合同缺失，而错过“最新证据已经清楚成立”的显著机会。
-
-2. 错误优先级明确为：
-   - 第一严重：做出一笔不符合工作流的烂单
-   - 第二严重：错过一笔本来能赚钱的单
-
-3. “像人类顶级订单流交易员”的优先级明确为：
-   - 第一：最终收益结果
-   - 第二：低质量过滤能力
-   - 第三：流程忠实度
-
-4. v1 交易范围冻结为：
-   - 交易所：Binance
-   - 账户：需求方自有账户
-   - 合约：`ETHUSDT` 永续合约
-   - symbol 范围：单 symbol，且 v1 永远只做 `ETHUSDT`
-
-5. v1 运行形态冻结为：
-   - 全自动实盘决策与执行
-   - 不做人工复核链路
-   - 不做影子模式
-
-6. 数据缺失处理默认策略冻结为：
-   - 优先尝试数据库补数
-   - 如果补不到，不得仅因为 `spot_confirm / OI / funding / ratio / VPIN` 缺失就一律阻断交易
-   - 允许在部分证据缺失时继续判断，但不得伪造、补写或臆测缺失数据
-
-7. `failure_level` 命中且已有持仓时，默认行为冻结为：
-   - 先请求 `Stage1` 重评
-   - `FLATTEN_POSITION` 不是强制默认动作，而是可选并发动作
-
-8. 当驱动恶化但 `failure_level` 尚未命中时，管理默认哲学冻结为：
-   - 按 `setup_type` 区分，不写成全局单一风格
-
-9. 执行层 `intent_mode` 当前只先实现：
-   - `immediate`
-   - `pullback`
-   - `breakout`
-   需求方认为长期不够，但允许在 v1 之后再扩展，不要求本轮先发明新执行模式。
-
-10. v1 暂不引入外部账户级风险约束：
-   - 不加最大日亏
-   - 不加 symbol 冷却时间
-   - 不加最大同时持仓数
-   - 不加账户级熔断
-
-11. v1 暂不纳入理论回放作为验收范围。
-   理论回放移到下一版本，不在本次冻结版实施方案内作为交付要求。
-
-12. 正式开工前必须先冻结一份“需求已确认版”文档。
-   后续代码实现只允许在冻结版内执行，不再口头追加内核规则。
-
-### 1.1.8 需求冻结补充（2026-03-27）
-
-以下内容是第一轮问答后的补充冻结结论。自本节确认后，v1 文档不再存在阻塞冻结开工的未决内核问题。
-
-1. 关于“同一 symbol 多上下文”的具体含义，现已确认。
-
-   冻结结论：
-   - v1 必须支持同一 `ETHUSDT` 下多个上下文并发恢复与管理
-   - 允许例如：
-     - 旧多单上下文仍在管理
-     - 新反手上下文已经开始记录自己的 `entry_snapshot / path_id / management_action`
-   - 这是一条运行期恢复与执行合同，不是新的策略规则
-
-2. 关于 Stage1 与 Stage2 的权责，现已确认。
-
-   冻结结论：
-   - 继续忠于原始内核
-   - Stage2 不能在 15m 直接改剧本或改方向
-   - Stage2 只负责用最新证据更快触发 `REQUEST_STAGE1_REEVALUATION`
-   - Stage1 仍然是主剧本与 `path object` 的唯一授权来源
-
-3. 关于 `next_path_target` 之外的延展持仓，现已确认。
-
-   冻结结论：
-   - 允许延展到 `next_path_target` 之外
-   - 但延展必须先经过一次新的 Stage1 重评
-   - Stage2 不允许自行扩展目标位
-   - 在新的 Stage1 未给出新 path / 新目标位之前，当前 path 的管理上限仍然止于 `next_path_target`
-
-4. 关于 `soft gate = 3/4`，需求方已明确“不想写死”，并已确认采用按 `setup_type` 分开的配置方式。
-
-   最终冻结默认值：
-   - `A_continuation = 3/4`
-   - `B_reversal = 2/4`
-   - `C_value_return = 2/4`
-
-   推荐理由：
-   - `A_continuation` 最容易在 mid-auction 或晚一步追价时误开，应该维持更严格的软过滤
-   - `B_reversal` 在 hard gate 已满足“极限位置 + 反转确认”的前提下，若继续要求 `3/4`，容易错过第一段反转
-   - `C_value_return` 本质也是失败拍卖后的回归价值单，进入窗口通常比延续更短，适合比 `A_continuation` 更宽一些
-
-   以上三组值自 2026-03-27 起作为 v1 冻结默认值，不允许实现层自行再拆更多档位。
+11. `Stage1 / Stage2` 的职责边界已经完全换代。
+    这意味着 JSON schema、prompt input、parser、provider schema 都必须重做，不能在 `v1.3.1` 的旧合同上继续打补丁。
 
 ---
 
-## 2. 当前代码基线
+## 2. 当前代码 review 结论
 
-当前 `systems/llm` 的主要结构如下：
+当前 `systems/llm` 主链已经是 workflow-only，但仍然是 `v1.3.1` 时代的链路，不是 `v2.0.0` 需要的链路。
 
-| 路径 | 当前职责 | 与 v1.3.1 的关系 |
-|---|---|---|
-| [runtime.rs](/data/systems/llm/src/app/runtime.rs) | 调度 MQ 消费、先跑 stage1 scan，再跑 stage2 core，再决定是否执行 | 需要重构为新工作流总编排器 |
-| [provider.rs](/data/systems/llm/src/llm/provider.rs) | 负责两段 prompt 调用、拼接 `STAGE_1_MARKET_SCAN_JSON`、解析模型响应 | 需要改成新的 Stage1 / Stage2 双 prompt 管线 |
-| [decision.rs](/data/systems/llm/src/llm/decision.rs) | 解析旧式 `LONG/SHORT/NO_TRADE`、management、pending-order 输出 | 需要改成解析 `Stage1Output`、`Stage2Decision`、`ExecutionIntent`、`ManagementAction` |
-| [scan.rs](/data/systems/llm/src/llm/filter/scan.rs) | 旧 Stage1 scan 输入压缩 | 不再作为最终结构；可复用其结构压缩逻辑生成 `indicator_summary` |
-| [core.rs](/data/systems/llm/src/llm/filter/core.rs) | 旧 Stage2 core 输入拼装 | 需要拆解并重组为新的 Stage2 输入合同 |
-| [core_entry.rs](/data/systems/llm/src/llm/filter/core_entry.rs) | entry 模式过滤 | 旧模式，需下线 |
-| [core_management.rs](/data/systems/llm/src/llm/filter/core_management.rs) | management 模式过滤 | 旧模式，需下线 |
-| [core_pending.rs](/data/systems/llm/src/llm/filter/core_pending.rs) | pending-order 模式过滤 | 不属于 v1.3.1 主工作流，需移出主链 |
-| [core_shared.rs](/data/systems/llm/src/llm/filter/core_shared.rs) | 公共裁剪和 realtime_flow_context 逻辑 | 可复用部分基础函数 |
-| [prompt.rs](/data/systems/llm/src/llm/prompt.rs) | 旧的 `Scan / Finalize / Management / Pending` prompt 路由 | 需要改成 `Stage1 / Stage2` 路由 |
-| [execution/binance.rs](/data/systems/llm/src/execution/binance.rs) | 实盘下单、管理、挂单修改 | 需要保留交易所接口，但上层输入类型要改 |
-| [config.rs](/data/systems/llm/src/app/config.rs) | LLM 调度与执行配置 | 需要加入 Stage1 调度、workflow state、兼容开关，并下放旧 gate 参数 |
+### 2.1 当前主链真实形态
 
-当前运行方式的关键事实：
+当前 `app/runtime.rs` 的真实顺序仍然是：
 
-1. Stage1 每个 15m bundle 都会跑一次 scan
-2. Stage2 会按账户状态切成 `entry / pending / management`
-3. Stage2 会消费 Stage1 的旧 scan JSON，再基于实时 bundle 做 finalize
-4. 交易执行入口仍然围绕旧 `TradeIntent`
-5. 管理与 pending-order 都是单独的 LLM 模式
-6. 当前代码里还保留了 `entry freshness recheck`、`RR gate`、`V gate`、`entry/sl remap` 等旧交易/执行规则
+`1m minute_bundle -> Stage1(按4h/refresh) -> Stage2(按每次 bundle 评估) -> 直接执行 execution_intent -> 直接处理 management_actions`
 
-这些都与 v1.3.1 的双层分离版不一致。
+这意味着：
+- 还没有独立的 `watcher / candidate engine`
+- `Stage2` 还是定时决策器，不是事件驱动审计器
+- 还没有“path 活着则交给 watcher”的边界
+- 还没有 `primary_entry_plan / secondary_entry_plan`
+- 还没有 `path_review_candidate / entry_candidate` 事件模型
+
+### 2.2 当前代码与 v2.0.0 的主要偏差
+
+1. `runtime.rs`
+- 仍然在一次 `bundle invoke` 中完成 Stage1、Stage2、执行、管理
+- 没有独立 watcher 状态机
+- 仍然把 Stage2 作为直接执行入口
+
+2. `workflow/schema.rs`
+- 仍是旧合同
+- `Stage1Output` 没有 `risk_grade`
+- `Stage2Decision` 仍是 `WAIT / EXECUTE / REQUEST_STAGE1_REEVALUATION`
+- 仍有 `ExecutionIntent`
+- 没有 `tactical_entry_plan`
+- 没有 `primary_entry_plan / secondary_entry_plan`
+- 没有 `CandidateEvent / PathRuntimeState / TacticalPlanState`
+
+3. `workflow/stage2.rs`
+- 仍在计算旧的 `Stage2RuntimeEvaluation`
+- `reevaluation_trigger_hit` 仍是宽松的任一信号命中
+- 仍由代码侧直接导出 `allow_execute`
+- Stage2 仍围绕 `hard_gate / soft_gate / execute` 展开
+
+4. `workflow/parser.rs`
+- 仍强绑定旧 Stage2 输出
+- 仍要求模型回显 `hard_gate / soft_gate`
+- 仍要求 `EXECUTE` 时给 `execution_intent`
+- 没有 path 审计优先的双阶段校验
+
+5. `workflow/code_layer.rs`
+- 仍只产出一个巨大的 `IndicatorSummary`
+- 没有战略层与战术层拆分
+- 没有 `state_guardrail_snapshot`
+- 没有 `driver_guardrail_snapshot`
+- 没有 `tactical_position_slice`
+- 没有 `candidate_event` 所需的代码侧事实对象
+- `options_surface` 目前只是原样透传到 `aux_context`
+- 没有 `4H / 1D` 战略辅助摘要
+- 没有 `Stage2` 可消费的 `options_guardrail_snapshot`
+- 没有任何与新增 `i27` 期权指标对应的正式归一与压缩逻辑
+
+6. `workflow/state.rs` 与 `workflow/persistence.rs`
+- 状态过薄
+- 只记了 `pending_stage1_refresh_reason` 和 `last_stage1_ts`
+- 不足以承载 path lifecycle、tactical plan、尝试次数、15m 窗口、候选事件去重
+
+7. `execution/intent_adapter.rs` 与 `execution/binance.rs`
+- 仍是单次 `ExecutionIntent`
+- 仍没有 watcher 选出的具体 `entry_plan`
+- 仍没有 dual-entry / same-15m retry contract
+
+8. `workflow/management.rs`
+- 目前只是旧 `execution_intent` 的 snapshot helper
+- 还不是代码侧管理引擎
+
+9. `llm/prompt/workflow_stage1/base.txt` 与 `workflow_stage2/base.txt`
+- 仍是旧 prompt 职责
+- `Stage1` 仍写成 `4H/1D map`
+- `Stage2` 仍写成 `WAIT / EXECUTE / REQUEST_STAGE1_REEVALUATION`
+
+10. `llm/workflow_provider.rs`
+- 仍在生成旧 JSON schema
+- 没有 Stage2 新的 `PATH_CONFIRMED + tactical_entry_plan` 合同
+
+11. `v1.3.1` 的历史合同残留还深度嵌在代码里
+- `runtime_contract`
+- `hard_gate / soft_gate`
+- `execution_intent`
+- `management_actions`
+- `WAIT / EXECUTE`
+- `Stage2RuntimeEvaluation`
+- `stage2_refresh_minutes`
+- 这些都说明当前代码仍在按旧 Stage2 思路组织，不是 `v2.0.0` 的 `path auditor + tactical plan` 链路
+
+12. 当前 `llm` 的 RabbitMQ 摄入链路仍然只有：
+- `q.llm.ind.minute`
+- 绑定 `x.ind`
+- `routing_key = bundle.1m.*`
+- 也就是当前 `llm` 只消费 `ind.minute_bundle`
+- 没有独立消费 `evt.*` 的 watcher 事件流
+- 也没有独立的低延迟价格流
+
+13. 上游 `indicator_engine` 已经具备本次改造需要的大部分原始指标产出能力，但 `llm` 侧尚未正式接好：
+- `i27 -> options_surface` 已存在，且输出 `5m / 15m / 4h / 1d / 3d`
+- `i25 -> open_interest` 已存在，且输出 `5m / 15m / 4h / 1d / 3d`
+- `i26 -> long_short_ratios` 已存在，且输出 `5m / 15m / 4h / 1d / 3d`
+- `i18 -> avwap` 已存在 `7d lookback`，并输出 `15m / 1h / 4h / 1d / 3d`
+- 但 `llm` 代码层当前仍未把这些能力重组为 `Stage1 strategic summary / Stage2 tactical slice / watcher facts`
+
+14. 当前 minute bundle 的多窗口指标不能只看顶层 `window_code`
+- `indicator_engine` 在 bundle 组装时会优先把“主窗口”放到顶层 `window_code`
+- 但真正的多窗口内容在 `payload.by_window` 或 `payload.series_by_window`
+- 如果 `llm` 新 code layer 继续把顶层 `window_code` 当成真实时框来源，就会误判 `open_interest / long_short_ratios / options_surface / avwap` 是否具备 `4h / 1d / 3d`
+
+15. `kline_history` 当前只正式产出：
+- `1m`
+- `15m`
+- `4h`
+- `1d`
+- 还没有 `3d` 原始 bars
+- 因此如果新版 `Stage1` 最终决定需要直接消费原始 `3d` bar 序列，而不仅仅依赖 `3d` 结构化指标，上游 `indicator_engine` 必须补 `i19 kline_history` 的 `3d` 输出
+
+### 2.3 结论
+
+这不是“局部补齐字段”能解决的问题。
+
+必须重构的核心不是某一个 prompt，而是整个工作流分层：
+
+`Stage1 -> watcher/candidate engine -> Stage2 -> watcher execution -> management engine`
 
 ---
 
-## 3. 目标代码架构
+## 3. 目标架构
 
-目标架构必须变成：
+### 3.1 重构后的唯一允许主链
 
 ```text
-indicator bundle
-    ↓
-代码层（15m，无LLM）
-    ↓
-Stage1（4H 或显式刷新，LLM）
-    ↓
-Stage2（15m，LLM）
-    ↓
-执行引擎（1m / 100ms，无LLM）
+minute_bundle / realtime_feed
+    ->
+code layer
+    ->
+Stage1 strategic engine
+    ->
+watcher / candidate engine
+    -> path_review_candidate / entry_candidate -> Stage2 tactical auditor
+    -> hard_invalidation -> Stage1 refresh
+    -> approved tactical plan -> concrete entry selection -> execution engine
+    -> position lifecycle -> management engine
+    -> telegram / x / journal
 ```
 
-新的职责分配：
+### 3.2 各层唯一职责
 
-- `代码层`
-  - 输入原始 indicator bundle
-  - 输出 `indicator_summary`
-  - 维护 `auction_context.tracked_zones / zone_states / recent_15m_bars`
+`code layer`
+- 压缩与标准化数据
+- 产出战略输入、战术切片、guardrail snapshot、watcher predicate facts
 
-- `Stage1`
-  - 输入 `indicator_summary`
-  - 输出一个 `current_script + current_path`
-  - 输出 `driver_attribution`
-  - 输出 `monitoring_status`
+`Stage1`
+- 输出唯一战略主剧本
+- 输出唯一战略 path
+- 输出 `risk_grade`
+- 输出战略级 `reevaluation_trigger`
 
-- `Stage2`
-  - 输入 `indicator_summary + stage1_output + active_positions`
-  - 先判断当前剧本是否失效
-  - 失效则请求 Stage1 重评
-  - 未失效则检查 activation + setup + gate
-  - 需要时输出 `execution_intent`
-  - 如有持仓，输出 `management_actions[]`
+`watcher / candidate engine`
+- 持续监测 path 是否接近、是否硬失效、是否满足候选送审条件
+- 维护 tactical plan 生命周期
+- 控制同一 `15m` 窗口内最多 `2` 次“实际成交后被打掉”的尝试
 
-- `执行引擎`
-  - 输入 `execution_intent` / `management_actions[]`
-  - 做 1m / 100ms 成交优化和订单变更
+`Stage2`
+- 第一身份：`path auditor`
+- 第二身份：`tactical entry designer`
+- 只输出：
+  - `PATH_CONFIRMED`
+  - `REQUEST_STAGE1_REEVALUATION`
 
----
+`execution engine`
+- 只做执行
+- 不做战略判断
+- 不做 path audit
 
-## 4. 代码落地原则
-
-### 4.1 保留哪些现有能力
-
-以下能力保留并复用：
-
-- Binance REST / WS 的交易执行与账户状态拉取
-- 现有 temp input / temp output / journal 持久化框架
-- 现有 indicator bundle 读取方式
-- 现有 prompt provider 适配器
-- 现有 `core_shared.rs` 中可复用的结构裁剪函数
-- 现有 `PositionContextState` / journal 恢复机制中的“持仓上下文持久化”思想
-
-### 4.2 必须移出主工作流的旧逻辑
-
-以下逻辑不得继续挂在主工作流判断链中：
-
-- `management_mode / pending_order_mode` 作为 LLM 路由主开关
-- pending-order 单独 LLM 模式
-- `entry freshness recheck veto`
-- `min_rr` 和 `min_distance_v` 作为核心策略 gate
-- `entry_sl_remap`
-- 旧 `scan_v6_x` 结构直接作为 Stage1/Stage2 合同
-- 基于当前账户状态切换 prompt 职责
-
-这些逻辑如果未来仍然保留，只能下放为：
-- 执行层兼容行为
-- 风险配置
-- 研究附录
-- 灰度兼容开关
-
-不能再以“工作流必需规则”的形式存在。
+`management engine`
+- 只做代码侧管理
+- 不再让 Stage2 输出管理动作
 
 ---
 
-## 5. 新模块设计
+## 4. 重构策略
 
-### 5.1 新建 `workflow` 领域模块
+### 4.1 这是破坏式重构
 
-新增目录：
+本次实施按以下策略进行：
+
+1. 不保留与新合同冲突的旧 Stage2 决策语义
+2. 不保留旧的 `WorkflowRuntimeContract -> allow_execute -> execution_intent` 主链
+3. 不保留旧的 `Stage2.management_actions` 主链
+4. 不保留旧 persistence 对新 state 文件的隐式兼容
+5. 不保留旧 prompt/schema 作为 fallback
+
+### 4.2 状态文件采用版本化切换
+
+当前状态文件与新链路不兼容。
+
+实施方案采用以下规则：
+- 新链路状态文件使用新的版本化命名或新目录，例如 `workflow_v2`
+- 部署时不读取旧 `stage1_output / workflow_state / entry_snapshot` 文件
+- 如需平滑切换，允许在上线脚本中显式清空旧 workflow state
+
+原因很简单：
+- 旧 `entry_snapshot` 是单一 `execution_intent` 合同
+- 新链路需要 `strategic state + tactical plan state + watcher runtime state`
+- 强行向后兼容只会把错误状态带入新系统
+
+### 4.3 文件级职责必须拆开
+
+当前 `schema.rs / parser.rs / code_layer.rs / stage2.rs / runtime.rs` 都过于肥大。
+
+重构后必须做到：
+- 单个文件只承担单一职责
+- `runtime.rs` 只做 orchestration
+- schema 与 parser 分离
+- strategic 与 tactical 分离
+- watcher 与 execution 分离
+- management 与 Stage2 分离
+
+---
+
+## 5. 目标代码结构
+
+推荐结构如下。
 
 ```text
 systems/llm/src/workflow/
   mod.rs
-  schema.rs
   state.rs
+  persistence.rs
   predicate.rs
-  code_layer.rs
+  management.rs
+  watcher.rs
+  candidate.rs
   stage1.rs
   stage2.rs
-  parser.rs
-  management.rs
-  persistence.rs
+  contracts/
+    strategic.rs
+    tactical.rs
+    runtime.rs
+  parser/
+    stage1.rs
+    stage2.rs
+  code_layer/
+    mod.rs
+    strategic.rs
+    tactical.rs
+    guardrail.rs
+    candidate.rs
 ```
 
-各文件职责：
+说明：
+- `contracts/strategic.rs`：Stage1 输入输出合同
+- `contracts/tactical.rs`：Stage2 输入输出合同、entry plan 合同
+- `contracts/runtime.rs`：watcher/runtime state 合同
+- `parser/stage1.rs`：只解析 Stage1
+- `parser/stage2.rs`：只解析 Stage2
+- `code_layer/strategic.rs`：只构建战略层摘要
+- `code_layer/tactical.rs`：只构建战术切片
+- `code_layer/guardrail.rs`：只构建状态/驱动 guardrail
+- `code_layer/candidate.rs`：只给 watcher 提供确定性候选事实
 
-| 文件 | 职责 |
-|---|---|
-| `schema.rs` | 定义所有新工作流结构体 |
-| `state.rs` | 定义运行期 `WorkflowState` |
-| `predicate.rs` | 负责结构化谓词的确定性判断 |
-| `code_layer.rs` | 从现有 raw bundle 生成 `indicator_summary` |
-| `stage1.rs` | Stage1 输入输出拼装与辅助校验 |
-| `stage2.rs` | Stage2 输入输出拼装与辅助校验 |
-| `parser.rs` | 解析 Stage1 / Stage2 模型输出 |
-| `management.rs` | 管理规则执行辅助 |
-| `persistence.rs` | `stage1_output`、tracked zones 的 symbol 级持久化，以及 `entry_snapshot` 的 context 级持久化 |
+`workflow/schema.rs` 和 `workflow/parser.rs` 不应继续保留为大杂烩文件。
+如果短期需要兼容编译路径，可以先保留为 re-export facade，但完成迁移后应删除。
 
-### 5.2 核心结构体
+---
 
-`schema.rs` 必须至少定义以下类型：
+## 6. 具体实施改造方案
 
-```rust
-pub struct IndicatorSummary { ... }
-pub struct AuctionContext { ... }
-pub struct TrackedZone { ... }
-pub struct ZoneState { ... }
-pub struct Stage1Output { ... }
-pub struct MapSummary { ... }
-pub struct DriverAttribution { ... }
-pub struct CurrentPath { ... }
-pub struct ReevaluationTrigger { ... }
-pub struct ManagementPlan { ... }
-pub struct HardGateEvaluation { ... }
-pub struct SoftGateEvaluation { ... }
-pub struct Stage2Decision { ... }
-pub struct ExecutionIntent { ... }
-pub struct ManagementAction { ... }
-pub struct EntrySnapshot { ... }
-pub struct WorkflowState { ... }
-```
+## 6.1 数据源与 code layer 改造
 
-其中必须满足：
+### 6.1.1 目标
 
-- `Stage1Output` 只能有一个 `current_script`
-- `Stage1Output` 只能有一个 `current_path`
-- `current_path.id` 必须存在，作为 Stage2 / 执行层 / 持久化链路的唯一当前 path 标识
-- `Stage2Decision` 不得包含“切换到另一个并行 path”的动作
-- `EntrySnapshot` 必须绑定 `context_key`，不得只用 `symbol` 作为唯一标识
-- `ManagementPlan` 必须把结构位目标和驱动恶化响应写成明确字段，不能只留自然语言说明
-- `ExecutionIntent` 必须是可直接传给执行引擎的线协议，不能只留空对象
-- `ManagementAction` 必须按 action type 携带足够参数，不允许执行层自行猜测
-- `Stage2Decision` 必须支持 `management_actions[]`，因为同一 `symbol` 下允许多个上下文并发恢复与管理
-- `ManagementAction` 只能包含：
-  - `HOLD`
-  - `REDUCE_POSITION`
-  - `FLATTEN_POSITION`
-  - `MOVE_STOP`
-  - `UPDATE_TAKE_PROFIT`
+把当前单一 `IndicatorSummary` 改造成三类输出：
 
-### 5.3 结构化谓词
+1. `StrategicIndicatorSummary`
+- 给 Stage1
 
-`predicate.rs` 只实现 v1.3.1 允许的谓词：
+2. `TacticalReviewInputSlice`
+- 给 Stage2
 
-- `zone_acceptance_above`
-- `zone_acceptance_below`
+3. `WatcherFacts`
+- 给 watcher / management / execution
+
+### 6.1.2 数据源硬要求
+
+`AVWAP`
+- 最少保留：`7D / 3D / 1D / 4H`
+
+`RVWAP sigma bands`
+- 最少保留：`15m / 4H / 1D`
+
+`options_surface`
+- 必须保留为 `aux_context`
+- 但必须额外压成 `4H / 1D` 可消费的战略辅助摘要供 `Stage1` 使用
+- 不允许继续只作为“存在于 payload 里但没人正式消费”的边缘字段
+- 上游若以新增指标 `i27` 提供期权面数据，代码层必须先把 `i27 -> options_surface` 归一成逻辑名称，再进入 workflow 合同；不得把 `i27` 这种编号直接泄露到 Stage1/Stage2 schema
+
+`EMA regime`
+- 最少保留：`3D / 1D / 4H`
+
+`OI / long_short_ratios`
+- 只接确认后的 `5m` 规范桶
+- 允许边界后晚到
+- 作为状态层，不作为秒级触发器
+
+`divergence`
+- 只保留去趋势、显著性过滤后的有效事件
+- 必须带 `event_available_ts`
+- 不允许用“原始 CVD 看起来像背离”替代
+
+`trigger` 事件
+- 必须都带：
+  - `confirmed_at`
+  - `confirmed_price`
+  - `side`
+  - `spot_confirm`
+
+`kline_history`
+- 只作为数据载体，不单独打分
+
+### 6.1.2.1 上游数据源现状判断
+
+这里先给出结论，避免后面把“上游没数据”和“`llm` 没接好数据”混为一谈。
+
+当前仓库中的 `orderflow-indicator-engine` 对应实现目录是：
+- `/data/systems/indicator_engine`
+
+按第一性原理复核后的判断如下：
+
+1. 对 `Stage1` 来说，当前上游已经具备大部分原始战略输入
+- `3D / 1D / 4H` 的 `price_volume_structure`
+- `liquidation_density`
+- `AVWAP`
+- `TPO market profile`
+- `RVWAP sigma bands`
+- `EMA trend regime`
+- `FVG`
+- `funding`
+- `VPIN`
+- `open_interest`
+- `long_short_ratios`
+- `CVD pack`
+- `divergence`
+- `whale_trades`
+- 以及新增的 `i27/options_surface`
+
+2. 对 `Stage2` 来说，当前上游也已经具备大部分原始战术输入
+- `15m` 触发层事件
+- `5m` 规范化的 `OI / ratio`
+- `4H / 1D` 的状态和驱动快照
+- `15m RVWAP`
+- `orderbook_depth / footprint / absorption / initiation / exhaustion / high_volume_pulse`
+
+3. 真正的缺口主要不在“有没有指标”，而在“数据组织方式”和“消费方式”
+- `llm` 还在吃旧的 `minute_bundle -> old Stage1 -> old Stage2`
+- `options_surface` 仍然只是 raw payload 透传
+- `Stage2` 还没有事件驱动输入对象
+- watcher 还没有自己的事件消费链
+
+4. 当前 minute bundle 可以继续作为 `Stage1` 的基础输入来源
+- 它足够承载新的 `Stage1 strategic summary`
+- 也足够给 `Stage2` 提供基础战术切片
+- 但不够承载 `watcher` 需要的“实时等待、事件驱动复核、秒级执行监测”
+
+5. 当前 `indicator_engine` 已经存在 `evt.{indicator_code}.{symbol}` 的 snapshot fanout
+- 这意味着我们不是从零发明 watcher 事件流
+- 但必须把它正式接入 `llm` 新链路
+- 不能继续停留在“仓库里有 fanout 代码，但 `llm` 实际没消费”
+
+### 6.1.2.2 需要修改上游吗？
+
+结论分三层：
+
+1. 为了拿到 `i27/options_surface` 本身，不需要额外新增指标
+- 上游已经有 `i27`
+- 上游也已经按逻辑名 `options_surface` 对外输出
+- 这里的工作重点是 `llm` 侧做正式归一、压缩和合同化消费
+
+2. 为了让新 `Stage1 / Stage2` 真正跑起来，需要做上游 / MQ 侧改造
+- 当前 `llm` 只消费 `bundle.1m.*`
+- 新 watcher 必须新增独立消费者，至少接入 `x.ind` 上的 `evt.*.{symbol}` 一类事件流
+- 如果不把 watcher 的事件流接进来，`Stage2` 仍然会退化成“按 bundle 定时跑一次”的旧模式
+
+3. 为了实现你要求的“更快等待和更快入场”，仅靠当前 `bundle.1m.*` 和 `evt.*` 还不够
+- `bundle.1m.*` 是分钟级
+- `evt.*` 当前本质上也是 snapshot fanout，不是秒级价格流
+- 如果 watcher 真的要承担秒级价格监测、执行窗口判定、主入场/备选 re-entry 的低延迟执行，则需要新增低延迟价格源
+- 这通常意味着要从 MQ topology 或上游市场数据链路新增：
+  - watcher 专用实时价格队列
+  - 或直接接入更低延迟的 `x.md.live` / 等价实时价格流
+
+4. `kline_history` 是否要改上游，取决于我们最终是否要求 Stage1 直接看原始 `3d` bars
+- 如果 `Stage1` 只依赖 `3d` 的结构化指标地图，那么上游现状基本够用
+- 如果 `Stage1 prompt/schema` 最终明确要求 raw `3d` kline context，则必须扩 `indicator_engine` 的 `i19 kline_history`
+
+### 6.1.2.3 对实施方案的硬结论
+
+本次改造不能写成“只改 `systems/llm` 就够了”。
+
+必须把工作拆成两条并行线：
+
+1. `systems/llm` 重构
+- 新 contracts
+- 新 code layer
+- 新 Stage1 / Stage2
+- 新 watcher / candidate engine
+- 新 execution / management chain
+
+2. 上游与 MQ 拓扑改造
+- 验证并正式接入 `evt.*` fanout
+- 为 watcher 新增独立 queue / consumer
+- 若要秒级等待与更快执行，新增低延迟价格流
+- 若要 raw `3d` bars 进入 Stage1，再扩 `kline_history`
+
+### 6.1.3 分层输出规则
+
+`StrategicIndicatorSummary`
+- 位置层：全量战略地图
+- 状态层：全量战略状态
+- 驱动层：全量战略驱动
+- 触发层：只允许最近一段与 `1D / 4H` 关键位绑定的已确认高质量摘要
+- 辅助层：`options_surface` 的 `4H / 1D` 战略摘要，用于补充 `risk_grade / target corridor / failure envelope` 收敛
+
+`TacticalReviewInputSlice`
+- 当前 path corridor 周边的 `1D / 4H` 关键位
+- 当日 `TPO POC / IB / Single Print`
+- `15m RVWAP ±σ`
+- 与当前 path 真正相交的 `4H / 1D AVWAP`
+- 若 `7D / 3D AVWAP` 已进入当前 path corridor，也必须纳入
+- 最新 `15m` 触发事实：
+  - footprint
+  - orderbook_depth
+  - absorption/initiation
+  - exhaustion
+  - high_volume_pulse
+
+`WatcherFacts`
+- `price_in_stage1_activation_corridor`
+- `price_breached_stage1_failure`
+- `zone_acceptance_above/below`
 - `reaccept_inside_value`
 - `failed_auction_confirmed`
-- `price_above_on_close`
-- `price_below_on_close`
-- `max_age_minutes`
-- `near_level`
-- `event_after_precondition`
+- `extreme_location_hit`
+- `reverse_confirmation_hit`
+- `driver_change_hit`
+- `current_15m_window_id`
+- `latest_realtime_price`
 
-不得新增：
-- RR 谓词
-- 仓位排他谓词
-- path 并行切换谓词
+### 6.1.4 当前 RabbitMQ / bundle 语义必须显式处理
 
----
+实现时必须额外注意以下几点：
 
-## 6. 代码层实施方案
+1. 新 code layer 不能把顶层 `window_code` 当成多窗口指标的真实时框来源
+- `open_interest`
+- `long_short_ratios`
+- `options_surface`
+- `avwap`
+- `rvwap_sigma_bands`
+- 这些都必须从 `payload.by_window` 或 `payload.series_by_window` 取值
 
-### 6.1 新代码层不改 indicator_engine
+2. `bundle.1m.*` 仍可作为 Stage1 的基础快照输入
+- 但不能再承担 watcher 的全部职责
 
-本次不改 `systems/indicator_engine`。
+3. watcher 必须新增自己的输入源抽象
+- `indicator_event_feed`
+- `realtime_price_feed`
+- `bundle_snapshot_feed`
+- 这样才能把“分钟级战略刷新”和“事件驱动战术执行”彻底分开
 
-原因：
-- v1.3.1 的代码层属于 LLM 系统内部的数据压缩层
-- 当前 indicator bundle 已经包含所需原始信息
-- 直接在 `systems/llm` 内从 raw bundle 生成 `indicator_summary`，改造范围最小
+### 6.1.5 当前文件改造
 
-### 6.2 新增 `workflow::code_layer`
+必须改：
+- `/data/systems/llm/src/workflow/code_layer.rs`
+- `/data/systems/llm/src/llm/filter/code_layer_entry.rs`
+- `/data/systems/llm/src/llm/filter/code_layer_management.rs`
+- `/data/systems/llm/src/llm/filter/core_shared.rs`
 
-新增：
-
-`systems/llm/src/workflow/code_layer.rs`
-
-功能：
-- 输入 `ModelInvocationInput.indicators`
-- 输出 `IndicatorSummary`
-
-生成规则：
-
-1. 位置层、状态层、驱动层、触发层由当前 `scan.rs` 和 `core_shared.rs` 现有裁剪逻辑抽取
-2. 所有事件统一补齐：
-   - `confirmed_at`
-   - `confirmed_price`
-3. 新增 `auction_context`
-   - `tracked_zones`
-   - `zone_states`
-   - `recent_15m_bars`
-4. `options_surface` 如果保留，只能进入 `aux_context`
-
-### 6.3 代码复用策略
-
-直接复用或迁移的现有代码来源：
-
-- 从 [scan.rs](/data/systems/llm/src/llm/filter/scan.rs) 迁移位置层压缩逻辑
-- 从 [core_shared.rs](/data/systems/llm/src/llm/filter/core_shared.rs) 迁移事件、orderbook、footprint、divergence 的基础裁剪逻辑
-- 从 [core_entry.rs](/data/systems/llm/src/llm/filter/core_entry.rs) 提取 entry 关注的事件裁剪逻辑
-- 从 [core_management.rs](/data/systems/llm/src/llm/filter/core_management.rs) 提取管理期所需的持仓证据构造逻辑
-
-### 6.4 tracked zones 的实现
-
-必须实现持久化的 `tracked_zones`。
-
-实现方式：
-
-1. Stage1 每次输出 `current_path.tracked_zones`
-2. `workflow::persistence` 将其按 symbol 落盘
-3. 下一轮代码层在生成 `IndicatorSummary` 时读取上一轮 `tracked_zones`
-4. 代码层为每个 tracked zone 计算 `zone_states`
-
-### 6.5 `entry_snapshot` 的持久化粒度
-
-`stage1_output` 和 `tracked_zones` 仍然是 symbol 级状态，但 `entry_snapshot` 不能做成 symbol 单实例。
-
-必须改成：
-
-1. `entry_snapshot` 按 `context_key` 落盘
-2. `context_key` 复用当前 runtime / journal 已有的执行上下文键语义，不新发明仓位政策
-3. 同一 `symbol` 下允许存在多个 `entry_snapshot`
-4. 不得因为持久化文件只有一个而隐含引入 “one-symbol-one-position” 或其他仓位排他规则
-
-这里的 `context_key` 是运行期上下文标识，不是新的交易策略字段。它只负责区分：
-- 同一 symbol 下不同持仓方向或执行上下文
-- 同一 symbol 下需要分别恢复的 entry / management 连续性
-
-建议新增状态文件目录：
-
-```text
-systems/llm/state/workflow/
-  ETHUSDT.stage1_output.json
-  ETHUSDT.tracked_zones.json
-  ETHUSDT.entry_snapshot.BOTH.json
-  ETHUSDT.entry_snapshot.LONG.json
-  ETHUSDT.entry_snapshot.SHORT.json
-```
-
-如果当前 symbol 只有一个上下文，就只存在其中一个文件；如果有多个上下文并存，则分别持久化，不互相覆盖。
+实施要求：
+- `workflow/code_layer.rs` 拆分，不允许继续单文件承载战略、战术、watcher 三类构建
+- `filter` 层补齐 `3D`、`7D AVWAP`、`15m RVWAP`、`3D EMA`
+- `options_surface` 继续只放 `aux_context` 原始包，但必须额外产出 `Stage1` 可消费的战略辅助摘要
+- 必须新增 `i27/options_surface` 的过滤与归一逻辑，而不是继续直接透传原始 payload
+- 必须新增 `options_guardrail_snapshot` 构建逻辑，供 `Stage2` 在 path corridor 与关键期权障碍重叠时使用
 
 ---
 
-## 7. Stage1 实施方案
+## 6.2 Stage1 改造
 
-### 7.1 Stage1 输入
+### 6.2.1 新职责
 
-Stage1 输入必须改成：
+Stage1 必须完全重写成：
+- `3D / 1D / 4H` 地图
+- 唯一主剧本
+- 战略 path
+- `risk_grade`
+- `4H / 1D` 驱动归因
 
-```json
-{
-  "task": "执行地图、剧本选择、path object 构建、驱动归因",
-  "indicator_summary": {},
-  "previous_stage1_output": {},
-  "refresh_reason": "scheduled_4h | thesis_invalidated | no_edge_reentered"
-}
-```
+### 6.2.2 新输入合同
 
-不得再输入旧的：
-- `scan_v6_x`
-- `stage_1_market_scan_json`
-- 多条 prior paths
+Stage1 输入对象应至少包含：
+- `task`
+- `strategic_indicator_summary`
+- `previous_stage1_output`
+- `refresh_reason`
 
-### 7.2 Stage1 输出
+不再使用当前旧的泛型 `indicator_summary` 直塞模式。
 
-Stage1 输出必须严格遵守 v1.3.1：
+### 6.2.3 新输出合同
 
-- `meta.stage1_ts`
+Stage1 输出必须至少包含：
 - `monitoring_status`
 - `no_trade_reason`
-- `refresh_hints`
 - `map_summary`
 - `current_script`
 - `driver_attribution`
 - `current_path`
 
-其中 `current_path` 还必须包含：
-- `id`
-- 六个核心字段：`thesis / activation_level / first_path_target / next_path_target / failure_level / failure_switch`
-- `setup_type`
+`current_path` 必须新增：
+- `risk_grade`
+- 结构化 `reevaluation_trigger`
+- 明确的 `path envelope`
+- 必要的 `options_context_summary` 或等价战略辅助字段，用来表达期权面如何约束当前 path
+
+`no_trade_reason` 只允许：
+- `conflict_no_edge`
+- `script_not_unique`
+- `path_not_actionable`
+
+### 6.2.4 代码侧校验
+
+Stage1 parser 必须新增强校验：
+
+1. `monitoring_status=no_edge` 时：
+- `current_script == null`
+- `current_path == null`
+
+2. `monitoring_status=active` 时：
+- 必须恰好一个 `current_path`
+- `risk_grade` 必须存在
+- `failure_switch` 必须是机器可读 identifier
+
+3. 多时框冲突裁决必须做 parser 级别一致性校验：
+- `4H` 逆 `1D` 且非极限位置，不允许输出可交易 path
+- `4H` 同时逆 `1D` 和 `3D`，不允许输出趋势 continuation 型 target corridor
+
+4. “价格还远离 activation_level”不得成为 `no_edge`
+
+### 6.2.5 当前文件改造
+
+必须改：
+- `/data/systems/llm/src/workflow/stage1.rs`
+- `/data/systems/llm/src/llm/prompt/workflow_stage1/base.txt`
+- `/data/systems/llm/src/llm/prompt/workflow_stage1.rs`
+- `/data/systems/llm/src/llm/workflow_provider.rs`
+- `/data/systems/llm/src/workflow/parser.rs` 或其拆分后的 `parser/stage1.rs`
+
+### 6.2.6 Stage1 schema 重设计要求
+
+Stage1 schema 不允许在旧 `Stage1Output` 上做“字段追加式修补”。
+
+必须明确做一次 schema 换代，至少做到：
+
+1. 删除旧时代的宽泛字段语义
+- `map_summary.market_tradeable`
+- `map_summary.location_bias`
+- `driver_attribution.driver_bias`
+- 这些旧字段名如果继续保留，只能在语义完全重定义后存在；否则应删除
+
+2. 新 schema 必须围绕新的战略职责组织
+- `map_summary`
+- `current_script`
+- `driver_attribution`
+- `current_path`
+- `risk_grade`
+- `no_trade_reason`
+
+3. 新 schema 必须直接表达多时框裁决和 path 风险约束
+- `3D / 1D / 4H` 背景结论
+- `risk_grade`
+- `failure_switch`
 - `reevaluation_trigger`
-- `management_plan`
-- `tracked_zones`
 
-其中语义必须区分清楚：
+4. 新 schema 必须允许 `options_surface` 的战略辅助摘要进入 Stage1 输出或其解释对象
+- 但不能把期权面写成主 gate
+- schema 命名必须继续使用逻辑名 `options_surface` 或 `options_context_summary`，不得把上游 `i27` 编号直接暴露给 LLM
 
-- `activation_level / first_path_target / next_path_target / failure_level` 是价格或价格带字段，必须绑定 1D / 4H 结构位
-- `thesis` 是当前 path 的剧本说明，不是价格字段
-- `failure_switch` 是失效后的下一优先重评方向，不是价格字段，也不是并行活跃 path
+---
 
-不得输出：
-- `paths[]`
-- `map_premises`
-- `path_premises`
-- `switch_predicate`
-- `position_policy`
+## 6.3 watcher / candidate engine 改造
 
-### 7.2.1 `management_plan` 必填合同
+### 6.3.1 这是本次重构的关键新增层
 
-`management_plan` 不能只写成自然语言摘要，必须至少展开为：
+当前代码完全没有这一层，必须新增。
 
-```json
-{
-  "take_profit_1_basis": "first_path_target",
-  "take_profit_2_basis": "next_path_target",
-  "take_profit_1_level": 0,
-  "take_profit_2_level": 0,
-  "stop_migration_rules": [
-    {
-      "after_target": "take_profit_1 | take_profit_2",
-      "new_stop_basis": "activation_level | first_path_target | next_path_target",
-      "new_stop_level": 0
-    }
-  ],
-  "reduce_on_driver_deterioration": [
-    {
-      "driver_signal": "spot_confirmation_lost | oi_support_lost | fake_order_risk_rising | driver_flip_confirmed",
-      "reduce_ratio": 0.0
-    }
-  ],
-  "exit_full_on_driver_deterioration": [
-    {
-      "driver_signal": "driver_flip_confirmed"
-    }
-  ]
-}
-```
+watcher 不是一个 helper，而是新的运行主组件。
+
+### 6.3.2 watcher 的职责
+
+watcher 必须负责：
+- 维护当前战略 path runtime state
+- 维护当前战术 plan runtime state
+- 生成 `path_review_candidate`
+- 生成 `entry_candidate`
+- 直接触发 `hard_invalidation`
+- 控制 `same_15m_window` 内最多 `2` 次“实际成交后被打掉”的尝试
+- 处理 `primary_entry_plan` 与 `secondary_entry_plan` 的生命周期
+
+### 6.3.3 watcher 必须持有的状态
+
+新增 `WorkflowState` 不得再只剩两个字段。
+
+至少必须新增：
+- `active_stage1_path_id`
+- `active_stage1_ts`
+- `active_risk_grade`
+- `path_status`
+- `pending_stage1_refresh_reason`
+- `approved_tactical_plan`
+- `tactical_plan_generated_at`
+- `current_15m_window_id`
+- `filled_stopout_attempt_count`
+- `last_path_review_at`
+- `last_entry_review_at`
+- `last_management_eval_at`
+
+必要时拆成两个状态对象：
+- `WorkflowStrategicState`
+- `WorkflowTacticalState`
+
+### 6.3.4 候选事件模型
+
+推荐最小事件集：
+- `path_review_candidate`
+- `entry_candidate`
+- `hard_invalidation`
+- `management_event`
+- `no_edge_reentered`
 
 约束：
+- `hard_invalidation` 由 watcher 直接判定，不先问 Stage2
+- `path_review_candidate` 用于 path 仍活着但需要重新审计或重排 tactical plan
+- `entry_candidate` 用于准备执行 `primary` 或 `secondary` entry 之前的最后一次 Stage2 战术复核
 
-- `take_profit_1_level` 必须绑定 `first_path_target`
-- `take_profit_2_level` 必须绑定 `next_path_target`
-- 目标位必须来自结构位，不得引入固定 RR 目标
-- `stop_migration_rules` 只能在目标位兑现后生效，不得先于目标位主动移损
-- 超出 `next_path_target` 的目标延展不得由 `management_plan` 自行发明
-- 如果需求方希望继续延展，必须先触发新的 `Stage1` 重评，由新 path 提供新的目标位
-- `reduce_on_driver_deterioration` 和 `exit_full_on_driver_deterioration` 只能引用原始工作流已定义的驱动恶化语义：
-  - 现货确认丢失
-  - OI 支持丢失 / unwind
-  - fake order risk 上升
-  - spot / futures 驱动关系翻转
-- 上述 `driver_signal` 名称可以按代码风格调整，但语义不得超出原文
-- `failure_level_breached` 不属于 `management_plan`
-- `failure_level_breached` 属于 Stage2 的剧本失效处理：应触发 `REQUEST_STAGE1_REEVALUATION`，必要时可并发 `FLATTEN_POSITION`
+### 6.3.5 触发源
 
-### 7.3 Prompt 改造
+watcher 输入不应只靠当前 `1m minute_bundle`。
 
-调整 [prompt.rs](/data/systems/llm/src/llm/prompt.rs)：
+实施上必须显式接入：
+- `1m minute_bundle`
+- `15m` 触发确认事实
+- 秒级价格更新或等价实时事件流
 
-当前：
-- `Scan`
-- `Finalize`
+推荐实现：
+- 继续使用 RabbitMQ
+- 新增独立 routing key 或独立 consumer 供 watcher 消费
+- `Stage1` 基础快照继续走 `q.llm.ind.minute <- x.ind <- bundle.1m.*`
+- watcher 事件流新增独立队列，至少绑定 `x.ind <- evt.*.<symbol>`
+- 若要实现真正的秒级执行边际监测，再新增 watcher 的实时价格队列或直接接入更低延迟价格流
+- watcher 不再依赖“每来一个 1m bundle 就顺手跑 Stage2”
 
-改为：
-- `WorkflowStage1`
-- `WorkflowStage2`
+这里必须明确：
+- 仅复用当前 `q.llm.ind.minute` 不足以落地 `v2.0.0`
+- 如果没有 watcher 自己的事件流和价格流，新架构会再次退化成旧 `Stage2` 轮询器
 
-新增文件：
+### 6.3.6 当前文件改造
 
-```text
-systems/llm/src/llm/prompt/workflow_stage1.rs
-systems/llm/src/llm/prompt/workflow_stage2.rs
-systems/llm/src/llm/prompt/workflow_stage1/base.txt
-systems/llm/src/llm/prompt/workflow_stage2/base.txt
-```
+新增：
+- `/data/systems/llm/src/workflow/watcher.rs`
+- `/data/systems/llm/src/workflow/candidate.rs`
 
-Stage1 prompt 只允许模型做：
-- 地图
-- 当前主剧本选择
-- 当前 path object 构造
-- 驱动归因
+必须改：
+- `/data/systems/llm/src/workflow/state.rs`
+- `/data/systems/llm/src/workflow/persistence.rs`
+- `/data/systems/llm/src/app/runtime.rs`
 
-明确禁止：
-- 并行剧本
-- 多 path 排序
-- RR 规则扩展
-- 仓位政策发明
+---
 
-### 7.4 Stage1 解析器
+## 6.4 Stage2 改造
 
-新增 `workflow::parser::parse_stage1_output`。
+### 6.4.1 新职责
 
-解析器必须验证：
+Stage2 必须从旧的：
 
-1. `meta.stage1_ts` 必须存在
-2. `monitoring_status = active` 时必须有 `current_script` 和 `current_path`
-3. `monitoring_status = active` 时，`current_path` 必须同时包含：
-   - `id`
-   - 六个核心字段
-   - `setup_type`
-   - `reevaluation_trigger`
-   - `management_plan`
-   - `tracked_zones`
-4. `monitoring_status = no_edge` 时 `current_script = null` 且 `current_path = null`
-5. `failure_switch` 只能是剧本名，不是 path id
-6. `setup_type` 只能是：
-   - `A_continuation`
-   - `B_reversal`
-   - `C_value_return`
-7. `reevaluation_trigger` 只能表达三类证据：
+`WAIT / EXECUTE / REQUEST_STAGE1_REEVALUATION`
+
+重写成新的：
+
+`PATH_CONFIRMED / REQUEST_STAGE1_REEVALUATION`
+
+Stage2 必须严格按两步运行：
+
+`第一步：path 审计`
+- 当前 path 是否还活着
+
+`第二步：entry 设计`
+- 只有 path 还活着，才输出新的 `tactical_entry_plan`
+
+### 6.4.2 新输入合同
+
+Stage2 输入至少包含：
+- `candidate_event`
+- `path_runtime_state`
+- `previous_tactical_plan`
+- `tactical_position_slice`
+- `latest_15m_trigger_facts`
+- `state_guardrail_snapshot`
+- `driver_guardrail_snapshot`
+- `stage1_output`
+
+当前旧的 `runtime_contract + indicator_summary + active_positions + account` 模式必须删除。
+
+`Stage2` 的新输入对象不建议继续沿用旧名 `Stage2PromptInput`。
+更合理的命名应当是：
+- `Stage2ReviewInput`
+- `PathReviewInput`
+- 或等价的新合同名
+
+这样可以从命名上彻底切断 `v1.3.1` 时代的“定时决策器”心智模型。
+
+### 6.4.3 path 审计规则
+
+Stage2 path 审计顺序必须硬编码成：
+
+1. 先看 watcher 是否已给出 `hard_invalidation`
+2. 再看是否满足软否决三联条件：
    - `extreme_location`
    - `reverse_confirmation`
    - `driver_change`
-8. `management_plan` 必须包含：
-   - `take_profit_1_basis`
-   - `take_profit_2_basis`
-   - `take_profit_1_level`
-   - `take_profit_2_level`
-   - `stop_migration_rules`
-   - `reduce_on_driver_deterioration`
-   - `exit_full_on_driver_deterioration`
-9. `take_profit_1_basis` 只能是 `first_path_target`
-10. `take_profit_2_basis` 只能是 `next_path_target`
-11. `take_profit_1_level` 必须与 `first_path_target` 对齐
-12. `take_profit_2_level` 必须与 `next_path_target` 对齐
-13. `management_plan` 中不得出现：
-   - `rr`
-   - `min_rr`
-   - 任意固定盈亏比阈值
-   - 任意仓位排他或对冲政策
-14. `current_path.id` 必须存在且非空
-15. `failure_switch` 只能是剧本重评方向，不能被解析成价格位
+3. 只有 path 还活着，才进入战术设计
 
-`tracked_zones` 虽然是工程字段，但在本方案里属于 v1.3.1 已经明确允许的必要实施合同，不得省略。
+以下情况不得单独触发 `REQUEST_STAGE1_REEVALUATION`：
+- 当前微结构不够好
+- 当前还没走到执行位置
+- 主入场未触发
+- 当前 `15m` 只是出现短暂反向压力
+
+### 6.4.4 战术设计规则
+
+当 path 还活着时，Stage2 必须输出：
+- `primary_entry_plan`
+- `secondary_entry_plan`
+- `attempt_policy`
+
+Stage2 允许：
+- 大幅后移 `entry_activation_level`
+- 大幅加深 `entry_activation_level`
+- 重设更紧的 `entry_invalidation_level`
+- 重设执行级 `stop_loss`
+- 同时重写 `primary` 与 `secondary`
+
+Stage2 不允许：
+- 放宽 `Stage1.failure_level`
+- 越出 `Stage1` path envelope
+- 重写 `Stage1.activation_level` 的战略含义
+
+### 6.4.5 当前 15m 与 path 反向时的处理
+
+如果 path 仍活着，但当前 `15m` 的卖压、`OI`、`OBI/OFI/microprice/spot_confirm` 等表现与 path 相反：
+
+Stage2 必须优先做的不是请求重评，而是：
+- 重排 `primary_entry_plan`
+- 重排 `secondary_entry_plan`
+- 大幅调整战术入场点与执行级止损
+
+只有当 path 审计已经失败，才允许请求 `Stage1` 重评。
+
+### 6.4.6 当前文件改造
+
+必须改：
+- `/data/systems/llm/src/workflow/stage2.rs`
+- `/data/systems/llm/src/llm/prompt/workflow_stage2/base.txt`
+- `/data/systems/llm/src/llm/prompt/workflow_stage2.rs`
+- `/data/systems/llm/src/llm/workflow_provider.rs`
+- `/data/systems/llm/src/workflow/parser.rs` 或其拆分后的 `parser/stage2.rs`
+
+必须删除的旧 Stage2 语义：
+- `WAIT`
+- `EXECUTE`
+- `execution_intent`
+- `management_actions`
+- `WorkflowRuntimeContract.allow_execute`
+- `hard_gate / soft_gate` 的旧回显校验逻辑
+
+### 6.4.7 Stage2 schema 重设计要求
+
+Stage2 schema 必须整体重写，不能在旧 `Stage2Decision` 上删几个字段后继续使用。
+
+必须明确做到：
+
+1. 删除旧决定模型
+- `decision=WAIT`
+- `decision=EXECUTE`
+- `execution_intent`
+- `management_actions`
+- `hard_gate`
+- `soft_gate`
+- `request_stage1_reevaluation` 这种旧嵌套结构也不建议保留原名
+
+2. 新决定模型只保留：
+- `stage2_decision = PATH_CONFIRMED | REQUEST_STAGE1_REEVALUATION`
+- `tactical_entry_plan`
+- `reevaluation_reason`
+
+3. `tactical_entry_plan` 必须是完整新对象，而不是旧 `execution_intent` 的变体
+- `primary_entry_plan`
+- `secondary_entry_plan`
+- `attempt_policy`
+
+4. 新 schema 必须天然表达新的职责边界
+- 先 path audit
+- 再 tactical entry design
+- 绝不直接下 broker-ready order intent
+
+5. parser 校验必须围绕 path envelope，而不是围绕旧 runtime gate 回显
+- 如果存在 `options_guardrail_snapshot`，parser 只校验它是否作为战术约束存在，不得允许它单独改写 path 生死
 
 ---
 
-## 8. Stage2 实施方案
+## 6.5 执行引擎改造
 
-### 8.1 Stage2 输入
+### 6.5.1 新链路
 
-Stage2 输入必须统一，不再分 `entry / management / pending` 三种 prompt 模式。
+执行引擎不再吃 `Stage2.execution_intent`。
 
-输入合同：
+新链路必须是：
 
-```json
-{
-  "task": "执行当前path检查、setup确认、输出execution_intent、执行持仓管理",
-  "indicator_summary": {},
-  "stage1_output": {},
-  "active_positions": [],
-  "account": {}
-}
-```
+`Stage2.tactical_entry_plan -> watcher 选中具体 entry_plan -> execution adapter -> Binance execution`
 
-现有的：
-- `management_mode`
-- `pending_order_mode`
-- `stage_1_setup_scan_json`
+### 6.5.2 新输入对象
 
-全部退出主工作流。
+执行引擎应吃一个 watcher 选出的 `ConcreteEntryPlan`：
+- `path_id`
+- `entry_plan_id`
+- `entry_profile`
+- `intent_mode`
+- `entry_zone`
+- `entry_activation_level`
+- `entry_invalidation_level`
+- `stop_loss`
+- `take_profit_1`
+- `take_profit_2`
+- `ttl_minutes`
+- `max_drift_pct`
+- `attempt_index`
+- `context_key`
 
-### 8.2 Stage2 唯一权限
+### 6.5.3 当前文件改造
 
-Stage2 的主决策只有三种：
+必须改：
+- `/data/systems/llm/src/execution/intent_adapter.rs`
+- `/data/systems/llm/src/execution/binance.rs`
 
-1. 等待当前 path
-2. 基于当前 path 输出 `execution_intent`
-3. 请求 Stage1 重评
+实施要求：
+- 删除旧 `AdaptedExecutionIntent` 单一意图模型
+- 新增 `AdaptedEntryPlan`
+- `binance.rs` 入口从“从 LLM 直接执行”改为“执行 watcher 选定的 entry_plan”
+- 如果命名上仍保留 `intent` 一词，必须仅表示执行层适配对象；不得再承载旧 Stage2 决策语义
 
-此外，`management_actions[]` 不是第四种并列主决策，而是独立附带通道：
-- 只要存在持仓，Stage2 都可以同时输出 `management_actions[]`
-- `management_actions[]` 可以与 `WAIT / EXECUTE / REQUEST_STAGE1_REEVALUATION` 任一主决策并存
-- `management_actions[]` 允许同一 `symbol` 下按不同 `context_key` 同时管理多个恢复链路
+---
 
-绝对禁止：
+## 6.6 管理引擎改造
 
-1. 自己实例化 `failure_switch`
-2. 自己并行持有多个 path
-3. 自己把 `alternate path` 当场激活并直接下单
+### 6.6.1 新原则
 
-### 8.3 Stage2 输出
+管理不再由 Stage2 输出。
 
-新增统一结构：
+管理必须回到代码侧，根据：
+- `Stage1.management_plan`
+- `EntrySnapshot / PositionSnapshot`
+- 结构化 `driver deterioration`
+- `tp1 / tp2 / stop migration`
 
-```json
-{
-  "decision": "WAIT | EXECUTE | REQUEST_STAGE1_REEVALUATION",
-  "reason": "",
-  "request_stage1_reevaluation": {
-    "refresh_reason": "thesis_invalidated | no_edge_reentered",
-    "trigger_source": "failure_level | reevaluation_trigger | refresh_hint"
-  },
-  "execution_intent": {},
-  "management_actions": []
-}
-```
+来生成确定性管理动作。
 
-当前 `TradeIntent`、`PositionManagementIntent`、`PendingOrderManagementIntent` 三套输出模型不再作为主链协议。
+### 6.6.2 新职责
 
-输出约束：
-- `management_actions[]` 是正交字段，不是互斥分支
-- 有持仓时，即使 `decision = EXECUTE` 或 `REQUEST_STAGE1_REEVALUATION`，仍然允许同时携带 `management_actions[]`
-- 没有持仓时，`management_actions = []`
-- 如果 `failure_level` 已触发且当前 `context_key` 有持仓，允许输出：
-  - `decision = REQUEST_STAGE1_REEVALUATION`
-  - `management_actions[]` 中可包含一个或多个 `FLATTEN_POSITION`
+管理引擎必须负责：
+- 命中 `tp1 / tp2`
+- `stop_migration_rules`
+- `reduce_on_driver_deterioration`
+- `exit_full_on_driver_deterioration`
+- `failure_level` 硬失效后的强制退出
 
-### 8.3.1 `execution_intent` 线协议
+### 6.6.3 当前文件改造
 
-`EXECUTE` 时，`execution_intent` 不能再是空对象，必须至少展开为：
+必须重写：
+- `/data/systems/llm/src/workflow/management.rs`
 
-```json
-{
-  "side": "LONG | SHORT",
-  "intent_mode": "immediate | pullback | breakout",
-  "entry_zone": {
-    "low": 0,
-    "high": 0
-  },
-  "trigger_price": null,
-  "stop_loss": 0,
-  "take_profit_1": 0,
-  "take_profit_2": 0,
-  "ttl_minutes": 15,
-  "max_drift_pct": 0.3,
-  "path_id": "path_current",
-  "entry_snapshot": {
-    "context_key": "",
-    "path_id": "path_current"
-  }
-}
-```
+必须从主链移除：
+- `Stage2.management_actions`
+- `adapt_management_action(...)` 主路径依赖
 
-约束：
+如果保留 `adapt_management_action`，也只能作为代码侧管理引擎到 broker 执行的适配器，不再由 LLM 直接产出。
 
-- `side` 必须与 `current_script` / `current_path` 方向一致
-- `entry_zone` 或 `trigger_price` 必须来自 `activation_level` 与 setup 确认后的执行区
-- `stop_loss` 必须绑定 `failure_level`
-- `take_profit_1` 必须绑定 `first_path_target`
-- `take_profit_2` 必须绑定 `next_path_target`
-- `path_id` 必须等于 `current_path.id`
-- `entry_snapshot.path_id` 必须等于 `execution_intent.path_id`
-- `ttl_minutes` 和 `max_drift_pct` 属于执行参数，不得承载方向判断
-- `entry_snapshot.context_key` 必须存在，供 execution / management 连续性恢复使用
+---
 
-### 8.3.2 `management_actions[]` 线协议
+## 6.7 persistence 与状态改造
 
-`management_actions[]` 中的每个元素都必须是无歧义协议，不允许执行层猜测动作参数。
+### 6.7.1 新持久化对象
 
-最小合同：
+至少新增以下持久化对象：
 
-```json
-{
-  "type": "HOLD | REDUCE_POSITION | FLATTEN_POSITION | MOVE_STOP | UPDATE_TAKE_PROFIT",
-  "context_key": "",
-  "path_id": "path_current",
-  "reduce_ratio": null,
-  "new_stop_loss": null,
-  "take_profit_1": null,
-  "take_profit_2": null
-}
-```
+1. `workflow_state_v2`
+- 当前战略状态
+- 当前战术状态
+- 窗口与尝试次数
 
-按动作类型约束：
+2. `stage1_output_v2`
+- 最近一次战略输出
 
-- `HOLD`：所有可选数值字段必须为 `null`
-- `REDUCE_POSITION`：必须带 `reduce_ratio`
-- `FLATTEN_POSITION`：不得携带新的价格目标
-- `MOVE_STOP`：必须带 `new_stop_loss`
-- `UPDATE_TAKE_PROFIT`：至少带一个非空的 `take_profit_1` 或 `take_profit_2`
+3. `tactical_plan_v2`
+- 最近一次 `PATH_CONFIRMED` 产出的完整战术 plan
 
-统一约束：
+4. `entry_snapshot_v2`
+- 实际入场后的持仓快照
 
-- `context_key` 必须存在
-- `path_id` 必须等于该 `context_key` 对应持仓上下文所绑定的 `entry_snapshot.path_id`
-- 对于“当前 path 下新开的仓位”，其 `path_id` 可以与 `current_path.id` 相同；对于“旧上下文的持续管理”，其 `path_id` 可以不同于当前 `current_path.id`
-- 所有价格字段必须来自该上下文所属 path 的 `management_plan` 或该 path 的结构位，不得来自 RR 推导
-- `management_actions[]` 不得编码仓位排他、对冲、加仓优先级之类额外政策
+5. `management_state_v2`
+- 已完成的管理动作与当前允许的下一步管理边界
 
-### 8.4 Stage2 解析器
+### 6.7.2 当前文件改造
 
-新增 `workflow::parser::parse_stage2_decision`。
+必须改：
+- `/data/systems/llm/src/workflow/state.rs`
+- `/data/systems/llm/src/workflow/persistence.rs`
 
-解析器必须保证：
+实施要求：
+- 不再以单一 `context_key -> snapshot` 视角表达全部运行状态
+- tactical plan 与 filled-stopout attempt 必须可恢复
+- 同一 symbol 下的多执行 context 仍然要支持
 
-- `REQUEST_STAGE1_REEVALUATION` 必须带 `request_stage1_reevaluation.refresh_reason`
-- `request_stage1_reevaluation.refresh_reason` 只能取：
-  - `thesis_invalidated`
-  - `no_edge_reentered`
-- `REQUEST_STAGE1_REEVALUATION` 不能同时带 `execution_intent`
-- `EXECUTE` 必须带完整 `execution_intent`
-- `WAIT` 不得偷偷带交易指令
-- `management_actions[]` 可以与任一主决策并存
-- 没有持仓时不得输出非空 `management_actions[]`
-- `execution_intent.side` 必须与当前 path 方向一致
-- `execution_intent.stop_loss` 必须与 `failure_level` 对齐
-- `execution_intent.take_profit_1` 必须与 `first_path_target` 对齐
-- `execution_intent.take_profit_2` 必须与 `next_path_target` 对齐
-- `execution_intent.path_id` 必须等于 `current_path.id`
-- `execution_intent.entry_snapshot.context_key` 必须存在
-- `execution_intent.entry_snapshot.path_id` 必须等于 `execution_intent.path_id`
-- `management_actions[]` 中每个元素的 `type` 都必须满足对应字段约束
-- `management_actions[]` 中每个元素都必须携带 `context_key`
-- `management_actions[]` 中每个元素的 `path_id` 都必须与该 `context_key` 的持仓上下文绑定 path 一致
-- `management_actions[]` 的价格字段必须来自对应上下文所属 path 的 `management_plan` 或 path 结构位
-- `management_actions[]` 不得携带 RR 字段或仓位政策字段
+---
 
-### 8.5 Stage2 谓词执行
+## 6.8 runtime 编排改造
 
-Stage2 的结构化判断由 `workflow::predicate` 负责，不由 prompt 文本隐式完成。
+### 6.8.1 runtime.rs 必须瘦身
 
-Stage2 运行顺序必须严格固定：
+`app/runtime.rs` 在新架构中只允许承担：
+- MQ 消费与事件分发
+- Stage1 调度
+- watcher 调度
+- Stage2 调用调度
+- execution / management / signal 调度
+- journal 记录
 
-1. 处理 `no_edge`
-2. 检查 `failure_level`
-3. 检查 `reevaluation_trigger`
-4. 检查 `activation_level`
-5. 检查 `setup_type`
-6. 过 `hard gate / soft gate`
-7. 输出 `execution_intent`
-8. 独立执行持仓管理
+不得继续把：
+- Stage2 业务规则
+- persistence 细节
+- execution 业务判断
+- management 规则
+堆在同一个函数里。
 
-不能调整顺序。
+### 6.8.2 运行主循环要拆成三个通道
 
-### 8.5.1 `hard gate / soft gate` 字段级合同
+建议拆成：
 
-Stage2 在代码内必须落成明确的 gate 结构，不允许只保留模糊描述。
+1. `StrategicRefreshLoop`
+- 处理 `scheduled_4h`
+- 处理 `path_invalidated`
+- 处理 `no_edge_reentered`
 
-建议最小内部结构：
+2. `WatcherLoop`
+- 消费实时价格与事件
+- 维护 path state
+- 生成 candidate
+- 执行 primary/secondary entry
+- 驱动 management
 
-```json
-{
-  "hard_gate": {
-    "location_valid": false,
-    "trigger_confirmed": false
-  },
-  "soft_gate": {
-    "state_clear": false,
-    "driver_clear": false,
-    "orderflow_real": false,
-    "invalidation_clear": false,
-    "passed_count": 0
-  }
-}
-```
+3. `Stage2ReviewLoop`
+- 只处理 `path_review_candidate / entry_candidate`
 
-字段语义：
+### 6.8.3 当前文件改造
 
-- `hard_gate.location_valid`
-  - 价格必须位于当前 path 对应的 value edge / anchor / sigma / IB / single print / liquidation zone / reaccept 区
-- `hard_gate.trigger_confirmed`
-  - 必须已经出现与 `setup_type` 对应的确认事件，不能裸猜
-- `soft_gate.state_clear`
-  - OI / ratio / funding / VPIN 与当前剧本不冲突
-- `soft_gate.driver_clear`
-  - `driver_attribution` 与当前 15m 证据一致，没有出现明显 driver flip
-- `soft_gate.orderflow_real`
-  - OBI / OFI / microprice / spot_confirm / fake_order_risk 对当前 setup 不构成反证
-- `soft_gate.invalidation_clear`
-  - `failure_level` 与 `execution_intent.stop_loss` 都明确存在
+必须重写：
+- `/data/systems/llm/src/app/runtime.rs`
 
-判定规则：
+实施要求：
+- 不能再保留 `invoke_workflow_bundle_models(...)` 这种“一口气做完整个旧链路”的大函数
+- `runtime.rs` 中旧的 `workflow_code_allows_execution(...)` 必须删除
+- 旧 `stage2_runtime_eval -> runtime_contract -> execution_intent` 主链必须删除
 
-- `hard_gate` 必须全部为 `true`
-- `soft_gate` 采用按 `setup_type` 分开的最低通过值
-- 当前推荐默认值为：
-  - `A_continuation: passed_count >= 3`
-  - `B_reversal: passed_count >= 2`
-  - `C_value_return: passed_count >= 2`
-- `trigger_confirmed` 的成立必须绑定到第 4 步 setup checklist，不得跳过 setup 直接过 gate
+---
 
-### 8.5.2 setup checklist 与 gate 的绑定
+## 6.9 provider / prompt / parser 改造
 
-为避免 `hard gate / soft gate` 变成新的自由裁量层，Stage2 必须固定采用以下绑定关系：
+### 6.9.1 provider schema 必须整体换代
 
-- `A_continuation`
-  - setup checklist 只检查：`initiation / stacked imbalance / OBI-OFI-microprice 同向 / spot_confirm / fake_order_risk / OI 支持`
-- `B_reversal`
-  - setup checklist 只检查：`absorption 或 exhaustion / divergence / 现货不再同向推动 / footprint 失败信号`
-- `C_value_return`
-  - setup checklist 只检查：`failed auction / 回收 value / 缺失 OI 与 spot 支持`
+`workflow_provider.rs` 需要重新定义：
 
-这些 checklist 只是在代码里把原文触发条件结构化，不得扩展成新的策略评分器。
+`Stage1 schema`
+- 支持 `risk_grade`
+- 支持新的 `map_summary`
+- 支持新的 `no_trade_reason`
+- 支持更严格的 `reevaluation_trigger`
 
-### 8.5.3 `failure_level` 与持仓管理的边界
-
-为了避免把“剧本失效”误写成“管理规则”，必须明确：
-
-- `failure_level` 命中属于 path invalidation，不属于 `management_plan`
-- `management_plan` 只负责：
-  - 结构位目标兑现后的止盈 / 移损
-  - 驱动恶化导致的减仓 / 退出
-- `failure_level` 命中时，Stage2 必须优先走：
+`Stage2 schema`
+- 只支持：
+  - `PATH_CONFIRMED`
   - `REQUEST_STAGE1_REEVALUATION`
-- 如果当前 `context_key` 存在持仓，Stage2 可以并发输出：
-  - `management_actions[]` 中对应上下文的 `type = FLATTEN_POSITION`
+- 支持 `tactical_entry_plan`
+- 支持 `primary_entry_plan`
+- 支持 `secondary_entry_plan`
+- 支持 `attempt_policy`
 
-实现上不得把 `failure_level_breached` 塞回 `driver_signal` 列表。
+这里的关键不是“字段补齐”，而是“旧 schema 退役”。
 
----
+因此 provider 层必须遵守：
+- 不保留旧 `Stage2Decision` JSON schema 作为 fallback
+- 不保留旧 `execution_intent_schema`
+- 不保留旧 `management_action_schema` 主链
+- 不保留旧 `WorkflowRuntimeContract` 回显合同
+- 不保留旧 `WAIT / EXECUTE` enum
+- 不允许把新增 `i27` 指标以编号名直接塞进 provider schema；provider 侧只能认逻辑名 `options_surface`
 
-## 9. 执行引擎实施方案
+### 6.9.2 prompt 必须跟职责同步
 
-### 9.1 保留 `execution/binance.rs`
+`workflow_stage1/base.txt`
+- 改成 `3D / 1D / 4H` map builder
+- 强化多时框冲突裁决
+- 强化 `risk_grade` 与 target 约束
 
-[binance.rs](/data/systems/llm/src/execution/binance.rs) 保留为交易所适配层。
+`workflow_stage2/base.txt`
+- 改成 path auditor first
+- 明确只有 path alive 才谈 entry plan
+- 明确软否决三联条件
+- 明确“15m 反向压力时允许大幅改战术 entry/SL，但不得改战略 failure”
 
-本次不重写 Binance 交互细节，只改上层输入协议。
+### 6.9.3 parser 必须拆开
 
-### 9.2 新增执行适配层
+Stage1 parser 要校验：
+- `no_edge` 语义
+- `risk_grade`
+- 多时框冲突裁决一致性
+- `options_surface` 只作为战略辅助输入，不得被 parser 或 prompt 偷偷升格成主 gate
 
-新增：
+Stage2 parser 要校验：
+- 只允许两个决定
+- `PATH_CONFIRMED` 时必须有完整 tactical plan
+- `REQUEST_STAGE1_REEVALUATION` 时不得带 tactical plan
+- tactical plan 不得越出 Stage1 path envelope
+- `take_profit_1 / take_profit_2` 必须继承 Stage1 path
+- `options_guardrail_snapshot` 即使存在，也只能约束 tactical entry，不能单独触发重评
 
-```text
-systems/llm/src/execution/intent_adapter.rs
-```
+### 6.9.4 当前文件改造
 
-功能：
-- 把新的 `ExecutionIntent` 转为当前 Binance 下单函数可执行的参数
-- 把新的 `ManagementAction` 转为当前管理执行函数可执行的参数
+必须改：
+- `/data/systems/llm/src/llm/workflow_provider.rs`
+- `/data/systems/llm/src/llm/prompt/workflow_stage1/base.txt`
+- `/data/systems/llm/src/llm/prompt/workflow_stage2/base.txt`
+- `/data/systems/llm/src/workflow/parser.rs`
 
-适配要求：
+### 6.9.5 清理 v1.3.1 历史设计残留
 
-- 适配层不得补全缺失的 `stop_loss / take_profit_1 / take_profit_2`
-- 适配层不得自行推断方向
-- 适配层不得根据 RR 或账户状态改写 `management_actions[]`
-- 如果上游协议缺字段，必须报错而不是猜测执行
+本次升级必须显式清理以下 `v1.3.1` 时代残留，不允许“逻辑绕过但代码还在”：
 
-### 9.3 新的执行职责
+- `WorkflowRuntimeContract`
+- `Stage2RuntimeEvaluation`
+- `WAIT / EXECUTE / REQUEST_STAGE1_REEVALUATION` 旧 decision contract
+- `execution_intent`
+- `management_actions`
+- `hard_gate / soft_gate` 旧主链
+- `stage2_refresh_minutes`
+- 旧的 `Stage2PromptInput` 命名与其旧字段组织方式
+- “期权面只在 aux_context 生存、但没有正式战略/战术摘要合同”的半接入状态
 
-执行引擎必须只做：
-
-- `immediate / pullback / breakout` 三类入场执行
-- 挂止损和止盈
-- 根据 `management_actions[]` 逐条减仓 / 平仓 / 移损 / 更新止盈
-
-### 9.4 旧逻辑处置
-
-以下逻辑从主链移除：
-
-- pending-order LLM mode
-- `entry freshness recheck`
-- `entry_sl_remap`
-- `min_rr`
-- `min_distance_v`
-
-处理方式：
-
-- 默认关闭
-- 如果短期为了兼容保留，必须移到 `compatibility` 配置块
-- 新工作流路径默认不读取这些参数
-
----
-
-## 10. runtime 重构方案
-
-### 10.1 重构目标
-
-当前 [runtime.rs](/data/systems/llm/src/app/runtime.rs) 的职责太集中。
-
-需要拆成：
-
-1. bundle 接收
-2. `indicator_summary` 生成
-3. Stage1 调度与刷新
-4. Stage2 调度
-5. 执行分发
-6. state 持久化
-
-### 10.2 新运行时流程
-
-新的主流程必须是：
-
-```text
-收到 15m bundle
-→ build_indicator_summary
-→ load_workflow_state
-→ if 到 4h 边界或存在 refresh_request: run_stage1
-→ persist_stage1_output
-→ run_stage2
-→ dispatch_execution_intent
-→ dispatch_management_actions
-→ persist_entry_snapshot_for_context / workflow_state
-```
-
-### 10.3 Stage1 调度
-
-新增调度规则：
-
-- 默认只在 `00:00 / 04:00 / 08:00 / 12:00 / 16:00 / 20:00 UTC` 跑 Stage1
-- 如果 Stage2 请求重评，则在下一个 15m cycle 立即跑 Stage1
-
-这要求 `config.rs` 新增：
-
-```yaml
-llm:
-  workflow:
-    stage1_refresh_hours: [0, 4, 8, 12, 16, 20]
-    stage2_refresh_minutes: [0, 15, 30, 45]
-    state_dir: "systems/llm/state/workflow"
-```
-
-### 10.4 runtime 内部函数重组
-
-建议在 [runtime.rs](/data/systems/llm/src/app/runtime.rs) 中新增或抽离：
-
-- `build_indicator_summary_from_bundle`
-- `load_workflow_state`
-- `load_entry_snapshot_for_context`
-- `should_run_stage1`
-- `invoke_stage1_workflow`
-- `invoke_stage2_workflow`
-- `handle_stage1_reevaluation_request`
-- `persist_workflow_state`
-- `persist_entry_snapshot_for_context`
-
-并逐步删除当前：
-
-- `invoke_models_scan_stage` 驱动的旧 stage1 scan 流程
-- `management_mode / pending_order_mode` 路由判断
-- `load_entry_freshness_recheck_snapshot`
-- `evaluate_entry_freshness_recheck`
+这是一次大版本升级，不是旧设计的兼容演化。
 
 ---
 
-## 11. provider 与 prompt 管线改造
+## 6.10 config 改造
 
-### 11.1 Provider 分层
-
-当前 [provider.rs](/data/systems/llm/src/llm/provider.rs) 直接把“scan / finalize / management / pending”写死在调用层。
-
-改造后必须变成两层：
-
-1. 通用 provider 适配层
-2. workflow stage 调用层
-
-建议新增：
-
-```text
-systems/llm/src/llm/workflow_provider.rs
-```
-
-职责：
-- `invoke_stage1_models`
-- `invoke_stage2_models`
-
-现有 [provider.rs](/data/systems/llm/src/llm/provider.rs) 继续保留底层 provider 适配细节，不再直接承载工作流语义。
-
-### 11.2 Prompt 输入持久化
-
-保留当前 prompt input artifact 机制，但 stage 名称改成：
-
-- `workflow_stage1`
-- `workflow_stage2`
-
-不再使用：
-
-- `scan`
-- `entry_core`
-- `management_core`
-- `pending_core`
-
----
-
-## 12. 配置改造
-
-### 12.1 保留现有配置
+### 6.10.1 保留
 
 保留：
+- `workflow.stage1_refresh_hours`
+- `workflow.state_dir`
+- `persist_prompt_inputs`
+- `telegram / x` 配置
 
-- `llm.request_enabled`
-- `llm.default_model`
-- `llm.prompt_template`
-- `models[].stage1_reasoning`
-- `models[].stage2_reasoning`
-- `bundle_stale_secs`
-- `bundle_execution_stale_secs`
+### 6.10.2 删除或降级
 
-### 12.2 新增 workflow 配置
+删除旧的：
+- `workflow.stage2_refresh_minutes`
+- 旧 `soft_gate_min_pass` 若仍只服务旧 Stage2 execute 语义，则改为 watcher/stage2 内部 guardrail 配置或直接固化到新 predicate 中
 
-新增：
+约束：
+- 不允许为了兼容旧配置，把新的事件驱动 Stage2 又退化回定时轮询 Stage2
 
-```yaml
-llm:
-  workflow:
-    enabled: true
-    stage1_refresh_hours: [0, 4, 8, 12, 16, 20]
-    stage2_refresh_minutes: [0, 15, 30, 45]
-    soft_gate_min_pass:
-      A_continuation: 3
-      B_reversal: 2
-      C_value_return: 2
-    state_dir: "systems/llm/state/workflow"
-    persist_prompt_inputs: true
-```
+### 6.10.3 新增
 
-### 12.3 降级为兼容配置
-
-以下配置不再进入主工作流：
-
-- `llm.execution.min_distance_v`
-- `llm.execution.min_rr`
-- `llm.execution.entry_sl_remap.*`
-
-处理方式：
-
-- 改名移动到 `llm.compatibility.execution_policy`
-- 默认关闭
-- 主工作流代码路径不得依赖这些字段
+建议新增：
+- `workflow_v2.state_dir`
+- `watcher.review_debounce_secs`
+- `watcher.entry_candidate_cooldown_secs`
+- `watcher.realtime_price_source`
+- `watcher.max_filled_stopout_attempts`
+- `watcher.entry_attempt_window_policy`
+- `watcher.indicator_events_queue_key`
+- `watcher.realtime_price_queue_key`
+- `watcher.use_indicator_snapshot_fanout`
 
 ---
 
-## 13. 文件级改动清单
+## 6.11 telegram / x / journal 改造
 
-### 13.1 新建文件
+### 6.11.1 外部通知保留，但改绑定点
 
-```text
-systems/llm/src/workflow/mod.rs
-systems/llm/src/workflow/schema.rs
-systems/llm/src/workflow/state.rs
-systems/llm/src/workflow/predicate.rs
-systems/llm/src/workflow/code_layer.rs
-systems/llm/src/workflow/stage1.rs
-systems/llm/src/workflow/stage2.rs
-systems/llm/src/workflow/parser.rs
-systems/llm/src/workflow/management.rs
-systems/llm/src/workflow/persistence.rs
-systems/llm/src/execution/intent_adapter.rs
-systems/llm/src/llm/workflow_provider.rs
-systems/llm/src/llm/prompt/workflow_stage1.rs
-systems/llm/src/llm/prompt/workflow_stage2.rs
-systems/llm/src/llm/prompt/workflow_stage1/base.txt
-systems/llm/src/llm/prompt/workflow_stage2/base.txt
-```
+保留：
+- `/data/systems/llm/src/app/telegram.rs`
+- `/data/systems/llm/src/app/x.rs`
 
-### 13.2 修改文件
+但通知绑定点必须改成新链路：
 
-| 文件 | 修改内容 |
-|---|---|
-| [main.rs](/data/systems/llm/src/main.rs) | 挂载 `workflow` 模块 |
-| [runtime.rs](/data/systems/llm/src/app/runtime.rs) | 改造成新 workflow 编排主线 |
-| [config.rs](/data/systems/llm/src/app/config.rs) | 增加 workflow 配置，降级旧 gate 参数 |
-| [provider.rs](/data/systems/llm/src/llm/provider.rs) | 收敛为底层 provider 适配层 |
-| [prompt.rs](/data/systems/llm/src/llm/prompt.rs) | 切换到 `workflow_stage1 / workflow_stage2` |
-| [decision.rs](/data/systems/llm/src/llm/decision.rs) | 迁移为 workflow parser，或拆分并逐步废弃 |
-| [scan.rs](/data/systems/llm/src/llm/filter/scan.rs) | 仅保留可复用裁剪函数，主入口迁出 |
-| [core.rs](/data/systems/llm/src/llm/filter/core.rs) | 仅保留可复用函数，主入口迁出 |
-| [core_entry.rs](/data/systems/llm/src/llm/filter/core_entry.rs) | 复用部分裁剪逻辑后下线 |
-| [core_management.rs](/data/systems/llm/src/llm/filter/core_management.rs) | 复用部分裁剪逻辑后下线 |
-| [core_pending.rs](/data/systems/llm/src/llm/filter/core_pending.rs) | 从主工作流移除 |
-| [core_shared.rs](/data/systems/llm/src/llm/filter/core_shared.rs) | 作为基础函数库保留 |
-| [binance.rs](/data/systems/llm/src/execution/binance.rs) | 新增对 `ExecutionIntent / ManagementAction` 的适配入口 |
+外部交易信号建议绑定：
+- watcher 选中具体 `entry_plan` 并提交执行时
+- 实际成交后
+- 关键管理动作后
 
-### 13.3 计划废弃文件
+不建议再把外部信号直接绑在：
+- `Stage2 PATH_CONFIRMED`
+- 任何尚未进入执行的 path review
 
-以下文件在 workflow v1 稳定后可以进入废弃流程：
+原因：
+- `PATH_CONFIRMED` 是“当前 path 可继续沿用 + tactical plan 已生成”
+- 不是“当前已经成交或必须立刻通知外部世界”
 
-- [prompt/entry.rs](/data/systems/llm/src/llm/prompt/entry.rs)
-- [prompt/management.rs](/data/systems/llm/src/llm/prompt/management.rs)
-- [prompt/pending_order.rs](/data/systems/llm/src/llm/prompt/pending_order.rs)
-- [prompt/scan.rs](/data/systems/llm/src/llm/prompt/scan.rs)
-- `prompt/entry/*`
-- `prompt/management/*`
-- `prompt/pending_order/*`
-- `prompt/scan/*`
+### 6.11.2 journal 事件需要重做
+
+至少新增：
+- `workflow_stage1_output_v2`
+- `workflow_path_review_candidate`
+- `workflow_entry_candidate`
+- `workflow_stage2_path_audit`
+- `workflow_tactical_plan_approved`
+- `workflow_entry_plan_selected`
+- `workflow_entry_execution_report`
+- `workflow_management_report`
 
 ---
 
-## 14. 实施顺序
+## 7. 文件级实施清单
 
-### 阶段 1：引入新 schema 和 state
+### 7.1 必须新增
 
-完成项：
-- 新建 `workflow/schema.rs`
-- 新建 `workflow/state.rs`
-- 新建 `workflow/persistence.rs`
-- 新增 state 目录落盘
+- `/data/systems/llm/src/workflow/watcher.rs`
+- `/data/systems/llm/src/workflow/candidate.rs`
+- `/data/systems/llm/src/workflow/contracts/strategic.rs`
+- `/data/systems/llm/src/workflow/contracts/tactical.rs`
+- `/data/systems/llm/src/workflow/contracts/runtime.rs`
+- `/data/systems/llm/src/workflow/parser/stage1.rs`
+- `/data/systems/llm/src/workflow/parser/stage2.rs`
+- `/data/systems/llm/src/workflow/code_layer/mod.rs`
+- `/data/systems/llm/src/workflow/code_layer/strategic.rs`
+- `/data/systems/llm/src/workflow/code_layer/tactical.rs`
+- `/data/systems/llm/src/workflow/code_layer/guardrail.rs`
+- `/data/systems/llm/src/workflow/code_layer/candidate.rs`
 
-验收标准：
-- 项目可编译
-- 可以序列化/反序列化 `Stage1Output`、`Stage2Decision`
-- 可以按 symbol 读写 `WorkflowState`
-- 可以在同一 symbol 下按 `context_key` 分别读写多个 `EntrySnapshot`
+### 7.2 必须重写
 
-### 阶段 2：落地代码层
+- `/data/systems/llm/src/app/runtime.rs`
+- `/data/systems/llm/src/workflow/state.rs`
+- `/data/systems/llm/src/workflow/persistence.rs`
+- `/data/systems/llm/src/workflow/management.rs`
+- `/data/systems/llm/src/workflow/stage1.rs`
+- `/data/systems/llm/src/workflow/stage2.rs`
+- `/data/systems/llm/src/llm/workflow_provider.rs`
+- `/data/systems/llm/src/execution/intent_adapter.rs`
+- `/data/systems/llm/src/execution/binance.rs`
 
-完成项：
-- 新建 `workflow/code_layer.rs`
-- 从 raw bundle 生成 `indicator_summary`
-- 接入 `tracked_zones / zone_states / recent_15m_bars`
+### 7.3 完成迁移后必须删除
 
-验收标准：
-- 输入当前真实 bundle，可产出完整 `IndicatorSummary`
-- `options_surface` 仅出现在 `aux_context`
-- `auction_context` 三项齐全
+- `/data/systems/llm/src/workflow/schema.rs`
+- `/data/systems/llm/src/workflow/parser.rs`
+- 旧 Stage2 `WAIT / EXECUTE` 相关分支
+- 旧 `execution_intent` 直达执行主链
+- 旧 `management_actions` 由 Stage2 输出的主链
+- 旧 `runtime_contract.allow_execute` 主链
+- 旧 `stage2_refresh_minutes` 调度语义
+- 旧 `Stage2RuntimeEvaluation`
+- 旧 `WorkflowRuntimeContract`
+- 旧 `execution_intent_schema / management_action_schema`
 
-### 阶段 3：落地 Stage1
-
-完成项：
-- 新建 Stage1 prompt
-- 新建 Stage1 parser
-- runtime 增加 Stage1 4h/刷新调度
-
-验收标准：
-- Stage1 只输出一个 `current_script`
-- Stage1 只输出一个 `current_path`
-- `failure_switch` 只能是剧本名
-
-### 阶段 4：落地 Stage2
-
-完成项：
-- 新建 Stage2 prompt
-- 新建 Stage2 parser
-- runtime 接入统一 Stage2 输入
-
-验收标准：
-- 不再区分 entry / management / pending 三种 LLM prompt
-- Stage2 主决策只能 `WAIT / EXECUTE / REQUEST_STAGE1_REEVALUATION`
-- `management_actions[]` 是独立附带通道，不是第四种主决策
-- Stage2 不得直接切 path
-
-### 阶段 5：接入执行引擎
-
-完成项：
-- 新建 `execution/intent_adapter.rs`
-- 将 `ExecutionIntent / ManagementAction` 对接到 Binance 执行器
-- 下线 pending-order LLM 主路径
-
-验收标准：
-- `EXECUTE` 能转成真实下单调用
-- 携带 `management_actions[]` 的 Stage2 输出能转成真实管理调用
-- 没有 `pending_order_mode` 参与主工作流判断
-
-### 阶段 6：清理旧逻辑
-
-完成项：
-- 关闭 `entry freshness recheck`
-- 关闭 `entry_sl_remap`
-- 关闭 `min_rr` / `min_distance_v` 主链 gate
-- 清理旧 prompt 路由
-
-验收标准：
-- 主工作流只走 v1.3.1 规定的 Stage1 / Stage2 / ExecutionEngine
-- 旧逻辑仅能在 compatibility 开关下存在
+如果阶段性需要过渡编译，可以保留 facade 文件，但过渡完成后必须删除，不能永久双轨。
 
 ---
 
-## 15. 验收与测试
+## 8. 实施顺序
 
-### 15.1 单元测试
+### Phase 0. 先锁数据源与消息拓扑
 
-必须新增：
+1. 复核 `indicator_engine` 当前 bundle 是否满足 `Stage1 strategic summary` 的原始字段要求
+2. 复核 `evt.*` fanout 是否已在生产链路中稳定发布
+3. 为 watcher 设计并落地新的 MQ queue / bindings
+4. 明确是否需要 raw `3d` kline；若需要，则先改上游 `i19 kline_history`
+5. 明确 watcher 的实时价格源来自哪里；若当前 MQ 没有合适队列，先补拓扑
 
-- `workflow/schema.rs` 的 roundtrip 测试
-- `workflow/predicate.rs` 的 acceptance / failed auction / freshness / ordering 测试
-- `workflow/parser.rs` 的 Stage1 / Stage2 输出解析测试
-- `workflow/persistence.rs` 的 state 读写测试
-- `workflow/persistence.rs` 的多 `context_key` `EntrySnapshot` 不互相覆盖测试
-- `workflow/parser.rs` 的 `management_plan` 合同校验测试
-- `workflow/stage2.rs` 的 `hard_gate / soft_gate` 字段级判定测试
-- `execution/intent_adapter.rs` 的 `ExecutionIntent / ManagementAction` 线协议校验测试
-- `workflow/parser.rs` 的 `current_path.id ↔ execution_intent.path_id` 一致性测试
-- `workflow/parser.rs` 的 `management_actions[].context_key ↔ path_id ↔ persisted entry_snapshot` 一致性测试
-- `workflow/stage2.rs` 的 `failure_level` 命中后 `REQUEST_STAGE1_REEVALUATION + 可选 FLATTEN_POSITION` 测试
+完成标志：
+- 我们已经明确区分“上游已有但 `llm` 未接入”和“上游必须新增”的工作项
+- 新 Stage1 / Stage2 / watcher 不再建立在错误的数据源假设上
 
-### 15.2 运行时测试
+### Phase 1. 先定合同
 
-必须新增：
+1. 新建 strategic / tactical / runtime contracts
+2. 重写 provider schema
+3. 重写 Stage1 / Stage2 prompt
+4. 拆分 parser
 
-- Stage1 调度只在 4h 边界或 refresh 时触发
-- Stage2 每 15m 都会跑
-- Stage2 请求重评后，下一个 15m cycle 会触发 Stage1
-- 持仓存在时，Stage2 即使不开新仓也会输出 `management_actions[]`
+完成标志：
+- 旧 `WAIT / EXECUTE` 合同从编译主链移除
 
-### 15.3 v1 暂不纳入理论回放
+### Phase 2. 再改 code layer
 
-根据 2026-03-27 的需求确认，v1 冻结版不把理论回放作为当前交付的验收项目。
+1. 拆 strategic/tactical/guardrail/candidate builder
+2. 补齐 `3D / 7D AVWAP / 15m RVWAP / 3D EMA`
+3. 补齐 `options_surface` 的 Stage1 战略摘要与 Stage2 guardrail snapshot
+4. 产出 watcher facts
+5. 修正多窗口 bundle 解析逻辑，不再误用顶层 `window_code`
 
-原因不是放弃验证，而是先把内核、合同、代码主链收敛正确，再在下一个版本单独补：
+完成标志：
+- Stage1 和 Stage2 不再共享一个旧式 `IndicatorSummary`
 
-1. 趋势延续
-2. V 型反转
-3. 区间震荡
-4. 假突破
-5. 无边缘震荡
+### Phase 3. 引入 watcher
 
-当前版本因此也不引入：
-- shadow mode 对比
-- 新旧系统决策差异统计
-- 额外 KPI 体系
-- 理论回放通过率指标
+1. 扩展 `WorkflowState`
+2. 新增 `watcher.rs`
+3. 新增 `candidate.rs`
+4. 新增 tactical plan persistence
 
-### 15.4 建议执行命令
+完成标志：
+- watcher 能独立生成 `path_review_candidate / entry_candidate / hard_invalidation`
 
-```bash
-cd /data
-cargo test -p llm
-cargo build -p llm
-```
+### Phase 4. 改 Stage1
 
-如果需要单独验证工作流模块：
+1. 接入新的 strategic summary
+2. 输出 `risk_grade`
+3. 输出新的 `no_trade_reason`
+4. 校验多时框冲突裁决
 
-```bash
-cd /data
-cargo test -p llm workflow::
-```
+完成标志：
+- Stage1 输出已与 `v2.0.0` 对齐
+
+### Phase 5. 改 Stage2
+
+1. 接入新的 tactical review input
+2. 改成 path audit first
+3. 输出 dual-entry tactical plan
+4. 删除 execution/management 旧合同
+
+完成标志：
+- Stage2 只剩 `PATH_CONFIRMED / REQUEST_STAGE1_REEVALUATION`
+
+### Phase 6. 改执行与管理
+
+1. watcher 选出 concrete entry plan
+2. execution adapter / binance 吃 new entry plan
+3. management engine 代码侧化
+
+完成标志：
+- 旧 `execution_intent` 与 `management_actions` 从主链删除
+
+### Phase 7. 瘦身 runtime 与清理旧代码
+
+1. 重写 runtime orchestrator
+2. 删除旧 schema/parser monolith
+3. 删除旧 Stage2 runtime eval 旧逻辑
+4. 删除旧 persistence/state 兼容层
+
+完成标志：
+- 仓库中不再存在旧 Stage2 主链
 
 ---
 
-## 16. 最终落地定义
+## 9. 验收标准
 
-只有同时满足以下条件，才算本次改造完成：
+本次改造通过的标准不是“能编译”。
 
-1. 代码主链已经从旧 `scan + finalize + management/pending` 切换到新 `代码层 + Stage1 + Stage2 + 执行引擎`
-2. Stage1 只输出一个当前主剧本和一个当前 path
-3. Stage2 只能等待、执行当前 path、或请求 Stage1 重评
-4. 执行层只负责 1m / 100ms 执行优化与订单管理
-5. 主链中已经没有多 path 并行、Stage2 自主切 path、固定 RR gate、pending-order LLM 模式这些旧逻辑
+必须同时满足以下 10 条：
 
-一句话定义本方案：
+1. `Stage1` 只能输出一个战略主剧本和一个战略 path
+2. `Stage1` 能正确输出：
+   - `risk_grade`
+   - `conflict_no_edge / script_not_unique / path_not_actionable`
+3. `Stage2` 只允许两个输出：
+   - `PATH_CONFIRMED`
+   - `REQUEST_STAGE1_REEVALUATION`
+4. `Stage2` 的软否决只有在三联条件同时成立时才触发
+5. path 活着但 15m 反向压力增强时，Stage2 会大幅修改 tactical entry 与执行级 SL，而不是直接重评
+6. watcher 能在同一 `15m` 窗口内完成：
+   - `primary_entry_plan`
+   - `secondary_entry_plan`
+   - 最多 `2` 次“实际成交后被打掉”的尝试控制
+7. execution engine 不再直接吃 LLM 的旧 `execution_intent`
+8. management engine 不再依赖 `Stage2.management_actions`
+9. 外部通知仍然保留，但绑定到新链路关键节点
+10. 仓库中旧 `WAIT / EXECUTE / execution_intent / management_actions` 主路径已被删除
+11. watcher 已不再只依赖 `q.llm.ind.minute <- bundle.1m.*`
+12. 多窗口指标解析已改为读取 `payload.by_window / payload.series_by_window`，不再误用顶层 `window_code`
 
-`不是在当前代码上打补丁，而是把当前 llm 层的主状态机整体收敛到 v1.3.1 的双层分离版。`
+### 9.1 必测场景
+
+至少覆盖以下测试：
+
+1. `4H` 与 `1D` 同向，`3D` 反向
+- 允许做
+- `risk_grade=aligned_trend`
+- target corridor 收窄
+
+1.5 `i27/options_surface` 出现显著 pin / gamma wall / expiry magnet`
+- `Stage1` 能把它收敛到 `options_context_summary`
+- 它可以影响 `risk_grade / target corridor / failure envelope`
+- 但不能单独主导主剧本
+
+2. `4H` 逆 `1D`，但在极限位置，且为 `value_return`
+- 允许 path
+- `risk_grade=countertrend_repair`
+
+3. `4H` 同时逆 `1D` 与 `3D`
+- 只允许短程修复 target
+- 不得输出 continuation 型远端目标
+
+4. path 活着，但 15m 反向压力变大
+- `PATH_CONFIRMED`
+- tactical entry plan 后移或加深
+- stop_loss 收紧
+
+5. path 被软否决
+- 必须同时满足 `extreme_location + reverse_confirmation + driver_change`
+
+5.5 当前 path corridor 与关键期权障碍重叠
+- `Stage2` 可收到 `options_guardrail_snapshot`
+- 只能用于收紧 tactical entry / stop_loss
+- 不得单独触发 `REQUEST_STAGE1_REEVALUATION`
+
+6. 第一次成交后被打掉，且仍在同一 `15m` 窗口
+- watcher 可以按 `secondary_entry_plan` 再入一次
+
+7. 第二次成交后再被打掉
+- watcher 不允许第三次尝试
+
+8. `open_interest / long_short_ratios / options_surface / avwap` 的 minute bundle 顶层 `window_code` 仍是低窗口
+- 新 code layer 仍能正确抽取 `4h / 1d / 3d` 战略信息
+
+9. watcher 已接入 `evt.*.<symbol>`，但 `Stage1` 仍继续走 `bundle.1m.*`
+- `Stage2` 不再因每个 minute bundle 被动轮询
+
+10. 若系统要求 Stage1 消费 raw `3d` bars
+- `indicator_engine` 的 `kline_history` 已扩出 `3d`
+- 否则 Stage1 必须仍能只依赖 `3d` 结构化指标完成地图
+
+---
+
+## 10. 明确禁止事项
+
+以下实现方式明确禁止：
+
+1. 继续保留旧 `Stage2 WAIT` 语义，只是换个名字
+2. watcher 继续缺位，仍由 `runtime.rs` 每个 minute bundle 顺手跑 Stage2
+3. 让 Stage2 继续输出 broker-ready 的旧 `execution_intent`
+4. 让 Stage2 继续输出 `management_actions`
+5. 把“当前价格没到位”错误实现成 `Stage1=no_edge`
+6. 让单一 15m 微结构弱化直接触发重评
+7. 为了兼容旧 state 文件而保留错误字段与错误主链
+8. 让 `telegram / x` 继续绑定旧 `WAIT / EXECUTE` 语义
+
+---
+
+## 11. 最终结论
+
+本次改造的真实工作量集中在五个地方：
+- `Stage1` 战略合同重做
+- `watcher / candidate engine` 新增
+- `Stage2` 从定时决策器改成 path auditor
+- `execution / management` 与旧 LLM intent 脱钩
+- `runtime / state / persistence` 重写
+
+这五块里，`watcher / candidate engine` 是新的核心。
+
+如果不把 watcher 独立出来，而只是继续在当前 `runtime.rs` 和 `stage2.rs` 上堆判断，那么无论 prompt 写得多漂亮，最后都不会真正落成 `v2.0.0`。
+
+所以这次实施的标准很明确：
+
+**不是把旧 workflow 改得“看起来像 v2.0.0”，而是把 `systems/llm` 真正重构成 `Stage1 -> watcher -> Stage2 -> watcher execution -> management engine` 这条新链路。**

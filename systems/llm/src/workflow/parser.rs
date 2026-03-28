@@ -16,6 +16,15 @@ const ALLOWED_MANAGEMENT_ACTIONS: &[&str] = &[
     "MOVE_STOP",
     "UPDATE_TAKE_PROFIT",
 ];
+const ALLOWED_STOP_MIGRATION_AFTER_TARGETS: &[&str] = &["take_profit_1", "take_profit_2"];
+const ALLOWED_STOP_MIGRATION_BASES: &[&str] =
+    &["activation_level", "first_path_target", "next_path_target"];
+const ALLOWED_DRIVER_DETERIORATION_SIGNALS: &[&str] = &[
+    "spot_confirmation_lost",
+    "oi_support_lost",
+    "fake_order_risk_rising",
+    "driver_flip_confirmed",
+];
 
 fn approx_in_zone(level: f64, low: f64, high: f64) -> bool {
     level >= low && level <= high
@@ -25,6 +34,80 @@ fn approx_in_levels(level: f64, levels: &[f64]) -> bool {
     levels
         .iter()
         .any(|candidate| (*candidate - level).abs() < f64::EPSILON)
+}
+
+fn is_machine_identifier(value: &str) -> bool {
+    let trimmed = value.trim();
+    !trimmed.is_empty()
+        && trimmed
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+}
+
+fn stop_basis_zone<'a>(
+    current_path: &'a crate::workflow::schema::CurrentPath,
+    basis: &str,
+) -> Option<&'a crate::workflow::schema::PriceZone> {
+    match basis {
+        "activation_level" => Some(&current_path.activation_level),
+        "first_path_target" => Some(&current_path.first_path_target),
+        "next_path_target" => Some(&current_path.next_path_target),
+        _ => None,
+    }
+}
+
+fn validate_stop_migration_rule(
+    current_path: &crate::workflow::schema::CurrentPath,
+    rule: &crate::workflow::schema::StopMigrationRule,
+) -> Result<()> {
+    if !ALLOWED_STOP_MIGRATION_AFTER_TARGETS.contains(&rule.after_target.as_str()) {
+        return Err(anyhow!(
+            "unsupported stop_migration_rules.after_target {}",
+            rule.after_target
+        ));
+    }
+    if !ALLOWED_STOP_MIGRATION_BASES.contains(&rule.new_stop_basis.as_str()) {
+        return Err(anyhow!(
+            "unsupported stop_migration_rules.new_stop_basis {}",
+            rule.new_stop_basis
+        ));
+    }
+    let zone = stop_basis_zone(current_path, &rule.new_stop_basis)
+        .ok_or_else(|| anyhow!("unsupported stop migration basis"))?;
+    if !approx_in_zone(rule.new_stop_level, zone.low, zone.high) {
+        return Err(anyhow!(
+            "stop_migration_rules.new_stop_level must align with {}",
+            rule.new_stop_basis
+        ));
+    }
+    Ok(())
+}
+
+fn validate_driver_deterioration_rule(
+    rule: &crate::workflow::schema::DriverDeteriorationRule,
+    require_reduce_ratio: bool,
+    field_name: &str,
+) -> Result<()> {
+    if !ALLOWED_DRIVER_DETERIORATION_SIGNALS.contains(&rule.driver_signal.as_str()) {
+        return Err(anyhow!(
+            "{}.driver_signal must be one of [spot_confirmation_lost, oi_support_lost, fake_order_risk_rising, driver_flip_confirmed]",
+            field_name
+        ));
+    }
+    if require_reduce_ratio {
+        let ratio = rule
+            .reduce_ratio
+            .ok_or_else(|| anyhow!("{}.reduce_ratio is required", field_name))?;
+        if !(0.0 < ratio && ratio <= 1.0) {
+            return Err(anyhow!(
+                "{}.reduce_ratio must be between 0 and 1",
+                field_name
+            ));
+        }
+    } else if rule.reduce_ratio.is_some() {
+        return Err(anyhow!("{} must not include reduce_ratio", field_name));
+    }
+    Ok(())
 }
 
 fn validate_runtime_context_key(
@@ -78,7 +161,7 @@ fn runtime_requires_reevaluation(runtime_contract: &WorkflowRuntimeContract) -> 
 }
 
 pub fn parse_stage1_output(value: Value) -> Result<Stage1Output> {
-    let output: Stage1Output = serde_json::from_value(value)?;
+    let mut output: Stage1Output = serde_json::from_value(value)?;
     if output.monitoring_status.trim().is_empty() {
         return Err(anyhow!("monitoring_status must be non-empty"));
     }
@@ -117,6 +200,11 @@ pub fn parse_stage1_output(value: Value) -> Result<Stage1Output> {
         if current_path.failure_switch.trim().is_empty() {
             return Err(anyhow!("failure_switch must be non-empty"));
         }
+        if !is_machine_identifier(&current_path.failure_switch) {
+            return Err(anyhow!(
+                "failure_switch must be an English machine-style script identifier"
+            ));
+        }
         if current_path.tracked_zones.is_empty() {
             return Err(anyhow!("tracked_zones must be non-empty"));
         }
@@ -149,28 +237,22 @@ pub fn parse_stage1_output(value: Value) -> Result<Stage1Output> {
                 return Err(anyhow!("unsupported reevaluation signal {}", signal));
             }
         }
+        for rule in &current_path.management_plan.stop_migration_rules {
+            validate_stop_migration_rule(current_path, rule)?;
+        }
         for signal in &current_path.management_plan.reduce_on_driver_deterioration {
-            if signal.driver_signal == "failure_level_breached" {
-                return Err(anyhow!(
-                    "failure_level_breached must not appear in management_plan"
-                ));
-            }
+            validate_driver_deterioration_rule(signal, true, "reduce_on_driver_deterioration")?;
         }
         for signal in &current_path
             .management_plan
             .exit_full_on_driver_deterioration
         {
-            if signal.driver_signal == "failure_level_breached" {
-                return Err(anyhow!(
-                    "failure_level_breached must not appear in management_plan"
-                ));
-            }
+            validate_driver_deterioration_rule(signal, false, "exit_full_on_driver_deterioration")?;
         }
     } else if output.monitoring_status == "no_edge" {
         if output.current_script.is_some() || output.current_path.is_some() {
-            return Err(anyhow!(
-                "no_edge output must not include current path/script"
-            ));
+            output.current_script = None;
+            output.current_path = None;
         }
     }
     Ok(output)
@@ -1191,5 +1273,145 @@ mod tests {
         .expect("parse");
         assert_eq!(parsed.decision, "WAIT");
         assert_eq!(parsed.management_actions.len(), 1);
+    }
+
+    #[test]
+    fn stage1_parser_rejects_natural_language_failure_switch() {
+        let value = json!({
+            "meta": { "stage1_ts": Utc::now() },
+            "monitoring_status": "active",
+            "no_trade_reason": null,
+            "refresh_hints": [],
+            "map_summary": null,
+            "current_script": "value_return_long",
+            "driver_attribution": null,
+            "current_path": {
+                "id": "path_a",
+                "side": "LONG",
+                "thesis": "English thesis",
+                "activation_level": {"low": 100.0, "high": 101.0, "timeframe": null, "label": null, "reason": null},
+                "first_path_target": {"low": 103.0, "high": 103.0, "timeframe": null, "label": null, "reason": null},
+                "next_path_target": {"low": 105.0, "high": 105.0, "timeframe": null, "label": null, "reason": null},
+                "failure_level": {"low": 99.0, "high": 99.0, "timeframe": null, "label": null, "reason": null},
+                "failure_switch": "若失效则转空重评",
+                "setup_type": "C_value_return",
+                "reevaluation_trigger": { "signals": ["driver_change"] },
+                "management_plan": {
+                    "take_profit_1_basis": "first_path_target",
+                    "take_profit_2_basis": "next_path_target",
+                    "take_profit_1_level": 103.0,
+                    "take_profit_2_level": 105.0,
+                    "stop_migration_rules": [],
+                    "reduce_on_driver_deterioration": [],
+                    "exit_full_on_driver_deterioration": []
+                },
+                "tracked_zones": [{
+                    "zone_id": "z1",
+                    "timeframe": "4h",
+                    "role": "activation",
+                    "low": 100.0,
+                    "high": 101.0,
+                    "reason": null
+                }]
+            }
+        });
+        assert!(parse_stage1_output(value).is_err());
+    }
+
+    #[test]
+    fn stage1_parser_rejects_freeform_management_plan_contract_fields() {
+        let value = json!({
+            "meta": { "stage1_ts": Utc::now() },
+            "monitoring_status": "active",
+            "no_trade_reason": null,
+            "refresh_hints": [],
+            "map_summary": null,
+            "current_script": "value_return_long",
+            "driver_attribution": null,
+            "current_path": {
+                "id": "path_a",
+                "side": "LONG",
+                "thesis": "English thesis",
+                "activation_level": {"low": 100.0, "high": 101.0, "timeframe": null, "label": null, "reason": null},
+                "first_path_target": {"low": 103.0, "high": 103.0, "timeframe": null, "label": null, "reason": null},
+                "next_path_target": {"low": 105.0, "high": 105.0, "timeframe": null, "label": null, "reason": null},
+                "failure_level": {"low": 99.0, "high": 99.0, "timeframe": null, "label": null, "reason": null},
+                "failure_switch": "reevaluate_short",
+                "setup_type": "C_value_return",
+                "reevaluation_trigger": { "signals": ["driver_change"] },
+                "management_plan": {
+                    "take_profit_1_basis": "first_path_target",
+                    "take_profit_2_basis": "next_path_target",
+                    "take_profit_1_level": 103.0,
+                    "take_profit_2_level": 105.0,
+                    "stop_migration_rules": [{
+                        "after_target": "TP1",
+                        "new_stop_basis": "4h_tpo_poc",
+                        "new_stop_level": 100.5
+                    }],
+                    "reduce_on_driver_deterioration": [{
+                        "driver_signal": "若15m期货CVD转负则减仓",
+                        "reduce_ratio": 0.5
+                    }],
+                    "exit_full_on_driver_deterioration": []
+                },
+                "tracked_zones": [{
+                    "zone_id": "z1",
+                    "timeframe": "4h",
+                    "role": "activation",
+                    "low": 100.0,
+                    "high": 101.0,
+                    "reason": null
+                }]
+            }
+        });
+        assert!(parse_stage1_output(value).is_err());
+    }
+
+    #[test]
+    fn stage1_parser_normalizes_no_edge_output_with_extra_path_fields() {
+        let value = json!({
+            "meta": { "stage1_ts": Utc::now() },
+            "monitoring_status": "no_edge",
+            "no_trade_reason": "balanced inside value",
+            "refresh_hints": [],
+            "map_summary": null,
+            "current_script": "should_be_dropped",
+            "driver_attribution": null,
+            "current_path": {
+                "id": "path_a",
+                "side": "LONG",
+                "thesis": "English thesis",
+                "activation_level": {"low": 100.0, "high": 101.0, "timeframe": null, "label": null, "reason": null},
+                "first_path_target": {"low": 103.0, "high": 103.0, "timeframe": null, "label": null, "reason": null},
+                "next_path_target": {"low": 105.0, "high": 105.0, "timeframe": null, "label": null, "reason": null},
+                "failure_level": {"low": 99.0, "high": 99.0, "timeframe": null, "label": null, "reason": null},
+                "failure_switch": "reevaluate_short",
+                "setup_type": "C_value_return",
+                "reevaluation_trigger": { "signals": ["driver_change"] },
+                "management_plan": {
+                    "take_profit_1_basis": "first_path_target",
+                    "take_profit_2_basis": "next_path_target",
+                    "take_profit_1_level": 103.0,
+                    "take_profit_2_level": 105.0,
+                    "stop_migration_rules": [],
+                    "reduce_on_driver_deterioration": [],
+                    "exit_full_on_driver_deterioration": []
+                },
+                "tracked_zones": [{
+                    "zone_id": "z1",
+                    "timeframe": "4h",
+                    "role": "activation",
+                    "low": 100.0,
+                    "high": 101.0,
+                    "reason": null
+                }]
+            }
+        });
+
+        let parsed = parse_stage1_output(value).expect("parse");
+        assert_eq!(parsed.monitoring_status, "no_edge");
+        assert!(parsed.current_script.is_none());
+        assert!(parsed.current_path.is_none());
     }
 }

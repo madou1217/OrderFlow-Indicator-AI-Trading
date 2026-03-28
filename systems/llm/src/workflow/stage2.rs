@@ -830,7 +830,7 @@ pub fn build_stage2_prompt_input(
         .collect();
 
     Stage2PromptInput {
-        task: "执行当前path检查、setup确认、输出execution_intent、执行持仓管理".to_string(),
+        task: "Evaluate the current path, confirm the setup, emit execution_intent when allowed, and manage active contexts.".to_string(),
         indicator_summary,
         stage1_output,
         runtime_contract,

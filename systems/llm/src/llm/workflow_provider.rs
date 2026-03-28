@@ -92,8 +92,14 @@ fn stop_migration_rule_schema() -> Value {
         "additionalProperties": false,
         "required": ["after_target", "new_stop_basis", "new_stop_level"],
         "properties": {
-            "after_target": {"type": "string"},
-            "new_stop_basis": {"type": "string"},
+            "after_target": {
+                "type": "string",
+                "enum": ["take_profit_1", "take_profit_2"]
+            },
+            "new_stop_basis": {
+                "type": "string",
+                "enum": ["activation_level", "first_path_target", "next_path_target"]
+            },
             "new_stop_level": {"type": "number"}
         }
     })
@@ -105,7 +111,15 @@ fn driver_deterioration_rule_schema() -> Value {
         "additionalProperties": false,
         "required": ["driver_signal", "reduce_ratio"],
         "properties": {
-            "driver_signal": {"type": "string"},
+            "driver_signal": {
+                "type": "string",
+                "enum": [
+                    "spot_confirmation_lost",
+                    "oi_support_lost",
+                    "fake_order_risk_rising",
+                    "driver_flip_confirmed"
+                ]
+            },
             "reduce_ratio": {"type": ["number", "null"]}
         }
     })
@@ -624,6 +638,33 @@ mod tests {
         assert!(management_required.contains(&"take_profit_1"));
         assert!(management_required.contains(&"take_profit_2"));
         assert!(management_required.contains(&"reason"));
+    }
+
+    #[test]
+    fn stage1_schema_constrains_management_plan_contract_enums() {
+        let schema = workflow_stage1_schema();
+        let current_path = schema["properties"]["current_path"]["anyOf"][0].clone();
+        let stop_rule = current_path["properties"]["management_plan"]["properties"]
+            ["stop_migration_rules"]["items"]
+            .clone();
+        let after_target = stop_rule["properties"]["after_target"]["enum"]
+            .as_array()
+            .expect("after_target enum");
+        assert!(after_target.iter().any(|value| value == "take_profit_1"));
+        assert!(after_target.iter().any(|value| value == "take_profit_2"));
+
+        let driver_rule = current_path["properties"]["management_plan"]["properties"]
+            ["reduce_on_driver_deterioration"]["items"]
+            .clone();
+        let driver_signal = driver_rule["properties"]["driver_signal"]["enum"]
+            .as_array()
+            .expect("driver_signal enum");
+        assert!(driver_signal
+            .iter()
+            .any(|value| value == "spot_confirmation_lost"));
+        assert!(driver_signal
+            .iter()
+            .any(|value| value == "driver_flip_confirmed"));
     }
 }
 
