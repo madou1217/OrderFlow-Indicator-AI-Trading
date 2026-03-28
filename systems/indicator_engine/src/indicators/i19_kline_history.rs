@@ -20,11 +20,32 @@ impl Indicator for I19KlineHistory {
             ("15m", 15, ctx.kline_history_bars_15m),
             ("4h", 240, ctx.kline_history_bars_4h),
             ("1d", 1440, ctx.kline_history_bars_1d),
+            ("3d", 4320, ctx.kline_history_bars_3d),
         ];
+
+        let futures_1d_records = merge_interval_bar_records(
+            &ctx.kline_history_futures_1d_db,
+            &build_interval_bar_records(
+                &ctx.history_futures,
+                1440,
+                usize::MAX,
+                current_minute_close,
+            ),
+        );
+        let spot_1d_records = merge_interval_bar_records(
+            &ctx.kline_history_spot_1d_db,
+            &build_interval_bar_records(&ctx.history_spot, 1440, usize::MAX, current_minute_close),
+        );
 
         let mut intervals = serde_json::Map::new();
         for (interval_code, interval_minutes, limit) in interval_specs {
             let futures_bars = match interval_code {
+                "3d" => build_interval_bars_from_records(
+                    &futures_1d_records,
+                    interval_minutes,
+                    limit,
+                    current_minute_close,
+                ),
                 "4h" => build_interval_bars_with_db(
                     &ctx.history_futures,
                     &ctx.kline_history_futures_4h_db,
@@ -47,6 +68,12 @@ impl Indicator for I19KlineHistory {
                 ),
             };
             let spot_bars = match interval_code {
+                "3d" => build_interval_bars_from_records(
+                    &spot_1d_records,
+                    interval_minutes,
+                    limit,
+                    current_minute_close,
+                ),
                 "4h" => build_interval_bars_with_db(
                     &ctx.history_spot,
                     &ctx.kline_history_spot_4h_db,
@@ -243,6 +270,57 @@ fn build_interval_bars(
         .collect()
 }
 
+pub fn build_interval_bar_records_from_records(
+    bars: &[KlineHistoryBar],
+    interval_minutes: i64,
+    limit: usize,
+    current_minute_close: DateTime<Utc>,
+) -> Vec<KlineHistoryBar> {
+    if interval_minutes <= 0 || limit == 0 || bars.is_empty() {
+        return Vec::new();
+    }
+
+    let mut grouped = BTreeMap::<DateTime<Utc>, KlineHistoryBar>::new();
+    for bar in bars {
+        let open_time = floor_to_interval(bar.open_time, interval_minutes);
+        let entry = grouped.entry(open_time).or_insert_with(|| KlineHistoryBar {
+            open_time,
+            close_time: open_time + Duration::minutes(interval_minutes),
+            open: None,
+            high: None,
+            low: None,
+            close: None,
+            volume_base: 0.0,
+            volume_quote: 0.0,
+            is_closed: false,
+            minutes_covered: 0,
+            expected_minutes: interval_minutes,
+        });
+        apply_record_to_bar(entry, bar);
+    }
+
+    let mut records = grouped.into_values().collect::<Vec<_>>();
+    for record in &mut records {
+        record.is_closed = record.close_time <= current_minute_close;
+    }
+    if records.len() > limit {
+        records = records.split_off(records.len() - limit);
+    }
+    records
+}
+
+fn build_interval_bars_from_records(
+    bars: &[KlineHistoryBar],
+    interval_minutes: i64,
+    limit: usize,
+    current_minute_close: DateTime<Utc>,
+) -> Vec<serde_json::Value> {
+    build_interval_bar_records_from_records(bars, interval_minutes, limit, current_minute_close)
+        .into_iter()
+        .map(bar_to_json)
+        .collect()
+}
+
 fn build_interval_bars_with_db(
     history: &[MinuteHistory],
     db_bars: &[KlineHistoryBar],
@@ -271,6 +349,26 @@ fn build_interval_bars_with_db(
         bars = bars.split_off(bars.len() - limit);
     }
     bars
+}
+
+fn merge_interval_bar_records(
+    db_bars: &[KlineHistoryBar],
+    in_mem_bars: &[KlineHistoryBar],
+) -> Vec<KlineHistoryBar> {
+    let mut merged = BTreeMap::<DateTime<Utc>, KlineHistoryBar>::new();
+    for bar in db_bars {
+        merged.insert(bar.open_time, bar.clone());
+    }
+    for bar in in_mem_bars {
+        let preserve_existing_db_bar = merged
+            .get(&bar.open_time)
+            .map(|existing| !bar_has_any_price(bar) && bar_has_any_price(existing))
+            .unwrap_or(false);
+        if !preserve_existing_db_bar {
+            merged.insert(bar.open_time, bar.clone());
+        }
+    }
+    merged.into_values().collect()
 }
 
 fn minute_bar_to_record(bar: &MinuteHistory) -> KlineHistoryBar {
@@ -303,6 +401,24 @@ fn bar_has_any_price(bar: &KlineHistoryBar) -> bool {
     bar.open.is_some() || bar.high.is_some() || bar.low.is_some() || bar.close.is_some()
 }
 
+fn apply_record_to_bar(target: &mut KlineHistoryBar, source: &KlineHistoryBar) {
+    if target.open.is_none() {
+        target.open = source.open;
+    }
+    if let Some(value) = source.high {
+        target.high = Some(target.high.map_or(value, |prev| prev.max(value)));
+    }
+    if let Some(value) = source.low {
+        target.low = Some(target.low.map_or(value, |prev| prev.min(value)));
+    }
+    if source.close.is_some() {
+        target.close = source.close;
+    }
+    target.volume_base += source.volume_base;
+    target.volume_quote += source.volume_quote;
+    target.minutes_covered += source.minutes_covered;
+}
+
 fn bar_to_json(bar: KlineHistoryBar) -> serde_json::Value {
     json!({
         "open_time": bar.open_time.to_rfc3339(),
@@ -327,7 +443,9 @@ fn floor_to_interval(ts: DateTime<Utc>, interval_minutes: i64) -> DateTime<Utc> 
 
 #[cfg(test)]
 mod tests {
-    use super::{build_interval_bars_with_db, floor_to_interval};
+    use super::{
+        build_interval_bar_records_from_records, build_interval_bars_with_db, floor_to_interval,
+    };
     use crate::indicators::context::KlineHistoryBar;
     use crate::ingest::decoder::MarketKind;
     use crate::runtime::state_store::MinuteHistory;
@@ -456,5 +574,29 @@ mod tests {
         assert_eq!(bars[0]["open"], json!(2100.0));
         assert_eq!(bars[0]["close"], json!(2100.0));
         assert_eq!(bars[0]["minutes_covered"], json!(1));
+    }
+
+    #[test]
+    fn daily_records_can_be_aggregated_into_3d_bars() {
+        let current_close = Utc.with_ymd_and_hms(2026, 3, 7, 0, 0, 0).single().unwrap();
+        let start = floor_to_interval(current_close - Duration::days(6), 4320);
+        let bars = vec![
+            db_bar(start, 100.0, 1440),
+            db_bar(start + Duration::days(1), 110.0, 1440),
+            db_bar(start + Duration::days(2), 120.0, 1440),
+            db_bar(start + Duration::days(3), 90.0, 1440),
+            db_bar(start + Duration::days(4), 80.0, 1440),
+            db_bar(start + Duration::days(5), 70.0, 1440),
+        ];
+
+        let aggregated = build_interval_bar_records_from_records(&bars, 4320, 10, current_close);
+
+        assert_eq!(aggregated.len(), 2);
+        assert_eq!(aggregated[0].open, Some(100.0));
+        assert_eq!(aggregated[0].close, Some(121.0));
+        assert_eq!(aggregated[0].minutes_covered, 4320);
+        assert_eq!(aggregated[1].open, Some(90.0));
+        assert_eq!(aggregated[1].close, Some(71.0));
+        assert_eq!(aggregated[1].minutes_covered, 4320);
     }
 }

@@ -306,6 +306,8 @@ pub struct KlineHistoryConfig {
     pub bars_4h: usize,
     #[serde(default = "default_kline_history_bars_1d")]
     pub bars_1d: usize,
+    #[serde(default = "default_kline_history_bars_3d")]
+    pub bars_3d: usize,
     #[serde(default = "default_kline_history_fill_1d_from_db")]
     pub fill_1d_from_db: bool,
 }
@@ -317,6 +319,7 @@ impl Default for KlineHistoryConfig {
             bars_15m: default_kline_history_bars_15m(),
             bars_4h: default_kline_history_bars_4h(),
             bars_1d: default_kline_history_bars_1d(),
+            bars_3d: default_kline_history_bars_3d(),
             fill_1d_from_db: default_kline_history_fill_1d_from_db(),
         }
     }
@@ -404,6 +407,8 @@ pub struct EmaTrendRegimeConfig {
     pub db_bars_4h: usize,
     #[serde(default = "default_ema_db_bars_1d")]
     pub db_bars_1d: usize,
+    #[serde(default = "default_ema_db_bars_3d")]
+    pub db_bars_3d: usize,
 }
 
 impl Default for EmaTrendRegimeConfig {
@@ -416,6 +421,7 @@ impl Default for EmaTrendRegimeConfig {
             fill_from_db: default_ema_fill_from_db(),
             db_bars_4h: default_ema_db_bars_4h(),
             db_bars_1d: default_ema_db_bars_1d(),
+            db_bars_3d: default_ema_db_bars_3d(),
         }
     }
 }
@@ -526,6 +532,10 @@ fn default_kline_history_bars_1d() -> usize {
     120
 }
 
+fn default_kline_history_bars_3d() -> usize {
+    120
+}
+
 fn default_kline_history_fill_1d_from_db() -> bool {
     true
 }
@@ -583,7 +593,7 @@ fn default_ema_htf_periods() -> Vec<usize> {
 }
 
 fn default_ema_htf_windows() -> Vec<String> {
-    vec!["4h".to_string(), "1d".to_string()]
+    vec!["4h".to_string(), "1d".to_string(), "3d".to_string()]
 }
 
 fn default_ema_output_windows() -> Vec<String> {
@@ -599,6 +609,10 @@ fn default_ema_db_bars_4h() -> usize {
 }
 
 fn default_ema_db_bars_1d() -> usize {
+    256
+}
+
+fn default_ema_db_bars_3d() -> usize {
     256
 }
 
@@ -842,6 +856,7 @@ pub async fn bootstrap() -> Result<AppContext> {
         kline_history_bars_15m = config.indicator.kline_history.bars_15m,
         kline_history_bars_4h = config.indicator.kline_history.bars_4h,
         kline_history_bars_1d = config.indicator.kline_history.bars_1d,
+        kline_history_bars_3d = config.indicator.kline_history.bars_3d,
         kline_history_fill_1d_from_db = config.indicator.kline_history.fill_1d_from_db,
         tpo_rows_nb = config.indicator.tpo_market_profile.rows_nb,
         tpo_value_area_pct = config.indicator.tpo_market_profile.value_area_pct,
@@ -861,6 +876,7 @@ pub async fn bootstrap() -> Result<AppContext> {
         ema_fill_from_db = config.indicator.ema_trend_regime.fill_from_db,
         ema_db_bars_4h = config.indicator.ema_trend_regime.db_bars_4h,
         ema_db_bars_1d = config.indicator.ema_trend_regime.db_bars_1d,
+        ema_db_bars_3d = config.indicator.ema_trend_regime.db_bars_3d,
         fvg_windows = ?config.indicator.fvg.windows,
         fvg_fill_from_db = config.indicator.fvg.fill_from_db,
         fvg_db_bars_4h = config.indicator.fvg.db_bars_4h,
@@ -1323,6 +1339,9 @@ fn validate_config(cfg: &RootConfig) -> Result<()> {
     if cfg.indicator.kline_history.bars_1d == 0 {
         return Err(anyhow!("indicator.kline_history.bars_1d must be > 0"));
     }
+    if cfg.indicator.kline_history.bars_3d == 0 {
+        return Err(anyhow!("indicator.kline_history.bars_3d must be > 0"));
+    }
     if cfg.indicator.tpo_market_profile.rows_nb == 0 {
         return Err(anyhow!("indicator.tpo_market_profile.rows_nb must be > 0"));
     }
@@ -1488,7 +1507,7 @@ fn validate_config(cfg: &RootConfig) -> Result<()> {
     }
     for code in &cfg.indicator.ema_trend_regime.htf_windows {
         match code.as_str() {
-            "4h" | "1d" => {}
+            "4h" | "1d" | "3d" => {}
             other => {
                 return Err(anyhow!(
                     "unsupported indicator.ema_trend_regime.htf_windows value: {}",
@@ -1518,6 +1537,9 @@ fn validate_config(cfg: &RootConfig) -> Result<()> {
     }
     if cfg.indicator.ema_trend_regime.db_bars_1d == 0 {
         return Err(anyhow!("indicator.ema_trend_regime.db_bars_1d must be > 0"));
+    }
+    if cfg.indicator.ema_trend_regime.db_bars_3d == 0 {
+        return Err(anyhow!("indicator.ema_trend_regime.db_bars_3d must be > 0"));
     }
     if cfg.indicator.fvg.windows.is_empty() {
         return Err(anyhow!("indicator.fvg.windows cannot be empty"));

@@ -1,9 +1,10 @@
 use crate::app::bootstrap::{build_db_pool, AppContext, DbPoolConfig, RootConfig};
 use crate::indicators::context::{
     DivergenceSigTestMode, IndicatorContext, IndicatorRuntimeOptions, IndicatorSnapshotRow,
-    KlineHistoryBar, KlineHistorySupplement,
+    KlineHistoryBar, KlineHistorySupplement, OptionsSurfacePoint,
 };
 use crate::indicators::i19_kline_history::build_interval_bar_records;
+use crate::indicators::i27_options_surface::OPTIONS_SURFACE_WINDOWS;
 use crate::ingest::decoder::{decode_contract_body, EngineEvent, MdData};
 use crate::ingest::mq_consumer;
 use crate::ingest::watermark::floor_minute;
@@ -223,6 +224,7 @@ pub fn build_indicator_runtime_options(
         kline_history_bars_15m: config.indicator.kline_history.bars_15m,
         kline_history_bars_4h: config.indicator.kline_history.bars_4h,
         kline_history_bars_1d: config.indicator.kline_history.bars_1d,
+        kline_history_bars_3d: config.indicator.kline_history.bars_3d,
         kline_history_fill_1d_from_db: config.indicator.kline_history.fill_1d_from_db,
         fvg_windows: config.indicator.fvg.windows.clone(),
         fvg_fill_from_db: config.indicator.fvg.fill_from_db,
@@ -262,6 +264,7 @@ pub fn build_indicator_runtime_options(
         ema_fill_from_db: config.indicator.ema_trend_regime.fill_from_db,
         ema_db_bars_4h: config.indicator.ema_trend_regime.db_bars_4h,
         ema_db_bars_1d: config.indicator.ema_trend_regime.db_bars_1d,
+        ema_db_bars_3d: config.indicator.ema_trend_regime.db_bars_3d,
         divergence_sig_test_mode: DivergenceSigTestMode::from_str(
             &config.indicator.divergence.sig_test_mode,
         ),
@@ -1335,27 +1338,37 @@ fn minute_history_has_any_price(row: &MinuteHistory) -> bool {
 
 fn snapshot_has_required_history(snap: &StateSnapshot) -> bool {
     let required_start_ts = required_snapshot_history_start_ts(snap);
-    if !snapshot_history_reaches_required_start(&snap.history_futures, required_start_ts) {
+    if !snapshot_history_covers_required_window(
+        &snap.history_futures,
+        required_start_ts,
+        snap.last_finalized_ts,
+    ) {
         warn!(
             required_start_ts = %required_start_ts,
             history_start_ts = ?snap.history_futures.first().map(|row| row.ts_bucket),
+            history_end_ts = ?snap.history_futures.last().map(|row| row.ts_bucket),
             history_len = snap.history_futures.len(),
             effective_history_floor_ts = ?snap.effective_history_floor_ts,
             history_limit_minutes = HISTORY_LIMIT_MINUTES,
-            "State snapshot futures history does not cover required restart window, ignoring"
+            "State snapshot futures history does not provide contiguous required restart coverage, ignoring"
         );
         return false;
     }
     if !snap.history_spot.is_empty()
-        && !snapshot_history_reaches_required_start(&snap.history_spot, required_start_ts)
+        && !snapshot_history_covers_required_window(
+            &snap.history_spot,
+            required_start_ts,
+            snap.last_finalized_ts,
+        )
     {
         warn!(
             required_start_ts = %required_start_ts,
             history_start_ts = ?snap.history_spot.first().map(|row| row.ts_bucket),
+            history_end_ts = ?snap.history_spot.last().map(|row| row.ts_bucket),
             history_len = snap.history_spot.len(),
             effective_history_floor_ts = ?snap.effective_history_floor_ts,
             history_limit_minutes = HISTORY_LIMIT_MINUTES,
-            "State snapshot spot history does not cover required restart window, ignoring"
+            "State snapshot spot history does not provide contiguous required restart coverage, ignoring"
         );
         return false;
     }
@@ -1378,6 +1391,15 @@ fn snapshot_history_reaches_required_start(
         .first()
         .map(|row| row.ts_bucket <= required_start_ts)
         .unwrap_or(false)
+}
+
+fn snapshot_history_covers_required_window(
+    history: &[MinuteHistory],
+    required_start_ts: DateTime<Utc>,
+    last_finalized_ts: DateTime<Utc>,
+) -> bool {
+    snapshot_history_reaches_required_start(history, required_start_ts)
+        && minute_history_is_strictly_contiguous(history, last_finalized_ts)
 }
 
 async fn save_state_snapshot(snap: &StateSnapshot, path: &str) -> anyhow::Result<()> {
@@ -1410,22 +1432,26 @@ pub async fn load_kline_history_supplement(
     history_spot: &[MinuteHistory],
     bars_4h: usize,
     bars_1d: usize,
+    bars_3d: usize,
     fill_1d_from_db: bool,
     ema_fill_from_db: bool,
+    ema_htf_windows: &[String],
     ema_db_bars_4h: usize,
     ema_db_bars_1d: usize,
+    ema_db_bars_3d: usize,
     fvg_fill_from_db: bool,
     fvg_windows: &[String],
     fvg_db_bars_4h: usize,
     fvg_db_bars_1d: usize,
     current_minute_close: DateTime<Utc>,
 ) -> KlineHistorySupplement {
-    if !fill_1d_from_db && !ema_fill_from_db && !fvg_fill_from_db && bars_4h == 0 {
+    if !fill_1d_from_db && !ema_fill_from_db && !fvg_fill_from_db && bars_4h == 0 && bars_3d == 0 {
         return KlineHistorySupplement::default();
     }
 
     let fvg_needs_4h = fvg_fill_from_db && fvg_windows.iter().any(|code| code == "4h");
     let fvg_needs_1d = fvg_fill_from_db && fvg_windows.iter().any(|code| code == "1d");
+    let ema_needs_3d = ema_fill_from_db && ema_htf_windows.iter().any(|code| code == "3d");
 
     let in_mem_futures_1d =
         build_interval_bar_records(history_futures, 1440, usize::MAX, current_minute_close);
@@ -1437,9 +1463,15 @@ pub async fn load_kline_history_supplement(
         build_interval_bar_records(history_spot, 240, usize::MAX, current_minute_close);
 
     let required_futures_1d = if fill_1d_from_db { bars_1d } else { 0 }
+        .max(bars_3d.saturating_mul(3))
         .max(if ema_fill_from_db { ema_db_bars_1d } else { 0 })
+        .max(if ema_needs_3d {
+            ema_db_bars_3d.saturating_mul(3)
+        } else {
+            0
+        })
         .max(if fvg_needs_1d { fvg_db_bars_1d } else { 0 });
-    let required_spot_1d = if fill_1d_from_db { bars_1d } else { 0 };
+    let required_spot_1d = if fill_1d_from_db { bars_1d } else { 0 }.max(bars_3d.saturating_mul(3));
     let required_futures_4h = bars_4h
         .max(if ema_fill_from_db { ema_db_bars_4h } else { 0 })
         .max(if fvg_needs_4h { fvg_db_bars_4h } else { 0 });
@@ -1599,6 +1631,160 @@ pub async fn load_kline_history_supplement(
         spot_1d_db,
         ..KlineHistorySupplement::default()
     }
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct OptionsSurfaceFeatureRow {
+    ts_bucket: DateTime<Utc>,
+    front_expiry_ts: Option<DateTime<Utc>>,
+    second_expiry_ts: Option<DateTime<Utc>>,
+    atm_strike_front: Option<f64>,
+    atm_iv_front: Option<f64>,
+    atm_iv_second: Option<f64>,
+    atm_iv_30d_proxy: Option<f64>,
+    rr_25d_front: Option<f64>,
+    rr_25d_second: Option<f64>,
+    skew_state: String,
+    term_structure_state: String,
+}
+
+fn required_options_surface_history_points() -> usize {
+    OPTIONS_SURFACE_WINDOWS
+        .iter()
+        .map(|(_, _, samples)| samples.saturating_add(1))
+        .max()
+        .unwrap_or(0)
+}
+
+async fn load_options_surface_history_supplement(
+    pool: &PgPool,
+    symbol: &str,
+    existing_points: &[OptionsSurfacePoint],
+    current_minute_close: DateTime<Utc>,
+) -> (Option<DateTime<Utc>>, Vec<OptionsSurfacePoint>) {
+    let required_points = required_options_surface_history_points();
+    if required_points == 0 || existing_points.len() >= required_points {
+        return (
+            existing_points.last().map(|point| point.ts_bucket),
+            Vec::new(),
+        );
+    }
+
+    let limit = if existing_points.is_empty() {
+        required_points
+    } else {
+        required_points.saturating_sub(existing_points.len())
+    };
+    if limit == 0 {
+        return (
+            existing_points.last().map(|point| point.ts_bucket),
+            Vec::new(),
+        );
+    }
+
+    let rows_result: Result<Vec<OptionsSurfaceFeatureRow>> =
+        if let Some(oldest_bucket) = existing_points.first().map(|point| point.ts_bucket) {
+            sqlx::query_as(
+                r#"
+            SELECT
+                ts_bucket,
+                front_expiry_ts,
+                second_expiry_ts,
+                atm_strike_front,
+                atm_iv_front,
+                atm_iv_second,
+                atm_iv_30d_proxy,
+                rr_25d_front,
+                rr_25d_second,
+                skew_state,
+                term_structure_state
+            FROM feat.options_surface_feature
+            WHERE symbol = $1
+              AND bar_interval = interval '5 minutes'
+              AND ts_bucket < $2
+            ORDER BY ts_bucket DESC
+            LIMIT $3
+            "#,
+            )
+            .bind(symbol.to_uppercase())
+            .bind(oldest_bucket)
+            .bind(limit as i64)
+            .fetch_all(pool)
+            .await
+            .context("query options surface supplement before oldest bundle bucket")
+        } else {
+            sqlx::query_as(
+                r#"
+            SELECT
+                ts_bucket,
+                front_expiry_ts,
+                second_expiry_ts,
+                atm_strike_front,
+                atm_iv_front,
+                atm_iv_second,
+                atm_iv_30d_proxy,
+                rr_25d_front,
+                rr_25d_second,
+                skew_state,
+                term_structure_state
+            FROM feat.options_surface_feature
+            WHERE symbol = $1
+              AND bar_interval = interval '5 minutes'
+              AND ts_bucket <= $2
+            ORDER BY ts_bucket DESC
+            LIMIT $3
+            "#,
+            )
+            .bind(symbol.to_uppercase())
+            .bind(current_minute_close)
+            .bind(limit as i64)
+            .fetch_all(pool)
+            .await
+            .context("query latest options surface supplement")
+        };
+
+    let rows = match rows_result {
+        Ok(rows) => rows,
+        Err(err) => {
+            warn!(
+                error = %err,
+                symbol = %symbol,
+                current_points = existing_points.len(),
+                required_points = required_points,
+                "load options surface supplement from DB failed"
+            );
+            return (
+                existing_points.last().map(|point| point.ts_bucket),
+                Vec::new(),
+            );
+        }
+    };
+
+    let mut points = rows
+        .into_iter()
+        .map(|row| OptionsSurfacePoint {
+            ts_bucket: row.ts_bucket,
+            front_expiry_ts: row.front_expiry_ts,
+            second_expiry_ts: row.second_expiry_ts,
+            atm_strike_front: row.atm_strike_front,
+            atm_iv_front: row.atm_iv_front,
+            atm_iv_second: row.atm_iv_second,
+            atm_iv_30d_proxy: row.atm_iv_30d_proxy,
+            rr_25d_front: row.rr_25d_front,
+            rr_25d_second: row.rr_25d_second,
+            skew_state: row.skew_state,
+            term_structure_state: row.term_structure_state,
+        })
+        .collect::<Vec<_>>();
+    points.sort_by_key(|point| point.ts_bucket);
+
+    (
+        points
+            .last()
+            .map(|point| point.ts_bucket)
+            .or_else(|| existing_points.last().map(|point| point.ts_bucket)),
+        points,
+    )
 }
 
 async fn fetch_older_interval_bars(
@@ -2298,17 +2484,20 @@ async fn process_window_bundle(
     mode: DispatchMode,
 ) -> Result<Vec<IndicatorSnapshotRow>> {
     let minute = window.ts_bucket;
-    let kline_history_supplement = load_kline_history_supplement(
+    let mut kline_history_supplement = load_kline_history_supplement(
         &ctx.db_pool,
         &ctx.config.indicator.symbol,
         &window.history_futures,
         &window.history_spot,
         runtime_options.kline_history_bars_4h,
         runtime_options.kline_history_bars_1d,
+        runtime_options.kline_history_bars_3d,
         runtime_options.kline_history_fill_1d_from_db,
         runtime_options.ema_fill_from_db,
+        &runtime_options.ema_htf_windows,
         runtime_options.ema_db_bars_4h,
         runtime_options.ema_db_bars_1d,
+        runtime_options.ema_db_bars_3d,
         runtime_options.fvg_fill_from_db,
         &runtime_options.fvg_windows,
         runtime_options.fvg_db_bars_4h,
@@ -2316,6 +2505,25 @@ async fn process_window_bundle(
         minute + ChronoDuration::minutes(1),
     )
     .await;
+    let (latest_options_surface_bucket, options_surface_5m) =
+        load_options_surface_history_supplement(
+            &ctx.db_pool,
+            &ctx.config.indicator.symbol,
+            &window.options_surface_5m,
+            minute + ChronoDuration::minutes(1),
+        )
+        .await;
+    if !options_surface_5m.is_empty() {
+        debug!(
+            symbol = %ctx.config.indicator.symbol,
+            minute = %minute,
+            loaded_points = options_surface_5m.len(),
+            latest_options_surface_bucket = ?latest_options_surface_bucket,
+            "loaded options surface history supplement"
+        );
+    }
+    kline_history_supplement.latest_options_surface_bucket = latest_options_surface_bucket;
+    kline_history_supplement.options_surface_5m = options_surface_5m;
     let ictx = Arc::new(IndicatorContext::from_bundle(
         window,
         runtime_options,

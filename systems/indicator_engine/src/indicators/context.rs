@@ -8,6 +8,7 @@ use crate::runtime::state_store::{
 };
 use chrono::{DateTime, Duration, Utc};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,6 +40,7 @@ pub struct IndicatorRuntimeOptions {
     pub kline_history_bars_15m: usize,
     pub kline_history_bars_4h: usize,
     pub kline_history_bars_1d: usize,
+    pub kline_history_bars_3d: usize,
     pub kline_history_fill_1d_from_db: bool,
     pub fvg_windows: Vec<String>,
     pub fvg_fill_from_db: bool,
@@ -70,6 +72,7 @@ pub struct IndicatorRuntimeOptions {
     pub ema_fill_from_db: bool,
     pub ema_db_bars_4h: usize,
     pub ema_db_bars_1d: usize,
+    pub ema_db_bars_3d: usize,
     pub divergence_sig_test_mode: DivergenceSigTestMode,
     pub divergence_bootstrap_b: usize,
     pub divergence_bootstrap_block_len: usize,
@@ -108,6 +111,7 @@ pub struct IndicatorContext {
     pub kline_history_bars_15m: usize,
     pub kline_history_bars_4h: usize,
     pub kline_history_bars_1d: usize,
+    pub kline_history_bars_3d: usize,
     pub kline_history_fill_1d_from_db: bool,
     pub fvg_windows: Vec<String>,
     pub fvg_fill_from_db: bool,
@@ -143,6 +147,7 @@ pub struct IndicatorContext {
     pub ema_fill_from_db: bool,
     pub ema_db_bars_4h: usize,
     pub ema_db_bars_1d: usize,
+    pub ema_db_bars_3d: usize,
     pub divergence_sig_test_mode: DivergenceSigTestMode,
     pub divergence_bootstrap_b: usize,
     pub divergence_bootstrap_block_len: usize,
@@ -271,6 +276,15 @@ impl IndicatorContext {
         options: &IndicatorRuntimeOptions,
         kline_history_supplement: KlineHistorySupplement,
     ) -> Self {
+        let merged_options_surface_5m = merge_options_surface_history(
+            &bundle.options_surface_5m,
+            &kline_history_supplement.options_surface_5m,
+        );
+        let latest_options_surface_bucket = merged_options_surface_5m
+            .last()
+            .map(|point| point.ts_bucket)
+            .or(bundle.latest_options_surface_bucket)
+            .or(kline_history_supplement.latest_options_surface_bucket);
         Self {
             ts_bucket: bundle.ts_bucket,
             symbol: bundle.symbol.clone(),
@@ -294,13 +308,14 @@ impl IndicatorContext {
             global_account_ratio_5m: bundle.global_account_ratio_5m.clone(),
             top_account_ratio_5m: bundle.top_account_ratio_5m.clone(),
             top_position_ratio_5m: bundle.top_position_ratio_5m.clone(),
-            latest_options_surface_bucket: bundle.latest_options_surface_bucket,
-            options_surface_5m: bundle.options_surface_5m.clone(),
+            latest_options_surface_bucket,
+            options_surface_5m: merged_options_surface_5m,
             whale_threshold_usdt: options.whale_threshold_usdt,
             kline_history_bars_1m: options.kline_history_bars_1m,
             kline_history_bars_15m: options.kline_history_bars_15m,
             kline_history_bars_4h: options.kline_history_bars_4h,
             kline_history_bars_1d: options.kline_history_bars_1d,
+            kline_history_bars_3d: options.kline_history_bars_3d,
             kline_history_fill_1d_from_db: options.kline_history_fill_1d_from_db,
             fvg_windows: options.fvg_windows.clone(),
             fvg_fill_from_db: options.fvg_fill_from_db,
@@ -336,6 +351,7 @@ impl IndicatorContext {
             ema_fill_from_db: options.ema_fill_from_db,
             ema_db_bars_4h: options.ema_db_bars_4h,
             ema_db_bars_1d: options.ema_db_bars_1d,
+            ema_db_bars_3d: options.ema_db_bars_3d,
             divergence_sig_test_mode: options.divergence_sig_test_mode,
             divergence_bootstrap_b: options.divergence_bootstrap_b,
             divergence_bootstrap_block_len: options.divergence_bootstrap_block_len,
@@ -610,6 +626,27 @@ impl IndicatorContext {
                 })
             })
     }
+}
+
+fn merge_options_surface_history(
+    primary: &[OptionsSurfacePoint],
+    fallback: &[OptionsSurfacePoint],
+) -> Vec<OptionsSurfacePoint> {
+    if primary.is_empty() {
+        return fallback.to_vec();
+    }
+    if fallback.is_empty() {
+        return primary.to_vec();
+    }
+
+    let mut by_bucket = BTreeMap::<DateTime<Utc>, OptionsSurfacePoint>::new();
+    for point in fallback {
+        by_bucket.insert(point.ts_bucket, point.clone());
+    }
+    for point in primary {
+        by_bucket.insert(point.ts_bucket, point.clone());
+    }
+    by_bucket.into_values().collect()
 }
 
 impl BasicEventHistorySeries {
@@ -1179,7 +1216,8 @@ pub fn top_profile_levels(
 
 #[cfg(test)]
 mod tests {
-    use super::robust_z_at;
+    use super::{merge_options_surface_history, robust_z_at, OptionsSurfacePoint};
+    use chrono::{Duration, TimeZone, Utc};
 
     #[test]
     fn robust_z_at_returns_zero_when_mad_is_effectively_flat() {
@@ -1203,5 +1241,49 @@ mod tests {
         let z = robust_z_at(&values, values.len() - 1, 5).expect("z score");
         assert!(z.is_finite());
         assert!(z > 0.0);
+    }
+
+    fn point(
+        ts_bucket: chrono::DateTime<Utc>,
+        atm_iv_front: Option<f64>,
+        skew_state: &str,
+    ) -> OptionsSurfacePoint {
+        OptionsSurfacePoint {
+            ts_bucket,
+            front_expiry_ts: None,
+            second_expiry_ts: None,
+            atm_strike_front: None,
+            atm_iv_front,
+            atm_iv_second: None,
+            atm_iv_30d_proxy: None,
+            rr_25d_front: None,
+            rr_25d_second: None,
+            skew_state: skew_state.to_string(),
+            term_structure_state: "flat".to_string(),
+        }
+    }
+
+    #[test]
+    fn merge_options_surface_history_prefers_primary_and_keeps_order() {
+        let ts_0 = Utc.with_ymd_and_hms(2026, 3, 28, 0, 0, 0).single().unwrap();
+        let ts_1 = ts_0 + Duration::minutes(5);
+        let ts_2 = ts_1 + Duration::minutes(5);
+
+        let fallback = vec![
+            point(ts_0, Some(0.40), "neutral"),
+            point(ts_1, Some(0.41), "neutral"),
+        ];
+        let primary = vec![
+            point(ts_1, Some(0.55), "put_skewed"),
+            point(ts_2, Some(0.56), "put_skewed"),
+        ];
+
+        let merged = merge_options_surface_history(&primary, &fallback);
+        assert_eq!(merged.len(), 3);
+        assert_eq!(merged[0].ts_bucket, ts_0);
+        assert_eq!(merged[1].ts_bucket, ts_1);
+        assert_eq!(merged[2].ts_bucket, ts_2);
+        assert_eq!(merged[1].atm_iv_front, Some(0.55));
+        assert_eq!(merged[1].skew_state, "put_skewed");
     }
 }
