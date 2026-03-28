@@ -6,7 +6,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-const CHECKPOINT_MIN_UPSERT_INTERVAL_MS: i64 = 10_000;
+// Align WS checkpoint write throttling with the recv heartbeat window so that
+// the ops DB only sees materially new checkpoint writes, not a 10-second churn
+// on every active stream.
+const CHECKPOINT_MIN_UPSERT_INTERVAL_MS: i64 = 30_000;
 const CHECKPOINT_RECV_HEARTBEAT_SECS: i64 = 30;
 const DATA_GAP_DEDUP_WINDOW_SECS: i64 = 300;
 const DATA_GAP_LOCAL_CACHE_MAX: usize = 20_000;

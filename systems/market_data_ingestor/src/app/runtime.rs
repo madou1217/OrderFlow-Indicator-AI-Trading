@@ -71,6 +71,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
             ctx.ops_db_pool.clone(),
             ctx.mq.clone(),
             ctx.config.mq.exchanges.md_live.name.clone(),
+            ctx.config.mq.exchanges.md_replay.name.clone(),
         );
         spawn_critical_task(&mut tasks, "outbox dispatcher worker", async move {
             let perform_housekeeping = worker_id == 0;

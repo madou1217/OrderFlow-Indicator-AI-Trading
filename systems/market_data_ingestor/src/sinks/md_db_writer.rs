@@ -1,11 +1,17 @@
 use crate::normalize::NormalizedMdEvent;
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
-use serde_json::Value;
+use serde_json::{json, Map, Value};
 use sqlx::{PgPool, Postgres, QueryBuilder, Transaction};
 use std::collections::HashSet;
 
 const BBO_ROLLUP_WINDOW_MS: i64 = 250;
+const ORDERBOOK_DB_HEATMAP_COMPACT_THRESHOLD: usize = 256;
+const ORDERBOOK_DB_HEATMAP_TOP_TOTAL_LEVELS: usize = 64;
+const ORDERBOOK_DB_HEATMAP_TOP_ABS_NET_LEVELS: usize = 32;
+const ORDERBOOK_DB_HEATMAP_TOP_BID_LEVELS: usize = 16;
+const ORDERBOOK_DB_HEATMAP_TOP_ASK_LEVELS: usize = 16;
+const ORDERBOOK_DB_HEATMAP_NEAR_MID_LEVELS: usize = 64;
 
 #[derive(Clone)]
 pub struct MdDbWriter {
@@ -52,6 +58,10 @@ impl MdDbWriter {
             return Ok(());
         }
 
+        let mut open_interest_current_rows: Vec<OpenInterestCurrentBatchRow> = Vec::new();
+        let mut open_interest_hist_rows: Vec<OpenInterestHist5mBatchRow> = Vec::new();
+        let mut long_short_ratio_rows: Vec<LongShortRatio5mBatchRow> = Vec::new();
+        let mut option_mark_rows: Vec<OptionMarkGreeks5mBatchRow> = Vec::new();
         let mut kline_rows: Vec<KlineBatchRow> = Vec::new();
         let mut agg_trade_rows: Vec<AggTrade1mBatchRow> = Vec::new();
         let mut agg_orderbook_rows: Vec<AggOrderbook1mBatchRow> = Vec::new();
@@ -65,6 +75,18 @@ impl MdDbWriter {
                     if should_write_kline_hotpath(&event.data) {
                         kline_rows.push(KlineBatchRow::from_event(event)?);
                     }
+                }
+                "md.open_interest_current" => {
+                    open_interest_current_rows.push(OpenInterestCurrentBatchRow::from_event(event)?)
+                }
+                "md.open_interest_hist_5m" => {
+                    open_interest_hist_rows.push(OpenInterestHist5mBatchRow::from_event(event)?)
+                }
+                "md.long_short_ratio_5m" => {
+                    long_short_ratio_rows.push(LongShortRatio5mBatchRow::from_event(event)?)
+                }
+                "md.option_mark_greeks_5m" => {
+                    option_mark_rows.push(OptionMarkGreeks5mBatchRow::from_event(event)?)
                 }
                 "md.agg.trade.1m" => agg_trade_rows.push(AggTrade1mBatchRow::from_event(event)?),
                 "md.agg.orderbook.1m" => {
@@ -84,6 +106,14 @@ impl MdDbWriter {
         dedupe_agg_funding_rows(&mut agg_funding_rows);
 
         let mut tx = self.pool.begin().await.context("begin md batch write tx")?;
+        self.insert_open_interest_current_1m_batch(&mut tx, &open_interest_current_rows)
+            .await?;
+        self.insert_open_interest_hist_5m_batch(&mut tx, &open_interest_hist_rows)
+            .await?;
+        self.insert_long_short_ratio_5m_batch(&mut tx, &long_short_ratio_rows)
+            .await?;
+        self.insert_option_mark_greeks_5m_batch(&mut tx, &option_mark_rows)
+            .await?;
         self.insert_kline_batch(&mut tx, &kline_rows).await?;
         self.insert_agg_trade_1m_batch(&mut tx, &agg_trade_rows)
             .await?;
@@ -326,6 +356,262 @@ impl MdDbWriter {
         .execute(&self.pool)
         .await
         .context("insert md.option_mark_greeks_5m")?;
+        Ok(())
+    }
+
+    async fn insert_open_interest_current_1m_batch(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        rows: &[OpenInterestCurrentBatchRow],
+    ) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+
+        let mut builder = QueryBuilder::<Postgres>::new(
+            r#"
+            INSERT INTO md.open_interest_current_1m (
+                ts_event, ts_recv, venue, market, symbol, source_kind, stream_name,
+                open_interest_contracts, mark_price, open_interest_value_usdt, payload_json
+            )
+            "#,
+        );
+
+        builder.push_values(rows, |mut b, row| {
+            b.push_bind(row.ts_event)
+                .push_bind(row.ts_recv)
+                .push("'binance'")
+                .push_bind(&row.market)
+                .push_unseparated("::cfg.market_type")
+                .push_bind(&row.symbol)
+                .push_bind(&row.source_kind)
+                .push_unseparated("::cfg.source_type")
+                .push_bind(&row.stream_name)
+                .push_bind(row.open_interest_contracts)
+                .push_bind(row.mark_price)
+                .push_bind(row.open_interest_value_usdt)
+                .push_bind(&row.payload_json);
+        });
+
+        builder.push(
+            r#"
+            ON CONFLICT (market, symbol, ts_event)
+            DO UPDATE SET
+                ts_recv = EXCLUDED.ts_recv,
+                source_kind = EXCLUDED.source_kind,
+                stream_name = EXCLUDED.stream_name,
+                open_interest_contracts = EXCLUDED.open_interest_contracts,
+                mark_price = EXCLUDED.mark_price,
+                open_interest_value_usdt = EXCLUDED.open_interest_value_usdt,
+                payload_json = EXCLUDED.payload_json
+            "#,
+        );
+        builder
+            .build()
+            .execute(&mut **tx)
+            .await
+            .context("insert md.open_interest_current_1m batch")?;
+
+        Ok(())
+    }
+
+    async fn insert_open_interest_hist_5m_batch(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        rows: &[OpenInterestHist5mBatchRow],
+    ) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+
+        let mut builder = QueryBuilder::<Postgres>::new(
+            r#"
+            INSERT INTO md.open_interest_hist_5m (
+                ts_event, ts_recv, venue, ts_bucket, market, symbol, source_kind, stream_name,
+                open_interest_contracts, open_interest_value_usdt, payload_json
+            )
+            "#,
+        );
+
+        builder.push_values(rows, |mut b, row| {
+            b.push_bind(row.ts_event)
+                .push_bind(row.ts_recv)
+                .push("'binance'")
+                .push_bind(row.ts_bucket)
+                .push_bind(&row.market)
+                .push_unseparated("::cfg.market_type")
+                .push_bind(&row.symbol)
+                .push_bind(&row.source_kind)
+                .push_unseparated("::cfg.source_type")
+                .push_bind(&row.stream_name)
+                .push_bind(row.open_interest_contracts)
+                .push_bind(row.open_interest_value_usdt)
+                .push_bind(&row.payload_json);
+        });
+
+        builder.push(
+            r#"
+            ON CONFLICT (market, symbol, ts_bucket)
+            DO UPDATE SET
+                ts_event = EXCLUDED.ts_event,
+                ts_recv = EXCLUDED.ts_recv,
+                source_kind = EXCLUDED.source_kind,
+                stream_name = EXCLUDED.stream_name,
+                open_interest_contracts = EXCLUDED.open_interest_contracts,
+                open_interest_value_usdt = EXCLUDED.open_interest_value_usdt,
+                payload_json = EXCLUDED.payload_json
+            "#,
+        );
+        builder
+            .build()
+            .execute(&mut **tx)
+            .await
+            .context("insert md.open_interest_hist_5m batch")?;
+
+        Ok(())
+    }
+
+    async fn insert_long_short_ratio_5m_batch(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        rows: &[LongShortRatio5mBatchRow],
+    ) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+
+        let mut builder = QueryBuilder::<Postgres>::new(
+            r#"
+            INSERT INTO md.long_short_ratio_5m (
+                ts_event, ts_recv, venue, ts_bucket, market, symbol, source_kind, stream_name,
+                ratio_type, long_short_ratio, long_account_ratio, short_account_ratio, payload_json
+            )
+            "#,
+        );
+
+        builder.push_values(rows, |mut b, row| {
+            b.push_bind(row.ts_event)
+                .push_bind(row.ts_recv)
+                .push("'binance'")
+                .push_bind(row.ts_bucket)
+                .push_bind(&row.market)
+                .push_unseparated("::cfg.market_type")
+                .push_bind(&row.symbol)
+                .push_bind(&row.source_kind)
+                .push_unseparated("::cfg.source_type")
+                .push_bind(&row.stream_name)
+                .push_bind(&row.ratio_type)
+                .push_bind(row.long_short_ratio)
+                .push_bind(row.long_account_ratio)
+                .push_bind(row.short_account_ratio)
+                .push_bind(&row.payload_json);
+        });
+
+        builder.push(
+            r#"
+            ON CONFLICT (market, symbol, ratio_type, ts_bucket)
+            DO UPDATE SET
+                ts_event = EXCLUDED.ts_event,
+                ts_recv = EXCLUDED.ts_recv,
+                source_kind = EXCLUDED.source_kind,
+                stream_name = EXCLUDED.stream_name,
+                long_short_ratio = EXCLUDED.long_short_ratio,
+                long_account_ratio = EXCLUDED.long_account_ratio,
+                short_account_ratio = EXCLUDED.short_account_ratio,
+                payload_json = EXCLUDED.payload_json
+            "#,
+        );
+        builder
+            .build()
+            .execute(&mut **tx)
+            .await
+            .context("insert md.long_short_ratio_5m batch")?;
+
+        Ok(())
+    }
+
+    async fn insert_option_mark_greeks_5m_batch(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        rows: &[OptionMarkGreeks5mBatchRow],
+    ) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+
+        let mut builder = QueryBuilder::<Postgres>::new(
+            r#"
+            INSERT INTO md.option_mark_greeks_5m (
+                ts_event, ts_recv, venue, ts_bucket, market, symbol, option_symbol,
+                underlying_asset, source_kind, stream_name, expiry_ts, strike_price,
+                contract_side, unit, index_price, mark_price, bid_iv, ask_iv, mark_iv,
+                delta, gamma, vega, theta, risk_free_interest, payload_json
+            )
+            "#,
+        );
+
+        builder.push_values(rows, |mut b, row| {
+            b.push_bind(row.ts_event)
+                .push_bind(row.ts_recv)
+                .push("'binance'")
+                .push_bind(row.ts_bucket)
+                .push_bind(&row.market)
+                .push_unseparated("::cfg.market_type")
+                .push_bind(&row.symbol)
+                .push_bind(&row.option_symbol)
+                .push_bind(&row.underlying_asset)
+                .push_bind(&row.source_kind)
+                .push_unseparated("::cfg.source_type")
+                .push_bind(&row.stream_name)
+                .push_bind(row.expiry_ts)
+                .push_bind(row.strike_price)
+                .push_bind(&row.contract_side)
+                .push_bind(row.unit)
+                .push_bind(row.index_price)
+                .push_bind(row.mark_price)
+                .push_bind(row.bid_iv)
+                .push_bind(row.ask_iv)
+                .push_bind(row.mark_iv)
+                .push_bind(row.delta)
+                .push_bind(row.gamma)
+                .push_bind(row.vega)
+                .push_bind(row.theta)
+                .push_bind(row.risk_free_interest)
+                .push_bind(&row.payload_json);
+        });
+
+        builder.push(
+            r#"
+            ON CONFLICT (market, symbol, option_symbol, ts_bucket)
+            DO UPDATE SET
+                ts_event = EXCLUDED.ts_event,
+                ts_recv = EXCLUDED.ts_recv,
+                underlying_asset = EXCLUDED.underlying_asset,
+                source_kind = EXCLUDED.source_kind,
+                stream_name = EXCLUDED.stream_name,
+                expiry_ts = EXCLUDED.expiry_ts,
+                strike_price = EXCLUDED.strike_price,
+                contract_side = EXCLUDED.contract_side,
+                unit = EXCLUDED.unit,
+                index_price = EXCLUDED.index_price,
+                mark_price = EXCLUDED.mark_price,
+                bid_iv = EXCLUDED.bid_iv,
+                ask_iv = EXCLUDED.ask_iv,
+                mark_iv = EXCLUDED.mark_iv,
+                delta = EXCLUDED.delta,
+                gamma = EXCLUDED.gamma,
+                vega = EXCLUDED.vega,
+                theta = EXCLUDED.theta,
+                risk_free_interest = EXCLUDED.risk_free_interest,
+                payload_json = EXCLUDED.payload_json
+            "#,
+        );
+        builder
+            .build()
+            .execute(&mut **tx)
+            .await
+            .context("insert md.option_mark_greeks_5m batch")?;
+
         Ok(())
     }
 
@@ -973,6 +1259,7 @@ impl MdDbWriter {
 
     async fn insert_agg_orderbook_1m(&self, event: &NormalizedMdEvent) -> Result<()> {
         let d = &event.data;
+        let compacted = compact_orderbook_heatmap_for_db(d)?;
         sqlx::query(
             r#"
             INSERT INTO md.agg_orderbook_1m (
@@ -1042,8 +1329,8 @@ impl MdDbWriter {
         .bind(required_f64(d, "microprice_adj_sum")?)
         .bind(required_f64(d, "ofi_sum")?)
         .bind(optional_f64(d, "obi_k_dw_close"))
-        .bind(required_value(d, "heatmap_levels")?)
-        .bind(payload_json(d))
+        .bind(compacted.heatmap_levels)
+        .bind(compacted.payload_json)
         .execute(&self.pool)
         .await
         .context("insert md.agg_orderbook_1m")?;
@@ -1599,6 +1886,162 @@ impl BboRollupDefaults {
     }
 }
 
+struct OpenInterestCurrentBatchRow {
+    ts_event: DateTime<Utc>,
+    ts_recv: DateTime<Utc>,
+    market: String,
+    symbol: String,
+    source_kind: String,
+    stream_name: String,
+    open_interest_contracts: f64,
+    mark_price: Option<f64>,
+    open_interest_value_usdt: Option<f64>,
+    payload_json: Value,
+}
+
+impl OpenInterestCurrentBatchRow {
+    fn from_event(event: &NormalizedMdEvent) -> Result<Self> {
+        let d = &event.data;
+        Ok(Self {
+            ts_event: event.event_ts,
+            ts_recv: parse_ts(d, "ts_recv")?,
+            market: event.market.clone(),
+            symbol: event.symbol.clone(),
+            source_kind: event.source_kind.clone(),
+            stream_name: required_str(d, "stream_name")?,
+            open_interest_contracts: required_f64(d, "open_interest_contracts")?,
+            mark_price: optional_f64(d, "mark_price"),
+            open_interest_value_usdt: optional_f64(d, "open_interest_value_usdt"),
+            payload_json: payload_json(d),
+        })
+    }
+}
+
+struct OpenInterestHist5mBatchRow {
+    ts_event: DateTime<Utc>,
+    ts_recv: DateTime<Utc>,
+    ts_bucket: DateTime<Utc>,
+    market: String,
+    symbol: String,
+    source_kind: String,
+    stream_name: String,
+    open_interest_contracts: f64,
+    open_interest_value_usdt: f64,
+    payload_json: Value,
+}
+
+impl OpenInterestHist5mBatchRow {
+    fn from_event(event: &NormalizedMdEvent) -> Result<Self> {
+        let d = &event.data;
+        Ok(Self {
+            ts_event: event.event_ts,
+            ts_recv: parse_ts(d, "ts_recv")?,
+            ts_bucket: parse_ts(d, "ts_bucket")?,
+            market: event.market.clone(),
+            symbol: event.symbol.clone(),
+            source_kind: event.source_kind.clone(),
+            stream_name: required_str(d, "stream_name")?,
+            open_interest_contracts: required_f64(d, "open_interest_contracts")?,
+            open_interest_value_usdt: required_f64(d, "open_interest_value_usdt")?,
+            payload_json: payload_json(d),
+        })
+    }
+}
+
+struct LongShortRatio5mBatchRow {
+    ts_event: DateTime<Utc>,
+    ts_recv: DateTime<Utc>,
+    ts_bucket: DateTime<Utc>,
+    market: String,
+    symbol: String,
+    source_kind: String,
+    stream_name: String,
+    ratio_type: String,
+    long_short_ratio: f64,
+    long_account_ratio: Option<f64>,
+    short_account_ratio: Option<f64>,
+    payload_json: Value,
+}
+
+impl LongShortRatio5mBatchRow {
+    fn from_event(event: &NormalizedMdEvent) -> Result<Self> {
+        let d = &event.data;
+        Ok(Self {
+            ts_event: event.event_ts,
+            ts_recv: parse_ts(d, "ts_recv")?,
+            ts_bucket: parse_ts(d, "ts_bucket")?,
+            market: event.market.clone(),
+            symbol: event.symbol.clone(),
+            source_kind: event.source_kind.clone(),
+            stream_name: required_str(d, "stream_name")?,
+            ratio_type: required_str(d, "ratio_type")?,
+            long_short_ratio: required_f64(d, "long_short_ratio")?,
+            long_account_ratio: optional_f64(d, "long_account_ratio"),
+            short_account_ratio: optional_f64(d, "short_account_ratio"),
+            payload_json: payload_json(d),
+        })
+    }
+}
+
+struct OptionMarkGreeks5mBatchRow {
+    ts_event: DateTime<Utc>,
+    ts_recv: DateTime<Utc>,
+    ts_bucket: DateTime<Utc>,
+    market: String,
+    symbol: String,
+    option_symbol: String,
+    underlying_asset: String,
+    source_kind: String,
+    stream_name: String,
+    expiry_ts: DateTime<Utc>,
+    strike_price: f64,
+    contract_side: String,
+    unit: Option<f64>,
+    index_price: Option<f64>,
+    mark_price: Option<f64>,
+    bid_iv: Option<f64>,
+    ask_iv: Option<f64>,
+    mark_iv: Option<f64>,
+    delta: Option<f64>,
+    gamma: Option<f64>,
+    vega: Option<f64>,
+    theta: Option<f64>,
+    risk_free_interest: Option<f64>,
+    payload_json: Value,
+}
+
+impl OptionMarkGreeks5mBatchRow {
+    fn from_event(event: &NormalizedMdEvent) -> Result<Self> {
+        let d = &event.data;
+        Ok(Self {
+            ts_event: event.event_ts,
+            ts_recv: parse_ts(d, "ts_recv")?,
+            ts_bucket: parse_ts(d, "ts_bucket")?,
+            market: event.market.clone(),
+            symbol: event.symbol.clone(),
+            option_symbol: required_str(d, "option_symbol")?,
+            underlying_asset: required_str(d, "underlying_asset")?,
+            source_kind: event.source_kind.clone(),
+            stream_name: required_str(d, "stream_name")?,
+            expiry_ts: parse_ts(d, "expiry_ts")?,
+            strike_price: required_f64(d, "strike_price")?,
+            contract_side: required_str(d, "contract_side")?,
+            unit: optional_f64(d, "unit"),
+            index_price: optional_f64(d, "index_price"),
+            mark_price: optional_f64(d, "mark_price"),
+            bid_iv: optional_f64(d, "bid_iv"),
+            ask_iv: optional_f64(d, "ask_iv"),
+            mark_iv: optional_f64(d, "mark_iv"),
+            delta: optional_f64(d, "delta"),
+            gamma: optional_f64(d, "gamma"),
+            vega: optional_f64(d, "vega"),
+            theta: optional_f64(d, "theta"),
+            risk_free_interest: optional_f64(d, "risk_free_interest"),
+            payload_json: payload_json(d),
+        })
+    }
+}
+
 struct KlineBatchRow {
     open_time: DateTime<Utc>,
     close_time: DateTime<Utc>,
@@ -1732,6 +2175,7 @@ struct AggOrderbook1mBatchRow {
 impl AggOrderbook1mBatchRow {
     fn from_event(event: &NormalizedMdEvent) -> Result<Self> {
         let d = &event.data;
+        let compacted = compact_orderbook_heatmap_for_db(d)?;
         Ok(Self {
             ts_event: event.event_ts,
             ts_bucket: parse_ts(d, "ts_bucket")?,
@@ -1758,8 +2202,8 @@ impl AggOrderbook1mBatchRow {
             microprice_adj_sum: required_f64(d, "microprice_adj_sum")?,
             ofi_sum: required_f64(d, "ofi_sum")?,
             obi_k_dw_close: optional_f64(d, "obi_k_dw_close"),
-            heatmap_levels: required_value(d, "heatmap_levels")?,
-            payload_json: payload_json(d),
+            heatmap_levels: compacted.heatmap_levels,
+            payload_json: compacted.payload_json,
         })
     }
 }
@@ -1990,6 +2434,201 @@ fn payload_json(value: &Value) -> Value {
         .unwrap_or_else(|| Value::Object(Default::default()))
 }
 
+#[derive(Debug, Clone)]
+struct CompactOrderbookDbPayload {
+    heatmap_levels: Value,
+    payload_json: Value,
+}
+
+#[derive(Debug, Clone)]
+struct HeatmapLevelCompact {
+    price: f64,
+    bid_liquidity: f64,
+    ask_liquidity: f64,
+}
+
+impl HeatmapLevelCompact {
+    fn total(&self) -> f64 {
+        self.bid_liquidity + self.ask_liquidity
+    }
+
+    fn abs_net(&self) -> f64 {
+        (self.bid_liquidity - self.ask_liquidity).abs()
+    }
+}
+
+fn compact_orderbook_heatmap_for_db(data: &Value) -> Result<CompactOrderbookDbPayload> {
+    let payload_json = payload_json(data);
+    let levels_value = required_value(data, "heatmap_levels")?;
+    let levels = parse_heatmap_levels_compact(&levels_value)?;
+    let total_levels = levels.len();
+
+    if total_levels <= ORDERBOOK_DB_HEATMAP_COMPACT_THRESHOLD {
+        let payload_json =
+            augment_orderbook_payload(payload_json, total_levels as i64, total_levels as i64);
+        return Ok(CompactOrderbookDbPayload {
+            heatmap_levels: levels_value,
+            payload_json,
+        });
+    }
+
+    let representative_mid = representative_orderbook_mid(data);
+    let compact_levels = select_compact_heatmap_levels(&levels, representative_mid);
+    let payload_json = augment_orderbook_payload(
+        payload_json,
+        total_levels as i64,
+        compact_levels.len() as i64,
+    );
+
+    Ok(CompactOrderbookDbPayload {
+        heatmap_levels: Value::Array(
+            compact_levels
+                .into_iter()
+                .map(|level| json!([level.price, level.bid_liquidity, level.ask_liquidity]))
+                .collect(),
+        ),
+        payload_json,
+    })
+}
+
+fn augment_orderbook_payload(
+    payload_json: Value,
+    heatmap_total_levels: i64,
+    heatmap_stored_levels: i64,
+) -> Value {
+    let mut payload_obj = match payload_json {
+        Value::Object(map) => map,
+        Value::Null => Map::new(),
+        other => {
+            let mut map = Map::new();
+            map.insert("raw_payload_json".to_string(), other);
+            map
+        }
+    };
+    payload_obj.insert(
+        "heatmap_total_levels".to_string(),
+        json!(heatmap_total_levels.max(0)),
+    );
+    payload_obj.insert(
+        "heatmap_stored_levels".to_string(),
+        json!(heatmap_stored_levels.max(0)),
+    );
+    payload_obj.insert(
+        "heatmap_db_compacted".to_string(),
+        json!(heatmap_stored_levels < heatmap_total_levels),
+    );
+    Value::Object(payload_obj)
+}
+
+fn representative_orderbook_mid(data: &Value) -> Option<f64> {
+    let sample_count = optional_i64(data, "sample_count").filter(|count| *count > 0)? as f64;
+    optional_f64(data, "microprice_kappa_sum")
+        .or_else(|| optional_f64(data, "microprice_sum"))
+        .or_else(|| optional_f64(data, "microprice_classic_sum"))
+        .or_else(|| optional_f64(data, "microprice_adj_sum"))
+        .map(|sum| sum / sample_count)
+        .filter(|mid| mid.is_finite() && *mid > 0.0)
+}
+
+fn parse_heatmap_levels_compact(value: &Value) -> Result<Vec<HeatmapLevelCompact>> {
+    let arr = value
+        .as_array()
+        .ok_or_else(|| anyhow!("heatmap_levels must be array"))?;
+    let mut out = Vec::with_capacity(arr.len());
+    for row in arr {
+        let level = row
+            .as_array()
+            .ok_or_else(|| anyhow!("heatmap level row must be [price,bid,ask]"))?;
+        if level.len() < 3 {
+            continue;
+        }
+        out.push(HeatmapLevelCompact {
+            price: to_f64(&level[0])?,
+            bid_liquidity: to_f64(&level[1])?,
+            ask_liquidity: to_f64(&level[2])?,
+        });
+    }
+    Ok(out)
+}
+
+fn select_compact_heatmap_levels(
+    levels: &[HeatmapLevelCompact],
+    representative_mid: Option<f64>,
+) -> Vec<HeatmapLevelCompact> {
+    let mut selected = HashSet::new();
+    collect_top_heatmap_indices(
+        levels,
+        &mut selected,
+        ORDERBOOK_DB_HEATMAP_TOP_TOTAL_LEVELS,
+        |level| level.total(),
+    );
+    collect_top_heatmap_indices(
+        levels,
+        &mut selected,
+        ORDERBOOK_DB_HEATMAP_TOP_ABS_NET_LEVELS,
+        |level| level.abs_net(),
+    );
+    collect_top_heatmap_indices(
+        levels,
+        &mut selected,
+        ORDERBOOK_DB_HEATMAP_TOP_BID_LEVELS,
+        |level| level.bid_liquidity,
+    );
+    collect_top_heatmap_indices(
+        levels,
+        &mut selected,
+        ORDERBOOK_DB_HEATMAP_TOP_ASK_LEVELS,
+        |level| level.ask_liquidity,
+    );
+
+    if let Some(mid) = representative_mid {
+        let mut indices = (0..levels.len()).collect::<Vec<_>>();
+        indices.sort_by(|left, right| {
+            let left_dist = (levels[*left].price - mid).abs();
+            let right_dist = (levels[*right].price - mid).abs();
+            left_dist
+                .partial_cmp(&right_dist)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        for idx in indices
+            .into_iter()
+            .take(ORDERBOOK_DB_HEATMAP_NEAR_MID_LEVELS)
+        {
+            selected.insert(idx);
+        }
+    }
+
+    let mut compact = selected
+        .into_iter()
+        .map(|idx| levels[idx].clone())
+        .collect::<Vec<_>>();
+    compact.sort_by(|left, right| {
+        left.price
+            .partial_cmp(&right.price)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    compact
+}
+
+fn collect_top_heatmap_indices<F>(
+    levels: &[HeatmapLevelCompact],
+    selected: &mut HashSet<usize>,
+    take: usize,
+    score: F,
+) where
+    F: Fn(&HeatmapLevelCompact) -> f64,
+{
+    let mut indices = (0..levels.len()).collect::<Vec<_>>();
+    indices.sort_by(|left, right| {
+        score(&levels[*right])
+            .partial_cmp(&score(&levels[*left]))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    for idx in indices.into_iter().take(take) {
+        selected.insert(idx);
+    }
+}
+
 fn to_f64(value: &Value) -> Result<f64> {
     match value {
         Value::String(s) => s
@@ -2005,7 +2644,7 @@ fn to_f64(value: &Value) -> Result<f64> {
 
 #[cfg(test)]
 mod tests {
-    use super::should_write_kline_hotpath;
+    use super::{compact_orderbook_heatmap_for_db, should_write_kline_hotpath};
     use serde_json::json;
 
     #[test]
@@ -2024,5 +2663,65 @@ mod tests {
             "interval_code": "5m",
             "is_closed": true
         })));
+    }
+
+    #[test]
+    fn compacts_large_orderbook_heatmap_for_db() {
+        let levels = (0..1024)
+            .map(|idx| {
+                let price = 100_000.0 + idx as f64 * 0.1;
+                let bid = if idx % 2 == 0 {
+                    (1024 - idx) as f64
+                } else {
+                    0.0
+                };
+                let ask = if idx % 2 == 1 { (idx + 1) as f64 } else { 0.0 };
+                json!([price, bid, ask])
+            })
+            .collect::<Vec<_>>();
+        let payload = json!({
+            "sample_count": 60,
+            "microprice_kappa_sum": 6_000_000.0,
+            "heatmap_levels": levels,
+            "payload_json": {
+                "agg_mode": "canonical_1m"
+            }
+        });
+
+        let compacted = compact_orderbook_heatmap_for_db(&payload).expect("compact orderbook");
+        let stored = compacted
+            .heatmap_levels
+            .as_array()
+            .expect("stored heatmap levels array");
+        assert!(stored.len() < 256);
+        assert_eq!(compacted.payload_json["heatmap_total_levels"], json!(1024));
+        assert_eq!(compacted.payload_json["heatmap_db_compacted"], json!(true));
+        assert_eq!(
+            compacted.payload_json["heatmap_stored_levels"],
+            json!(stored.len())
+        );
+    }
+
+    #[test]
+    fn keeps_small_orderbook_heatmap_uncompacted_for_db() {
+        let payload = json!({
+            "sample_count": 10,
+            "microprice_sum": 1000.0,
+            "heatmap_levels": [
+                [100.0, 8.0, 2.0],
+                [101.0, 1.0, 9.0]
+            ],
+            "payload_json": {}
+        });
+
+        let compacted = compact_orderbook_heatmap_for_db(&payload).expect("compact orderbook");
+        let stored = compacted
+            .heatmap_levels
+            .as_array()
+            .expect("stored heatmap levels array");
+        assert_eq!(stored.len(), 2);
+        assert_eq!(compacted.payload_json["heatmap_total_levels"], json!(2));
+        assert_eq!(compacted.payload_json["heatmap_stored_levels"], json!(2));
+        assert_eq!(compacted.payload_json["heatmap_db_compacted"], json!(false));
     }
 }

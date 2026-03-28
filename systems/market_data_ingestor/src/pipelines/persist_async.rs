@@ -59,6 +59,10 @@ const PERSIST_TRADE_CHANNEL_CAPACITY: usize = 2_000;
 const PERSIST_NON_TRADE_CHANNEL_CAPACITY: usize = 20_000;
 const PERSIST_PENDING_WARN_STEP: usize = 20_000;
 const PERSIST_EVENT_LAG_WARN_SECS: i64 = 10;
+// Binance 5m OI / ratio buckets are intentionally allowed to arrive after the
+// bucket close; docs/指标v2.md defines them as late sidecar inputs that must not
+// be judged on a 10-second SLA.
+const PERSIST_OI_RATIO_EVENT_LAG_WARN_SECS: i64 = 6 * 60;
 const PERSIST_OPTION_MARK_EVENT_LAG_WARN_SECS: i64 = 30;
 const CHECKPOINT_FLUSH_INTERVAL_MS: u64 = 10_000;
 const CHECKPOINT_FLUSH_SLOW_WARN_MS: u128 = 5_000;
@@ -2470,7 +2474,10 @@ fn is_raw_orderbook_msg(msg_type: &str) -> bool {
 }
 
 fn is_funding_mark_critical_msg(msg_type: &str) -> bool {
-    matches!(msg_type, "md.mark_price" | "md.funding_rate")
+    matches!(
+        msg_type,
+        "md.mark_price" | "md.funding_rate" | "md.open_interest_current"
+    )
 }
 
 fn is_options_surface_msg(msg_type: &str) -> bool {
@@ -2590,6 +2597,12 @@ fn emit_lag_log(market: &'static str, shard_id: usize, job: &PersistJob) {
 }
 
 fn event_lag_warn_threshold_secs(msg_type: &str) -> i64 {
+    if matches!(
+        msg_type,
+        "md.open_interest_hist_5m" | "md.long_short_ratio_5m"
+    ) {
+        return PERSIST_OI_RATIO_EVENT_LAG_WARN_SECS;
+    }
     if msg_type == "md.option_mark_greeks_5m" {
         return PERSIST_OPTION_MARK_EVENT_LAG_WARN_SECS;
     }
@@ -3505,8 +3518,10 @@ fn is_hot_path_md_event(event: &NormalizedMdEvent) -> bool {
 mod tests {
     use super::{
         apply_trade_raw_event, build_option_lag_summaries, classify_persist_lane,
-        collect_db_passthrough_events, collect_publish_passthrough_events, PersistJob, PersistLane,
-        TradeSecondChunk, TradeVpinState,
+        collect_db_passthrough_events, collect_publish_passthrough_events,
+        event_lag_warn_threshold_secs, PersistJob, PersistLane, TradeSecondChunk, TradeVpinState,
+        PERSIST_EVENT_LAG_WARN_SECS, PERSIST_OI_RATIO_EVENT_LAG_WARN_SECS,
+        PERSIST_OPTION_MARK_EVENT_LAG_WARN_SECS,
     };
     use crate::normalize::NormalizedMdEvent;
     use chrono::{TimeZone, Utc};
@@ -3679,9 +3694,24 @@ mod tests {
             event_ts: ts,
             data: json!({}),
         };
+        let oi_current = NormalizedMdEvent {
+            msg_type: "md.open_interest_current".to_string(),
+            market: "futures".to_string(),
+            symbol: "ETHUSDT".to_string(),
+            source_kind: "rest".to_string(),
+            backfill_in_progress: false,
+            routing_key: "md.futures.open_interest.current.ethusdt".to_string(),
+            stream_name: "fapi/v1/openInterest".to_string(),
+            event_ts: ts,
+            data: json!({}),
+        };
 
         assert_eq!(
             classify_persist_lane(&mark),
+            PersistLane::NonTradeFundingMark
+        );
+        assert_eq!(
+            classify_persist_lane(&oi_current),
             PersistLane::NonTradeFundingMark
         );
         assert_eq!(
@@ -3728,5 +3758,25 @@ mod tests {
         assert_eq!(summaries[0].contracts_in_bucket, 2);
         assert_eq!(summaries[0].event_lag_secs, 40);
         assert!(summaries[0].max_queue_wait_ms >= 50);
+    }
+
+    #[test]
+    fn oi_ratio_events_use_late_bucket_threshold() {
+        assert_eq!(
+            event_lag_warn_threshold_secs("md.open_interest_hist_5m"),
+            PERSIST_OI_RATIO_EVENT_LAG_WARN_SECS
+        );
+        assert_eq!(
+            event_lag_warn_threshold_secs("md.long_short_ratio_5m"),
+            PERSIST_OI_RATIO_EVENT_LAG_WARN_SECS
+        );
+        assert_eq!(
+            event_lag_warn_threshold_secs("md.option_mark_greeks_5m"),
+            PERSIST_OPTION_MARK_EVENT_LAG_WARN_SECS
+        );
+        assert_eq!(
+            event_lag_warn_threshold_secs("md.trade"),
+            PERSIST_EVENT_LAG_WARN_SECS
+        );
     }
 }

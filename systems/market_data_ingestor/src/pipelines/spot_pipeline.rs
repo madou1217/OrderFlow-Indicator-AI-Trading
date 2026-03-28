@@ -12,6 +12,10 @@ use crate::pipelines::persist_async::{
     mirror_raw_event_to_cold_store, persist_event, try_enqueue_registered_persist_event,
     AsyncPersistQueue,
 };
+use crate::pipelines::source_lag::{
+    SourceLagTracker, SOURCE_LAG_FORCE_RECONNECT_DWELL_SECS, SOURCE_LAG_FORCE_RECONNECT_SECS,
+    SOURCE_LAG_WARN_SECS,
+};
 use crate::pipelines::ws_preagg::WsOneSecondPreAggregator;
 use crate::sinks::{
     md_db_writer::MdDbWriter, mq_publisher::MqPublisher, ops_db_writer::OpsDbWriter,
@@ -43,10 +47,6 @@ const WS_PERSIST_QUEUE_CONGESTED_THRESHOLD: usize = 4_000;
 const WS_PRE_ENQUEUE_CONFLATION_ENABLED: bool = false;
 const WS_PRE_ENQUEUE_CONFLATION_MS: i64 = 100;
 const WS_PRE_ENQUEUE_SUPPRESS_LOG_EVERY: u64 = 10_000;
-const SOURCE_LAG_WARN_SECS: i64 = 5;
-const SOURCE_LAG_FORCE_RECONNECT_SECS: i64 = 20;
-const SOURCE_LAG_FORCE_RECONNECT_STREAK: u64 = 200;
-const SOURCE_LAG_LOG_EVERY: u64 = 100;
 const KLINE_GAP_WORKER_QUEUE_CAPACITY: usize = 1024;
 const BACKFILL_TRADE_THROTTLE: BackfillThrottleConfig = BackfillThrottleConfig {
     max_events_per_sec: 180,
@@ -483,8 +483,7 @@ pub async fn run(
         stats_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
         stats_interval.tick().await;
         let mut last_recv_at = Instant::now();
-        let mut stale_source_streak: u64 = 0;
-        let mut stale_source_seen: u64 = 0;
+        let mut source_lag_tracker = SourceLagTracker::default();
         let mut ws_read_total: u64 = 0;
         let mut ws_drop_total: u64 = 0;
         let mut ws_read_per_sec: u64 = 0;
@@ -504,9 +503,11 @@ pub async fn run(
                     let persist_queue_pending = persist_queue.pending();
                     let persist_trade_pending = persist_queue.trade_pending();
                     let persist_non_trade_pending = persist_queue.non_trade_pending();
+                    let stale_source_streak = source_lag_tracker.stale_source_streak();
+                    let stale_source_seen = source_lag_tracker.stale_source_seen();
                     metrics.set_queue_lag(persist_queue_pending as i64);
                     if ws_drop_per_sec > 0
-                        || stale_source_streak > 0
+                        || source_lag_tracker.has_logged_stale()
                         || persist_queue_pending >= WS_PERSIST_QUEUE_CONGESTED_THRESHOLD
                     {
                         warn!(
@@ -593,52 +594,50 @@ pub async fn run(
                     };
 
                     let source_lag_secs = (Utc::now() - event.event_ts).num_seconds();
-                    let mut force_reconnect_after_event = false;
-                    if !event.backfill_in_progress && source_lag_secs > SOURCE_LAG_WARN_SECS {
-                        stale_source_streak = stale_source_streak.saturating_add(1);
-                        stale_source_seen = stale_source_seen.saturating_add(1);
+                    let observation =
+                        source_lag_tracker.observe(source_lag_secs, event.backfill_in_progress);
+                    let force_reconnect_after_event = observation.force_reconnect;
+                    if observation.source_lag_secs > SOURCE_LAG_WARN_SECS {
                         ws_source_lag_per_sec = ws_source_lag_per_sec.saturating_add(1);
-                        if stale_source_streak == 1
-                            || stale_source_streak % SOURCE_LAG_LOG_EVERY == 0
-                        {
-                            warn!(
-                                market = %event.market,
-                                symbol = %event.symbol,
-                                msg_type = %event.msg_type,
-                                stream_name = %event.stream_name,
-                                source_kind = %event.source_kind,
-                                source_lag_secs = source_lag_secs,
-                                stale_source_streak = stale_source_streak,
-                                stale_source_seen = stale_source_seen,
-                                event_ts = %event.event_ts,
-                                now_ts = %Utc::now(),
-                                "source lag before persist"
-                            );
-                        }
-                        if source_lag_secs >= SOURCE_LAG_FORCE_RECONNECT_SECS
-                            && stale_source_streak >= SOURCE_LAG_FORCE_RECONNECT_STREAK
-                        {
-                            force_reconnect_after_event = true;
-                            warn!(
-                                market = %event.market,
-                                symbol = %event.symbol,
-                                source_lag_secs = source_lag_secs,
-                                stale_source_streak = stale_source_streak,
-                                stale_source_seen = stale_source_seen,
-                                force_reconnect_after_secs = SOURCE_LAG_FORCE_RECONNECT_SECS,
-                                "stale ws source detected, schedule reconnect after current event persistence"
-                            );
-                        }
-                    } else if stale_source_streak > 0 {
+                    }
+                    if observation.log_stale {
+                        warn!(
+                            market = %event.market,
+                            symbol = %event.symbol,
+                            msg_type = %event.msg_type,
+                            stream_name = %event.stream_name,
+                            source_kind = %event.source_kind,
+                            source_lag_secs = observation.source_lag_secs,
+                            stale_source_streak = observation.stale_source_streak,
+                            stale_source_seen = observation.stale_source_seen,
+                            stale_for_ms = observation.stale_duration_ms,
+                            event_ts = %event.event_ts,
+                            now_ts = %Utc::now(),
+                            "source lag before persist"
+                        );
+                    }
+                    if observation.force_reconnect {
+                        warn!(
+                            market = %event.market,
+                            symbol = %event.symbol,
+                            source_lag_secs = observation.source_lag_secs,
+                            stale_source_streak = observation.stale_source_streak,
+                            stale_source_seen = observation.stale_source_seen,
+                            stale_for_ms = observation.stale_duration_ms,
+                            force_reconnect_after_secs = SOURCE_LAG_FORCE_RECONNECT_SECS,
+                            force_reconnect_after_dwell_secs = SOURCE_LAG_FORCE_RECONNECT_DWELL_SECS,
+                            "stale ws source detected, schedule reconnect after current event persistence"
+                        );
+                    } else if observation.log_recovered {
                         info!(
                             market = %event.market,
                             symbol = %event.symbol,
-                            recovered_source_lag_secs = source_lag_secs,
-                            stale_source_seen = stale_source_seen,
+                            recovered_source_lag_secs = observation.source_lag_secs,
+                            stale_source_streak = observation.stale_source_streak,
+                            stale_source_seen = observation.stale_source_seen,
+                            stale_for_ms = observation.stale_duration_ms,
                             "ws source lag recovered"
                         );
-                        stale_source_streak = 0;
-                        stale_source_seen = 0;
                     }
 
                     handle_trade_gap(
@@ -745,7 +744,7 @@ pub async fn run(
             reconnect_reason = reconnect_reason,
             ws_read_total = ws_read_total,
             ws_drop_total = ws_drop_total,
-            stale_source_seen = stale_source_seen,
+            stale_source_seen = source_lag_tracker.stale_source_seen(),
             reconnect_attempt = reconnect_attempt,
             backoff_secs = sleep_for.as_secs(),
             "websocket reconnect scheduled"

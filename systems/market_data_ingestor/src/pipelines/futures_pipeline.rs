@@ -14,6 +14,10 @@ use crate::pipelines::persist_async::{
     mirror_raw_event_to_cold_store, persist_event, try_enqueue_registered_persist_event,
     AsyncPersistQueue,
 };
+use crate::pipelines::source_lag::{
+    SourceLagTracker, SOURCE_LAG_FORCE_RECONNECT_DWELL_SECS, SOURCE_LAG_FORCE_RECONNECT_SECS,
+    SOURCE_LAG_WARN_SECS,
+};
 use crate::pipelines::ws_preagg::WsOneSecondPreAggregator;
 use crate::sinks::{
     md_db_writer::MdDbWriter, mq_publisher::MqPublisher, ops_db_writer::OpsDbWriter,
@@ -45,17 +49,6 @@ const WS_PERSIST_QUEUE_CONGESTED_THRESHOLD: usize = 10_000;
 const WS_PRE_ENQUEUE_CONFLATION_ENABLED: bool = false;
 const WS_PRE_ENQUEUE_CONFLATION_MS: i64 = 100;
 const WS_PRE_ENQUEUE_SUPPRESS_LOG_EVERY: u64 = 10_000;
-// Warn when a single event's exchange timestamp is more than 5 s behind wall
-// clock — this surfaces the kind of 14-15 s lag bursts seen in production
-// that previously went undetected (old threshold was 30 s).
-const SOURCE_LAG_WARN_SECS: i64 = 5;
-// Force a WS reconnect once the source has delivered stale events continuously
-// for this many seconds AND for this many consecutive events.  20 s matches
-// the ≤5 s real-time SLA with a small safety margin; the old value (120 s) was
-// far too permissive.
-const SOURCE_LAG_FORCE_RECONNECT_SECS: i64 = 20;
-const SOURCE_LAG_FORCE_RECONNECT_STREAK: u64 = 200;
-const SOURCE_LAG_LOG_EVERY: u64 = 100;
 const KLINE_GAP_WORKER_QUEUE_CAPACITY: usize = 1024;
 const BACKFILL_TRADE_THROTTLE: BackfillThrottleConfig = BackfillThrottleConfig {
     max_events_per_sec: 300,
@@ -504,8 +497,7 @@ pub async fn run(
         stats_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
         stats_interval.tick().await;
         let mut last_recv_at = Instant::now();
-        let mut stale_source_streak: u64 = 0;
-        let mut stale_source_seen: u64 = 0;
+        let mut source_lag_tracker = SourceLagTracker::default();
         let mut ws_read_total: u64 = 0;
         let mut ws_drop_total: u64 = 0;
         let mut ws_read_per_sec: u64 = 0;
@@ -525,9 +517,11 @@ pub async fn run(
                     let persist_queue_pending = persist_queue.pending();
                     let persist_trade_pending = persist_queue.trade_pending();
                     let persist_non_trade_pending = persist_queue.non_trade_pending();
+                    let stale_source_streak = source_lag_tracker.stale_source_streak();
+                    let stale_source_seen = source_lag_tracker.stale_source_seen();
                     metrics.set_queue_lag(persist_queue_pending as i64);
                     if ws_drop_per_sec > 0
-                        || stale_source_streak > 0
+                        || source_lag_tracker.has_logged_stale()
                         || persist_queue_pending >= WS_PERSIST_QUEUE_CONGESTED_THRESHOLD
                     {
                         warn!(
@@ -614,52 +608,50 @@ pub async fn run(
                     };
 
                     let source_lag_secs = (Utc::now() - event.event_ts).num_seconds();
-                    let mut force_reconnect_after_event = false;
-                    if !event.backfill_in_progress && source_lag_secs > SOURCE_LAG_WARN_SECS {
-                        stale_source_streak = stale_source_streak.saturating_add(1);
-                        stale_source_seen = stale_source_seen.saturating_add(1);
+                    let observation =
+                        source_lag_tracker.observe(source_lag_secs, event.backfill_in_progress);
+                    let force_reconnect_after_event = observation.force_reconnect;
+                    if observation.source_lag_secs > SOURCE_LAG_WARN_SECS {
                         ws_source_lag_per_sec = ws_source_lag_per_sec.saturating_add(1);
-                        if stale_source_streak == 1
-                            || stale_source_streak % SOURCE_LAG_LOG_EVERY == 0
-                        {
-                            warn!(
-                                market = %event.market,
-                                symbol = %event.symbol,
-                                msg_type = %event.msg_type,
-                                stream_name = %event.stream_name,
-                                source_kind = %event.source_kind,
-                                source_lag_secs = source_lag_secs,
-                                stale_source_streak = stale_source_streak,
-                                stale_source_seen = stale_source_seen,
-                                event_ts = %event.event_ts,
-                                now_ts = %Utc::now(),
-                                "source lag before persist"
-                            );
-                        }
-                        if source_lag_secs >= SOURCE_LAG_FORCE_RECONNECT_SECS
-                            && stale_source_streak >= SOURCE_LAG_FORCE_RECONNECT_STREAK
-                        {
-                            force_reconnect_after_event = true;
-                            warn!(
-                                market = %event.market,
-                                symbol = %event.symbol,
-                                source_lag_secs = source_lag_secs,
-                                stale_source_streak = stale_source_streak,
-                                stale_source_seen = stale_source_seen,
-                                force_reconnect_after_secs = SOURCE_LAG_FORCE_RECONNECT_SECS,
-                                "stale ws source detected, schedule reconnect after current event persistence"
-                            );
-                        }
-                    } else if stale_source_streak > 0 {
+                    }
+                    if observation.log_stale {
+                        warn!(
+                            market = %event.market,
+                            symbol = %event.symbol,
+                            msg_type = %event.msg_type,
+                            stream_name = %event.stream_name,
+                            source_kind = %event.source_kind,
+                            source_lag_secs = observation.source_lag_secs,
+                            stale_source_streak = observation.stale_source_streak,
+                            stale_source_seen = observation.stale_source_seen,
+                            stale_for_ms = observation.stale_duration_ms,
+                            event_ts = %event.event_ts,
+                            now_ts = %Utc::now(),
+                            "source lag before persist"
+                        );
+                    }
+                    if observation.force_reconnect {
+                        warn!(
+                            market = %event.market,
+                            symbol = %event.symbol,
+                            source_lag_secs = observation.source_lag_secs,
+                            stale_source_streak = observation.stale_source_streak,
+                            stale_source_seen = observation.stale_source_seen,
+                            stale_for_ms = observation.stale_duration_ms,
+                            force_reconnect_after_secs = SOURCE_LAG_FORCE_RECONNECT_SECS,
+                            force_reconnect_after_dwell_secs = SOURCE_LAG_FORCE_RECONNECT_DWELL_SECS,
+                            "stale ws source detected, schedule reconnect after current event persistence"
+                        );
+                    } else if observation.log_recovered {
                         info!(
                             market = %event.market,
                             symbol = %event.symbol,
-                            recovered_source_lag_secs = source_lag_secs,
-                            stale_source_seen = stale_source_seen,
+                            recovered_source_lag_secs = observation.source_lag_secs,
+                            stale_source_streak = observation.stale_source_streak,
+                            stale_source_seen = observation.stale_source_seen,
+                            stale_for_ms = observation.stale_duration_ms,
                             "ws source lag recovered"
                         );
-                        stale_source_streak = 0;
-                        stale_source_seen = 0;
                     }
 
                     handle_trade_gap(
@@ -766,7 +758,7 @@ pub async fn run(
             reconnect_reason = reconnect_reason,
             ws_read_total = ws_read_total,
             ws_drop_total = ws_drop_total,
-            stale_source_seen = stale_source_seen,
+            stale_source_seen = source_lag_tracker.stale_source_seen(),
             reconnect_attempt = reconnect_attempt,
             backoff_secs = sleep_for.as_secs(),
             "websocket reconnect scheduled"
@@ -1264,22 +1256,40 @@ async fn bootstrap_missing_kline_history(
 ) -> Result<()> {
     let mut bootstrap_intervals = Vec::new();
     for interval_code in KLINE_INTERVALS {
-        let canonical_rows: i64 = sqlx::query_scalar(
+        let Some(step_ms) = interval_ms(interval_code) else {
+            continue;
+        };
+        let recent_closed_open_times: Vec<DateTime<Utc>> = sqlx::query_scalar(
             r#"
-            SELECT COUNT(*)::bigint
+            SELECT open_time
             FROM md.kline_bar
             WHERE market = 'futures'::cfg.market_type
               AND symbol = $1
               AND interval_code = $2
               AND is_closed = true
+            ORDER BY open_time DESC
+            LIMIT $3
             "#,
         )
         .bind(symbol)
         .bind(interval_code)
-        .fetch_one(md_pool)
+        .bind(KLINE_STARTUP_BOOTSTRAP_BARS)
+        .fetch_all(md_pool)
         .await?;
+
+        if let Some(latest_open_time) = recent_closed_open_times.first() {
+            last_closed_kline_open_ms
+                .entry(interval_code.to_string())
+                .or_insert_with(|| latest_open_time.timestamp_millis());
+        }
+
         let has_checkpoint = last_closed_kline_open_ms.contains_key(interval_code);
-        if !has_checkpoint || canonical_rows < KLINE_STARTUP_BOOTSTRAP_BARS {
+        let has_recent_contiguous_history = has_contiguous_recent_kline_history(
+            &recent_closed_open_times,
+            step_ms,
+            KLINE_STARTUP_BOOTSTRAP_BARS as usize,
+        );
+        if !has_checkpoint || !has_recent_contiguous_history {
             bootstrap_intervals.push(interval_code);
         }
     }
@@ -1643,10 +1653,59 @@ fn last_closed_open_time_ms(step_ms: i64) -> i64 {
     current_open_ms.saturating_sub(step_ms)
 }
 
+fn has_contiguous_recent_kline_history(
+    open_times_desc: &[DateTime<Utc>],
+    step_ms: i64,
+    required_bars: usize,
+) -> bool {
+    if open_times_desc.len() < required_bars || step_ms <= 0 {
+        return false;
+    }
+
+    open_times_desc
+        .windows(2)
+        .take(required_bars.saturating_sub(1))
+        .all(|pair| {
+            pair[0]
+                .timestamp_millis()
+                .saturating_sub(pair[1].timestamp_millis())
+                == step_ms
+        })
+}
+
 fn parse_rfc3339(raw: Option<&str>) -> Option<DateTime<Utc>> {
     raw.and_then(|s| {
         DateTime::parse_from_rfc3339(s)
             .ok()
             .map(|dt| dt.with_timezone(&Utc))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::has_contiguous_recent_kline_history;
+    use chrono::{Duration, TimeZone, Utc};
+
+    #[test]
+    fn contiguous_recent_kline_history_requires_exact_spacing() {
+        let latest = Utc.with_ymd_and_hms(2026, 3, 28, 2, 30, 0).unwrap();
+        let open_times = (0..32)
+            .map(|offset| latest - Duration::minutes(offset))
+            .collect::<Vec<_>>();
+        assert!(has_contiguous_recent_kline_history(&open_times, 60_000, 32));
+    }
+
+    #[test]
+    fn contiguous_recent_kline_history_rejects_gaps() {
+        let latest = Utc.with_ymd_and_hms(2026, 3, 28, 2, 30, 0).unwrap();
+        let mut open_times = (0..32)
+            .map(|offset| latest - Duration::minutes(offset))
+            .collect::<Vec<_>>();
+        open_times[10] = open_times[10] - Duration::minutes(1);
+        assert!(!has_contiguous_recent_kline_history(
+            &open_times,
+            60_000,
+            32
+        ));
+    }
 }

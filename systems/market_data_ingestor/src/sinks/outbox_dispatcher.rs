@@ -27,20 +27,33 @@ const OUTBOX_PARTITION_PRECREATE_DAYS_AHEAD: i32 = 7;
 const OUTBOX_PARTITION_PRECREATE_DAYS_BACK: i32 = 2;
 const OUTBOX_BACKLOG_WARN_SECS: i64 = 30;
 const OUTBOX_BACKLOG_TOP_KEYS: usize = 8;
+const OUTBOX_DISPATCH_DRAIN_MAX_BATCHES: usize = 8;
+const OUTBOX_HOT_CLAIM_LOOKBACK_DAYS: i64 = 2;
+const OUTBOX_DISPATCH_STARTUP_PROTECTION_SECS: u64 = 180;
+const OUTBOX_DISPATCH_STARTUP_BATCH_SIZE: i64 = 256;
+const OUTBOX_PAYLOAD_FETCH_BATCH_SIZE: usize = 128;
+const OUTBOX_PAYLOAD_FETCH_STARTUP_BATCH_SIZE: usize = 64;
 
 #[derive(Clone)]
 pub struct OutboxDispatcher {
     pool: PgPool,
     mq: Arc<AmqpConnectionManager>,
     live_exchange_name: String,
+    replay_exchange_name: String,
 }
 
 impl OutboxDispatcher {
-    pub fn new(pool: PgPool, mq: Arc<AmqpConnectionManager>, live_exchange_name: String) -> Self {
+    pub fn new(
+        pool: PgPool,
+        mq: Arc<AmqpConnectionManager>,
+        live_exchange_name: String,
+        replay_exchange_name: String,
+    ) -> Self {
         Self {
             pool,
             mq,
             live_exchange_name,
+            replay_exchange_name,
         }
     }
 
@@ -49,6 +62,7 @@ impl OutboxDispatcher {
     }
 
     pub async fn run_loop_worker(&self, perform_housekeeping: bool) -> Result<()> {
+        let worker_started_at = Instant::now();
         let mut listener = PgListener::connect_with(&self.pool)
             .await
             .context("create outbox PgListener")?;
@@ -73,6 +87,10 @@ impl OutboxDispatcher {
             notify_channel = OUTBOX_NOTIFY_CHANNEL,
             notify_timeout_secs = OUTBOX_NOTIFY_TIMEOUT_SECS,
             batch_size = OUTBOX_DISPATCH_BATCH_SIZE,
+            startup_batch_size = OUTBOX_DISPATCH_STARTUP_BATCH_SIZE,
+            payload_fetch_batch_size = OUTBOX_PAYLOAD_FETCH_BATCH_SIZE,
+            startup_payload_fetch_batch_size = OUTBOX_PAYLOAD_FETCH_STARTUP_BATCH_SIZE,
+            drain_max_batches = OUTBOX_DISPATCH_DRAIN_MAX_BATCHES,
             housekeeping_interval_secs = OUTBOX_HOUSEKEEPING_INTERVAL_SECS,
             dead_retention_hours = OUTBOX_DEAD_RETENTION_HOURS,
             gc_batch_size = OUTBOX_GC_BATCH_SIZE,
@@ -98,8 +116,24 @@ impl OutboxDispatcher {
                 Err(_timeout) => { /* periodic fallback — dispatch anyway */ }
             }
 
-            if let Err(err) = self.dispatch_batch(OUTBOX_DISPATCH_BATCH_SIZE).await {
-                warn!(error = %err, debug_error = ?err, "outbox dispatch batch failed");
+            for _ in 0..OUTBOX_DISPATCH_DRAIN_MAX_BATCHES {
+                let dispatch_batch_size = effective_outbox_dispatch_batch_size(&worker_started_at);
+                let payload_fetch_batch_size =
+                    effective_outbox_payload_fetch_batch_size(&worker_started_at);
+                match self
+                    .dispatch_batch(dispatch_batch_size, payload_fetch_batch_size)
+                    .await
+                {
+                    Ok(dispatched) => {
+                        if dispatched < dispatch_batch_size as usize {
+                            break;
+                        }
+                    }
+                    Err(err) => {
+                        warn!(error = %err, debug_error = ?err, "outbox dispatch batch failed");
+                        break;
+                    }
+                }
             }
 
             if perform_housekeeping && Instant::now() >= next_housekeeping_at {
@@ -119,8 +153,16 @@ impl OutboxDispatcher {
         }
     }
 
-    async fn dispatch_batch(&self, batch_size: i64) -> Result<()> {
-        let rows = self.claim_batch(batch_size).await?;
+    async fn dispatch_batch(
+        &self,
+        batch_size: i64,
+        payload_fetch_batch_size: usize,
+    ) -> Result<usize> {
+        let claim_keys = self.claim_batch(batch_size).await?;
+        let claimed_count = claim_keys.len();
+        let rows = self
+            .load_claimed_rows(&claim_keys, payload_fetch_batch_size)
+            .await?;
         let mut sent_keys: Vec<(NaiveDate, i64)> = Vec::with_capacity(rows.len());
         let mut pending_confirms: Vec<(NaiveDate, i64, PublisherConfirm)> =
             Vec::with_capacity(rows.len());
@@ -222,10 +264,10 @@ impl OutboxDispatcher {
         }
 
         self.delete_sent_batch(&sent_keys).await?;
-        Ok(())
+        Ok(claimed_count)
     }
 
-    async fn claim_batch(&self, batch_size: i64) -> Result<Vec<OutboxRow>> {
+    async fn claim_batch(&self, batch_size: i64) -> Result<Vec<OutboxClaimKey>> {
         if batch_size <= 0 {
             return Ok(Vec::new());
         }
@@ -252,115 +294,212 @@ impl OutboxDispatcher {
         }
 
         let mut fallback = self
-            .claim_batch_tier(remaining, ClaimTier::FallbackAnyExchange)
+            .claim_batch_tier(remaining, ClaimTier::ReplayAny)
             .await?;
         claimed.append(&mut fallback);
 
         Ok(claimed)
     }
 
-    async fn claim_batch_tier(&self, batch_size: i64, tier: ClaimTier) -> Result<Vec<OutboxRow>> {
-        let (sql, context_text) = match tier {
-            ClaimTier::LiveTrade => (
-                r#"
-                WITH picked AS (
-                    SELECT bucket_date, outbox_id
-                    FROM ops.outbox_event
-                    WHERE status IN ('pending', 'failed', 'sending')
-                      AND available_at <= now()
-                      AND exchange_name = $2
-                      AND routing_key LIKE 'md.%.trade.%'
-                    ORDER BY available_at, outbox_id
-                    LIMIT $1
-                    FOR UPDATE SKIP LOCKED
-                )
-                UPDATE ops.outbox_event o
-                SET status = 'sending',
-                    available_at = now() + interval '30 seconds'
-                FROM picked
-                WHERE o.bucket_date = picked.bucket_date
-                  AND o.outbox_id = picked.outbox_id
-                RETURNING
-                    o.bucket_date,
-                    o.outbox_id,
-                    o.created_at,
-                    o.exchange_name,
-                    o.routing_key,
-                    o.message_id,
-                    o.headers_json,
-                    o.payload_json
-                "#,
-                "claim live trade outbox rows",
-            ),
-            ClaimTier::LiveNonTrade => (
-                r#"
-                WITH picked AS (
-                    SELECT bucket_date, outbox_id
-                    FROM ops.outbox_event
-                    WHERE status IN ('pending', 'failed', 'sending')
-                      AND available_at <= now()
-                      AND exchange_name = $2
-                      AND routing_key NOT LIKE 'md.%.trade.%'
-                    ORDER BY available_at, outbox_id
-                    LIMIT $1
-                    FOR UPDATE SKIP LOCKED
-                )
-                UPDATE ops.outbox_event o
-                SET status = 'sending',
-                    available_at = now() + interval '30 seconds'
-                FROM picked
-                WHERE o.bucket_date = picked.bucket_date
-                  AND o.outbox_id = picked.outbox_id
-                RETURNING
-                    o.bucket_date,
-                    o.outbox_id,
-                    o.created_at,
-                    o.exchange_name,
-                    o.routing_key,
-                    o.message_id,
-                    o.headers_json,
-                    o.payload_json
-                "#,
-                "claim live non-trade outbox rows",
-            ),
-            ClaimTier::FallbackAnyExchange => (
-                r#"
-                WITH picked AS (
-                    SELECT bucket_date, outbox_id
-                    FROM ops.outbox_event
-                    WHERE status IN ('pending', 'failed', 'sending')
-                      AND available_at <= now()
-                      AND exchange_name <> $2
-                    ORDER BY available_at, outbox_id
-                    LIMIT $1
-                    FOR UPDATE SKIP LOCKED
-                )
-                UPDATE ops.outbox_event o
-                SET status = 'sending',
-                    available_at = now() + interval '30 seconds'
-                FROM picked
-                WHERE o.bucket_date = picked.bucket_date
-                  AND o.outbox_id = picked.outbox_id
-                RETURNING
-                    o.bucket_date,
-                    o.outbox_id,
-                    o.created_at,
-                    o.exchange_name,
-                    o.routing_key,
-                    o.message_id,
-                    o.headers_json,
-                    o.payload_json
-                "#,
-                "claim fallback outbox rows",
-            ),
+    async fn claim_batch_tier(
+        &self,
+        batch_size: i64,
+        tier: ClaimTier,
+    ) -> Result<Vec<OutboxClaimKey>> {
+        let mut claimed = Vec::with_capacity(batch_size.max(0) as usize);
+        let mut remaining = batch_size.max(0);
+
+        for bucket_date in hot_claim_bucket_dates(Utc::now().date_naive()) {
+            if remaining <= 0 {
+                break;
+            }
+            let mut rows = self
+                .claim_batch_tier_for_bucket(remaining, tier, bucket_date)
+                .await?;
+            remaining -= rows.len() as i64;
+            claimed.append(&mut rows);
+        }
+
+        Ok(claimed)
+    }
+
+    async fn claim_batch_tier_for_bucket(
+        &self,
+        batch_size: i64,
+        tier: ClaimTier,
+        bucket_date: NaiveDate,
+    ) -> Result<Vec<OutboxClaimKey>> {
+        let context_text = match tier {
+            ClaimTier::LiveTrade => "claim live trade outbox rows",
+            ClaimTier::LiveNonTrade => "claim live non-trade outbox rows",
+            ClaimTier::ReplayAny => "claim replay outbox rows",
         };
 
-        sqlx::query_as(sql)
-            .bind(batch_size)
-            .bind(&self.live_exchange_name)
-            .fetch_all(&self.pool)
-            .await
-            .context(context_text)
+        let rows = match tier {
+            ClaimTier::LiveTrade => {
+                sqlx::query_as(
+                    r#"
+                    WITH picked AS (
+                        SELECT bucket_date, outbox_id
+                        FROM ops.outbox_event
+                        WHERE bucket_date = $2
+                          AND status IN ('pending', 'failed', 'sending')
+                          AND available_at <= now()
+                          AND exchange_name = $3
+                          AND routing_key LIKE 'md.%.trade.%'
+                        ORDER BY available_at, outbox_id
+                        LIMIT $1
+                        FOR UPDATE SKIP LOCKED
+                    )
+                    UPDATE ops.outbox_event o
+                    SET status = 'sending',
+                        available_at = now() + interval '30 seconds'
+                    FROM picked
+                    WHERE o.bucket_date = picked.bucket_date
+                      AND o.outbox_id = picked.outbox_id
+                    RETURNING
+                        o.bucket_date,
+                        o.outbox_id
+                    "#,
+                )
+                .bind(batch_size)
+                .bind(bucket_date)
+                .bind(&self.live_exchange_name)
+                .fetch_all(&self.pool)
+                .await
+            }
+            ClaimTier::LiveNonTrade => {
+                sqlx::query_as(
+                    r#"
+                    WITH picked AS (
+                        SELECT bucket_date, outbox_id
+                        FROM ops.outbox_event
+                        WHERE bucket_date = $2
+                          AND status IN ('pending', 'failed', 'sending')
+                          AND available_at <= now()
+                          AND exchange_name = $3
+                          AND routing_key NOT LIKE 'md.%.trade.%'
+                        ORDER BY available_at, outbox_id
+                        LIMIT $1
+                        FOR UPDATE SKIP LOCKED
+                    )
+                    UPDATE ops.outbox_event o
+                    SET status = 'sending',
+                        available_at = now() + interval '30 seconds'
+                    FROM picked
+                    WHERE o.bucket_date = picked.bucket_date
+                      AND o.outbox_id = picked.outbox_id
+                    RETURNING
+                        o.bucket_date,
+                        o.outbox_id
+                    "#,
+                )
+                .bind(batch_size)
+                .bind(bucket_date)
+                .bind(&self.live_exchange_name)
+                .fetch_all(&self.pool)
+                .await
+            }
+            ClaimTier::ReplayAny => {
+                sqlx::query_as(
+                    r#"
+                    WITH picked AS (
+                        SELECT bucket_date, outbox_id
+                        FROM ops.outbox_event
+                        WHERE bucket_date = $2
+                          AND status IN ('pending', 'failed', 'sending')
+                          AND available_at <= now()
+                          AND exchange_name = $3
+                        ORDER BY available_at, outbox_id
+                        LIMIT $1
+                        FOR UPDATE SKIP LOCKED
+                    )
+                    UPDATE ops.outbox_event o
+                    SET status = 'sending',
+                        available_at = now() + interval '30 seconds'
+                    FROM picked
+                    WHERE o.bucket_date = picked.bucket_date
+                      AND o.outbox_id = picked.outbox_id
+                    RETURNING
+                        o.bucket_date,
+                        o.outbox_id
+                    "#,
+                )
+                .bind(batch_size)
+                .bind(bucket_date)
+                .bind(&self.replay_exchange_name)
+                .fetch_all(&self.pool)
+                .await
+            }
+        };
+
+        rows.context(context_text)
+    }
+
+    async fn load_claimed_rows(
+        &self,
+        claim_keys: &[OutboxClaimKey],
+        payload_fetch_batch_size: usize,
+    ) -> Result<Vec<OutboxRow>> {
+        if claim_keys.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut rows = Vec::with_capacity(claim_keys.len());
+        for key_chunk in claim_keys.chunks(payload_fetch_batch_size.max(1)) {
+            let mut ids_by_bucket: HashMap<NaiveDate, Vec<i64>> = HashMap::new();
+            for key in key_chunk {
+                ids_by_bucket
+                    .entry(key.bucket_date)
+                    .or_default()
+                    .push(key.outbox_id);
+            }
+
+            let mut row_by_key: HashMap<(NaiveDate, i64), OutboxRow> =
+                HashMap::with_capacity(key_chunk.len());
+            for (bucket_date, outbox_ids) in ids_by_bucket {
+                let fetched_rows: Vec<OutboxRow> = sqlx::query_as(
+                    r#"
+                    SELECT
+                        bucket_date,
+                        outbox_id,
+                        created_at,
+                        exchange_name,
+                        routing_key,
+                        message_id,
+                        headers_json,
+                        payload_json
+                    FROM ops.outbox_event
+                    WHERE bucket_date = $1
+                      AND outbox_id = ANY($2::BIGINT[])
+                    "#,
+                )
+                .bind(bucket_date)
+                .bind(outbox_ids)
+                .fetch_all(&self.pool)
+                .await
+                .context("load claimed outbox payload rows")?;
+
+                for row in fetched_rows {
+                    row_by_key.insert((row.bucket_date, row.outbox_id), row);
+                }
+            }
+
+            for key in key_chunk {
+                let row = row_by_key
+                    .remove(&(key.bucket_date, key.outbox_id))
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "claimed outbox row disappeared bucket_date={} outbox_id={}",
+                            key.bucket_date,
+                            key.outbox_id
+                        )
+                    })?;
+                rows.push(row);
+            }
+        }
+
+        Ok(rows)
     }
 
     async fn publish_row(&self, channel: &Channel, row: &OutboxRow) -> Result<PublisherConfirm> {
@@ -403,26 +542,28 @@ impl OutboxDispatcher {
             return Ok(());
         }
 
-        let mut bucket_dates = Vec::with_capacity(outbox_keys.len());
-        let mut outbox_ids = Vec::with_capacity(outbox_keys.len());
+        let mut ids_by_bucket: HashMap<NaiveDate, Vec<i64>> = HashMap::new();
         for (bucket_date, outbox_id) in outbox_keys {
-            bucket_dates.push(*bucket_date);
-            outbox_ids.push(*outbox_id);
+            ids_by_bucket
+                .entry(*bucket_date)
+                .or_default()
+                .push(*outbox_id);
         }
 
-        sqlx::query(
-            r#"
-            DELETE FROM ops.outbox_event o
-            USING UNNEST($1::DATE[], $2::BIGINT[]) AS t(bucket_date, outbox_id)
-            WHERE o.bucket_date = t.bucket_date
-              AND o.outbox_id = t.outbox_id
-            "#,
-        )
-        .bind(bucket_dates)
-        .bind(outbox_ids)
-        .execute(&self.pool)
-        .await
-        .context("delete delivered outbox rows")?;
+        for (bucket_date, outbox_ids) in ids_by_bucket {
+            sqlx::query(
+                r#"
+                DELETE FROM ops.outbox_event
+                WHERE bucket_date = $1
+                  AND outbox_id = ANY($2::BIGINT[])
+                "#,
+            )
+            .bind(bucket_date)
+            .bind(outbox_ids)
+            .execute(&self.pool)
+            .await
+            .context("delete delivered outbox rows")?;
+        }
         Ok(())
     }
 
@@ -545,6 +686,12 @@ struct OutboxRow {
     payload_json: Value,
 }
 
+#[derive(Debug, Clone, Copy, FromRow)]
+struct OutboxClaimKey {
+    bucket_date: chrono::NaiveDate,
+    outbox_id: i64,
+}
+
 #[derive(Debug, Clone, Default)]
 struct OutboxBacklogStat {
     count: u64,
@@ -555,7 +702,7 @@ struct OutboxBacklogStat {
 enum ClaimTier {
     LiveTrade,
     LiveNonTrade,
-    FallbackAnyExchange,
+    ReplayAny,
 }
 
 fn json_to_field_table(raw: &Value) -> Result<FieldTable> {
@@ -599,4 +746,71 @@ fn is_undefined_function(err: &sqlx::Error, fn_name: &str) -> bool {
         }
     }
     false
+}
+
+fn hot_claim_bucket_dates(today: NaiveDate) -> Vec<NaiveDate> {
+    (0..=OUTBOX_HOT_CLAIM_LOOKBACK_DAYS)
+        .map(|offset| today - chrono::Duration::days(offset))
+        .collect()
+}
+
+fn effective_outbox_dispatch_batch_size(worker_started_at: &Instant) -> i64 {
+    if worker_started_at.elapsed() < Duration::from_secs(OUTBOX_DISPATCH_STARTUP_PROTECTION_SECS) {
+        OUTBOX_DISPATCH_STARTUP_BATCH_SIZE
+    } else {
+        OUTBOX_DISPATCH_BATCH_SIZE
+    }
+}
+
+fn effective_outbox_payload_fetch_batch_size(worker_started_at: &Instant) -> usize {
+    if worker_started_at.elapsed() < Duration::from_secs(OUTBOX_DISPATCH_STARTUP_PROTECTION_SECS) {
+        OUTBOX_PAYLOAD_FETCH_STARTUP_BATCH_SIZE
+    } else {
+        OUTBOX_PAYLOAD_FETCH_BATCH_SIZE
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        effective_outbox_dispatch_batch_size, effective_outbox_payload_fetch_batch_size,
+        hot_claim_bucket_dates, OUTBOX_DISPATCH_BATCH_SIZE, OUTBOX_DISPATCH_STARTUP_BATCH_SIZE,
+        OUTBOX_PAYLOAD_FETCH_BATCH_SIZE, OUTBOX_PAYLOAD_FETCH_STARTUP_BATCH_SIZE,
+    };
+    use chrono::NaiveDate;
+    use std::time::Duration;
+    use tokio::time::Instant;
+
+    #[test]
+    fn hot_claim_bucket_dates_prioritize_recent_partitions() {
+        let today = NaiveDate::from_ymd_opt(2026, 3, 28).unwrap();
+        let dates = hot_claim_bucket_dates(today);
+        assert_eq!(dates.len(), 3);
+        assert_eq!(dates[0], today);
+        assert_eq!(dates[1], NaiveDate::from_ymd_opt(2026, 3, 27).unwrap());
+        assert_eq!(dates[2], NaiveDate::from_ymd_opt(2026, 3, 26).unwrap());
+    }
+
+    #[test]
+    fn startup_batch_sizes_shrink_during_protection_window() {
+        let fresh = Instant::now();
+        assert_eq!(
+            effective_outbox_dispatch_batch_size(&fresh),
+            OUTBOX_DISPATCH_STARTUP_BATCH_SIZE
+        );
+        assert_eq!(
+            effective_outbox_payload_fetch_batch_size(&fresh),
+            OUTBOX_PAYLOAD_FETCH_STARTUP_BATCH_SIZE
+        );
+
+        let old = Instant::now() - Duration::from_secs(600);
+        assert_eq!(
+            effective_outbox_dispatch_batch_size(&old),
+            OUTBOX_DISPATCH_BATCH_SIZE
+        );
+        assert_eq!(
+            effective_outbox_payload_fetch_batch_size(&old),
+            OUTBOX_PAYLOAD_FETCH_BATCH_SIZE
+        );
+    }
 }

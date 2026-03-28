@@ -14,6 +14,9 @@ const OUTBOX_INSERT_WORKERS: usize = 3;
 const OUTBOX_INSERT_BATCH_SIZE: usize = 1_000;
 const OUTBOX_INSERT_CHANNEL_CAPACITY: usize = 100_000;
 const OUTBOX_INSERT_COALESCE_MS: u64 = 5;
+const OUTBOX_INSERT_STARTUP_PROTECTION_SECS: u64 = 180;
+const OUTBOX_INSERT_STARTUP_BATCH_SIZE: usize = 256;
+const OUTBOX_INSERT_STARTUP_BACKLOG_THRESHOLD: usize = 1_024;
 
 #[derive(Clone)]
 pub struct OutboxWriter {
@@ -31,6 +34,7 @@ impl OutboxWriter {
         info!(
             workers = OUTBOX_INSERT_WORKERS,
             batch_size = OUTBOX_INSERT_BATCH_SIZE,
+            startup_batch_size = OUTBOX_INSERT_STARTUP_BATCH_SIZE,
             channel_capacity = OUTBOX_INSERT_CHANNEL_CAPACITY,
             coalesce_ms = OUTBOX_INSERT_COALESCE_MS,
             "outbox writer batch insert worker started"
@@ -160,16 +164,21 @@ async fn run_insert_worker(
     worker_id: usize,
     mut receiver: mpsc::Receiver<PendingOutboxRecord>,
 ) {
+    let worker_started_at = Instant::now();
     loop {
         let Some(first) = receiver.recv().await else {
             break;
         };
 
-        let mut batch = Vec::with_capacity(OUTBOX_INSERT_BATCH_SIZE);
+        let target_batch_size = effective_outbox_insert_batch_size(
+            &worker_started_at,
+            receiver.len().saturating_add(1),
+        );
+        let mut batch = Vec::with_capacity(target_batch_size);
         batch.push(first);
 
         let deadline = Instant::now() + Duration::from_millis(OUTBOX_INSERT_COALESCE_MS);
-        while batch.len() < OUTBOX_INSERT_BATCH_SIZE {
+        while batch.len() < target_batch_size {
             let now = Instant::now();
             if now >= deadline {
                 break;
@@ -182,7 +191,7 @@ async fn run_insert_worker(
             }
         }
 
-        while batch.len() < OUTBOX_INSERT_BATCH_SIZE {
+        while batch.len() < target_batch_size {
             match receiver.try_recv() {
                 Ok(next) => batch.push(next),
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
@@ -244,4 +253,43 @@ async fn insert_outbox_batch(pool: &PgPool, batch: &[PendingOutboxRecord]) -> Re
         .context("insert ops.outbox_event batch")?;
 
     Ok(())
+}
+
+fn effective_outbox_insert_batch_size(worker_started_at: &Instant, queued_records: usize) -> usize {
+    if worker_started_at.elapsed() < Duration::from_secs(OUTBOX_INSERT_STARTUP_PROTECTION_SECS)
+        && queued_records >= OUTBOX_INSERT_STARTUP_BACKLOG_THRESHOLD
+    {
+        OUTBOX_INSERT_STARTUP_BATCH_SIZE
+    } else {
+        OUTBOX_INSERT_BATCH_SIZE
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        effective_outbox_insert_batch_size, OUTBOX_INSERT_BATCH_SIZE,
+        OUTBOX_INSERT_STARTUP_BACKLOG_THRESHOLD, OUTBOX_INSERT_STARTUP_BATCH_SIZE,
+    };
+    use std::time::Duration;
+    use tokio::time::Instant;
+
+    #[test]
+    fn insert_batch_size_shrinks_only_for_startup_backlog() {
+        let fresh = Instant::now();
+        assert_eq!(
+            effective_outbox_insert_batch_size(&fresh, OUTBOX_INSERT_STARTUP_BACKLOG_THRESHOLD),
+            OUTBOX_INSERT_STARTUP_BATCH_SIZE
+        );
+        assert_eq!(
+            effective_outbox_insert_batch_size(&fresh, 1),
+            OUTBOX_INSERT_BATCH_SIZE
+        );
+
+        let old = Instant::now() - Duration::from_secs(600);
+        assert_eq!(
+            effective_outbox_insert_batch_size(&old, OUTBOX_INSERT_STARTUP_BACKLOG_THRESHOLD),
+            OUTBOX_INSERT_BATCH_SIZE
+        );
+    }
 }
