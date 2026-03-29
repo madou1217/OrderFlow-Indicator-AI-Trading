@@ -66,7 +66,6 @@ EXACT_CHECK_NAMES = [
     "whale_trades.feature_1m",
 ]
 
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Randomly validate indicator output slices against source/feature tables."
@@ -161,7 +160,7 @@ def fetch_candidate_timestamps(
 def fetch_snapshot_payloads(dsn: str, symbol: str, ts: str) -> dict[str, Any]:
     sql = f"""
     SELECT indicator_code, payload_json::text
-    FROM feat.indicator_snapshot
+    FROM feat.v_indicator_snapshot_hydrated
     WHERE symbol = {sql_literal(symbol)}
       AND ts_snapshot = {sql_literal(ts)}
     ORDER BY indicator_code

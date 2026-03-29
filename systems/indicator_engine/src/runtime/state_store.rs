@@ -2,6 +2,8 @@ use crate::indicators::context::{
     LongShortRatioPoint, OpenInterestCurrentSidecar, OpenInterestHistPoint, OptionMarkGreeksPoint,
     OptionsSurfacePoint,
 };
+use crate::indicators::shared::funding::funding_change_json;
+use crate::indicators::shared::liquidation::build_recent_7d_entry as build_liquidation_recent_7d_entry;
 use crate::ingest::decoder::{
     AggFundingMark1mEvent, AggLiq1mEvent, AggOrderbook1mEvent, AggTrade1mEvent, AggVpinSnapshot,
     BboEvent, DepthDeltaEvent, EngineEvent, ForceOrderEvent, LongShortRatio5mEvent,
@@ -9,6 +11,7 @@ use crate::ingest::decoder::{
     OptionMarkGreeks5mEvent, OrderbookSnapshotEvent, TradeEvent,
 };
 use chrono::{DateTime, Duration, TimeZone, Utc};
+use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use tracing::debug;
 
@@ -283,8 +286,10 @@ pub struct WindowBundle {
     pub funding_points_in_window: Vec<LatestFundingState>,
     pub mark_points_in_window: Vec<LatestMarkState>,
     pub funding_changes_recent: Vec<FundingChange>,
+    pub funding_recent_7d_payload: Vec<Value>,
     pub funding_points_recent: Vec<LatestFundingState>,
     pub mark_points_recent: Vec<LatestMarkState>,
+    pub liquidation_recent_7d_payload: Vec<Value>,
     pub latest_common_oi_ratio_bucket: Option<DateTime<Utc>>,
     pub current_open_interest: Option<OpenInterestCurrentSidecar>,
     pub open_interest_hist_5m: Vec<OpenInterestHistPoint>,
@@ -301,6 +306,12 @@ struct CanonicalMinuteInputs {
     orderbook: Option<AggOrderbook1mEvent>,
     liq: Option<AggLiq1mEvent>,
     funding_mark: Option<AggFundingMark1mEvent>,
+}
+
+#[derive(Debug, Clone)]
+struct TimedJsonPayload {
+    ts: DateTime<Utc>,
+    payload_json: Value,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1239,8 +1250,10 @@ pub struct StateStore {
     latest_mark: Option<LatestMarkState>,
     latest_funding: Option<LatestFundingState>,
     funding_changes: VecDeque<FundingChange>,
+    funding_recent_7d_payload: VecDeque<TimedJsonPayload>,
     mark_timeline: VecDeque<LatestMarkState>,
     funding_timeline: VecDeque<LatestFundingState>,
+    liquidation_recent_7d_payload: VecDeque<TimedJsonPayload>,
     current_open_interest_timeline: VecDeque<OpenInterestCurrentSidecar>,
     open_interest_hist_5m: VecDeque<OpenInterestHistPoint>,
     global_account_ratio_5m: VecDeque<LongShortRatioPoint>,
@@ -1288,8 +1301,10 @@ impl StateStore {
             latest_mark: None,
             latest_funding: None,
             funding_changes: VecDeque::new(),
+            funding_recent_7d_payload: VecDeque::new(),
             mark_timeline: VecDeque::new(),
             funding_timeline: VecDeque::new(),
+            liquidation_recent_7d_payload: VecDeque::new(),
             current_open_interest_timeline: VecDeque::new(),
             open_interest_hist_5m: VecDeque::new(),
             global_account_ratio_5m: VecDeque::new(),
@@ -1327,8 +1342,10 @@ impl StateStore {
         self.latest_mark = None;
         self.latest_funding = None;
         self.funding_changes.clear();
+        self.funding_recent_7d_payload.clear();
         self.mark_timeline.clear();
         self.funding_timeline.clear();
+        self.liquidation_recent_7d_payload.clear();
         self.current_open_interest_timeline.clear();
         self.open_interest_hist_5m.clear();
         self.global_account_ratio_5m.clear();
@@ -1649,6 +1666,7 @@ impl StateStore {
         self.apply_canonical_funding_minute(ts_bucket);
         self.last_finalized_minute = Some(ts_bucket);
         self.trim_replay_retention(ts_bucket);
+        self.prune_recent_7d_payloads(ts_bucket);
         self.build_window_bundle(ts_bucket, futures, spot)
     }
 
@@ -1658,6 +1676,7 @@ impl StateStore {
         self.apply_canonical_funding_minute(ts_bucket);
         self.last_finalized_minute = Some(ts_bucket);
         self.trim_replay_retention(ts_bucket);
+        self.prune_recent_7d_payloads(ts_bucket);
     }
 
     /// Process at most `max_batch` dirty-recompute windows per call, yielding
@@ -1834,9 +1853,9 @@ impl StateStore {
 
         if market == MarketKind::Futures {
             self.cvd_futures = cvd_new;
-            self.history_futures.push_back(history);
+            self.push_futures_history(history);
             while self.history_futures.len() > HISTORY_LIMIT_MINUTES {
-                self.history_futures.pop_front();
+                self.pop_oldest_futures_history();
             }
             self.push_finalized_vpin_snapshot(market, ts_bucket);
         } else {
@@ -1849,6 +1868,53 @@ impl StateStore {
         }
 
         window
+    }
+
+    fn push_futures_history(&mut self, history: MinuteHistory) {
+        let ts_bucket = history.ts_bucket;
+        let payload_json = build_liquidation_recent_7d_entry(&history);
+        self.history_futures.push_back(history);
+        self.liquidation_recent_7d_payload
+            .push_back(TimedJsonPayload {
+                ts: ts_bucket,
+                payload_json,
+            });
+    }
+
+    fn pop_oldest_futures_history(&mut self) {
+        if let Some(removed) = self.history_futures.pop_front() {
+            if self
+                .liquidation_recent_7d_payload
+                .front()
+                .map(|row| row.ts == removed.ts_bucket)
+                .unwrap_or(false)
+            {
+                self.liquidation_recent_7d_payload.pop_front();
+            } else {
+                self.liquidation_recent_7d_payload
+                    .retain(|row| row.ts != removed.ts_bucket);
+            }
+        }
+    }
+
+    fn prune_recent_7d_payloads(&mut self, ts_bucket: DateTime<Utc>) {
+        let cutoff = (ts_bucket + Duration::minutes(1)) - Duration::days(7);
+        while self
+            .funding_recent_7d_payload
+            .front()
+            .map(|row| row.ts < cutoff)
+            .unwrap_or(false)
+        {
+            self.funding_recent_7d_payload.pop_front();
+        }
+        while self
+            .liquidation_recent_7d_payload
+            .front()
+            .map(|row| row.ts <= ts_bucket - Duration::days(7))
+            .unwrap_or(false)
+        {
+            self.liquidation_recent_7d_payload.pop_front();
+        }
     }
 
     fn bucket_mut(&mut self, market: MarketKind, ts_bucket: DateTime<Utc>) -> &mut MinuteBucket {
@@ -2332,8 +2398,18 @@ impl StateStore {
             funding_points_in_window,
             mark_points_in_window,
             funding_changes_recent: self.funding_changes.iter().cloned().collect(),
+            funding_recent_7d_payload: self
+                .funding_recent_7d_payload
+                .iter()
+                .map(|row| row.payload_json.clone())
+                .collect(),
             funding_points_recent: self.funding_timeline.iter().cloned().collect(),
             mark_points_recent: self.mark_timeline.iter().cloned().collect(),
+            liquidation_recent_7d_payload: self
+                .liquidation_recent_7d_payload
+                .iter()
+                .map(|row| row.payload_json.clone())
+                .collect(),
             latest_common_oi_ratio_bucket: oi_ratio_view.latest_common_bucket,
             current_open_interest: oi_ratio_view.current_open_interest,
             open_interest_hist_5m: oi_ratio_view.open_interest_hist_5m,
@@ -2374,8 +2450,20 @@ impl StateStore {
             funding_points_in_window: self.funding_points_between(ts_bucket, as_of_ts),
             mark_points_in_window: self.mark_points_between(ts_bucket, as_of_ts),
             funding_changes_recent: self.funding_changes_until(as_of_ts),
+            funding_recent_7d_payload: self
+                .funding_recent_7d_payload
+                .iter()
+                .filter(|row| row.ts < as_of_ts)
+                .map(|row| row.payload_json.clone())
+                .collect(),
             funding_points_recent: self.funding_points_until(as_of_ts),
             mark_points_recent: self.mark_points_until(as_of_ts),
+            liquidation_recent_7d_payload: self
+                .liquidation_recent_7d_payload
+                .iter()
+                .filter(|row| row.ts <= ts_bucket)
+                .map(|row| row.payload_json.clone())
+                .collect(),
             latest_common_oi_ratio_bucket: oi_ratio_view.latest_common_bucket,
             current_open_interest: oi_ratio_view.current_open_interest,
             open_interest_hist_5m: oi_ratio_view.open_interest_hist_5m,
@@ -2696,6 +2784,7 @@ impl StateStore {
             .unwrap_or(false)
         {
             self.history_futures.pop_back();
+            self.liquidation_recent_7d_payload.pop_back();
         }
         while self
             .history_spot
@@ -2763,6 +2852,7 @@ impl StateStore {
             .unwrap_or(false)
         {
             self.funding_changes.pop_back();
+            self.funding_recent_7d_payload.pop_back();
         }
 
         self.latest_mark = self.mark_timeline.back().cloned();
@@ -2800,15 +2890,23 @@ impl StateStore {
             .map(|p| (p - funding_rate).abs() > 1e-12)
             .unwrap_or(true);
         if changed {
-            self.funding_changes.push_back(FundingChange {
+            let change = FundingChange {
                 ts_change: change_ts,
                 prev,
                 new: funding_rate,
                 delta,
                 mark_price_at_change: mark_price,
+            };
+            self.funding_changes.push_back(change.clone());
+            self.funding_recent_7d_payload.push_back(TimedJsonPayload {
+                ts: change_ts,
+                payload_json: funding_change_json(&change),
             });
             while self.funding_changes.len() > HISTORY_LIMIT_MINUTES {
                 self.funding_changes.pop_front();
+            }
+            while self.funding_recent_7d_payload.len() > HISTORY_LIMIT_MINUTES {
+                self.funding_recent_7d_payload.pop_front();
             }
         }
     }
@@ -2919,11 +3017,40 @@ impl StateStore {
         self.top_account_ratio_5m = snap.top_account_ratio_5m.into_iter().collect();
         self.top_position_ratio_5m = snap.top_position_ratio_5m.into_iter().collect();
         self.option_mark_greeks_5m = snap.option_mark_greeks_5m.into_iter().collect();
+        self.rebuild_incremental_recent_7d_payloads();
         // CVD must be derived from history tail (not stored value) to ensure accuracy.
         self.cvd_futures = self.history_futures.back().map(|h| h.cvd).unwrap_or(0.0);
         self.cvd_spot = self.history_spot.back().map(|h| h.cvd).unwrap_or(0.0);
         // last_finalized_minute also derived from history tail.
         self.last_finalized_minute = self.history_futures.back().map(|h| h.ts_bucket);
+    }
+
+    fn rebuild_incremental_recent_7d_payloads(&mut self) {
+        self.funding_recent_7d_payload.clear();
+        for change in &self.funding_changes {
+            self.funding_recent_7d_payload.push_back(TimedJsonPayload {
+                ts: change.ts_change,
+                payload_json: funding_change_json(change),
+            });
+        }
+
+        self.liquidation_recent_7d_payload.clear();
+        for row in &self.history_futures {
+            self.liquidation_recent_7d_payload
+                .push_back(TimedJsonPayload {
+                    ts: row.ts_bucket,
+                    payload_json: build_liquidation_recent_7d_entry(row),
+                });
+        }
+
+        if let Some(ts_bucket) = self
+            .history_futures
+            .back()
+            .map(|row| row.ts_bucket)
+            .or(self.history_spot.back().map(|row| row.ts_bucket))
+        {
+            self.prune_recent_7d_payloads(ts_bucket);
+        }
     }
 }
 
@@ -3629,11 +3756,11 @@ fn collect_heatmap_levels(
 
 #[cfg(test)]
 mod tests {
-    use super::StateStore;
     use super::{
         aggregate_options_surface_bucket, choose_nearest_strike,
         OPTIONS_SURFACE_HISTORY_KEEP_5M_BUCKETS,
     };
+    use super::{minute_window_from_history_row, MinuteWindowData, StateStore};
     use crate::indicators::context::OptionMarkGreeksPoint;
     use crate::ingest::decoder::{
         AggFundingMark1mEvent, AggFundingPoint, AggHeatmapLevel, AggLiq1mEvent, AggLiqLevel,
@@ -5199,6 +5326,52 @@ mod tests {
                 .as_ref()
                 .map(|v| v.funding_rate),
             Some(-0.0020)
+        );
+    }
+
+    #[test]
+    fn recent_7d_payloads_round_trip_through_snapshot_restore() {
+        let mut store = StateStore::new("TESTUSDT".to_string(), 1_000.0);
+        let ts_1 = Utc.with_ymd_and_hms(2026, 3, 6, 6, 30, 0).single().unwrap();
+        let ts_2 = ts_1 + ChronoDuration::minutes(1);
+
+        store.ingest(agg_trade_event(ts_1, 2.0, 1.0, 0.20));
+        store.ingest(agg_liq_event(ts_1, 10.0));
+        store.ingest(agg_funding_mark_event(ts_1, 30, 2000.0, -0.0010));
+        store.finalize_minute(ts_1);
+
+        store.ingest(agg_trade_event(ts_2, 3.0, 1.0, 0.30));
+        store.ingest(agg_liq_event(ts_2, 25.0));
+        store.ingest(agg_funding_mark_event(ts_2, 30, 2010.0, -0.0020));
+        store.finalize_minute(ts_2);
+
+        let expected_history_row = store.history_futures.back().cloned().unwrap();
+        let expected_bundle = store.build_window_bundle(
+            ts_2,
+            minute_window_from_history_row(&expected_history_row),
+            MinuteWindowData::empty(MarketKind::Spot, ts_2),
+        );
+        assert_eq!(expected_bundle.funding_recent_7d_payload.len(), 2);
+        assert_eq!(expected_bundle.liquidation_recent_7d_payload.len(), 2);
+
+        let snapshot = store.extract_snapshot();
+        let mut restored = StateStore::new("TESTUSDT".to_string(), 1_000.0);
+        restored.restore_from_snapshot(snapshot);
+
+        let restored_history_row = restored.history_futures.back().cloned().unwrap();
+        let restored_bundle = restored.build_window_bundle(
+            ts_2,
+            minute_window_from_history_row(&restored_history_row),
+            MinuteWindowData::empty(MarketKind::Spot, ts_2),
+        );
+
+        assert_eq!(
+            restored_bundle.funding_recent_7d_payload,
+            expected_bundle.funding_recent_7d_payload
+        );
+        assert_eq!(
+            restored_bundle.liquidation_recent_7d_payload,
+            expected_bundle.liquidation_recent_7d_payload
         );
     }
 }

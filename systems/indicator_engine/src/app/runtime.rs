@@ -340,6 +340,10 @@ pub async fn run(ctx: AppContext) -> Result<()> {
 
     let feature_writer = FeatureWriter::new(ctx.db_pool.clone());
     let snapshot_writer = SnapshotWriter::new(ctx.db_pool.clone());
+    snapshot_writer
+        .ensure_schema()
+        .await
+        .context("ensure indicator snapshot blob schema")?;
     let level_writer = LevelWriter::new(ctx.db_pool.clone());
     let event_writer = EventWriter::new(ctx.db_pool.clone(), metrics.clone());
     let publisher = IndPublisher::new(

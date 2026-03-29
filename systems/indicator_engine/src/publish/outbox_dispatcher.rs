@@ -1,5 +1,6 @@
 use crate::app::bootstrap::AmqpConnectionManager;
 use crate::publish::ind_publisher::IndPublisher;
+use crate::storage::snapshot_writer::hydrate_snapshot_payload_values;
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use flate2::{write::GzEncoder, Compression};
@@ -378,7 +379,7 @@ impl OutboxDispatcher {
             return Ok(payload);
         }
 
-        let rows: Vec<SnapshotPayloadRow> = sqlx::query_as(
+        let mut rows: Vec<SnapshotPayloadRow> = sqlx::query_as(
             r#"
             SELECT indicator_code, window_code, payload_json
             FROM feat.indicator_snapshot
@@ -392,6 +393,15 @@ impl OutboxDispatcher {
         .fetch_all(&self.pool)
         .await
         .context("fetch snapshot rows for minute bundle rebuild")?;
+
+        let mut payloads = rows
+            .iter()
+            .map(|row| row.payload_json.clone())
+            .collect::<Vec<_>>();
+        hydrate_snapshot_payload_values(&self.pool, &mut payloads).await?;
+        for (row, payload_json) in rows.iter_mut().zip(payloads.into_iter()) {
+            row.payload_json = payload_json;
+        }
 
         if rows.is_empty() {
             return Err(anyhow!(

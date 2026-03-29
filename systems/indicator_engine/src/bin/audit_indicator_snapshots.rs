@@ -204,7 +204,7 @@ async fn load_stored_snapshots(
     let rows = sqlx::query(
         r#"
         SELECT ts_snapshot, indicator_code, window_code, payload_json
-        FROM feat.indicator_snapshot
+        FROM feat.v_indicator_snapshot_hydrated
         WHERE symbol = $1
           AND ts_snapshot >= $2
           AND ts_snapshot <= $3

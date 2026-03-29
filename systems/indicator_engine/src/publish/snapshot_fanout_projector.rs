@@ -1,6 +1,7 @@
 use crate::app::bootstrap::AmqpConnectionManager;
 use crate::publish::ind_publisher::IndPublisher;
 use crate::publish::outbox_dispatcher::{identity_json_publish_payload, publish_amqp_message};
+use crate::storage::snapshot_writer::hydrate_snapshot_payload_values;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use lapin::publisher_confirm::Confirmation;
@@ -149,7 +150,7 @@ impl SnapshotFanoutProjector {
         };
 
         let started_at = Instant::now();
-        let rows: Vec<SnapshotFanoutRow> = sqlx::query_as(
+        let mut rows: Vec<SnapshotFanoutRow> = sqlx::query_as(
             r#"
             SELECT ts_snapshot, indicator_code, window_code, payload_json
             FROM feat.indicator_snapshot
@@ -163,6 +164,15 @@ impl SnapshotFanoutProjector {
         .fetch_all(&self.pool)
         .await
         .with_context(|| format!("load snapshot fanout rows symbol={} ts={}", symbol, next_ts))?;
+
+        let mut payloads = rows
+            .iter()
+            .map(|row| row.payload_json.clone())
+            .collect::<Vec<_>>();
+        hydrate_snapshot_payload_values(&self.pool, &mut payloads).await?;
+        for (row, payload_json) in rows.iter_mut().zip(payloads.into_iter()) {
+            row.payload_json = payload_json;
+        }
 
         if rows.is_empty() {
             self.advance_progress(next_ts).await?;

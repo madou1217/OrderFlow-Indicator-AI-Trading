@@ -177,6 +177,8 @@ pub struct IndicatorSharedCaches {
     initiation_all_events: OnceLock<Arc<Vec<InitiationEventData>>>,
     exhaustion_all_events: OnceLock<Arc<Vec<ExhaustionEventData>>>,
     orderbook_depth_precomputed: OnceLock<Arc<OrderbookDepthPrecomputed>>,
+    funding_recent_7d_payload: OnceLock<Arc<Vec<Value>>>,
+    liquidation_recent_7d_payload: OnceLock<Arc<Vec<Value>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -285,6 +287,13 @@ impl IndicatorContext {
             .map(|point| point.ts_bucket)
             .or(bundle.latest_options_surface_bucket)
             .or(kline_history_supplement.latest_options_surface_bucket);
+        let shared_caches = Arc::new(IndicatorSharedCaches::default());
+        let _ = shared_caches
+            .funding_recent_7d_payload
+            .set(Arc::new(bundle.funding_recent_7d_payload.clone()));
+        let _ = shared_caches
+            .liquidation_recent_7d_payload
+            .set(Arc::new(bundle.liquidation_recent_7d_payload.clone()));
         Self {
             ts_bucket: bundle.ts_bucket,
             symbol: bundle.symbol.clone(),
@@ -357,7 +366,7 @@ impl IndicatorContext {
             divergence_bootstrap_block_len: options.divergence_bootstrap_block_len,
             divergence_p_value_threshold: options.divergence_p_value_threshold,
             window_codes: options.window_codes.clone(),
-            shared_caches: Arc::new(IndicatorSharedCaches::default()),
+            shared_caches,
         }
     }
 
@@ -407,6 +416,26 @@ impl IndicatorContext {
     {
         self.shared_caches
             .orderbook_depth_precomputed
+            .get_or_init(|| Arc::new(build(self)))
+            .clone()
+    }
+
+    pub(crate) fn funding_recent_7d_payload_or_init<F>(&self, build: F) -> Arc<Vec<Value>>
+    where
+        F: FnOnce(&IndicatorContext) -> Vec<Value>,
+    {
+        self.shared_caches
+            .funding_recent_7d_payload
+            .get_or_init(|| Arc::new(build(self)))
+            .clone()
+    }
+
+    pub(crate) fn liquidation_recent_7d_payload_or_init<F>(&self, build: F) -> Arc<Vec<Value>>
+    where
+        F: FnOnce(&IndicatorContext) -> Vec<Value>,
+    {
+        self.shared_caches
+            .liquidation_recent_7d_payload
             .get_or_init(|| Arc::new(build(self)))
             .clone()
     }

@@ -20,4 +20,5 @@ log = "0.4"
 uuid = { version = "1", features = ["v4", "v5", "serde"] }
 urlencoding = "2"
 flate2 = "1.0"
+sha2 = "0.10"
 market_data_ingestor = { path = "../market_data_ingestor" }

@@ -3,11 +3,17 @@ use crate::publish::ind_publisher::BundleOutboxMessage;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres, QueryBuilder, Transaction};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::Instant;
 use tracing::warn;
 
 const OUTBOX_PROGRESS_TX_WARN_MS: u128 = 1_000;
+const SNAPSHOT_BLOB_REF_KEY: &str = "__snapshot_blob_ref_v1";
+const SNAPSHOT_BLOB_CHUNKS_KEY: &str = "__snapshot_blob_chunks_v1";
+const SNAPSHOT_BLOB_MIN_BYTES: usize = 4 * 1024;
+const SNAPSHOT_BLOB_CHUNK_SIZE: usize = 256;
 
 #[derive(Clone)]
 pub struct SnapshotWriter {
@@ -21,9 +27,169 @@ struct SnapshotBundleRow {
     payload_json: Value,
 }
 
+#[derive(Debug, Clone)]
+struct SnapshotBlobSpec {
+    blob_hash: String,
+    payload_json: Value,
+}
+
+#[derive(sqlx::FromRow)]
+struct SnapshotBlobRow {
+    blob_hash: String,
+    payload_json: Value,
+}
+
 impl SnapshotWriter {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
+    }
+
+    pub async fn ensure_schema(&self) -> Result<()> {
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS feat.indicator_snapshot_blob (
+                blob_hash TEXT PRIMARY KEY,
+                payload_json JSONB NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("create feat.indicator_snapshot_blob")?;
+
+        sqlx::query(
+            r#"
+            ALTER TABLE feat.indicator_snapshot_blob
+            ADD COLUMN IF NOT EXISTS payload_json JSONB
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("ensure feat.indicator_snapshot_blob.payload_json column")?;
+
+        sqlx::query(
+            r#"
+            CREATE OR REPLACE FUNCTION feat.hydrate_indicator_snapshot_payload(payload jsonb)
+            RETURNS jsonb
+            LANGUAGE plpgsql
+            STABLE
+            AS $$
+            DECLARE
+                ref_meta jsonb;
+                chunk_meta jsonb;
+                blob_hash text;
+                hydrated jsonb;
+                child_key text;
+                child_value jsonb;
+                out_obj jsonb;
+                out_arr jsonb;
+            BEGIN
+                IF payload IS NULL THEN
+                    RETURN NULL;
+                END IF;
+
+                IF jsonb_typeof(payload) = 'object' THEN
+                    ref_meta := payload -> '__snapshot_blob_ref_v1';
+                    IF jsonb_typeof(ref_meta) = 'object' AND (ref_meta ? 'hash') THEN
+                        blob_hash := ref_meta ->> 'hash';
+                        SELECT b.payload_json
+                          INTO hydrated
+                          FROM feat.indicator_snapshot_blob b
+                         WHERE b.blob_hash = blob_hash;
+                        IF hydrated IS NULL THEN
+                            RAISE EXCEPTION 'missing indicator snapshot blob hash=%', blob_hash;
+                        END IF;
+                        RETURN feat.hydrate_indicator_snapshot_payload(hydrated);
+                    END IF;
+
+                    chunk_meta := payload -> '__snapshot_blob_chunks_v1';
+                    IF jsonb_typeof(chunk_meta) = 'object' AND jsonb_typeof(chunk_meta -> 'chunk_hashes') = 'array' THEN
+                        out_arr := '[]'::jsonb;
+                        FOR blob_hash IN
+                            SELECT value
+                            FROM jsonb_array_elements_text(chunk_meta -> 'chunk_hashes')
+                        LOOP
+                            SELECT b.payload_json
+                              INTO hydrated
+                              FROM feat.indicator_snapshot_blob b
+                             WHERE b.blob_hash = blob_hash;
+                            IF hydrated IS NULL THEN
+                                RAISE EXCEPTION 'missing indicator snapshot chunk hash=%', blob_hash;
+                            END IF;
+                            IF jsonb_typeof(hydrated) <> 'array' THEN
+                                RAISE EXCEPTION 'indicator snapshot chunk blob is not an array hash=%', blob_hash;
+                            END IF;
+                            FOR child_value IN
+                                SELECT value
+                                FROM jsonb_array_elements(hydrated)
+                            LOOP
+                                out_arr := out_arr || jsonb_build_array(
+                                    feat.hydrate_indicator_snapshot_payload(child_value)
+                                );
+                            END LOOP;
+                        END LOOP;
+                        RETURN out_arr;
+                    END IF;
+
+                    out_obj := '{}'::jsonb;
+                    FOR child_key, child_value IN
+                        SELECT key, value
+                        FROM jsonb_each(payload)
+                    LOOP
+                        out_obj := out_obj || jsonb_build_object(
+                            child_key,
+                            feat.hydrate_indicator_snapshot_payload(child_value)
+                        );
+                    END LOOP;
+                    RETURN out_obj;
+                ELSIF jsonb_typeof(payload) = 'array' THEN
+                    out_arr := '[]'::jsonb;
+                    FOR child_value IN
+                        SELECT value
+                        FROM jsonb_array_elements(payload)
+                    LOOP
+                        out_arr := out_arr || jsonb_build_array(
+                            feat.hydrate_indicator_snapshot_payload(child_value)
+                        );
+                    END LOOP;
+                    RETURN out_arr;
+                END IF;
+
+                RETURN payload;
+            END
+            $$;
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("create feat.hydrate_indicator_snapshot_payload")?;
+
+        sqlx::query(
+            r#"
+            CREATE OR REPLACE VIEW feat.v_indicator_snapshot_hydrated AS
+            SELECT
+                ts_snapshot,
+                bar_interval,
+                venue,
+                symbol,
+                market_scope,
+                indicator_code,
+                window_code,
+                primary_market,
+                param_set_id,
+                calc_version,
+                feat.hydrate_indicator_snapshot_payload(payload_json) AS payload_json,
+                tags,
+                created_at
+            FROM feat.indicator_snapshot
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("create feat.v_indicator_snapshot_hydrated")?;
+
+        Ok(())
     }
 
     pub async fn write_snapshots(
@@ -46,6 +212,7 @@ impl SnapshotWriter {
         let mut window_codes: Vec<String> = Vec::new();
         let mut primary_markets: Vec<Option<String>> = Vec::new();
         let mut payload_jsons: Vec<Value> = Vec::new();
+        let mut blob_specs = BTreeMap::<String, SnapshotBlobSpec>::new();
 
         for row in rows {
             let primary_market = primary_market_for_code(row.indicator_code);
@@ -56,10 +223,12 @@ impl SnapshotWriter {
             indicator_codes.push(row.indicator_code.to_string());
             window_codes.push(row.window_code.to_string());
             primary_markets.push(primary_market.map(|s| s.to_string()));
-            payload_jsons.push(compact_snapshot_payload(
+            let compacted = compact_snapshot_payload(row.indicator_code, &row.payload_json);
+            payload_jsons.push(refize_snapshot_payload(
                 row.indicator_code,
-                &row.payload_json,
-            ));
+                &compacted,
+                &mut blob_specs,
+            )?);
         }
 
         if ts_snapshots.is_empty() {
@@ -71,6 +240,8 @@ impl SnapshotWriter {
             .begin()
             .await
             .context("begin indicator snapshot tx")?;
+
+        insert_snapshot_blobs(&mut tx, blob_specs.values()).await?;
 
         // Single round-trip: batch all rows with UNNEST.
         sqlx::query(
@@ -199,7 +370,7 @@ impl SnapshotWriter {
         symbol: &str,
         ts_bucket: DateTime<Utc>,
     ) -> Result<(Value, usize)> {
-        let rows: Vec<SnapshotBundleRow> = sqlx::query_as(
+        let mut rows: Vec<SnapshotBundleRow> = sqlx::query_as(
             r#"
             SELECT indicator_code, window_code, payload_json
             FROM feat.indicator_snapshot
@@ -213,6 +384,15 @@ impl SnapshotWriter {
         .fetch_all(&self.pool)
         .await
         .context("fetch snapshot rows for repair bundle rebuild")?;
+
+        let mut payloads = rows
+            .iter()
+            .map(|row| row.payload_json.clone())
+            .collect::<Vec<_>>();
+        hydrate_snapshot_payload_values(&self.pool, &mut payloads).await?;
+        for (row, payload_json) in rows.iter_mut().zip(payloads.into_iter()) {
+            row.payload_json = payload_json;
+        }
 
         if rows.is_empty() {
             anyhow::bail!(
@@ -475,6 +655,289 @@ async fn enqueue_outbox_batch_in_tx(
         })?;
 
     Ok(())
+}
+
+async fn insert_snapshot_blobs<'a>(
+    tx: &mut Transaction<'_, Postgres>,
+    blobs: impl Iterator<Item = &'a SnapshotBlobSpec>,
+) -> Result<()> {
+    let blobs = blobs.collect::<Vec<_>>();
+    if blobs.is_empty() {
+        return Ok(());
+    }
+
+    let mut builder = QueryBuilder::<Postgres>::new(
+        r#"
+        INSERT INTO feat.indicator_snapshot_blob (
+            blob_hash, payload_json
+        )
+        "#,
+    );
+
+    builder.push_values(blobs, |mut b, blob| {
+        b.push_bind(&blob.blob_hash).push_bind(&blob.payload_json);
+    });
+    builder.push(" ON CONFLICT (blob_hash) DO NOTHING");
+    builder
+        .build()
+        .execute(tx.as_mut())
+        .await
+        .context("insert indicator snapshot blobs")?;
+    Ok(())
+}
+
+pub async fn hydrate_snapshot_payload_values(pool: &PgPool, payloads: &mut [Value]) -> Result<()> {
+    let mut blob_hashes = BTreeSet::new();
+    for payload in payloads.iter() {
+        collect_snapshot_blob_hashes(payload, &mut blob_hashes);
+    }
+    if blob_hashes.is_empty() {
+        return Ok(());
+    }
+
+    let rows = sqlx::query_as::<_, SnapshotBlobRow>(
+        r#"
+        SELECT blob_hash, payload_json
+        FROM feat.indicator_snapshot_blob
+        WHERE blob_hash = ANY($1)
+        "#,
+    )
+    .bind(blob_hashes.iter().cloned().collect::<Vec<_>>())
+    .fetch_all(pool)
+    .await
+    .context("fetch indicator snapshot blobs for hydration")?;
+
+    let mut blob_map = HashMap::<String, Value>::new();
+    for row in rows {
+        blob_map.insert(row.blob_hash.clone(), row.payload_json);
+    }
+
+    for payload in payloads.iter_mut() {
+        hydrate_snapshot_payload_value(payload, &blob_map)?;
+    }
+
+    Ok(())
+}
+
+fn refize_snapshot_payload(
+    indicator_code: &str,
+    payload: &Value,
+    blobs: &mut BTreeMap<String, SnapshotBlobSpec>,
+) -> Result<Value> {
+    let Some(obj) = payload.as_object() else {
+        return Ok(payload.clone());
+    };
+
+    let mut out = Map::new();
+    for (key, value) in obj {
+        let transformed = if key == "recent_7d" {
+            refize_recent_7d_array(value, blobs)?
+        } else if should_blob_ref_field(indicator_code, key, value) {
+            build_snapshot_blob_ref(value, blobs)?
+        } else {
+            refize_nested_snapshot_value(indicator_code, value, blobs)?
+        };
+        out.insert(key.clone(), transformed);
+    }
+    Ok(Value::Object(out))
+}
+
+fn refize_nested_snapshot_value(
+    indicator_code: &str,
+    value: &Value,
+    blobs: &mut BTreeMap<String, SnapshotBlobSpec>,
+) -> Result<Value> {
+    match value {
+        Value::Object(obj) => {
+            let mut out = Map::new();
+            for (key, child) in obj {
+                let transformed = if key == "recent_7d" {
+                    refize_recent_7d_array(child, blobs)?
+                } else if should_blob_ref_field(indicator_code, key, child) {
+                    build_snapshot_blob_ref(child, blobs)?
+                } else {
+                    refize_nested_snapshot_value(indicator_code, child, blobs)?
+                };
+                out.insert(key.clone(), transformed);
+            }
+            Ok(Value::Object(out))
+        }
+        Value::Array(arr) => Ok(Value::Array(
+            arr.iter()
+                .map(|child| refize_nested_snapshot_value(indicator_code, child, blobs))
+                .collect::<Result<Vec<_>>>()?,
+        )),
+        _ => Ok(value.clone()),
+    }
+}
+
+fn should_blob_ref_field(indicator_code: &str, key: &str, value: &Value) -> bool {
+    if serialized_json_len(value) < SNAPSHOT_BLOB_MIN_BYTES {
+        return false;
+    }
+
+    matches!(
+        (indicator_code, key),
+        (
+            "footprint",
+            "by_window"
+                | "buy_imbalance_prices"
+                | "sell_imbalance_prices"
+                | "buy_stacks"
+                | "sell_stacks"
+        )
+    )
+}
+
+fn refize_recent_7d_array(
+    value: &Value,
+    blobs: &mut BTreeMap<String, SnapshotBlobSpec>,
+) -> Result<Value> {
+    let Some(arr) = value.as_array() else {
+        return Ok(value.clone());
+    };
+    if arr.is_empty() || serialized_json_len(value) < SNAPSHOT_BLOB_MIN_BYTES {
+        return Ok(value.clone());
+    }
+
+    let mut chunk_hashes = Vec::new();
+    for chunk in arr.chunks(SNAPSHOT_BLOB_CHUNK_SIZE) {
+        let chunk_value = Value::Array(chunk.to_vec());
+        let blob_hash = ensure_snapshot_blob(&chunk_value, blobs)?;
+        chunk_hashes.push(blob_hash);
+    }
+
+    Ok(json!({
+        SNAPSHOT_BLOB_CHUNKS_KEY: {
+            "chunk_hashes": chunk_hashes,
+            "chunk_size": SNAPSHOT_BLOB_CHUNK_SIZE,
+            "total_items": arr.len(),
+        }
+    }))
+}
+
+fn build_snapshot_blob_ref(
+    value: &Value,
+    blobs: &mut BTreeMap<String, SnapshotBlobSpec>,
+) -> Result<Value> {
+    let blob_hash = ensure_snapshot_blob(value, blobs)?;
+    Ok(json!({
+        SNAPSHOT_BLOB_REF_KEY: {
+            "hash": blob_hash,
+        }
+    }))
+}
+
+fn ensure_snapshot_blob(
+    value: &Value,
+    blobs: &mut BTreeMap<String, SnapshotBlobSpec>,
+) -> Result<String> {
+    let raw_bytes = serde_json::to_vec(value).context("serialize indicator snapshot blob")?;
+    let blob_hash = format!("{:x}", Sha256::digest(&raw_bytes));
+    if !blobs.contains_key(&blob_hash) {
+        blobs.insert(
+            blob_hash.clone(),
+            SnapshotBlobSpec {
+                blob_hash: blob_hash.clone(),
+                payload_json: value.clone(),
+            },
+        );
+    }
+    Ok(blob_hash)
+}
+
+fn collect_snapshot_blob_hashes(value: &Value, out: &mut BTreeSet<String>) {
+    if let Some(hash) = snapshot_blob_ref_hash(value) {
+        out.insert(hash.to_string());
+        return;
+    }
+    if let Some(chunk_hashes) = snapshot_blob_chunk_hashes(value) {
+        out.extend(chunk_hashes);
+        return;
+    }
+
+    match value {
+        Value::Object(obj) => {
+            for child in obj.values() {
+                collect_snapshot_blob_hashes(child, out);
+            }
+        }
+        Value::Array(arr) => {
+            for child in arr {
+                collect_snapshot_blob_hashes(child, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn hydrate_snapshot_payload_value(
+    value: &mut Value,
+    blob_map: &HashMap<String, Value>,
+) -> Result<()> {
+    if let Some(hash) = snapshot_blob_ref_hash(value) {
+        let replacement = blob_map
+            .get(hash)
+            .cloned()
+            .with_context(|| format!("missing indicator snapshot blob hash={hash}"))?;
+        *value = replacement;
+        return hydrate_snapshot_payload_value(value, blob_map);
+    }
+
+    if let Some(chunk_hashes) = snapshot_blob_chunk_hashes(value) {
+        let mut items = Vec::new();
+        for hash in chunk_hashes {
+            let chunk = blob_map
+                .get(&hash)
+                .cloned()
+                .with_context(|| format!("missing indicator snapshot chunk hash={hash}"))?;
+            let Value::Array(chunk_items) = chunk else {
+                return Err(anyhow::anyhow!(
+                    "indicator snapshot chunk blob is not an array hash={hash}"
+                ));
+            };
+            items.extend(chunk_items);
+        }
+        *value = Value::Array(items);
+        return hydrate_snapshot_payload_value(value, blob_map);
+    }
+
+    match value {
+        Value::Object(obj) => {
+            for child in obj.values_mut() {
+                hydrate_snapshot_payload_value(child, blob_map)?;
+            }
+        }
+        Value::Array(arr) => {
+            for child in arr.iter_mut() {
+                hydrate_snapshot_payload_value(child, blob_map)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn snapshot_blob_ref_hash(value: &Value) -> Option<&str> {
+    let obj = value.as_object()?;
+    let meta = obj.get(SNAPSHOT_BLOB_REF_KEY)?.as_object()?;
+    meta.get("hash")?.as_str()
+}
+
+fn snapshot_blob_chunk_hashes(value: &Value) -> Option<Vec<String>> {
+    let obj = value.as_object()?;
+    let meta = obj.get(SNAPSHOT_BLOB_CHUNKS_KEY)?.as_object()?;
+    let hashes = meta.get("chunk_hashes")?.as_array()?;
+    hashes
+        .iter()
+        .map(|hash| hash.as_str().map(str::to_string))
+        .collect()
+}
+
+fn serialized_json_len(value: &Value) -> usize {
+    serde_json::to_vec(value)
+        .map(|bytes| bytes.len())
+        .unwrap_or_default()
 }
 
 fn interval_text_by_window(window_code: &str) -> String {
@@ -856,8 +1319,12 @@ fn assemble_bundle_indicators_json(mut rows: Vec<SnapshotBundleRow>) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::{assemble_bundle_indicators_json, compact_snapshot_payload, SnapshotBundleRow};
+    use super::{
+        assemble_bundle_indicators_json, collect_snapshot_blob_hashes, compact_snapshot_payload,
+        hydrate_snapshot_payload_value, refize_snapshot_payload, SnapshotBundleRow,
+    };
     use serde_json::json;
+    use std::collections::{BTreeMap, BTreeSet, HashMap};
 
     #[test]
     fn compacts_price_volume_structure_levels() {
@@ -1017,5 +1484,106 @@ mod tests {
 
         assert_eq!(indicators["open_interest"]["window_code"], json!("5m"));
         assert_eq!(indicators["long_short_ratios"]["window_code"], json!("5m"));
+    }
+
+    #[test]
+    fn refizes_large_recent_7d_arrays_and_hydrates_them_back() {
+        let payload = json!({
+            "funding_current": -0.0001,
+            "recent_7d": (0..600)
+                .map(|idx| json!({
+                    "change_ts": format!("2026-03-29T00:{:02}:00Z", idx % 60),
+                    "funding_rate": idx as f64 / 10_000.0,
+                }))
+                .collect::<Vec<_>>(),
+            "by_window": {
+                "1h": {
+                    "change_count": 3
+                }
+            }
+        });
+
+        let mut blobs = BTreeMap::new();
+        let refized = refize_snapshot_payload("funding_rate", &payload, &mut blobs).unwrap();
+        assert!(refized.get("recent_7d").is_some());
+        assert!(refized["recent_7d"]
+            .get("__snapshot_blob_chunks_v1")
+            .is_some());
+        assert!(!blobs.is_empty());
+
+        let mut hashes = BTreeSet::new();
+        collect_snapshot_blob_hashes(&refized, &mut hashes);
+        assert_eq!(hashes.len(), blobs.len());
+
+        let blob_map = blobs
+            .values()
+            .map(|blob| (blob.blob_hash.clone(), blob.payload_json.clone()))
+            .collect::<HashMap<_, _>>();
+
+        let mut hydrated = refized.clone();
+        hydrate_snapshot_payload_value(&mut hydrated, &blob_map).unwrap();
+        assert_eq!(hydrated, payload);
+    }
+
+    #[test]
+    fn refizes_large_footprint_fields_and_hydrates_them_back() {
+        let price_rows = (0..900)
+            .map(|idx| format!("{:.2}", 2000.0 + idx as f64 * 0.5))
+            .collect::<Vec<_>>();
+        let stack_rows = (0..700)
+            .map(|idx| {
+                json!({
+                    "start_price": 2000.0 + idx as f64,
+                    "end_price": 2000.5 + idx as f64,
+                    "score": idx as f64 / 100.0,
+                })
+            })
+            .collect::<Vec<_>>();
+        let payload = json!({
+            "levels_count": 474,
+            "buy_imbalance_prices": price_rows,
+            "sell_imbalance_prices": (0..900)
+                .map(|idx| format!("{:.2}", 2100.0 + idx as f64 * 0.5))
+                .collect::<Vec<_>>(),
+            "buy_stacks": stack_rows,
+            "sell_stacks": (0..700)
+                .map(|idx| {
+                    json!({
+                        "start_price": 2200.0 + idx as f64,
+                        "end_price": 2200.5 + idx as f64,
+                        "score": idx as f64 / 100.0,
+                    })
+                })
+                .collect::<Vec<_>>(),
+            "by_window": {
+                "1m": {
+                    "levels_count": 474,
+                    "levels": (0..474)
+                        .map(|idx| json!({"price": 2000.0 + idx as f64, "delta": idx}))
+                        .collect::<Vec<_>>()
+                }
+            }
+        });
+
+        let mut blobs = BTreeMap::new();
+        let refized = refize_snapshot_payload("footprint", &payload, &mut blobs).unwrap();
+        for key in [
+            "buy_imbalance_prices",
+            "sell_imbalance_prices",
+            "buy_stacks",
+            "sell_stacks",
+            "by_window",
+        ] {
+            assert!(refized[key].get("__snapshot_blob_ref_v1").is_some());
+        }
+
+        let blob_map = blobs
+            .values()
+            .map(|blob| (blob.blob_hash.clone(), blob.payload_json.clone()))
+            .collect::<HashMap<_, _>>();
+
+        let mut hydrated = refized.clone();
+        hydrate_snapshot_payload_value(&mut hydrated, &blob_map).unwrap();
+        assert_eq!(hydrated, payload);
     }
 }

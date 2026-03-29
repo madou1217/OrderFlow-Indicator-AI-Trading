@@ -34,18 +34,10 @@ impl Indicator for I16FundingRate {
         let mark_price_last = current_metrics.mark_price_last;
         let mark_price_last_ts = current_metrics.mark_price_last_ts.map(|ts| ts.to_rfc3339());
         let mark_price_twap = current_metrics.mark_price_twap;
-        let end = ctx.ts_bucket + Duration::minutes(1);
-        let recent_cutoff = end - Duration::days(7);
-        let mut recent_changes = ctx
-            .funding_changes_recent
-            .iter()
-            .filter(|c| c.ts_change >= recent_cutoff && c.ts_change < end)
-            .collect::<Vec<_>>();
-        recent_changes.sort_by_key(|c| c.ts_change);
-        let recent_7d = recent_changes
-            .iter()
-            .map(|c| funding_change_json(c))
-            .collect::<Vec<_>>();
+        let recent_7d = ctx
+            .funding_recent_7d_payload_or_init(build_recent_7d_payload)
+            .as_ref()
+            .clone();
 
         IndicatorComputation {
             snapshot: Some(IndicatorSnapshotRow {
@@ -65,6 +57,21 @@ impl Indicator for I16FundingRate {
             ..Default::default()
         }
     }
+}
+
+fn build_recent_7d_payload(ctx: &IndicatorContext) -> Vec<Value> {
+    let end = ctx.ts_bucket + Duration::minutes(1);
+    let recent_cutoff = end - Duration::days(7);
+    let mut recent_changes = ctx
+        .funding_changes_recent
+        .iter()
+        .filter(|c| c.ts_change >= recent_cutoff && c.ts_change < end)
+        .collect::<Vec<_>>();
+    recent_changes.sort_by_key(|c| c.ts_change);
+    recent_changes
+        .iter()
+        .map(|c| funding_change_json(c))
+        .collect()
 }
 
 fn compute_window_metrics(ctx: &IndicatorContext, mins: i64, label: &str) -> Value {

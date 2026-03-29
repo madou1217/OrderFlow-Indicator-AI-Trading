@@ -149,7 +149,7 @@ fn time_weighted_avg(
 
 #[cfg(test)]
 mod tests {
-    use super::compute_funding_window_metrics;
+    use super::{compute_funding_window_metrics, funding_change_json};
     use crate::indicators::context::{
         DivergenceSigTestMode, IndicatorContext, IndicatorRuntimeOptions, KlineHistorySupplement,
     };
@@ -212,6 +212,13 @@ mod tests {
                 delta: Some(-0.00001),
                 mark_price_at_change: Some(2000.0),
             }],
+            funding_recent_7d_payload: vec![funding_change_json(&FundingChange {
+                ts_change: state_ts,
+                prev: Some(-0.00005),
+                new: -0.00006,
+                delta: Some(-0.00001),
+                mark_price_at_change: Some(2000.0),
+            })],
             funding_points_recent: vec![LatestFundingState {
                 ts: state_ts,
                 funding_rate: -0.00006,
@@ -225,6 +232,7 @@ mod tests {
                 funding_rate: Some(-0.00006),
                 next_funding_time: None,
             }],
+            liquidation_recent_7d_payload: Vec::new(),
             latest_common_oi_ratio_bucket: None,
             current_open_interest: None,
             open_interest_hist_5m: Vec::new(),

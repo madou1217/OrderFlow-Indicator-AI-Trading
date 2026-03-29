@@ -2,10 +2,13 @@ use crate::indicators::context::{
     clip01, IndicatorComputation, IndicatorContext, IndicatorSnapshotRow, LiquidationLevelRow,
 };
 use crate::indicators::indicator_trait::Indicator;
+use crate::indicators::shared::liquidation::{
+    aggregate_force_liq_rows, build_recent_7d_entry as build_liq_recent_7d_entry,
+    sort_desc_by_value_then_tick,
+};
 use crate::runtime::state_store::{tick_to_price, LiqAgg, MinuteHistory};
 use chrono::Duration;
 use serde_json::{json, Map, Value};
-use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashSet};
 
 const LONG_PEAK_PROMINENCE_FRACTION: f64 = 0.03;
@@ -41,7 +44,10 @@ impl Indicator for I04LiquidationDensity {
         }
 
         let payload = json!({
-            "recent_7d": build_recent_7d_history(&ctx.history_futures, ctx.ts_bucket),
+            "recent_7d": ctx
+                .liquidation_recent_7d_payload_or_init(build_recent_7d_history)
+                .as_ref()
+                .clone(),
             "by_window": Value::Object(by_window),
         });
 
@@ -152,24 +158,12 @@ fn build_window_view(
     )
 }
 
-fn build_recent_7d_history(
-    history: &[MinuteHistory],
-    ts_bucket: chrono::DateTime<chrono::Utc>,
-) -> Vec<Value> {
-    let cutoff = ts_bucket - Duration::days(7);
-    history
+fn build_recent_7d_history(ctx: &IndicatorContext) -> Vec<Value> {
+    let cutoff = ctx.ts_bucket - Duration::days(7);
+    ctx.history_futures
         .iter()
-        .filter(|row| row.ts_bucket > cutoff && row.ts_bucket <= ts_bucket)
-        .map(|row| {
-            let (payload, _) = build_window_view("1m", &row.force_liq, 1, 1);
-            json!({
-                "ts_snapshot": row.ts_bucket.to_rfc3339(),
-                "levels_count": payload.get("levels_count").cloned().unwrap_or(Value::Null),
-                "long_total": payload.get("long_total").cloned().unwrap_or(Value::Null),
-                "short_total": payload.get("short_total").cloned().unwrap_or(Value::Null),
-                "peak_levels": payload.get("peak_levels").cloned().unwrap_or_else(|| json!([])),
-            })
-        })
+        .filter(|row| row.ts_bucket > cutoff && row.ts_bucket <= ctx.ts_bucket)
+        .map(build_liq_recent_7d_entry)
         .collect()
 }
 
@@ -186,11 +180,7 @@ fn select_liquidation_audit_ticks(
         .iter()
         .map(|(tick, long, _, _)| (*tick, *long))
         .collect::<Vec<_>>();
-    by_long.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1)
-            .unwrap_or(Ordering::Equal)
-            .then_with(|| a.0.cmp(&b.0))
-    });
+    sort_desc_by_value_then_tick(&mut by_long);
     for (tick, _) in by_long.into_iter().take(RAW_AUDIT_TOP_LONG_LEVELS) {
         out.insert(tick);
     }
@@ -199,11 +189,7 @@ fn select_liquidation_audit_ticks(
         .iter()
         .map(|(tick, _, short, _)| (*tick, *short))
         .collect::<Vec<_>>();
-    by_short.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1)
-            .unwrap_or(Ordering::Equal)
-            .then_with(|| a.0.cmp(&b.0))
-    });
+    sort_desc_by_value_then_tick(&mut by_short);
     for (tick, _) in by_short.into_iter().take(RAW_AUDIT_TOP_SHORT_LEVELS) {
         out.insert(tick);
     }
@@ -212,11 +198,7 @@ fn select_liquidation_audit_ticks(
         .iter()
         .map(|(tick, _, _, net)| (*tick, net.abs()))
         .collect::<Vec<_>>();
-    by_abs_net.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1)
-            .unwrap_or(Ordering::Equal)
-            .then_with(|| a.0.cmp(&b.0))
-    });
+    sort_desc_by_value_then_tick(&mut by_abs_net);
     for (tick, _) in by_abs_net.into_iter().take(RAW_AUDIT_TOP_ABS_NET_LEVELS) {
         out.insert(tick);
     }
@@ -237,15 +219,7 @@ fn window_rows<'a>(
 }
 
 fn aggregate_force_liq(rows: &[&MinuteHistory]) -> BTreeMap<i64, LiqAgg> {
-    let mut out = BTreeMap::new();
-    for row in rows {
-        for (tick, agg) in &row.force_liq {
-            let dst = out.entry(*tick).or_insert_with(LiqAgg::default);
-            dst.long_liq += agg.long_liq;
-            dst.short_liq += agg.short_liq;
-        }
-    }
-    out
+    aggregate_force_liq_rows(rows)
 }
 
 fn detect_local_peaks(
