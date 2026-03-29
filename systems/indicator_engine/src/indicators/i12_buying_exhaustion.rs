@@ -26,6 +26,8 @@ const THETA_BUY_CVD: f64 = 0.0;
 const THETA_BUY_WHALE: f64 = 100_000.0;
 const THETA_SELL_CVD: f64 = 0.0;
 const THETA_SELL_WHALE: f64 = -100_000.0;
+pub(crate) const EXHAUSTION_INCREMENTAL_LOOKBACK_MINUTES: i64 =
+    MAX_LEG_GAP_MINUTES + PIVOT_LEFT as i64 + PIVOT_RIGHT as i64 + CONFIRM_BARS as i64 + 5;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ExhaustionEventData {
@@ -52,14 +54,20 @@ pub(crate) struct ExhaustionEventData {
     pub payload: Value,
 }
 
-fn compute_exhaustion_all_history(ctx: &IndicatorContext) -> Vec<ExhaustionEventData> {
-    let series = ctx.basic_event_history_series();
+pub(crate) fn compute_exhaustion_all_history_from_histories(
+    history_futures: &[MinuteHistory],
+    history_spot: &[MinuteHistory],
+) -> Vec<ExhaustionEventData> {
+    let series = crate::indicators::context::BasicEventHistorySeries::from_histories(
+        history_futures,
+        history_spot,
+    );
     let n = series.n;
     if n < (PIVOT_LEFT + PIVOT_RIGHT + CONFIRM_BARS + 3) {
         return Vec::new();
     }
 
-    let fut = &ctx.history_futures[ctx.history_futures.len() - n..];
+    let fut = &history_futures[history_futures.len().saturating_sub(n)..];
     let last_idx = n - 1;
 
     let highs = &series.high;
@@ -99,6 +107,10 @@ fn compute_exhaustion_all_history(ctx: &IndicatorContext) -> Vec<ExhaustionEvent
         last_idx,
     ));
     out
+}
+
+fn compute_exhaustion_all_history(ctx: &IndicatorContext) -> Vec<ExhaustionEventData> {
+    compute_exhaustion_all_history_from_histories(&ctx.history_futures, &ctx.history_spot)
 }
 
 pub(crate) fn detect_exhaustion_all_history(
@@ -494,7 +506,8 @@ impl Indicator for I12BuyingExhaustion {
     }
 
     fn evaluate(&self, ctx: &IndicatorContext) -> IndicatorComputation {
-        let all_events = detect_exhaustion_all_history(ctx)
+        let all_events = ctx
+            .exhaustion_all_events_or_init(compute_exhaustion_all_history)
             .iter()
             .filter(|e| e.event_type == "buying_exhaustion")
             .cloned()

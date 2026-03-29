@@ -158,6 +158,7 @@ mod tests {
         FundingChange, LatestFundingState, LatestMarkState, MinuteWindowData, WindowBundle,
     };
     use chrono::{Duration, TimeZone, Utc};
+    use std::sync::Arc;
 
     #[test]
     fn window_metrics_use_latest_point_within_minute() {
@@ -233,6 +234,8 @@ mod tests {
                 next_funding_time: None,
             }],
             liquidation_recent_7d_payload: Vec::new(),
+            divergence_all_events: Arc::new(Vec::new()),
+            exhaustion_all_events: Arc::new(Vec::new()),
             latest_common_oi_ratio_bucket: None,
             current_open_interest: None,
             open_interest_hist_5m: Vec::new(),
@@ -288,7 +291,7 @@ mod tests {
             window_codes: vec!["1m".to_string()],
         };
         let ctx =
-            IndicatorContext::from_bundle(&bundle, &options, KlineHistorySupplement::default());
+            IndicatorContext::from_bundle(bundle, &options, KlineHistorySupplement::default());
 
         let metrics = compute_funding_window_metrics(&ctx, 1);
 

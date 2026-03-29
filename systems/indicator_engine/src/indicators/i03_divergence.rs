@@ -9,6 +9,7 @@ use crate::indicators::shared::event_views::{
 };
 use chrono::Duration;
 use serde_json::{json, Map, Value};
+use std::collections::HashMap;
 
 pub struct I03Divergence;
 
@@ -24,6 +25,13 @@ const EPS_CVD_Z: f64 = 0.5;
 const ZP_MIN: f64 = 1.0;
 const ZC_MIN: f64 = 1.0;
 const BOOTSTRAP_MIN_RET_SAMPLES: usize = 32;
+pub(crate) const DIVERGENCE_INCREMENTAL_LOOKBACK_MINUTES: i64 = MAX_LEG_GAP_MINUTES
+    + DETREND_LEN_CVD as i64
+    + ROBUST_Z_LOOKBACK as i64
+    + DETREND_LEN_CVD as i64
+    + ATR_LOOKBACK as i64
+    + PIVOT_K as i64
+    + 5;
 
 #[derive(Debug, Clone)]
 struct DivergenceCandidate {
@@ -55,12 +63,92 @@ struct DivergenceCandidate {
     likely_driver: String,
 }
 
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct DivergenceEventData {
+    pub divergence_type: String,
+    pub pivot_side: String,
+    pub event_start_ts: chrono::DateTime<chrono::Utc>,
+    pub event_end_ts: chrono::DateTime<chrono::Utc>,
+    pub event_available_ts: chrono::DateTime<chrono::Utc>,
+    pub pivot_ts_1: chrono::DateTime<chrono::Utc>,
+    pub pivot_ts_2: chrono::DateTime<chrono::Utc>,
+    pub pivot_confirm_ts_1: chrono::DateTime<chrono::Utc>,
+    pub pivot_confirm_ts_2: chrono::DateTime<chrono::Utc>,
+    pub leg_minutes: i64,
+    pub price_start: f64,
+    pub price_end: f64,
+    pub cvd_start_fut: f64,
+    pub cvd_end_fut: f64,
+    pub cvd_start_spot: f64,
+    pub cvd_end_spot: f64,
+    pub price_diff: f64,
+    pub cvd_diff_fut: f64,
+    pub cvd_diff_spot: f64,
+    pub price_effect_z: f64,
+    pub cvd_effect_z: f64,
+    pub sig_pass: bool,
+    pub p_value_price: f64,
+    pub p_value_cvd: f64,
+    pub score: f64,
+    pub spot_price_flow_confirm: bool,
+    pub fut_divergence_sign: i16,
+    pub spot_lead_score: f64,
+    pub likely_driver: String,
+}
+
+fn candidate_to_event_data(
+    candidate: &DivergenceCandidate,
+    fut: &[crate::runtime::state_store::MinuteHistory],
+) -> DivergenceEventData {
+    DivergenceEventData {
+        divergence_type: candidate.divergence_type.clone(),
+        pivot_side: candidate.pivot_side.clone(),
+        event_start_ts: fut[candidate.i1].ts_bucket,
+        event_end_ts: fut[candidate.i2].ts_bucket + Duration::minutes(1),
+        event_available_ts: fut[candidate.available_i].ts_bucket + Duration::minutes(1),
+        pivot_ts_1: fut[candidate.i1].ts_bucket,
+        pivot_ts_2: fut[candidate.i2].ts_bucket,
+        pivot_confirm_ts_1: fut[candidate.confirm_i1].ts_bucket,
+        pivot_confirm_ts_2: fut[candidate.confirm_i2].ts_bucket,
+        leg_minutes: (fut[candidate.i2].ts_bucket - fut[candidate.i1].ts_bucket).num_minutes(),
+        price_start: candidate.price_start,
+        price_end: candidate.price_end,
+        cvd_start_fut: candidate.cvd_start_fut,
+        cvd_end_fut: candidate.cvd_end_fut,
+        cvd_start_spot: candidate.cvd_start_spot,
+        cvd_end_spot: candidate.cvd_end_spot,
+        price_diff: candidate.price_diff,
+        cvd_diff_fut: candidate.cvd_diff_fut,
+        cvd_diff_spot: candidate.cvd_diff_spot,
+        price_effect_z: candidate.price_effect_z,
+        cvd_effect_z: candidate.cvd_effect_z,
+        sig_pass: candidate.sig_pass,
+        p_value_price: candidate.p_value_price,
+        p_value_cvd: candidate.p_value_cvd,
+        score: candidate.score,
+        spot_price_flow_confirm: candidate.spot_price_flow_confirm,
+        fut_divergence_sign: candidate.fut_divergence_sign,
+        spot_lead_score: candidate.spot_lead_score,
+        likely_driver: candidate.likely_driver.clone(),
+    }
+}
+
 impl Indicator for I03Divergence {
     fn code(&self) -> &'static str {
         "divergence"
     }
 
     fn evaluate(&self, ctx: &IndicatorContext) -> IndicatorComputation {
+        let all_events = ctx.divergence_all_events_or_init(|ctx| {
+            compute_divergence_all_history(
+                &ctx.history_futures,
+                &ctx.history_spot,
+                ctx.divergence_sig_test_mode,
+                ctx.divergence_bootstrap_b,
+                ctx.divergence_bootstrap_block_len,
+                ctx.divergence_p_value_threshold,
+            )
+        });
         let n = ctx.history_futures.len().min(ctx.history_spot.len());
         if n < (PIVOT_K * 4).max(ROBUST_Z_LOOKBACK + 5) {
             return IndicatorComputation {
@@ -73,98 +161,40 @@ impl Indicator for I03Divergence {
             };
         }
 
-        let fut = ctx.history_futures[ctx.history_futures.len() - n..].to_vec();
-        let spot = ctx.history_spot[ctx.history_spot.len() - n..].to_vec();
-        let last_idx = n - 1;
-
-        let closes = fut
+        let current_available_ts = ctx.ts_bucket + Duration::minutes(1);
+        let current_candidates = all_events
             .iter()
-            .map(|h| h.close_price.or(h.last_price).unwrap_or(0.0))
-            .collect::<Vec<_>>();
-        let highs = fut
-            .iter()
-            .map(|h| h.high_price.or(h.last_price).unwrap_or(0.0))
-            .collect::<Vec<_>>();
-        let lows = fut
-            .iter()
-            .map(|h| h.low_price.or(h.last_price).unwrap_or(0.0))
-            .collect::<Vec<_>>();
-        let cvd_fut = fut.iter().map(|h| h.cvd).collect::<Vec<_>>();
-        let cvd_spot = spot.iter().map(|h| h.cvd).collect::<Vec<_>>();
-
-        let detrended_price = detrend_rolling_ols(
-            &closes.iter().map(|v| v.ln()).collect::<Vec<_>>(),
-            DETREND_LEN_PRICE,
-        );
-        let detrended_cvd_fut = detrend_rolling_ols(&cvd_fut, DETREND_LEN_CVD);
-        let detrended_cvd_spot = detrend_rolling_ols(&cvd_spot, DETREND_LEN_CVD);
-
-        let z_cvd_fut = robust_z_series(&detrended_cvd_fut, ROBUST_Z_LOOKBACK);
-        let z_cvd_spot = robust_z_series(&detrended_cvd_spot, ROBUST_Z_LOOKBACK);
-
-        let pivots_high = confirmed_high_pivots(&highs, PIVOT_K, last_idx);
-        let pivots_low = confirmed_low_pivots(&lows, PIVOT_K, last_idx);
-        let atr = rolling_atr(&highs, &lows, &closes, ATR_LOOKBACK);
-
-        let mut candidates = all_candidates(
-            true,
-            &pivots_high,
-            &fut,
-            &spot,
-            &closes,
-            &highs,
-            &lows,
-            &detrended_price,
-            &z_cvd_fut,
-            &z_cvd_spot,
-            &atr,
-            ctx.divergence_sig_test_mode,
-            ctx.divergence_bootstrap_b,
-            ctx.divergence_bootstrap_block_len,
-            ctx.divergence_p_value_threshold,
-        );
-        candidates.extend(all_candidates(
-            false,
-            &pivots_low,
-            &fut,
-            &spot,
-            &closes,
-            &highs,
-            &lows,
-            &detrended_price,
-            &z_cvd_fut,
-            &z_cvd_spot,
-            &atr,
-            ctx.divergence_sig_test_mode,
-            ctx.divergence_bootstrap_b,
-            ctx.divergence_bootstrap_block_len,
-            ctx.divergence_p_value_threshold,
-        ));
-        candidates.sort_by_key(|c| c.available_i);
-
-        let current_candidates = candidates
-            .iter()
-            .filter(|c| c.available_i == last_idx)
+            .filter(|c| c.event_available_ts == current_available_ts)
             .cloned()
             .collect::<Vec<_>>();
         let latest_current = current_candidates
             .iter()
-            .max_by_key(|c| c.available_i)
+            .max_by_key(|c| c.event_available_ts)
             .cloned();
         let window_view = build_event_window_view(
             ctx.ts_bucket,
-            candidates
+            all_events
                 .iter()
-                .map(|candidate| divergence_event_json(&ctx.symbol, candidate, &fut))
+                .map(|candidate| divergence_event_json(&ctx.symbol, candidate))
                 .collect(),
         );
         let lookback_covered_minutes = ctx.history_futures.len().min(ctx.history_spot.len()) as i64;
-
-        let candidates_json = candidates.iter().map(candidate_payload).collect::<Vec<_>>();
-        let latest_payload = latest_current.as_ref().map(candidate_payload);
+        let history_index = ctx
+            .history_futures
+            .iter()
+            .enumerate()
+            .map(|(idx, row)| (row.ts_bucket, idx))
+            .collect::<HashMap<_, _>>();
+        let candidates_json = all_events
+            .iter()
+            .map(|candidate| candidate_payload(candidate, &history_index))
+            .collect::<Vec<_>>();
+        let latest_payload = latest_current
+            .as_ref()
+            .map(|candidate| candidate_payload(candidate, &history_index));
         let signal = latest_current
             .as_ref()
-            .map(|c| c.available_i == last_idx)
+            .map(|c| c.event_available_ts == current_available_ts)
             .unwrap_or(false);
 
         let mut out = IndicatorComputation {
@@ -226,115 +256,112 @@ impl Indicator for I03Divergence {
             };
         }
 
-        for c in candidates {
-            let start_ts = fut[c.i1].ts_bucket;
-            let end_ts = fut[c.i2].ts_bucket + Duration::minutes(1);
-            let available_ts = fut[c.available_i].ts_bucket + Duration::minutes(1);
-            let direction = if c.divergence_type.contains("bearish") {
+        for event in all_events.iter() {
+            let direction = if event.divergence_type.contains("bearish") {
                 -1
             } else {
                 1
             };
             let payload = json!({
-                "event_start_ts": start_ts.to_rfc3339(),
-                "event_end_ts": end_ts.to_rfc3339(),
-                "event_available_ts": available_ts.to_rfc3339(),
-                "pivot_ts_1": fut[c.i1].ts_bucket.to_rfc3339(),
-                "pivot_ts_2": fut[c.i2].ts_bucket.to_rfc3339(),
-                "pivot_confirm_ts_1": fut[c.confirm_i1].ts_bucket.to_rfc3339(),
-                "pivot_confirm_ts_2": fut[c.confirm_i2].ts_bucket.to_rfc3339(),
-                "leg_minutes": (fut[c.i2].ts_bucket - fut[c.i1].ts_bucket).num_minutes(),
-                "price_diff": c.price_diff,
-                "price_norm_diff": c.price_diff,
-                "cvd_diff_fut": c.cvd_diff_fut,
-                "cvd_norm_diff_fut": c.cvd_diff_fut,
-                "cvd_diff_spot": c.cvd_diff_spot,
-                "cvd_norm_diff_spot": c.cvd_diff_spot,
-                "price_effect_z": c.price_effect_z,
-                "cvd_effect_z": c.cvd_effect_z,
-                "sig_pass": c.sig_pass,
-                "p_value_price": c.p_value_price,
-                "p_value_cvd": c.p_value_cvd,
+                "event_start_ts": event.event_start_ts.to_rfc3339(),
+                "event_end_ts": event.event_end_ts.to_rfc3339(),
+                "event_available_ts": event.event_available_ts.to_rfc3339(),
+                "pivot_ts_1": event.pivot_ts_1.to_rfc3339(),
+                "pivot_ts_2": event.pivot_ts_2.to_rfc3339(),
+                "pivot_confirm_ts_1": event.pivot_confirm_ts_1.to_rfc3339(),
+                "pivot_confirm_ts_2": event.pivot_confirm_ts_2.to_rfc3339(),
+                "leg_minutes": event.leg_minutes,
+                "price_diff": event.price_diff,
+                "price_norm_diff": event.price_diff,
+                "cvd_diff_fut": event.cvd_diff_fut,
+                "cvd_norm_diff_fut": event.cvd_diff_fut,
+                "cvd_diff_spot": event.cvd_diff_spot,
+                "cvd_norm_diff_spot": event.cvd_diff_spot,
+                "price_effect_z": event.price_effect_z,
+                "cvd_effect_z": event.cvd_effect_z,
+                "sig_pass": event.sig_pass,
+                "p_value_price": event.p_value_price,
+                "p_value_cvd": event.p_value_cvd,
                 "sig_test_mode": ctx.divergence_sig_test_mode.as_str(),
-                "spot_price_flow_confirm": c.spot_price_flow_confirm,
-                "fut_divergence_sign": c.fut_divergence_sign,
-                "spot_lead_score": c.spot_lead_score,
-                "likely_driver": c.likely_driver.clone()
+                "spot_price_flow_confirm": event.spot_price_flow_confirm,
+                "fut_divergence_sign": event.fut_divergence_sign,
+                "spot_lead_score": event.spot_lead_score,
+                "likely_driver": event.likely_driver.clone()
             });
             let event_id = build_indicator_event_id(
                 &ctx.symbol,
                 self.code(),
-                &format!("{}_divergence", c.divergence_type),
-                start_ts,
-                Some(end_ts),
+                &format!("{}_divergence", event.divergence_type),
+                event.event_start_ts,
+                Some(event.event_end_ts),
                 direction,
-                Some(fut[c.i1].ts_bucket),
-                Some(fut[c.i2].ts_bucket),
+                Some(event.pivot_ts_1),
+                Some(event.pivot_ts_2),
             );
             let divergence_event_id = build_divergence_event_id(
                 &ctx.symbol,
-                &c.divergence_type,
-                &c.pivot_side,
-                start_ts,
-                end_ts,
-                Some(fut[c.i1].ts_bucket),
-                Some(fut[c.i2].ts_bucket),
+                &event.divergence_type,
+                &event.pivot_side,
+                event.event_start_ts,
+                event.event_end_ts,
+                Some(event.pivot_ts_1),
+                Some(event.pivot_ts_2),
             );
-            let payload = divergence_payload_json(&ctx.symbol, &c, &fut, payload);
+            let payload = divergence_payload_json(&ctx.symbol, event, payload);
 
             out.event_rows.push(IndicatorEventRow::new(
                 event_id,
                 self.code(),
-                format!("{}_divergence", c.divergence_type),
+                format!("{}_divergence", event.divergence_type),
                 "warn".to_string(),
                 direction,
-                start_ts,
-                Some(end_ts),
-                available_ts,
+                event.event_start_ts,
+                Some(event.event_end_ts),
+                event.event_available_ts,
                 "1m",
-                Some(fut[c.i1].ts_bucket),
-                Some(fut[c.i2].ts_bucket),
-                Some(fut[c.confirm_i1].ts_bucket),
-                Some(fut[c.confirm_i2].ts_bucket),
-                Some(c.sig_pass),
-                Some(c.p_value_price.max(c.p_value_cvd)),
-                Some(c.score),
-                Some(c.score),
+                Some(event.pivot_ts_1),
+                Some(event.pivot_ts_2),
+                Some(event.pivot_confirm_ts_1),
+                Some(event.pivot_confirm_ts_2),
+                Some(event.sig_pass),
+                Some(event.p_value_price.max(event.p_value_cvd)),
+                Some(event.score),
+                Some(event.score),
                 payload.clone(),
             ));
 
             out.divergence_rows.push(DivergenceEventRow::new(
                 divergence_event_id,
-                c.divergence_type,
-                c.pivot_side,
-                Some(available_ts),
-                Some(fut[c.i1].ts_bucket),
-                Some(fut[c.i2].ts_bucket),
-                Some(fut[c.confirm_i1].ts_bucket),
-                Some(fut[c.confirm_i2].ts_bucket),
-                Some((fut[c.i2].ts_bucket - fut[c.i1].ts_bucket).num_minutes() as i32),
-                start_ts,
-                end_ts,
-                Some(c.price_start),
-                Some(c.price_end),
-                Some(c.price_diff),
-                Some(c.cvd_start_fut),
-                Some(c.cvd_end_fut),
-                Some(c.cvd_diff_fut),
-                Some(c.cvd_start_spot),
-                Some(c.cvd_end_spot),
-                Some(c.cvd_diff_spot),
-                Some(c.price_effect_z),
-                Some(c.cvd_effect_z),
-                Some(c.sig_pass),
-                Some(c.p_value_price),
-                Some(c.p_value_cvd),
-                Some(c.spot_price_flow_confirm),
-                Some(c.fut_divergence_sign),
-                Some(c.spot_lead_score),
-                Some(c.likely_driver.clone()),
-                Some(c.score),
-                Some(c.score),
+                event.divergence_type.clone(),
+                event.pivot_side.clone(),
+                Some(event.event_available_ts),
+                Some(event.pivot_ts_1),
+                Some(event.pivot_ts_2),
+                Some(event.pivot_confirm_ts_1),
+                Some(event.pivot_confirm_ts_2),
+                Some(event.leg_minutes as i32),
+                event.event_start_ts,
+                event.event_end_ts,
+                Some(event.price_start),
+                Some(event.price_end),
+                Some(event.price_diff),
+                Some(event.cvd_start_fut),
+                Some(event.cvd_end_fut),
+                Some(event.cvd_diff_fut),
+                Some(event.cvd_start_spot),
+                Some(event.cvd_end_spot),
+                Some(event.cvd_diff_spot),
+                Some(event.price_effect_z),
+                Some(event.cvd_effect_z),
+                Some(event.sig_pass),
+                Some(event.p_value_price),
+                Some(event.p_value_cvd),
+                Some(event.spot_price_flow_confirm),
+                Some(event.fut_divergence_sign),
+                Some(event.spot_lead_score),
+                Some(event.likely_driver.clone()),
+                Some(event.score),
+                Some(event.score),
                 "1m",
                 payload,
             ));
@@ -354,7 +381,84 @@ fn divergence_label(kind: &str) -> &'static str {
     }
 }
 
-fn signal_flags(candidate: &DivergenceCandidate) -> serde_json::Value {
+pub(crate) fn compute_divergence_all_history(
+    history_futures: &[crate::runtime::state_store::MinuteHistory],
+    history_spot: &[crate::runtime::state_store::MinuteHistory],
+    sig_test_mode: DivergenceSigTestMode,
+    bootstrap_b: usize,
+    bootstrap_block_len: usize,
+    p_value_threshold: f64,
+) -> Vec<DivergenceEventData> {
+    let series = crate::indicators::context::BasicEventHistorySeries::from_histories(
+        history_futures,
+        history_spot,
+    );
+    let n = series.n;
+    if n < (PIVOT_K * 4).max(ROBUST_Z_LOOKBACK + 5) {
+        return Vec::new();
+    }
+
+    let fut = &history_futures[history_futures.len().saturating_sub(n)..];
+    let spot = &history_spot[history_spot.len().saturating_sub(n)..];
+    let closes = &series.close;
+    let highs = &series.high;
+    let lows = &series.low;
+    let cvd_fut = fut.iter().map(|row| row.cvd).collect::<Vec<_>>();
+    let cvd_spot = &series.spot_cvd;
+
+    let detrended_price = detrend_rolling_ols(closes, DETREND_LEN_PRICE);
+    let detrended_cvd_fut = detrend_rolling_ols(&cvd_fut, DETREND_LEN_CVD);
+    let detrended_cvd_spot = detrend_rolling_ols(cvd_spot, DETREND_LEN_CVD);
+    let z_cvd_fut = robust_z_series(&detrended_cvd_fut, ROBUST_Z_LOOKBACK);
+    let z_cvd_spot = robust_z_series(&detrended_cvd_spot, ROBUST_Z_LOOKBACK);
+    let high_pivots = confirmed_high_pivots(highs, PIVOT_K, n - 1);
+    let low_pivots = confirmed_low_pivots(lows, PIVOT_K, n - 1);
+    let atr = rolling_atr(highs, lows, closes, ATR_LOOKBACK);
+
+    let mut candidates = Vec::new();
+    candidates.extend(all_candidates(
+        true,
+        &high_pivots,
+        fut,
+        spot,
+        closes,
+        highs,
+        lows,
+        &detrended_price,
+        &z_cvd_fut,
+        &z_cvd_spot,
+        &atr,
+        sig_test_mode,
+        bootstrap_b,
+        bootstrap_block_len,
+        p_value_threshold,
+    ));
+    candidates.extend(all_candidates(
+        false,
+        &low_pivots,
+        fut,
+        spot,
+        closes,
+        highs,
+        lows,
+        &detrended_price,
+        &z_cvd_fut,
+        &z_cvd_spot,
+        &atr,
+        sig_test_mode,
+        bootstrap_b,
+        bootstrap_block_len,
+        p_value_threshold,
+    ));
+    candidates.sort_by_key(|candidate| (candidate.available_i, candidate.i1, candidate.i2));
+
+    candidates
+        .iter()
+        .map(|candidate| candidate_to_event_data(candidate, fut))
+        .collect()
+}
+
+fn signal_flags(candidate: &DivergenceEventData) -> serde_json::Value {
     let label = divergence_label(&candidate.divergence_type);
     json!({
         "bearish_divergence": label == "bearish_divergence",
@@ -364,15 +468,39 @@ fn signal_flags(candidate: &DivergenceCandidate) -> serde_json::Value {
     })
 }
 
-fn candidate_payload(candidate: &DivergenceCandidate) -> serde_json::Value {
+fn candidate_index_json(
+    history_index: &HashMap<chrono::DateTime<chrono::Utc>, usize>,
+    ts: chrono::DateTime<chrono::Utc>,
+) -> Value {
+    history_index
+        .get(&ts)
+        .map(|idx| json!(idx))
+        .unwrap_or(Value::Null)
+}
+
+fn candidate_payload(
+    candidate: &DivergenceEventData,
+    history_index: &HashMap<chrono::DateTime<chrono::Utc>, usize>,
+) -> serde_json::Value {
     json!({
         "type": divergence_label(&candidate.divergence_type),
         "pivot_side": candidate.pivot_side.clone(),
-        "i1": candidate.i1,
-        "i2": candidate.i2,
-        "confirm_i1": candidate.confirm_i1,
-        "confirm_i2": candidate.confirm_i2,
-        "available_i": candidate.available_i,
+        "i1": candidate_index_json(history_index, candidate.pivot_ts_1),
+        "i2": candidate_index_json(history_index, candidate.pivot_ts_2),
+        "confirm_i1": candidate_index_json(history_index, candidate.pivot_confirm_ts_1),
+        "confirm_i2": candidate_index_json(history_index, candidate.pivot_confirm_ts_2),
+        "available_i": candidate_index_json(
+            history_index,
+            candidate.event_available_ts - Duration::minutes(1)
+        ),
+        "event_start_ts": candidate.event_start_ts.to_rfc3339(),
+        "event_end_ts": candidate.event_end_ts.to_rfc3339(),
+        "event_available_ts": candidate.event_available_ts.to_rfc3339(),
+        "pivot_ts_1": candidate.pivot_ts_1.to_rfc3339(),
+        "pivot_ts_2": candidate.pivot_ts_2.to_rfc3339(),
+        "pivot_confirm_ts_1": candidate.pivot_confirm_ts_1.to_rfc3339(),
+        "pivot_confirm_ts_2": candidate.pivot_confirm_ts_2.to_rfc3339(),
+        "leg_minutes": candidate.leg_minutes,
         "price_start": candidate.price_start,
         "price_end": candidate.price_end,
         "cvd_start_fut": candidate.cvd_start_fut,
@@ -396,20 +524,15 @@ fn candidate_payload(candidate: &DivergenceCandidate) -> serde_json::Value {
     })
 }
 
-fn divergence_payload_json(
-    symbol: &str,
-    candidate: &DivergenceCandidate,
-    fut: &[crate::runtime::state_store::MinuteHistory],
-    payload: Value,
-) -> Value {
+fn divergence_payload_json(symbol: &str, candidate: &DivergenceEventData, payload: Value) -> Value {
     let event_id = build_divergence_event_id(
         symbol,
         &candidate.divergence_type,
         &candidate.pivot_side,
-        fut[candidate.i1].ts_bucket,
-        fut[candidate.i2].ts_bucket + Duration::minutes(1),
-        Some(fut[candidate.i1].ts_bucket),
-        Some(fut[candidate.i2].ts_bucket),
+        candidate.event_start_ts,
+        candidate.event_end_ts,
+        Some(candidate.pivot_ts_1),
+        Some(candidate.pivot_ts_2),
     );
     let mut base = Map::new();
     base.insert("event_id".to_string(), json!(event_id));
@@ -420,15 +543,15 @@ fn divergence_payload_json(
     base.insert("pivot_side".to_string(), json!(candidate.pivot_side));
     base.insert(
         "start_ts".to_string(),
-        json!(fut[candidate.i1].ts_bucket.to_rfc3339()),
+        json!(candidate.event_start_ts.to_rfc3339()),
     );
     base.insert(
         "end_ts".to_string(),
-        json!((fut[candidate.i2].ts_bucket + Duration::minutes(1)).to_rfc3339()),
+        json!(candidate.event_end_ts.to_rfc3339()),
     );
     base.insert(
         "event_available_ts".to_string(),
-        json!((fut[candidate.available_i].ts_bucket + Duration::minutes(1)).to_rfc3339()),
+        json!(candidate.event_available_ts.to_rfc3339()),
     );
     base.insert("score".to_string(), json!(candidate.score));
     merge_payload_fields(base, &payload)
@@ -436,21 +559,20 @@ fn divergence_payload_json(
 
 fn divergence_event_json(
     symbol: &str,
-    candidate: &DivergenceCandidate,
-    fut: &[crate::runtime::state_store::MinuteHistory],
+    candidate: &DivergenceEventData,
 ) -> (chrono::DateTime<chrono::Utc>, Value) {
-    let start_ts = fut[candidate.i1].ts_bucket;
-    let end_ts = fut[candidate.i2].ts_bucket + Duration::minutes(1);
-    let available_ts = fut[candidate.available_i].ts_bucket + Duration::minutes(1);
+    let start_ts = candidate.event_start_ts;
+    let end_ts = candidate.event_end_ts;
+    let available_ts = candidate.event_available_ts;
     let payload = json!({
         "event_start_ts": start_ts.to_rfc3339(),
         "event_end_ts": end_ts.to_rfc3339(),
         "event_available_ts": available_ts.to_rfc3339(),
-        "pivot_ts_1": fut[candidate.i1].ts_bucket.to_rfc3339(),
-        "pivot_ts_2": fut[candidate.i2].ts_bucket.to_rfc3339(),
-        "pivot_confirm_ts_1": fut[candidate.confirm_i1].ts_bucket.to_rfc3339(),
-        "pivot_confirm_ts_2": fut[candidate.confirm_i2].ts_bucket.to_rfc3339(),
-        "leg_minutes": (fut[candidate.i2].ts_bucket - fut[candidate.i1].ts_bucket).num_minutes(),
+        "pivot_ts_1": candidate.pivot_ts_1.to_rfc3339(),
+        "pivot_ts_2": candidate.pivot_ts_2.to_rfc3339(),
+        "pivot_confirm_ts_1": candidate.pivot_confirm_ts_1.to_rfc3339(),
+        "pivot_confirm_ts_2": candidate.pivot_confirm_ts_2.to_rfc3339(),
+        "leg_minutes": candidate.leg_minutes,
         "price_diff": candidate.price_diff,
         "price_norm_diff": candidate.price_diff,
         "cvd_diff_fut": candidate.cvd_diff_fut,
@@ -466,11 +588,11 @@ fn divergence_event_json(
         "spot_price_flow_confirm": candidate.spot_price_flow_confirm,
         "fut_divergence_sign": candidate.fut_divergence_sign,
         "spot_lead_score": candidate.spot_lead_score,
-        "likely_driver": candidate.likely_driver
+        "likely_driver": candidate.likely_driver.clone()
     });
     (
         available_ts,
-        divergence_payload_json(symbol, candidate, fut, payload),
+        divergence_payload_json(symbol, candidate, payload),
     )
 }
 

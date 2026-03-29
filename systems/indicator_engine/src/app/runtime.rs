@@ -33,12 +33,13 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tokio::time::{interval, Instant, MissedTickBehavior};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-const STARTUP_BACKFILL_FALLBACK_LOOKBACK_MINUTES: i64 = 180;
-const STARTUP_BACKFILL_OVERLAP_MINUTES: i64 = 180;
+const STARTUP_BACKFILL_FALLBACK_LOOKBACK_MINUTES: i64 = 30;
+const STARTUP_BACKFILL_OVERLAP_MINUTES: i64 = 30;
 const MIN_REUSABLE_SNAPSHOT_HISTORY_MINUTES: i64 = 7 * 24 * 60;
 const STARTUP_BACKFILL_SAFETY_LAG_SECS: i64 = 10;
 const STARTUP_BACKFILL_MARKET: &str = "all";
@@ -120,6 +121,12 @@ struct LiveCanonicalRepairController {
     last_gap_repair_attempt_at: Option<Instant>,
     last_gap_repair_minute: Option<DateTime<Utc>>,
     last_tail_reconcile_at: Option<Instant>,
+}
+
+struct OiRatioPatchTask {
+    minutes: Vec<DateTime<Utc>>,
+    started_at: Instant,
+    handle: JoinHandle<Result<usize>>,
 }
 
 impl LiveCanonicalRepairController {
@@ -351,13 +358,13 @@ pub async fn run(ctx: AppContext) -> Result<()> {
         ctx.producer_instance_id.clone(),
     );
 
-    let dispatcher = Dispatcher::new(
+    let dispatcher = Arc::new(Dispatcher::new(
         feature_writer,
         snapshot_writer,
         level_writer,
         event_writer,
         publisher.clone(),
-    );
+    ));
     let publish_db_pool = build_publish_db_pool(&ctx.config).await?;
     let outbox_dispatcher = OutboxDispatcher::new(
         publish_db_pool.clone(),
@@ -400,6 +407,12 @@ pub async fn run(ctx: AppContext) -> Result<()> {
     let mut stale_drop_by_msg_type: HashMap<String, u64> = HashMap::new();
     let mut stale_drop_last_report = Instant::now();
     let runtime_options = build_indicator_runtime_options(&ctx.config);
+    state_store.set_divergence_runtime_options(
+        runtime_options.divergence_sig_test_mode,
+        runtime_options.divergence_bootstrap_b,
+        runtime_options.divergence_bootstrap_block_len,
+        runtime_options.divergence_p_value_threshold,
+    );
 
     let mut tick = interval(Duration::from_secs(1));
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -439,7 +452,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
         result = run_startup_backfill(
             &ctx,
             metrics.clone(),
-            &dispatcher,
+            dispatcher.as_ref(),
             &mut state_store,
             &mut scheduler,
             &runtime_options,
@@ -503,6 +516,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
     let mut stall_detector =
         RuntimeStallDetector::new(ts_from_millis(metrics.snapshot().last_persisted_ts_ms));
     let mut live_repair_controller = LiveCanonicalRepairController::default();
+    let mut oi_ratio_patch_task: Option<OiRatioPatchTask> = None;
 
     loop {
         tokio::select! {
@@ -577,6 +591,13 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                 }
             }
             _ = tick.tick() => {
+                settle_finished_oi_ratio_patch_task(
+                    &mut oi_ratio_patch_task,
+                    &mut state_store,
+                    &metrics,
+                )
+                .await;
+
                 let drain_result = drain_pending_ingest_events(
                     &mut trade_rx,
                     &mut non_trade_rx,
@@ -810,50 +831,65 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                 );
 
                 let Some(_next_minute) = next_minute else {
-                    if state_store.has_pending_oi_ratio_patch() && allow_oi_ratio_patches {
-                        process_pending_oi_ratio_patches(
-                            &dispatcher,
+                    if state_store.has_pending_oi_ratio_patch()
+                        && allow_oi_ratio_patches
+                        && oi_ratio_patch_task.is_none()
+                    {
+                        oi_ratio_patch_task = spawn_oi_ratio_patch_task(
+                            dispatcher.clone(),
                             &mut state_store,
                             &runtime_options,
                             &metrics,
-                        )
-                        .await
-                        .context("process oi_ratio patch minutes without live ready minute")?;
+                        )?;
                     }
                     continue;
                 };
                 let Some(ready_through_ts) = ready_through_ts else {
-                    if state_store.has_pending_oi_ratio_patch() && allow_oi_ratio_patches {
-                        process_pending_oi_ratio_patches(
-                            &dispatcher,
+                    if state_store.has_pending_oi_ratio_patch()
+                        && allow_oi_ratio_patches
+                        && oi_ratio_patch_task.is_none()
+                    {
+                        oi_ratio_patch_task = spawn_oi_ratio_patch_task(
+                            dispatcher.clone(),
                             &mut state_store,
                             &runtime_options,
                             &metrics,
-                        )
-                        .await
-                        .context("process oi_ratio patch minutes while no live minute is ready")?;
+                        )?;
                     }
                     continue;
                 };
                 if let Err(err) = process_ready_minutes(
                     &ctx,
                     metrics.clone(),
-                    &dispatcher,
+                    dispatcher.as_ref(),
                     &mut state_store,
                     &mut scheduler,
                     &runtime_options,
                     ready_through_ts,
                     DispatchMode::Live,
-                    allow_oi_ratio_patches,
+                    false,
                 )
                 .await
                 {
                     error!(error = %err, "process ready indicator minutes failed");
                     return Err(err).context("process ready indicator minutes failed");
                 }
+                if state_store.has_pending_oi_ratio_patch()
+                    && allow_oi_ratio_patches
+                    && oi_ratio_patch_task.is_none()
+                {
+                    oi_ratio_patch_task = spawn_oi_ratio_patch_task(
+                        dispatcher.clone(),
+                        &mut state_store,
+                        &runtime_options,
+                        &metrics,
+                    )?;
+                }
             }
         }
     }
+
+    abort_oi_ratio_patch_task(&mut oi_ratio_patch_task, &mut state_store).await;
 
     if shutdown_requested {
         let shutdown_closed_minute =
@@ -871,7 +907,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
         if let Err(err) = shutdown_drain_and_persist(
             &ctx,
             metrics.clone(),
-            &dispatcher,
+            dispatcher.as_ref(),
             &mut state_store,
             &mut scheduler,
             &runtime_options,
@@ -2331,7 +2367,7 @@ async fn process_ready_minutes(
         for window in dirty_batch {
             let minute = window.ts_bucket;
             let snapshots =
-                process_window_bundle(ctx, dispatcher, runtime_options, &window, dispatch_mode)
+                process_window_bundle(ctx, dispatcher, runtime_options, window, dispatch_mode)
                     .await?;
             metrics.inc_exported_window();
             metrics.set_last_persisted_ts(Some(minute.timestamp_millis()));
@@ -2390,8 +2426,7 @@ async fn process_ready_minutes(
 
     for minute in scheduler.ready_minutes_through(ready_through_ts) {
         let window = state_store.finalize_minute(minute);
-        match process_window_bundle(ctx, dispatcher, runtime_options, &window, dispatch_mode).await
-        {
+        match process_window_bundle(ctx, dispatcher, runtime_options, window, dispatch_mode).await {
             Ok(snapshots) => {
                 metrics.inc_exported_window();
                 metrics.set_last_persisted_ts(Some(minute.timestamp_millis()));
@@ -2514,7 +2549,7 @@ async fn process_pending_oi_ratio_patches(
         for minute in patch_batch {
             let bundle = state_store.build_oi_ratio_patch_bundle_for_minute(minute);
             let ictx = Arc::new(IndicatorContext::from_bundle(
-                &bundle,
+                bundle,
                 runtime_options,
                 KlineHistorySupplement::default(),
             ));
@@ -2539,6 +2574,135 @@ async fn process_pending_oi_ratio_patches(
     Ok(processed)
 }
 
+fn spawn_oi_ratio_patch_task(
+    dispatcher: Arc<Dispatcher>,
+    state_store: &mut StateStore,
+    runtime_options: &IndicatorRuntimeOptions,
+    metrics: &Arc<AppMetrics>,
+) -> Result<Option<OiRatioPatchTask>> {
+    let patch_batch = state_store.take_oi_ratio_patch_batch(OI_RATIO_PATCH_BATCH_SIZE);
+    if patch_batch.is_empty() {
+        return Ok(None);
+    }
+
+    let patch_from = patch_batch.first().copied();
+    let patch_to = patch_batch.last().copied();
+    let patch_batch_len = patch_batch.len();
+    let contexts = patch_batch
+        .iter()
+        .map(|minute| {
+            let bundle = state_store.build_oi_ratio_patch_bundle_for_minute(*minute);
+            Ok(Arc::new(IndicatorContext::from_bundle(
+                bundle,
+                runtime_options,
+                KlineHistorySupplement::default(),
+            )))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let metrics = metrics.clone();
+    let started_at = Instant::now();
+    let handle = tokio::spawn(async move {
+        let batch_started_at = Instant::now();
+        for ictx in contexts {
+            dispatcher.process_oi_ratio_patch_window(ictx).await?;
+        }
+        let elapsed_ms = batch_started_at.elapsed().as_millis();
+        metrics.record_oi_ratio_patch_batch(patch_batch_len, elapsed_ms);
+        metrics.record_oi_ratio_patch_republish(patch_batch_len);
+        debug!(
+            reason = "oi_ratio_patch_async",
+            from_ts = ?patch_from,
+            to_ts = ?patch_to,
+            windows_processed = patch_batch_len,
+            elapsed_ms = elapsed_ms,
+            batch_size = OI_RATIO_PATCH_BATCH_SIZE,
+            "background oi_ratio patch batch processed"
+        );
+        Ok(patch_batch_len)
+    });
+
+    Ok(Some(OiRatioPatchTask {
+        minutes: patch_batch,
+        started_at,
+        handle,
+    }))
+}
+
+async fn settle_finished_oi_ratio_patch_task(
+    task_slot: &mut Option<OiRatioPatchTask>,
+    state_store: &mut StateStore,
+    metrics: &Arc<AppMetrics>,
+) {
+    let finished = task_slot
+        .as_ref()
+        .map(|task| task.handle.is_finished())
+        .unwrap_or(false);
+    if !finished {
+        return;
+    }
+
+    let task = task_slot
+        .take()
+        .expect("finished oi_ratio patch task must exist");
+    let patch_from = task.minutes.first().copied();
+    let patch_to = task.minutes.last().copied();
+    let queued_elapsed_ms = task.started_at.elapsed().as_millis();
+    match task.handle.await {
+        Ok(Ok(processed)) => {
+            debug!(
+                reason = "oi_ratio_patch_async",
+                from_ts = ?patch_from,
+                to_ts = ?patch_to,
+                windows_processed = processed,
+                queued_elapsed_ms = queued_elapsed_ms,
+                "background oi_ratio patch task completed"
+            );
+        }
+        Ok(Err(err)) => {
+            state_store.requeue_oi_ratio_patch_batch(&task.minutes);
+            metrics.inc_db_error();
+            warn!(
+                error = %err,
+                from_ts = ?patch_from,
+                to_ts = ?patch_to,
+                windows_requeued = task.minutes.len(),
+                "background oi_ratio patch task failed; batch requeued"
+            );
+        }
+        Err(err) => {
+            state_store.requeue_oi_ratio_patch_batch(&task.minutes);
+            metrics.inc_db_error();
+            warn!(
+                error = %err,
+                from_ts = ?patch_from,
+                to_ts = ?patch_to,
+                windows_requeued = task.minutes.len(),
+                "background oi_ratio patch task join failed; batch requeued"
+            );
+        }
+    }
+}
+
+async fn abort_oi_ratio_patch_task(
+    task_slot: &mut Option<OiRatioPatchTask>,
+    state_store: &mut StateStore,
+) {
+    let Some(task) = task_slot.take() else {
+        return;
+    };
+    let patch_from = task.minutes.first().copied();
+    let patch_to = task.minutes.last().copied();
+    task.handle.abort();
+    let _ = task.handle.await;
+    state_store.requeue_oi_ratio_patch_batch(&task.minutes);
+    info!(
+        from_ts = ?patch_from,
+        to_ts = ?patch_to,
+        windows_requeued = task.minutes.len(),
+        "aborted in-flight oi_ratio patch task during shutdown and requeued batch"
+    );
+}
+
 fn replay_heatmap_hydration_batch_end(
     start_ts: DateTime<Utc>,
     inclusive_end_ts: DateTime<Utc>,
@@ -2552,7 +2716,7 @@ async fn process_window_bundle(
     ctx: &Arc<AppContext>,
     dispatcher: &Dispatcher,
     runtime_options: &IndicatorRuntimeOptions,
-    window: &crate::runtime::state_store::WindowBundle,
+    window: crate::runtime::state_store::WindowBundle,
     mode: DispatchMode,
 ) -> Result<Vec<IndicatorSnapshotRow>> {
     let minute = window.ts_bucket;
@@ -3000,7 +3164,7 @@ async fn run_startup_backfill(
                 ctx,
                 dispatcher,
                 runtime_options,
-                &window,
+                window,
                 DispatchMode::ReplayMaterialize,
             )
             .await?;

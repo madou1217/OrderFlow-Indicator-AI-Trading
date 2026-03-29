@@ -7,7 +7,7 @@ use crate::runtime::state_store::{tick_to_price, BookLevelAgg, MinuteHistory};
 use chrono::Duration;
 use serde_json::{json, Map, Value};
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 
 const OFI_NORM_LOOKBACK: usize = 60;
 const WINDOW_SPECS: [(&str, i64); 2] = [("15m", 15), ("1h", 60)];
@@ -649,12 +649,12 @@ mod tests {
         let upgraded_bundle = upgraded_store.finalize_minute(ts);
 
         let direct_ctx = IndicatorContext::from_bundle(
-            &direct_bundle,
+            direct_bundle,
             &runtime_options,
             KlineHistorySupplement::default(),
         );
         let upgraded_ctx = IndicatorContext::from_bundle(
-            &upgraded_bundle,
+            upgraded_bundle,
             &runtime_options,
             KlineHistorySupplement::default(),
         );
@@ -708,7 +708,7 @@ mod tests {
         store.ingest(orderbook_event(ts, true));
         let bundle = store.finalize_minute(ts);
         let ctx = IndicatorContext::from_bundle(
-            &bundle,
+            bundle,
             &runtime_options,
             KlineHistorySupplement::default(),
         );

@@ -235,13 +235,15 @@ impl SnapshotWriter {
             return Ok(());
         }
 
+        let blob_specs = blob_specs.into_values().collect::<Vec<_>>();
+
         let mut tx = self
             .pool
             .begin()
             .await
             .context("begin indicator snapshot tx")?;
 
-        insert_snapshot_blobs(&mut tx, blob_specs.values()).await?;
+        insert_snapshot_blobs_in_tx(&mut tx, &blob_specs).await?;
 
         // Single round-trip: batch all rows with UNNEST.
         sqlx::query(
@@ -657,11 +659,10 @@ async fn enqueue_outbox_batch_in_tx(
     Ok(())
 }
 
-async fn insert_snapshot_blobs<'a>(
+async fn insert_snapshot_blobs_in_tx(
     tx: &mut Transaction<'_, Postgres>,
-    blobs: impl Iterator<Item = &'a SnapshotBlobSpec>,
+    blobs: &[SnapshotBlobSpec],
 ) -> Result<()> {
-    let blobs = blobs.collect::<Vec<_>>();
     if blobs.is_empty() {
         return Ok(());
     }
@@ -682,7 +683,7 @@ async fn insert_snapshot_blobs<'a>(
         .build()
         .execute(tx.as_mut())
         .await
-        .context("insert indicator snapshot blobs")?;
+        .context("insert indicator snapshot blobs in snapshot tx")?;
     Ok(())
 }
 

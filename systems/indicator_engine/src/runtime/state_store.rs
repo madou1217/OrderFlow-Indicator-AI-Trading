@@ -2,6 +2,13 @@ use crate::indicators::context::{
     LongShortRatioPoint, OpenInterestCurrentSidecar, OpenInterestHistPoint, OptionMarkGreeksPoint,
     OptionsSurfacePoint,
 };
+use crate::indicators::i03_divergence::{
+    compute_divergence_all_history, DivergenceEventData, DIVERGENCE_INCREMENTAL_LOOKBACK_MINUTES,
+};
+use crate::indicators::i12_buying_exhaustion::{
+    compute_exhaustion_all_history_from_histories, ExhaustionEventData,
+    EXHAUSTION_INCREMENTAL_LOOKBACK_MINUTES,
+};
 use crate::indicators::shared::funding::funding_change_json;
 use crate::indicators::shared::liquidation::build_recent_7d_entry as build_liquidation_recent_7d_entry;
 use crate::ingest::decoder::{
@@ -13,6 +20,7 @@ use crate::ingest::decoder::{
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::sync::Arc;
 use tracing::debug;
 
 pub const HISTORY_LIMIT_MINUTES: usize = 60 * 24 * 9; // keep 9 days
@@ -290,6 +298,8 @@ pub struct WindowBundle {
     pub funding_points_recent: Vec<LatestFundingState>,
     pub mark_points_recent: Vec<LatestMarkState>,
     pub liquidation_recent_7d_payload: Vec<Value>,
+    pub(crate) divergence_all_events: Arc<Vec<DivergenceEventData>>,
+    pub(crate) exhaustion_all_events: Arc<Vec<ExhaustionEventData>>,
     pub latest_common_oi_ratio_bucket: Option<DateTime<Utc>>,
     pub current_open_interest: Option<OpenInterestCurrentSidecar>,
     pub open_interest_hist_5m: Vec<OpenInterestHistPoint>,
@@ -1254,6 +1264,8 @@ pub struct StateStore {
     mark_timeline: VecDeque<LatestMarkState>,
     funding_timeline: VecDeque<LatestFundingState>,
     liquidation_recent_7d_payload: VecDeque<TimedJsonPayload>,
+    divergence_all_events: Arc<Vec<DivergenceEventData>>,
+    exhaustion_all_events: Arc<Vec<ExhaustionEventData>>,
     current_open_interest_timeline: VecDeque<OpenInterestCurrentSidecar>,
     open_interest_hist_5m: VecDeque<OpenInterestHistPoint>,
     global_account_ratio_5m: VecDeque<LongShortRatioPoint>,
@@ -1274,6 +1286,10 @@ pub struct StateStore {
     oi_ratio_patch_mark_total: u64,
     oi_ratio_patch_extends_backward_total: u64,
     last_finalized_minute: Option<DateTime<Utc>>,
+    divergence_sig_test_mode: crate::indicators::context::DivergenceSigTestMode,
+    divergence_bootstrap_b: usize,
+    divergence_bootstrap_block_len: usize,
+    divergence_p_value_threshold: f64,
 }
 
 impl StateStore {
@@ -1305,6 +1321,8 @@ impl StateStore {
             mark_timeline: VecDeque::new(),
             funding_timeline: VecDeque::new(),
             liquidation_recent_7d_payload: VecDeque::new(),
+            divergence_all_events: Arc::new(Vec::new()),
+            exhaustion_all_events: Arc::new(Vec::new()),
             current_open_interest_timeline: VecDeque::new(),
             open_interest_hist_5m: VecDeque::new(),
             global_account_ratio_5m: VecDeque::new(),
@@ -1319,7 +1337,24 @@ impl StateStore {
             oi_ratio_patch_mark_total: 0,
             oi_ratio_patch_extends_backward_total: 0,
             last_finalized_minute: None,
+            divergence_sig_test_mode: crate::indicators::context::DivergenceSigTestMode::Threshold,
+            divergence_bootstrap_b: 200,
+            divergence_bootstrap_block_len: 5,
+            divergence_p_value_threshold: 0.05,
         }
+    }
+
+    pub fn set_divergence_runtime_options(
+        &mut self,
+        sig_test_mode: crate::indicators::context::DivergenceSigTestMode,
+        bootstrap_b: usize,
+        bootstrap_block_len: usize,
+        p_value_threshold: f64,
+    ) {
+        self.divergence_sig_test_mode = sig_test_mode;
+        self.divergence_bootstrap_b = bootstrap_b;
+        self.divergence_bootstrap_block_len = bootstrap_block_len;
+        self.divergence_p_value_threshold = p_value_threshold;
     }
 
     pub fn set_effective_history_floor(&mut self, ts: Option<DateTime<Utc>>) {
@@ -1346,6 +1381,8 @@ impl StateStore {
         self.mark_timeline.clear();
         self.funding_timeline.clear();
         self.liquidation_recent_7d_payload.clear();
+        self.divergence_all_events = Arc::new(Vec::new());
+        self.exhaustion_all_events = Arc::new(Vec::new());
         self.current_open_interest_timeline.clear();
         self.open_interest_hist_5m.clear();
         self.global_account_ratio_5m.clear();
@@ -1667,6 +1704,7 @@ impl StateStore {
         self.last_finalized_minute = Some(ts_bucket);
         self.trim_replay_retention(ts_bucket);
         self.prune_recent_7d_payloads(ts_bucket);
+        self.refresh_incremental_indicator_event_caches(ts_bucket);
         self.build_window_bundle(ts_bucket, futures, spot)
     }
 
@@ -1677,6 +1715,7 @@ impl StateStore {
         self.last_finalized_minute = Some(ts_bucket);
         self.trim_replay_retention(ts_bucket);
         self.prune_recent_7d_payloads(ts_bucket);
+        self.refresh_incremental_indicator_event_caches(ts_bucket);
     }
 
     /// Process at most `max_batch` dirty-recompute windows per call, yielding
@@ -1809,6 +1848,20 @@ impl StateStore {
         out
     }
 
+    pub fn requeue_oi_ratio_patch_batch(&mut self, minutes: &[DateTime<Utc>]) {
+        let Some(start) = minutes.first().copied() else {
+            return;
+        };
+        let end = minutes.last().copied().unwrap_or(start);
+        let current_end = self.oi_ratio_patch_end.or(self.last_finalized_minute);
+        self.oi_ratio_patch_from = Some(
+            self.oi_ratio_patch_from
+                .map(|prev| prev.min(start))
+                .unwrap_or(start),
+        );
+        self.oi_ratio_patch_end = Some(current_end.map(|prev| prev.max(end)).unwrap_or(end));
+    }
+
     pub fn has_unhydrated_futures_orderbook_heatmap_in_range(
         &self,
         from_ts: DateTime<Utc>,
@@ -1915,6 +1968,64 @@ impl StateStore {
         {
             self.liquidation_recent_7d_payload.pop_front();
         }
+    }
+
+    fn refresh_incremental_indicator_event_caches(&mut self, ts_bucket: DateTime<Utc>) {
+        let divergence_tail_start =
+            ts_bucket - Duration::minutes(DIVERGENCE_INCREMENTAL_LOOKBACK_MINUTES);
+        let divergence_tail_futures = self
+            .history_futures
+            .iter()
+            .filter(|row| row.ts_bucket >= divergence_tail_start)
+            .cloned()
+            .collect::<Vec<_>>();
+        let divergence_tail_spot = self
+            .history_spot
+            .iter()
+            .filter(|row| row.ts_bucket >= divergence_tail_start)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut divergence_events = self
+            .divergence_all_events
+            .iter()
+            .filter(|event| event.event_available_ts < divergence_tail_start)
+            .cloned()
+            .collect::<Vec<_>>();
+        divergence_events.extend(compute_divergence_all_history(
+            &divergence_tail_futures,
+            &divergence_tail_spot,
+            self.divergence_sig_test_mode,
+            self.divergence_bootstrap_b,
+            self.divergence_bootstrap_block_len,
+            self.divergence_p_value_threshold,
+        ));
+        self.divergence_all_events = Arc::new(divergence_events);
+
+        let exhaustion_tail_start =
+            ts_bucket - Duration::minutes(EXHAUSTION_INCREMENTAL_LOOKBACK_MINUTES);
+        let exhaustion_tail_futures = self
+            .history_futures
+            .iter()
+            .filter(|row| row.ts_bucket >= exhaustion_tail_start)
+            .cloned()
+            .collect::<Vec<_>>();
+        let exhaustion_tail_spot = self
+            .history_spot
+            .iter()
+            .filter(|row| row.ts_bucket >= exhaustion_tail_start)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut exhaustion_events = self
+            .exhaustion_all_events
+            .iter()
+            .filter(|event| event.confirm_ts < exhaustion_tail_start)
+            .cloned()
+            .collect::<Vec<_>>();
+        exhaustion_events.extend(compute_exhaustion_all_history_from_histories(
+            &exhaustion_tail_futures,
+            &exhaustion_tail_spot,
+        ));
+        self.exhaustion_all_events = Arc::new(exhaustion_events);
     }
 
     fn bucket_mut(&mut self, market: MarketKind, ts_bucket: DateTime<Utc>) -> &mut MinuteBucket {
@@ -2410,6 +2521,8 @@ impl StateStore {
                 .iter()
                 .map(|row| row.payload_json.clone())
                 .collect(),
+            divergence_all_events: self.divergence_all_events.clone(),
+            exhaustion_all_events: self.exhaustion_all_events.clone(),
             latest_common_oi_ratio_bucket: oi_ratio_view.latest_common_bucket,
             current_open_interest: oi_ratio_view.current_open_interest,
             open_interest_hist_5m: oi_ratio_view.open_interest_hist_5m,
@@ -2464,6 +2577,20 @@ impl StateStore {
                 .filter(|row| row.ts <= ts_bucket)
                 .map(|row| row.payload_json.clone())
                 .collect(),
+            divergence_all_events: Arc::new(
+                self.divergence_all_events
+                    .iter()
+                    .filter(|event| event.event_available_ts <= as_of_ts)
+                    .cloned()
+                    .collect(),
+            ),
+            exhaustion_all_events: Arc::new(
+                self.exhaustion_all_events
+                    .iter()
+                    .filter(|event| event.confirm_ts <= as_of_ts)
+                    .cloned()
+                    .collect(),
+            ),
             latest_common_oi_ratio_bucket: oi_ratio_view.latest_common_bucket,
             current_open_interest: oi_ratio_view.current_open_interest,
             open_interest_hist_5m: oi_ratio_view.open_interest_hist_5m,
@@ -3023,6 +3150,11 @@ impl StateStore {
         self.cvd_spot = self.history_spot.back().map(|h| h.cvd).unwrap_or(0.0);
         // last_finalized_minute also derived from history tail.
         self.last_finalized_minute = self.history_futures.back().map(|h| h.ts_bucket);
+        self.divergence_all_events = Arc::new(Vec::new());
+        self.exhaustion_all_events = Arc::new(Vec::new());
+        if let Some(ts_bucket) = self.last_finalized_minute {
+            self.refresh_incremental_indicator_event_caches(ts_bucket);
+        }
     }
 
     fn rebuild_incremental_recent_7d_payloads(&mut self) {
@@ -4841,6 +4973,37 @@ mod tests {
         assert!(store.has_pending_oi_ratio_patch());
         assert!(!store.has_pending_dirty_recompute());
         assert_eq!(store.pending_oi_ratio_patch_batch_range(10), Some((ts, ts)));
+    }
+
+    #[test]
+    fn requeue_oi_ratio_patch_batch_restores_taken_minutes() {
+        let mut store = StateStore::new("TESTUSDT".to_string(), 1_000.0);
+        let ts = Utc.with_ymd_and_hms(2026, 3, 6, 9, 20, 0).single().unwrap();
+        store.finalize_minute(ts);
+        store.finalize_minute(ts + ChronoDuration::minutes(1));
+        store.finalize_minute(ts + ChronoDuration::minutes(2));
+
+        store.ingest(ratio_event(ts, LongShortRatioType::GlobalAccount, 1.2));
+        assert_eq!(
+            store.pending_oi_ratio_patch_batch_range(10),
+            Some((ts, ts + ChronoDuration::minutes(2)))
+        );
+
+        let taken = store.take_oi_ratio_patch_batch(2);
+        assert_eq!(taken.len(), 2);
+        assert_eq!(
+            store.pending_oi_ratio_patch_batch_range(10),
+            Some((
+                ts + ChronoDuration::minutes(2),
+                ts + ChronoDuration::minutes(2)
+            ))
+        );
+
+        store.requeue_oi_ratio_patch_batch(&taken);
+        assert_eq!(
+            store.pending_oi_ratio_patch_batch_range(10),
+            Some((ts, ts + ChronoDuration::minutes(2)))
+        );
     }
 
     #[test]

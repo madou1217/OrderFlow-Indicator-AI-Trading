@@ -1,3 +1,4 @@
+use crate::indicators::i03_divergence::DivergenceEventData;
 use crate::indicators::i05_orderbook_depth::OrderbookDepthPrecomputed;
 use crate::indicators::i06_absorption::AbsorptionEventData;
 use crate::indicators::i07_initiation::InitiationEventData;
@@ -173,6 +174,7 @@ pub struct BasicEventHistorySeries {
 #[derive(Debug, Default)]
 pub struct IndicatorSharedCaches {
     basic_event_history_series: OnceLock<Arc<BasicEventHistorySeries>>,
+    divergence_all_events: OnceLock<Arc<Vec<DivergenceEventData>>>,
     absorption_all_events: OnceLock<Arc<Vec<AbsorptionEventData>>>,
     initiation_all_events: OnceLock<Arc<Vec<InitiationEventData>>>,
     exhaustion_all_events: OnceLock<Arc<Vec<ExhaustionEventData>>>,
@@ -274,49 +276,87 @@ pub struct KlineHistorySupplement {
 
 impl IndicatorContext {
     pub fn from_bundle(
-        bundle: &WindowBundle,
+        bundle: WindowBundle,
         options: &IndicatorRuntimeOptions,
         kline_history_supplement: KlineHistorySupplement,
     ) -> Self {
+        let WindowBundle {
+            ts_bucket,
+            symbol,
+            futures,
+            spot,
+            history_futures,
+            history_spot,
+            trade_history_futures,
+            trade_history_spot,
+            latest_mark,
+            latest_funding,
+            funding_changes_in_window,
+            funding_points_in_window,
+            mark_points_in_window,
+            funding_changes_recent,
+            funding_recent_7d_payload,
+            funding_points_recent,
+            mark_points_recent,
+            liquidation_recent_7d_payload,
+            divergence_all_events,
+            exhaustion_all_events,
+            latest_common_oi_ratio_bucket,
+            current_open_interest,
+            open_interest_hist_5m,
+            global_account_ratio_5m,
+            top_account_ratio_5m,
+            top_position_ratio_5m,
+            latest_options_surface_bucket,
+            options_surface_5m,
+        } = bundle;
         let merged_options_surface_5m = merge_options_surface_history(
-            &bundle.options_surface_5m,
+            &options_surface_5m,
             &kline_history_supplement.options_surface_5m,
         );
         let latest_options_surface_bucket = merged_options_surface_5m
             .last()
             .map(|point| point.ts_bucket)
-            .or(bundle.latest_options_surface_bucket)
+            .or(latest_options_surface_bucket)
             .or(kline_history_supplement.latest_options_surface_bucket);
         let shared_caches = Arc::new(IndicatorSharedCaches::default());
+        let funding_recent_7d_payload = Arc::new(funding_recent_7d_payload);
+        let liquidation_recent_7d_payload = Arc::new(liquidation_recent_7d_payload);
+        let _ = shared_caches
+            .divergence_all_events
+            .set(divergence_all_events);
         let _ = shared_caches
             .funding_recent_7d_payload
-            .set(Arc::new(bundle.funding_recent_7d_payload.clone()));
+            .set(funding_recent_7d_payload);
         let _ = shared_caches
             .liquidation_recent_7d_payload
-            .set(Arc::new(bundle.liquidation_recent_7d_payload.clone()));
+            .set(liquidation_recent_7d_payload);
+        let _ = shared_caches
+            .exhaustion_all_events
+            .set(exhaustion_all_events);
         Self {
-            ts_bucket: bundle.ts_bucket,
-            symbol: bundle.symbol.clone(),
-            futures: bundle.futures.clone(),
-            spot: bundle.spot.clone(),
-            history_futures: bundle.history_futures.clone(),
-            history_spot: bundle.history_spot.clone(),
-            trade_history_futures: bundle.trade_history_futures.clone(),
-            trade_history_spot: bundle.trade_history_spot.clone(),
-            latest_mark: bundle.latest_mark.clone(),
-            latest_funding: bundle.latest_funding.clone(),
-            funding_changes_in_window: bundle.funding_changes_in_window.clone(),
-            funding_points_in_window: bundle.funding_points_in_window.clone(),
-            mark_points_in_window: bundle.mark_points_in_window.clone(),
-            funding_changes_recent: bundle.funding_changes_recent.clone(),
-            funding_points_recent: bundle.funding_points_recent.clone(),
-            mark_points_recent: bundle.mark_points_recent.clone(),
-            latest_common_oi_ratio_bucket: bundle.latest_common_oi_ratio_bucket,
-            current_open_interest: bundle.current_open_interest.clone(),
-            open_interest_hist_5m: bundle.open_interest_hist_5m.clone(),
-            global_account_ratio_5m: bundle.global_account_ratio_5m.clone(),
-            top_account_ratio_5m: bundle.top_account_ratio_5m.clone(),
-            top_position_ratio_5m: bundle.top_position_ratio_5m.clone(),
+            ts_bucket,
+            symbol,
+            futures,
+            spot,
+            history_futures,
+            history_spot,
+            trade_history_futures,
+            trade_history_spot,
+            latest_mark,
+            latest_funding,
+            funding_changes_in_window,
+            funding_points_in_window,
+            mark_points_in_window,
+            funding_changes_recent,
+            funding_points_recent,
+            mark_points_recent,
+            latest_common_oi_ratio_bucket,
+            current_open_interest,
+            open_interest_hist_5m,
+            global_account_ratio_5m,
+            top_account_ratio_5m,
+            top_position_ratio_5m,
             latest_options_surface_bucket,
             options_surface_5m: merged_options_surface_5m,
             whale_threshold_usdt: options.whale_threshold_usdt,
@@ -383,6 +423,16 @@ impl IndicatorContext {
     {
         self.shared_caches
             .absorption_all_events
+            .get_or_init(|| Arc::new(build(self)))
+            .clone()
+    }
+
+    pub(crate) fn divergence_all_events_or_init<F>(&self, build: F) -> Arc<Vec<DivergenceEventData>>
+    where
+        F: FnOnce(&IndicatorContext) -> Vec<DivergenceEventData>,
+    {
+        self.shared_caches
+            .divergence_all_events
             .get_or_init(|| Arc::new(build(self)))
             .clone()
     }
@@ -680,9 +730,13 @@ fn merge_options_surface_history(
 
 impl BasicEventHistorySeries {
     fn from_context(ctx: &IndicatorContext) -> Self {
-        let n = ctx.history_futures.len().min(ctx.history_spot.len());
-        let fut = &ctx.history_futures[ctx.history_futures.len().saturating_sub(n)..];
-        let spot = &ctx.history_spot[ctx.history_spot.len().saturating_sub(n)..];
+        Self::from_histories(&ctx.history_futures, &ctx.history_spot)
+    }
+
+    pub(crate) fn from_histories(fut: &[MinuteHistory], spot: &[MinuteHistory]) -> Self {
+        let n = fut.len().min(spot.len());
+        let fut = &fut[fut.len().saturating_sub(n)..];
+        let spot = &spot[spot.len().saturating_sub(n)..];
 
         let open = fut
             .iter()

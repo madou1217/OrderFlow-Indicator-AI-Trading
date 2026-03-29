@@ -1407,7 +1407,7 @@ async fn compute_snapshots(
         bundle.ts_bucket + ChronoDuration::minutes(1),
     )
     .await;
-    let ctx = IndicatorContext::from_bundle(bundle, runtime_options, supplement);
+    let ctx = IndicatorContext::from_bundle(bundle.clone(), runtime_options, supplement);
     let mut snapshots = registry
         .iter()
         .filter_map(|indicator| indicator.evaluate(&ctx).snapshot)

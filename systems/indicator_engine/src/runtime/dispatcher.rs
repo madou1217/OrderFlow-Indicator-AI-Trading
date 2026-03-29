@@ -39,7 +39,7 @@ impl DispatchMode {
 }
 
 pub struct Dispatcher {
-    flow_indicators: Vec<Arc<dyn Indicator>>,
+    flow_groups: Vec<IndicatorGroup>,
     deriv_indicators: Vec<Arc<dyn Indicator>>,
     orderbook_indicators: Vec<Arc<dyn Indicator>>,
     oi_ratio_patch_indicators: Vec<Arc<dyn Indicator>>,
@@ -48,6 +48,12 @@ pub struct Dispatcher {
     level_writer: LevelWriter,
     event_writer: EventWriter,
     publisher: IndPublisher,
+}
+
+#[derive(Clone)]
+struct IndicatorGroup {
+    name: &'static str,
+    indicators: Vec<Arc<dyn Indicator>>,
 }
 
 #[derive(Default)]
@@ -71,25 +77,27 @@ impl Dispatcher {
         publisher: IndPublisher,
     ) -> Self {
         let indicators = build_registry();
-        let mut flow_indicators = Vec::new();
+        let mut flow_core_indicators = Vec::new();
+        let mut flow_avwap_indicators = Vec::new();
+        let mut flow_rvwap_indicators = Vec::new();
+        let mut flow_high_volume_indicators = Vec::new();
+        let mut flow_tpo_indicators = Vec::new();
         let mut deriv_indicators = Vec::new();
         let mut orderbook_indicators = Vec::new();
         let mut oi_ratio_patch_indicators = Vec::new();
         for indicator in indicators {
+            if let Some(flow_group) = flow_group_name_for_indicator(indicator.code()) {
+                match flow_group {
+                    "flow_core" => flow_core_indicators.push(indicator),
+                    "flow_avwap" => flow_avwap_indicators.push(indicator),
+                    "flow_rvwap" => flow_rvwap_indicators.push(indicator),
+                    "flow_high_volume" => flow_high_volume_indicators.push(indicator),
+                    "flow_tpo" => flow_tpo_indicators.push(indicator),
+                    _ => unreachable!("unknown flow group"),
+                }
+                continue;
+            }
             match indicator.code() {
-                "price_volume_structure"
-                | "footprint"
-                | "divergence"
-                | "cvd_pack"
-                | "whale_trades"
-                | "vpin"
-                | "avwap"
-                | "kline_history"
-                | "tpo_market_profile"
-                | "rvwap_sigma_bands"
-                | "high_volume_pulse"
-                | "ema_trend_regime"
-                | "fvg" => flow_indicators.push(indicator),
                 "liquidation_density"
                 | "funding_rate"
                 | "open_interest"
@@ -98,14 +106,31 @@ impl Dispatcher {
                     if matches!(indicator.code(), "open_interest" | "long_short_ratios") {
                         oi_ratio_patch_indicators.push(indicator.clone());
                     }
-                    deriv_indicators.push(indicator)
+                    deriv_indicators.push(indicator);
                 }
                 _ => orderbook_indicators.push(indicator),
             }
         }
 
+        let flow_groups = [
+            ("flow_core", flow_core_indicators),
+            ("flow_avwap", flow_avwap_indicators),
+            ("flow_rvwap", flow_rvwap_indicators),
+            ("flow_high_volume", flow_high_volume_indicators),
+            ("flow_tpo", flow_tpo_indicators),
+        ]
+        .into_iter()
+        .filter_map(|(name, indicators)| {
+            if indicators.is_empty() {
+                None
+            } else {
+                Some(IndicatorGroup { name, indicators })
+            }
+        })
+        .collect::<Vec<_>>();
+
         Self {
-            flow_indicators,
+            flow_groups,
             deriv_indicators,
             orderbook_indicators,
             oi_ratio_patch_indicators,
@@ -123,18 +148,34 @@ impl Dispatcher {
         mode: DispatchMode,
     ) -> Result<Vec<IndicatorSnapshotRow>> {
         let total_started_at = Instant::now();
-        let flow_handle = spawn_group_worker(self.flow_indicators.clone(), ctx.clone());
-        let deriv_handle = spawn_group_worker(self.deriv_indicators.clone(), ctx.clone());
-        let orderbook_handle = spawn_group_worker(self.orderbook_indicators.clone(), ctx.clone());
+        let mut group_handles: Vec<(&'static str, JoinHandle<GroupOutput>)> = self
+            .flow_groups
+            .iter()
+            .map(|group| {
+                (
+                    group.name,
+                    spawn_group_worker(group.indicators.clone(), ctx.clone()),
+                )
+            })
+            .collect();
+        group_handles.push((
+            "deriv",
+            spawn_group_worker(self.deriv_indicators.clone(), ctx.clone()),
+        ));
+        group_handles.push((
+            "orderbook_heavy",
+            spawn_group_worker(self.orderbook_indicators.clone(), ctx.clone()),
+        ));
 
-        let flow_output = join_group("flow", flow_handle).await?;
-        let deriv_output = join_group("deriv", deriv_handle).await?;
-        let orderbook_output = join_group("orderbook_heavy", orderbook_handle).await?;
+        let mut group_outputs = Vec::with_capacity(group_handles.len());
+        for (name, handle) in group_handles {
+            group_outputs.push((name, join_group(name, handle).await?));
+        }
         let compute_ms = total_started_at.elapsed().as_millis();
-
-        let flow_snapshot_count = flow_output.snapshots.len();
-        let deriv_snapshot_count = deriv_output.snapshots.len();
-        let orderbook_snapshot_count = orderbook_output.snapshots.len();
+        let group_snapshot_counts = group_outputs
+            .iter()
+            .map(|(name, output)| format!("{name}={}", output.snapshots.len()))
+            .collect::<Vec<_>>();
 
         let mut snapshots: Vec<IndicatorSnapshotRow> = Vec::new();
         let mut levels: Vec<IndicatorLevelRow> = Vec::new();
@@ -145,39 +186,19 @@ impl Dispatcher {
         let mut exhaustion_rows: Vec<ExhaustionEventRow> = Vec::new();
         let mut liq_rows: Vec<LiquidationLevelRow> = Vec::new();
 
-        merge_group_output(
-            flow_output,
-            &mut snapshots,
-            &mut levels,
-            &mut events,
-            &mut divergence_rows,
-            &mut absorption_rows,
-            &mut initiation_rows,
-            &mut exhaustion_rows,
-            &mut liq_rows,
-        );
-        merge_group_output(
-            deriv_output,
-            &mut snapshots,
-            &mut levels,
-            &mut events,
-            &mut divergence_rows,
-            &mut absorption_rows,
-            &mut initiation_rows,
-            &mut exhaustion_rows,
-            &mut liq_rows,
-        );
-        merge_group_output(
-            orderbook_output,
-            &mut snapshots,
-            &mut levels,
-            &mut events,
-            &mut divergence_rows,
-            &mut absorption_rows,
-            &mut initiation_rows,
-            &mut exhaustion_rows,
-            &mut liq_rows,
-        );
+        for (_, output) in group_outputs {
+            merge_group_output(
+                output,
+                &mut snapshots,
+                &mut levels,
+                &mut events,
+                &mut divergence_rows,
+                &mut absorption_rows,
+                &mut initiation_rows,
+                &mut exhaustion_rows,
+                &mut liq_rows,
+            );
+        }
         snapshots.sort_by(|a, b| {
             a.indicator_code.cmp(b.indicator_code).then_with(|| {
                 snapshot_window_rank(a.window_code).cmp(&snapshot_window_rank(b.window_code))
@@ -319,9 +340,7 @@ impl Dispatcher {
             ts_bucket = %ctx.ts_bucket,
             mode = ?mode,
             snapshot_count = snapshots.len(),
-            flow_snapshot_count = flow_snapshot_count,
-            deriv_snapshot_count = deriv_snapshot_count,
-            orderbook_snapshot_count = orderbook_snapshot_count,
+            group_snapshot_counts = %group_snapshot_counts.join(","),
             level_count = levels.len(),
             event_count = events.len(),
             divergence_count = divergence_rows.len(),
@@ -405,6 +424,25 @@ impl Dispatcher {
         );
 
         Ok(snapshots)
+    }
+}
+
+fn flow_group_name_for_indicator(indicator_code: &str) -> Option<&'static str> {
+    match indicator_code {
+        "price_volume_structure"
+        | "footprint"
+        | "divergence"
+        | "cvd_pack"
+        | "whale_trades"
+        | "vpin"
+        | "kline_history"
+        | "ema_trend_regime"
+        | "fvg" => Some("flow_core"),
+        "avwap" => Some("flow_avwap"),
+        "rvwap_sigma_bands" => Some("flow_rvwap"),
+        "high_volume_pulse" => Some("flow_high_volume"),
+        "tpo_market_profile" => Some("flow_tpo"),
+        _ => None,
     }
 }
 
@@ -505,11 +543,33 @@ fn snapshot_window_rank(window_code: &str) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::DispatchMode;
+    use super::{flow_group_name_for_indicator, DispatchMode};
 
     #[test]
     fn shutdown_flush_still_persists_and_publishes_outputs() {
         assert!(DispatchMode::ShutdownFlush.persist_outputs());
         assert!(DispatchMode::ShutdownFlush.publish_outputs());
+    }
+
+    #[test]
+    fn heavy_flow_indicators_are_isolated_into_dedicated_groups() {
+        assert_eq!(flow_group_name_for_indicator("avwap"), Some("flow_avwap"));
+        assert_eq!(
+            flow_group_name_for_indicator("rvwap_sigma_bands"),
+            Some("flow_rvwap")
+        );
+        assert_eq!(
+            flow_group_name_for_indicator("high_volume_pulse"),
+            Some("flow_high_volume")
+        );
+        assert_eq!(
+            flow_group_name_for_indicator("tpo_market_profile"),
+            Some("flow_tpo")
+        );
+        assert_eq!(
+            flow_group_name_for_indicator("price_volume_structure"),
+            Some("flow_core")
+        );
+        assert_eq!(flow_group_name_for_indicator("funding_rate"), None);
     }
 }
