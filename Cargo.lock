@@ -1436,6 +1436,7 @@ dependencies = [
  "anyhow",
  "base64",
  "chrono",
+ "flate2",
  "futures-util",
  "hex",
  "hmac",

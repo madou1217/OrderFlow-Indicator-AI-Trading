@@ -13,6 +13,7 @@ use crate::llm::input::{
 };
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Duration as ChronoDuration, NaiveDateTime, Timelike, Utc};
+use flate2::read::GzDecoder;
 use futures_util::StreamExt;
 use lapin::{
     options::{BasicAckOptions, BasicConsumeOptions, BasicQosOptions, QueuePurgeOptions},
@@ -22,10 +23,11 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::{PgPool, Row};
+use std::borrow::Cow;
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
@@ -65,6 +67,39 @@ struct LatestBundle {
     indicators: Value,
     missing_indicator_codes: Vec<String>,
     received_at: DateTime<Utc>,
+}
+
+fn decode_minute_bundle_body<'a>(
+    raw: &'a [u8],
+    content_encoding: Option<&str>,
+) -> Result<Cow<'a, [u8]>> {
+    let encoding = content_encoding.map(str::trim).filter(|v| !v.is_empty());
+    match encoding {
+        None => Ok(Cow::Borrowed(raw)),
+        Some(value) if value.eq_ignore_ascii_case("identity") => Ok(Cow::Borrowed(raw)),
+        Some(value)
+            if value.eq_ignore_ascii_case("gzip") || value.eq_ignore_ascii_case("x-gzip") =>
+        {
+            let mut decoder = GzDecoder::new(raw);
+            let mut decoded = Vec::new();
+            decoder
+                .read_to_end(&mut decoded)
+                .context("gunzip minute bundle payload")?;
+            Ok(Cow::Owned(decoded))
+        }
+        Some(other) => Err(anyhow!(
+            "unsupported minute bundle content_encoding={}",
+            other
+        )),
+    }
+}
+
+fn decode_minute_bundle_envelope(
+    raw: &[u8],
+    content_encoding: Option<&str>,
+) -> Result<MinuteBundleEnvelope> {
+    let decoded = decode_minute_bundle_body(raw, content_encoding)?;
+    serde_json::from_slice(decoded.as_ref()).context("parse minute bundle as json")
 }
 
 pub async fn run(ctx: AppContext) -> Result<()> {
@@ -164,7 +199,15 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                 match delivery_result {
                     Ok(delivery) => {
                         let now = Utc::now();
-                        let parse_result = serde_json::from_slice::<MinuteBundleEnvelope>(&delivery.data);
+                        let content_encoding = delivery
+                            .properties
+                            .content_encoding()
+                            .as_ref()
+                            .map(|value| value.as_str().to_string());
+                        let parse_result = decode_minute_bundle_envelope(
+                            &delivery.data,
+                            content_encoding.as_deref(),
+                        );
                         match parse_result {
                             Ok(bundle) => {
                                 if bundle.msg_type != "ind.minute_bundle" || bundle.window_code != "1m" {
@@ -244,7 +287,8 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                             Err(err) => {
                                 warn!(
                                     error = %err,
-                                    payload = %String::from_utf8_lossy(&delivery.data),
+                                    payload_len = delivery.data.len(),
+                                    content_encoding = content_encoding.as_deref().unwrap_or("identity"),
                                     "llm decode minute bundle failed"
                                 );
                             }
@@ -2622,6 +2666,7 @@ mod tests {
     use crate::app::config::load_config;
     use crate::workflow::schema::{Stage1Meta, Stage1Output};
     use crate::workflow::state::WorkflowState;
+    use flate2::{write::GzEncoder, Compression};
 
     fn workflow_test_config() -> RootConfig {
         load_config("/data/config/config.yaml").expect("load workflow test config")
@@ -2657,6 +2702,56 @@ mod tests {
             "minutes_covered": 1,
             "expected_minutes": 1
         })
+    }
+
+    fn sample_minute_bundle_json() -> Value {
+        json!({
+            "msg_type": "ind.minute_bundle",
+            "routing_key": "bundle.1m.btcusdt",
+            "symbol": "BTCUSDT",
+            "ts_bucket": "2026-03-28T04:15:00Z",
+            "window_code": "1m",
+            "indicator_count": 2,
+            "published_at": "2026-03-28T04:15:08Z",
+            "indicators": {
+                "footprint": {
+                    "window_code": "1m",
+                    "payload": {"levels": [1, 2, 3]}
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn decode_minute_bundle_envelope_accepts_plain_json() {
+        let raw = serde_json::to_vec(&sample_minute_bundle_json()).expect("serialize bundle");
+        let decoded = decode_minute_bundle_envelope(&raw, None).expect("decode plain bundle");
+        assert_eq!(decoded.msg_type, "ind.minute_bundle");
+        assert_eq!(decoded.symbol, "BTCUSDT");
+        assert_eq!(decoded.window_code, "1m");
+    }
+
+    #[test]
+    fn decode_minute_bundle_envelope_accepts_gzip_json() {
+        let raw = serde_json::to_vec(&sample_minute_bundle_json()).expect("serialize bundle");
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(&raw).expect("gzip write");
+        let compressed = encoder.finish().expect("gzip finish");
+
+        let decoded =
+            decode_minute_bundle_envelope(&compressed, Some("gzip")).expect("decode gzip bundle");
+        assert_eq!(decoded.msg_type, "ind.minute_bundle");
+        assert_eq!(decoded.symbol, "BTCUSDT");
+        assert_eq!(decoded.window_code, "1m");
+    }
+
+    #[test]
+    fn decode_minute_bundle_envelope_rejects_unknown_content_encoding() {
+        let raw = serde_json::to_vec(&sample_minute_bundle_json()).expect("serialize bundle");
+        let err = decode_minute_bundle_envelope(&raw, Some("br")).expect_err("reject encoding");
+        assert!(err
+            .to_string()
+            .contains("unsupported minute bundle content_encoding"));
     }
 
     #[test]

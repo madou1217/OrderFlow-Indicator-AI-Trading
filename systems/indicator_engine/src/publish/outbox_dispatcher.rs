@@ -2,7 +2,7 @@ use crate::app::bootstrap::AmqpConnectionManager;
 use crate::publish::ind_publisher::IndPublisher;
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
-use flate2::read::GzDecoder;
+use flate2::{write::GzEncoder, Compression};
 use lapin::{
     options::BasicPublishOptions,
     publisher_confirm::{Confirmation, PublisherConfirm},
@@ -12,7 +12,7 @@ use lapin::{
 use serde_json::{Map, Value};
 use sqlx::postgres::PgListener;
 use sqlx::{FromRow, PgPool};
-use std::io::Read;
+use std::io::Write;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::Instant;
@@ -341,14 +341,14 @@ impl OutboxDispatcher {
         Ok(())
     }
 
-    async fn build_publish_payload(&self, row: &OutboxRow) -> Result<Value> {
+    async fn build_publish_payload(&self, row: &OutboxRow) -> Result<PublishPayload> {
         if row
             .payload_json
             .get("indicators")
             .and_then(Value::as_object)
             .is_some()
         {
-            return Ok(row.payload_json.clone());
+            return gzip_json_value(&row.payload_json);
         }
 
         let symbol = row
@@ -414,7 +414,7 @@ impl OutboxDispatcher {
 
         let rebuilt = self
             .publisher
-            .build_minute_bundle_message(
+            .build_minute_bundle_outbox_message(
                 ts_bucket,
                 symbol,
                 &Value::Object(indicators),
@@ -422,14 +422,17 @@ impl OutboxDispatcher {
             )
             .context("rebuild minute bundle payload from snapshots")?;
 
-        Ok(rebuilt.payload_json)
+        Ok(PublishPayload {
+            body: rebuilt.payload_bytes,
+            content_encoding: normalize_payload_encoding(&rebuilt.payload_encoding)?,
+        })
     }
 
     async fn fetch_cached_bundle_payload(
         &self,
         symbol: &str,
         ts_bucket: DateTime<Utc>,
-    ) -> Result<Option<Value>> {
+    ) -> Result<Option<PublishPayload>> {
         let row = sqlx::query_as::<_, CachedBundlePayloadRow>(
             r#"
             SELECT payload_encoding, payload_bytes
@@ -444,8 +447,13 @@ impl OutboxDispatcher {
         .await
         .context("fetch cached indicator bundle payload row")?;
 
-        row.map(|r| decode_outbox_payload_bytes(&r.payload_encoding, &r.payload_bytes))
-            .transpose()
+        row.map(|r| {
+            Ok(PublishPayload {
+                body: r.payload_bytes,
+                content_encoding: normalize_payload_encoding(&r.payload_encoding)?,
+            })
+        })
+        .transpose()
     }
 }
 
@@ -566,23 +574,26 @@ pub(crate) async fn publish_amqp_message(
     routing_key: &str,
     message_id: Uuid,
     headers_json: &Value,
-    payload_json: &Value,
+    payload: &PublishPayload,
 ) -> Result<PublisherConfirm> {
-    let payload = serde_json::to_vec(payload_json).context("serialize outbox payload")?;
-    let headers = json_to_field_table(headers_json).context("build amqp headers")?;
+    let headers = build_publish_headers(headers_json, payload.content_encoding.as_deref())
+        .context("build amqp headers")?;
 
-    let properties = BasicProperties::default()
+    let mut properties = BasicProperties::default()
         .with_content_type(ShortString::from("application/json"))
         .with_delivery_mode(2)
         .with_headers(headers)
         .with_message_id(ShortString::from(message_id.to_string()));
+    if let Some(content_encoding) = payload.content_encoding.as_deref() {
+        properties = properties.with_content_encoding(ShortString::from(content_encoding));
+    }
 
     channel
         .basic_publish(
             exchange_name,
             routing_key,
             BasicPublishOptions::default(),
-            &payload,
+            &payload.body,
             properties,
         )
         .await
@@ -620,23 +631,57 @@ struct CachedBundlePayloadRow {
     payload_bytes: Vec<u8>,
 }
 
-fn decode_outbox_payload_bytes(payload_encoding: &str, payload_bytes: &[u8]) -> Result<Value> {
-    match payload_encoding {
-        "" | "identity" => serde_json::from_slice(payload_bytes)
-            .context("decode identity indicator bundle payload"),
-        "gzip" => {
-            let mut decoder = GzDecoder::new(payload_bytes);
-            let mut raw = Vec::new();
-            decoder
-                .read_to_end(&mut raw)
-                .context("gunzip indicator bundle payload")?;
-            serde_json::from_slice(&raw).context("decode gzip indicator bundle payload")
-        }
-        other => Err(anyhow!(
-            "unsupported indicator bundle payload encoding: {}",
-            other
-        )),
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PublishPayload {
+    pub(crate) body: Vec<u8>,
+    pub(crate) content_encoding: Option<String>,
+}
+
+fn gzip_json_value(payload_json: &Value) -> Result<PublishPayload> {
+    let raw = serde_json::to_vec(payload_json).context("serialize indicator bundle payload")?;
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+    encoder
+        .write_all(&raw)
+        .context("gzip indicator bundle payload")?;
+    let body = encoder
+        .finish()
+        .context("finish gzip indicator bundle payload")?;
+    Ok(PublishPayload {
+        body,
+        content_encoding: Some("gzip".to_string()),
+    })
+}
+
+pub(crate) fn identity_json_publish_payload(payload_json: &Value) -> Result<PublishPayload> {
+    Ok(PublishPayload {
+        body: serde_json::to_vec(payload_json).context("serialize json publish payload")?,
+        content_encoding: None,
+    })
+}
+
+fn normalize_payload_encoding(payload_encoding: &str) -> Result<Option<String>> {
+    let trimmed = payload_encoding.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("identity") {
+        return Ok(None);
     }
+    if trimmed.eq_ignore_ascii_case("gzip") || trimmed.eq_ignore_ascii_case("x-gzip") {
+        return Ok(Some("gzip".to_string()));
+    }
+    Err(anyhow!(
+        "unsupported indicator bundle payload encoding: {}",
+        payload_encoding
+    ))
+}
+
+fn build_publish_headers(raw: &Value, content_encoding: Option<&str>) -> Result<FieldTable> {
+    let mut table = json_to_field_table(raw)?;
+    if let Some(content_encoding) = content_encoding {
+        table.insert(
+            ShortString::from("content_encoding"),
+            AMQPValue::LongString(LongString::from(content_encoding.to_string())),
+        );
+    }
+    Ok(table)
 }
 
 fn json_to_field_table(raw: &Value) -> Result<FieldTable> {
@@ -651,6 +696,58 @@ fn json_to_field_table(raw: &Value) -> Result<FieldTable> {
         table.insert(key, value);
     }
     Ok(table)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_publish_headers, gzip_json_value, normalize_payload_encoding};
+    use flate2::read::GzDecoder;
+    use serde_json::json;
+    use std::io::Read;
+
+    #[test]
+    fn gzip_json_value_round_trips_and_marks_gzip_encoding() {
+        let payload = json!({
+            "msg_type": "ind.minute_bundle",
+            "symbol": "BTCUSDT",
+            "indicators": {"footprint": {"payload": {"levels": [1, 2, 3]}}}
+        });
+
+        let encoded = gzip_json_value(&payload).expect("gzip payload");
+        assert_eq!(encoded.content_encoding.as_deref(), Some("gzip"));
+
+        let mut decoder = GzDecoder::new(encoded.body.as_slice());
+        let mut raw = Vec::new();
+        decoder.read_to_end(&mut raw).expect("decode gzip body");
+        let decoded: serde_json::Value =
+            serde_json::from_slice(&raw).expect("parse decompressed json");
+        assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn normalize_payload_encoding_accepts_identity_and_gzip() {
+        assert_eq!(normalize_payload_encoding("").expect("identity"), None);
+        assert_eq!(
+            normalize_payload_encoding("identity").expect("identity"),
+            None
+        );
+        assert_eq!(
+            normalize_payload_encoding("gzip").expect("gzip"),
+            Some("gzip".to_string())
+        );
+        assert_eq!(
+            normalize_payload_encoding("X-GZIP").expect("x-gzip"),
+            Some("gzip".to_string())
+        );
+    }
+
+    #[test]
+    fn build_publish_headers_adds_content_encoding_header() {
+        let headers =
+            build_publish_headers(&json!({"schema": "v1"}), Some("gzip")).expect("build headers");
+        assert!(headers.contains_key("schema"));
+        assert!(headers.contains_key("content_encoding"));
+    }
 }
 
 fn json_to_amqp_value(v: &Value) -> AMQPValue {

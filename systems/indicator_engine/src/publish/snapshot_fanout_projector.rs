@@ -1,6 +1,6 @@
 use crate::app::bootstrap::AmqpConnectionManager;
 use crate::publish::ind_publisher::IndPublisher;
-use crate::publish::outbox_dispatcher::publish_amqp_message;
+use crate::publish::outbox_dispatcher::{identity_json_publish_payload, publish_amqp_message};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use lapin::publisher_confirm::Confirmation;
@@ -182,13 +182,14 @@ impl SnapshotFanoutProjector {
                 &row.window_code,
                 &row.payload_json,
             )?;
+            let publish_payload = identity_json_publish_payload(&message.payload_json)?;
             match publish_amqp_message(
                 &channel,
                 &message.exchange_name,
                 &message.routing_key,
                 message.message_id,
                 &message.headers_json,
-                &message.payload_json,
+                &publish_payload,
             )
             .await?
             .await
