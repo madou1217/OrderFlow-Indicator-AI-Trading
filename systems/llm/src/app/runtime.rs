@@ -1148,16 +1148,7 @@ async fn patch_input_kline_history_from_db(
     trigger: &str,
 ) -> Result<()> {
     let stats = hydrate_missing_kline_history_from_db(pool, input).await?;
-    if stats.bars_patched > 0 || stats.divergence_events_patched > 0 {
-        info!(
-            symbol = %input.symbol,
-            ts_bucket = %input.ts_bucket,
-            trigger = trigger,
-            patched_bars = stats.bars_patched,
-            patched_divergence_events = stats.divergence_events_patched,
-            "patched kline_history/divergence prices from db before llm invocation"
-        );
-    }
+    let _ = (trigger, stats);
     Ok(())
 }
 
@@ -1269,9 +1260,13 @@ fn workflow_stage1_refresh_reason(
     config: &RootConfig,
     bundle: &LatestBundle,
     workflow_state: &crate::workflow::state::WorkflowState,
+    stage1_output: Option<&crate::workflow::schema::Stage1Output>,
 ) -> Option<String> {
     if let Some(reason) = workflow_state.pending_stage1_refresh_reason.as_ref() {
         return Some(reason.clone());
+    }
+    if stage1_output.is_none() {
+        return Some("startup_missing_stage1".to_string());
     }
     let hour = bundle.raw.ts_bucket.hour() as u8;
     let minute = bundle.raw.ts_bucket.minute() as u8;
@@ -2596,7 +2591,8 @@ async fn invoke_workflow_bundle_models(
     let mut stage1_output = crate::workflow::persistence::load_stage1_output(&state_dir, &symbol)?;
     let mut tracked_zones = crate::workflow::persistence::load_tracked_zones(&state_dir, &symbol)?;
 
-    let stage1_refresh_reason = workflow_stage1_refresh_reason(&config, &bundle, &workflow_state);
+    let stage1_refresh_reason =
+        workflow_stage1_refresh_reason(&config, &bundle, &workflow_state, stage1_output.as_ref());
     let stage1_attempt = maybe_refresh_stage1(
         &config,
         &http_client,
@@ -6079,7 +6075,7 @@ mod tests {
             ..WorkflowState::default()
         };
         assert_eq!(
-            workflow_stage1_refresh_reason(&config, &bundle, &state).as_deref(),
+            workflow_stage1_refresh_reason(&config, &bundle, &state, None).as_deref(),
             Some("thesis_invalidated")
         );
     }
@@ -6139,8 +6135,47 @@ mod tests {
             ..WorkflowState::default()
         };
         assert_eq!(
-            workflow_stage1_refresh_reason(&config, &bundle, &state).as_deref(),
+            workflow_stage1_refresh_reason(
+                &config,
+                &bundle,
+                &state,
+                Some(&sample_stage1_output()),
+            )
+            .as_deref(),
             Some("scheduled_2h")
+        );
+    }
+
+    #[test]
+    fn workflow_stage1_refresh_reason_triggers_immediately_when_stage1_missing() {
+        let config = workflow_test_config();
+        let ts_bucket = DateTime::parse_from_rfc3339("2026-03-28T05:30:00Z")
+            .expect("ts")
+            .with_timezone(&Utc);
+        let bundle = LatestBundle {
+            raw: MinuteBundleEnvelope {
+                msg_type: "bundle".to_string(),
+                routing_key: "test.route".to_string(),
+                symbol: "ETHUSDT".to_string(),
+                ts_bucket,
+                window_code: "15m".to_string(),
+                indicator_count: 0,
+                published_at: None,
+                indicators: json!({}),
+            },
+            indicators: json!({}),
+            missing_indicator_codes: vec![],
+            received_at: ts_bucket,
+        };
+        let state = WorkflowState {
+            symbol: "ETHUSDT".to_string(),
+            pending_stage1_refresh_reason: None,
+            last_stage1_ts: Some(ts_bucket - ChronoDuration::minutes(30)),
+            ..WorkflowState::default()
+        };
+        assert_eq!(
+            workflow_stage1_refresh_reason(&config, &bundle, &state, None).as_deref(),
+            Some("startup_missing_stage1")
         );
     }
 
@@ -6171,7 +6206,13 @@ mod tests {
             last_stage1_ts: Some(ts_bucket - ChronoDuration::minutes(15)),
             ..WorkflowState::default()
         };
-        assert!(workflow_stage1_refresh_reason(&config, &bundle, &state).is_none());
+        assert!(workflow_stage1_refresh_reason(
+            &config,
+            &bundle,
+            &state,
+            Some(&sample_stage1_output()),
+        )
+        .is_none());
     }
 
     #[test]
