@@ -373,23 +373,24 @@ pub fn build_indicator_summary(
     });
 
     Ok(StrategicIndicatorSummary {
-        meta: StrategicSummaryMeta {
+        meta: Some(StrategicSummaryMeta {
             symbol: input.symbol.clone(),
             ts_bucket: input.ts_bucket,
             source_routing_key: input.source_routing_key.clone(),
             indicator_count: input.indicator_count,
             missing_indicator_codes: input.missing_indicator_codes.clone(),
-        },
+        }),
         position_layer,
         state_layer,
         driver_layer,
         trigger_layer,
+        structural_refresh_context: crate::workflow::schema::StructuralRefreshContext::default(),
+        aux_context,
         auction_context: AuctionContext {
             tracked_zones: tracked_zones.to_vec(),
             zone_states,
             recent_15m_bars: bars,
         },
-        aux_context,
     })
 }
 

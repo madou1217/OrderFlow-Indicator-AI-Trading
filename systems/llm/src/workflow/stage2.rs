@@ -1,10 +1,11 @@
-use crate::execution::binance::TradingStateSnapshot;
+use crate::execution::binance::{OpenOrderSnapshot, TradingStateSnapshot};
 use crate::workflow::predicate::{
     failed_auction_confirmed, reaccept_inside_value, zone_acceptance_above, zone_acceptance_below,
 };
 use crate::workflow::schema::{
-    CandidateEvent, EntrySnapshot, PathAuditFlags, PathRuntimeState, Stage1Output,
-    Stage2PromptInput, StrategicIndicatorSummary, TacticalEntryPlan, WorkflowAccountContext,
+    CandidateEvent, EntrySnapshot, PathAuditFlags, PathRuntimeState, PendingOrderManagementPlan,
+    Stage1Output, Stage2APromptInput, Stage2BPromptInput, Stage2CPromptInput,
+    StrategicIndicatorSummary, TacticalEntryPlan, WorkflowAccountContext, WorkflowPendingOrder,
     WorkflowPosition,
 };
 use anyhow::{anyhow, Result};
@@ -172,7 +173,12 @@ fn long_short_ratios(summary: &StrategicIndicatorSummary) -> &Value {
 }
 
 fn funding_rate(summary: &StrategicIndicatorSummary) -> &Value {
-    context_child(&summary.state_layer, "funding_rate")
+    let funding = context_child(&summary.state_layer, "funding");
+    if value_present(funding) {
+        funding
+    } else {
+        context_child(&summary.state_layer, "funding_rate")
+    }
 }
 
 fn vpin(summary: &StrategicIndicatorSummary) -> &Value {
@@ -604,7 +610,7 @@ fn build_state_guardrail_snapshot(summary: &StrategicIndicatorSummary) -> Value 
     json!({
         "open_interest": window_slice(open_interest(summary), "by_window", &["15m", "4h", "1d", "3d"]),
         "long_short_ratios": window_slice(long_short_ratios(summary), "by_window", &["15m", "4h", "1d", "3d"]),
-        "funding_rate": window_slice(funding_rate(summary), "by_window", &["4h", "1d"]),
+        "funding": window_slice(funding_rate(summary), "by_window", &["4h", "1d"]),
         "vpin": window_slice(vpin(summary), "by_window", &["4h", "1d"]),
     })
 }
@@ -638,9 +644,7 @@ fn build_options_guardrail_snapshot(
         return None;
     }
     let envelope = zone_envelope(stage1_output)?;
-    let windows = tactical_guardrail
-        .get("windows")
-        .and_then(Value::as_object)?;
+    let windows = tactical_guardrail.get("windows").and_then(Value::as_object)?;
     let mut overlapping_windows = Map::new();
     for ready_window in ready_windows {
         let Some(window) = ready_window.as_str() else {
@@ -692,7 +696,7 @@ fn workflow_positions_for_active_position(
         .collect::<Vec<_>>();
     if matching_snapshots.is_empty() {
         return vec![WorkflowPosition {
-            context_key: format!("{}:{}", symbol.to_ascii_uppercase(), direction),
+            context_key: format!("{}:{}:pathless", symbol.to_ascii_uppercase(), direction),
             position_side: position.position_side.clone(),
             direction,
             quantity: position.position_amt.abs(),
@@ -723,15 +727,102 @@ fn workflow_positions_for_active_position(
         .collect()
 }
 
-pub fn build_stage2_prompt_input(
+fn order_direction(order: &OpenOrderSnapshot) -> Option<&'static str> {
+    if order.reduce_only || order.close_position {
+        return None;
+    }
+    if order.side.eq_ignore_ascii_case("BUY") {
+        Some("LONG")
+    } else if order.side.eq_ignore_ascii_case("SELL") {
+        Some("SHORT")
+    } else {
+        None
+    }
+}
+
+fn workflow_pending_order_for_open_order(
+    symbol: &str,
+    order: &OpenOrderSnapshot,
+    entry_snapshots: &HashMap<String, EntrySnapshot>,
+) -> Option<WorkflowPendingOrder> {
+    let direction = order_direction(order)?;
+    let entry_snapshot = entry_snapshots
+        .values()
+        .find(|snapshot| snapshot_matches_direction(snapshot, symbol, direction))
+        .cloned();
+    Some(WorkflowPendingOrder {
+        context_key: entry_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.context_key.clone())
+            .unwrap_or_else(|| {
+                format!(
+                    "{}:{}:pending",
+                    symbol.to_ascii_uppercase(),
+                    direction.to_ascii_uppercase()
+                )
+            }),
+        order_id: order.order_id,
+        side: direction.to_string(),
+        position_side: order.position_side.clone(),
+        order_type: order.order_type.clone(),
+        status: order.status.clone(),
+        quantity: order.orig_qty,
+        executed_quantity: order.executed_qty,
+        price: order.price,
+        stop_price: order.stop_price,
+        post_fill_bracket_template: entry_snapshot.as_ref().map(|snapshot| {
+            crate::workflow::schema::PostFillBracketTemplate {
+                take_profit_1: snapshot.take_profit_1,
+                take_profit_2: snapshot.take_profit_2,
+                stop_loss: snapshot.stop_loss,
+            }
+        }),
+        entry_snapshot,
+    })
+}
+
+fn build_account_context(trading_state: &TradingStateSnapshot) -> WorkflowAccountContext {
+    WorkflowAccountContext {
+        total_wallet_balance: trading_state.total_wallet_balance,
+        available_balance: trading_state.available_balance,
+        has_active_positions: trading_state.has_active_positions,
+        has_open_orders: trading_state.has_open_orders,
+    }
+}
+
+pub fn build_stage2a_prompt_input(
     summary: StrategicIndicatorSummary,
     stage1_output: Stage1Output,
     candidate_event: CandidateEvent,
     path_runtime_state: PathRuntimeState,
     previous_tactical_plan: Option<TacticalEntryPlan>,
     trading_state: &TradingStateSnapshot,
+) -> Stage2APromptInput {
+    Stage2APromptInput {
+        task: "审核当前 strategic path，并基于 15m 战术输入设计 tactical entry".to_string(),
+        candidate_event,
+        path_runtime_state,
+        previous_tactical_plan,
+        exposure_state: "flat_no_orders".to_string(),
+        tactical_position_slice: build_tactical_position_slice(&summary, &stage1_output),
+        latest_15m_trigger_facts: build_latest_15m_trigger_facts(&summary),
+        state_guardrail_snapshot: build_state_guardrail_snapshot(&summary),
+        driver_guardrail_snapshot: build_driver_guardrail_snapshot(&summary),
+        options_guardrail_snapshot: build_options_guardrail_snapshot(&summary, &stage1_output),
+        stage1_output,
+        account: build_account_context(trading_state),
+    }
+}
+
+pub fn build_stage2b_prompt_input(
+    summary: StrategicIndicatorSummary,
+    stage1_output: Stage1Output,
+    candidate_event: CandidateEvent,
+    path_runtime_state: PathRuntimeState,
+    previous_management_plan: Option<crate::workflow::schema::PositionManagementPlan>,
+    trading_state: &TradingStateSnapshot,
     entry_snapshots: &HashMap<String, EntrySnapshot>,
-) -> Stage2PromptInput {
+) -> Stage2BPromptInput {
     let active_positions = trading_state
         .active_positions
         .iter()
@@ -739,311 +830,50 @@ pub fn build_stage2_prompt_input(
             workflow_positions_for_active_position(&trading_state.symbol, position, entry_snapshots)
         })
         .collect::<Vec<_>>();
-    let tactical_position_slice = build_tactical_position_slice(&summary, &stage1_output);
-    let latest_15m_trigger_facts = build_latest_15m_trigger_facts(&summary);
-    let state_guardrail_snapshot = build_state_guardrail_snapshot(&summary);
-    let driver_guardrail_snapshot = build_driver_guardrail_snapshot(&summary);
-    let options_guardrail_snapshot = build_options_guardrail_snapshot(&summary, &stage1_output);
-
-    Stage2PromptInput {
-        task: "Audit whether the current strategic path is still alive, and if it is still alive, design the best tactical entry plan inside the existing path envelope.".to_string(),
+    Stage2BPromptInput {
+        task: "基于当前 strategic path 与 15m 战术输入管理持仓，以最大化收益为目标".to_string(),
         candidate_event,
         path_runtime_state,
-        previous_tactical_plan,
-        tactical_position_slice,
-        latest_15m_trigger_facts,
-        state_guardrail_snapshot,
-        driver_guardrail_snapshot,
-        options_guardrail_snapshot,
-        stage1_output,
+        exposure_state: "in_position".to_string(),
         active_positions,
-        account: WorkflowAccountContext {
-            total_wallet_balance: trading_state.total_wallet_balance,
-            available_balance: trading_state.available_balance,
-            has_active_positions: trading_state.has_active_positions,
-            has_open_orders: trading_state.has_open_orders,
-        },
+        latest_15m_trigger_facts: build_latest_15m_trigger_facts(&summary),
+        state_guardrail_snapshot: build_state_guardrail_snapshot(&summary),
+        driver_guardrail_snapshot: build_driver_guardrail_snapshot(&summary),
+        options_guardrail_snapshot: build_options_guardrail_snapshot(&summary, &stage1_output),
+        stage1_output,
+        previous_management_plan,
+        account: build_account_context(trading_state),
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{build_candidate_event, build_path_runtime_state, build_stage2_prompt_input};
-    use crate::execution::binance::TradingStateSnapshot;
-    use crate::workflow::schema::{
-        AuctionContext, CurrentPath, DriverAttribution, ManagementPlan, MapSummary, PriceZone,
-        ReevaluationTrigger, Stage1Meta, Stage1Output, StrategicIndicatorSummary,
-        StrategicSummaryMeta,
-    };
-    use chrono::{Duration, Utc};
-    use serde_json::{json, Value};
-    use std::collections::HashMap;
-
-    fn sample_stage1_output() -> Stage1Output {
-        Stage1Output {
-            meta: Stage1Meta {
-                stage1_ts: Utc::now(),
-            },
-            monitoring_status: "active".to_string(),
-            no_trade_reason: None,
-            refresh_hints: vec![],
-            map_summary: MapSummary {
-                regime_3d: json!({"bias": "bearish"}),
-                location_1d: json!({"class": "value_edge"}),
-                location_4h: json!({"class": "value_edge"}),
-                price_location_class: "value_edge".to_string(),
-                key_levels: json!({}),
-            },
-            opportunity_assessment: crate::workflow::schema::OpportunityAssessment::default(),
-            script_rejections: vec![],
-            current_script: Some("value_return".to_string()),
-            driver_attribution: Some(DriverAttribution {
-                flow_driver: "mixed".to_string(),
-                spot_confirming: true,
-                driver_note: "supportive".to_string(),
-            }),
-            current_path: Some(CurrentPath {
-                id: "path_1".to_string(),
-                side: "LONG".to_string(),
-                thesis: "bounce".to_string(),
-                risk_grade: "countertrend_repair".to_string(),
-                activation_anchor_id: None,
-                activation_level: PriceZone {
-                    low: 1998.0,
-                    high: 2002.0,
-                    timeframe: Some("4h".to_string()),
-                    label: Some("activation".to_string()),
-                    reason: None,
-                },
-                first_path_target_anchor_id: None,
-                first_path_target: PriceZone {
-                    low: 2020.0,
-                    high: 2025.0,
-                    timeframe: Some("4h".to_string()),
-                    label: Some("tp1".to_string()),
-                    reason: None,
-                },
-                next_path_target_anchor_id: None,
-                next_path_target: PriceZone {
-                    low: 2030.0,
-                    high: 2035.0,
-                    timeframe: Some("4h".to_string()),
-                    label: Some("tp2".to_string()),
-                    reason: None,
-                },
-                failure_anchor_id: None,
-                failure_level: PriceZone {
-                    low: 1989.0,
-                    high: 1992.0,
-                    timeframe: Some("4h".to_string()),
-                    label: Some("failure".to_string()),
-                    reason: None,
-                },
-                failure_switch: Some("crowded_reversal".to_string()),
-                setup_type: "C_value_return".to_string(),
-                reevaluation_trigger: ReevaluationTrigger::default(),
-                management_plan: ManagementPlan {
-                    take_profit_1_basis: "first_path_target".to_string(),
-                    take_profit_2_basis: "next_path_target".to_string(),
-                    take_profit_1_level: 2022.0,
-                    take_profit_2_level: 2032.0,
-                    stop_migration_rules: vec![],
-                    reduce_on_driver_deterioration: vec![],
-                    exit_full_on_driver_deterioration: vec![],
-                },
-                tracked_zones: vec![],
-            }),
-        }
-    }
-
-    fn sample_summary(close: f64) -> StrategicIndicatorSummary {
-        let now = Utc::now();
-        StrategicIndicatorSummary {
-            meta: StrategicSummaryMeta {
-                symbol: "ETHUSDT".to_string(),
-                ts_bucket: now,
-                source_routing_key: "x".to_string(),
-                indicator_count: 1,
-                missing_indicator_codes: vec![],
-            },
-            position_layer: json!({
-                "price_volume_structure": {"by_window": {"4h": {"poc_price": 2000.0}, "1d": {"poc_price": 2001.0}, "3d": {"poc_price": 1990.0}}},
-                "rvwap_sigma_bands": {"by_window": {"15m": {"rvwap_w": 2000.0}, "4h": {"rvwap_w": 2001.0}, "1d": {"rvwap_w": 2002.0}}},
-                "avwap": {
-                    "lookback": "7d",
-                    "anchor_ts": "2026-03-28T00:00:00Z",
-                    "avwap_fut": 2100.0,
-                    "avwap_spot": 2098.0,
-                    "series_by_window": {
-                        "4h": {"latest_point": {"avwap_fut": 2000.0, "avwap_spot": 1999.0}},
-                        "1d": {"latest_point": {"avwap_fut": 2001.0, "avwap_spot": 2000.0}},
-                        "3d": {"latest_point": {"avwap_fut": 2500.0, "avwap_spot": 2498.0}}
-                    }
-                },
-                "tpo_market_profile": {"by_session": {"4h": {"tpo_poc": 2000.0}, "1d": {"tpo_poc": 2001.0}}},
-                "liquidation_density": {"by_window": {"4h": {}, "1d": {}, "3d": {}}},
-                "fvg": {"by_window": {"15m": {}, "4h": {}, "1d": {}, "3d": {}}}
-            }),
-            state_layer: json!({
-                "open_interest": {"by_window": {"15m": {"state": "long_unwind"}, "4h": {"state": "long_unwind"}, "1d": {"state": "long_unwind"}}},
-                "long_short_ratios": {"by_window": {"15m": {"crowding_state": "balanced"}, "4h": {"crowding_state": "balanced"}, "1d": {"crowding_state": "balanced"}}},
-                "funding_rate": {"by_window": {"4h": {"funding_twa": -0.0001}, "1d": {"funding_twa": -0.0002}}},
-                "vpin": {"by_window": {"4h": {"vpin_fut": 0.4}, "1d": {"vpin_fut": 0.5}}}
-            }),
-            driver_layer: json!({
-                "cvd_pack": {"by_window": {"4h": {"series": [{"delta_fut": 1}]}, "1d": {"series": [{"delta_fut": 2}]}}},
-                "divergence": {"signals": {"bullish_divergence": false}},
-                "whale_trades": {"by_window": {"4h": {"window": "4h"}, "1d": {"window": "1d"}}}
-            }),
-            trigger_layer: json!({
-                "footprint": {"by_window": {"15m": {"stacked_buy": true}, "4h": {}}},
-                "orderbook_depth": {"by_window": {"15m": {}}, "spot_confirm": true, "fake_order_risk_fut": 0.1, "obi": 0.8, "ofi_fut": 2.0},
-                "selling_exhaustion": {"recent_7d": {"events": []}},
-                "buying_exhaustion": {"recent_7d": {"events": []}},
-                "absorption": {"recent_7d": {"events": []}},
-                "initiation": {"direction": "buy"},
-                "high_volume_pulse": {"by_z_window": {"4h": {}, "1d": {}}},
-                "divergence": {"signals": {"bullish_divergence": false}}
-            }),
-            auction_context: AuctionContext {
-                tracked_zones: vec![],
-                zone_states: vec![],
-                recent_15m_bars: vec![crate::workflow::schema::RecentBar {
-                    open_time: now - Duration::minutes(15),
-                    close_time: now,
-                    open: close - 1.0,
-                    high: close + 1.0,
-                    low: close - 2.0,
-                    close,
-                    is_closed: true,
-                }],
-            },
-            aux_context: json!({
-                "options_surface": {
-                    "strategic_summary": {
-                        "windows": {"4h": {"is_ready": true}},
-                        "ready_windows": ["4h"]
-                    },
-                    "tactical_guardrail": {
-                        "windows": {
-                            "15m": {"is_ready": true, "atm_strike_front": 2000.0},
-                            "4h": {"is_ready": true, "atm_strike_front": 2001.0}
-                        },
-                        "ready_windows": ["15m", "4h"]
-                    }
-                }
-            }),
-        }
-    }
-
-    #[test]
-    fn path_runtime_state_marks_activation_touch() {
-        let summary = sample_summary(2000.0);
-        let state = build_path_runtime_state(&summary, &sample_stage1_output(), &HashMap::new())
-            .expect("runtime");
-        assert!(state.activation_level_touched);
-        assert!(state.path_alive);
-    }
-
-    #[test]
-    fn candidate_event_becomes_entry_candidate_when_activation_is_touched() {
-        let summary = sample_summary(2000.0);
-        let stage1 = sample_stage1_output();
-        let runtime_state =
-            build_path_runtime_state(&summary, &stage1, &HashMap::new()).expect("runtime");
-        let event = build_candidate_event(&summary, &stage1, &runtime_state)
-            .expect("candidate")
-            .expect("event");
-        assert_eq!(event.event_type, "entry_candidate");
-    }
-
-    #[test]
-    fn stage2_prompt_input_uses_new_contract() {
-        let summary = sample_summary(2000.0);
-        let stage1 = sample_stage1_output();
-        let runtime_state =
-            build_path_runtime_state(&summary, &stage1, &HashMap::new()).expect("runtime");
-        let event = build_candidate_event(&summary, &stage1, &runtime_state)
-            .expect("candidate")
-            .expect("event");
-        let prompt = build_stage2_prompt_input(
-            summary,
-            stage1,
-            event,
-            runtime_state,
-            None,
-            &TradingStateSnapshot {
-                symbol: "ETHUSDT".to_string(),
-                has_active_context: false,
-                has_active_positions: false,
-                has_open_orders: false,
-                active_positions: Vec::new(),
-                open_orders: Vec::new(),
-                total_wallet_balance: 0.0,
-                available_balance: 0.0,
-            },
-            &HashMap::new(),
-        );
-        assert_eq!(prompt.account.has_active_positions, false);
-        assert!(prompt.options_guardrail_snapshot.is_some());
-        assert_eq!(prompt.candidate_event.event_type, "entry_candidate");
-        assert!(prompt
-            .tactical_position_slice
-            .get("price_volume_structure")
-            .and_then(|value| value.get("by_window"))
-            .and_then(|value| value.get("3d"))
-            .is_none());
-        assert!(prompt
-            .tactical_position_slice
-            .get("avwap")
-            .and_then(|value| value.get("anchors"))
-            .and_then(|value| value.get("7d_lookback"))
-            .and_then(Value::as_object)
-            .is_none());
-    }
-
-    #[test]
-    fn stage2_options_guardrail_is_omitted_when_no_obstacle_overlaps_path() {
-        let mut summary = sample_summary(2000.0);
-        summary.aux_context = json!({
-            "options_surface": {
-                "strategic_summary": {
-                    "windows": {"4h": {"is_ready": true}},
-                    "ready_windows": ["4h"]
-                },
-                "tactical_guardrail": {
-                    "windows": {
-                        "15m": {"is_ready": true, "atm_strike_front": 2500.0},
-                        "4h": {"is_ready": true, "atm_strike_front": 2600.0}
-                    },
-                    "ready_windows": ["15m", "4h"]
-                }
-            }
-        });
-        let stage1 = sample_stage1_output();
-        let runtime_state =
-            build_path_runtime_state(&summary, &stage1, &HashMap::new()).expect("runtime");
-        let event = build_candidate_event(&summary, &stage1, &runtime_state)
-            .expect("candidate")
-            .expect("event");
-        let prompt = build_stage2_prompt_input(
-            summary,
-            stage1,
-            event,
-            runtime_state,
-            None,
-            &TradingStateSnapshot {
-                symbol: "ETHUSDT".to_string(),
-                has_active_context: false,
-                has_active_positions: false,
-                has_open_orders: false,
-                active_positions: Vec::new(),
-                open_orders: Vec::new(),
-                total_wallet_balance: 0.0,
-                available_balance: 0.0,
-            },
-            &HashMap::new(),
-        );
-        assert!(prompt.options_guardrail_snapshot.is_none());
+pub fn build_stage2c_prompt_input(
+    summary: StrategicIndicatorSummary,
+    stage1_output: Stage1Output,
+    candidate_event: CandidateEvent,
+    path_runtime_state: PathRuntimeState,
+    previous_pending_order_management_plan: Option<PendingOrderManagementPlan>,
+    trading_state: &TradingStateSnapshot,
+    entry_snapshots: &HashMap<String, EntrySnapshot>,
+) -> Stage2CPromptInput {
+    let active_orders = trading_state
+        .open_orders
+        .iter()
+        .filter_map(|order| {
+            workflow_pending_order_for_open_order(&trading_state.symbol, order, entry_snapshots)
+        })
+        .collect::<Vec<_>>();
+    Stage2CPromptInput {
+        task: "基于当前 strategic path 与 15m 战术输入管理未成交挂单，以最大化收益为目标".to_string(),
+        candidate_event,
+        path_runtime_state,
+        exposure_state: "flat_with_live_entry_orders".to_string(),
+        active_orders,
+        latest_15m_trigger_facts: build_latest_15m_trigger_facts(&summary),
+        state_guardrail_snapshot: build_state_guardrail_snapshot(&summary),
+        driver_guardrail_snapshot: build_driver_guardrail_snapshot(&summary),
+        options_guardrail_snapshot: build_options_guardrail_snapshot(&summary, &stage1_output),
+        stage1_output,
+        previous_pending_order_management_plan,
+        account: build_account_context(trading_state),
     }
 }

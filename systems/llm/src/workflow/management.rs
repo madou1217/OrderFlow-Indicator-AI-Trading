@@ -29,19 +29,22 @@ pub fn snapshot_from_execution_intent(
         context_key: intent.entry_snapshot.context_key.clone(),
         path_id: intent.path_id.clone(),
         side: intent.side.clone(),
+        entry_profile: intent.entry_profile.clone(),
+        intent_mode: Some(intent.intent_mode.clone()),
+        entry_activation_level: intent.entry_activation_level.clone(),
+        entry_zone: Some(intent.entry_zone.clone()),
+        entry_invalidation_level: intent.entry_invalidation_level.clone(),
+        max_drift_pct: Some(intent.max_drift_pct),
         stop_loss: intent.stop_loss,
         take_profit_1: intent.take_profit_1,
         take_profit_2: intent.take_profit_2,
-        allowed_stop_loss_levels: dedup_levels(
-            std::iter::once(intent.stop_loss).chain(
-                current_path
-                    .management_plan
-                    .stop_migration_rules
-                    .iter()
-                    .map(|rule| rule.new_stop_level),
-            ),
-        ),
-        allowed_take_profit_levels: dedup_levels([intent.take_profit_1, intent.take_profit_2]),
+        allowed_stop_loss_levels: dedup_levels([intent.stop_loss, current_path.failure_level.low]),
+        allowed_take_profit_levels: dedup_levels([
+            intent.take_profit_1,
+            intent.take_profit_2,
+            current_path.first_path_target.midpoint(),
+            current_path.next_path_target.midpoint(),
+        ]),
         tp1_realized: false,
         applied_driver_deterioration_signals: Vec::new(),
         created_at: now,
@@ -53,8 +56,7 @@ pub fn snapshot_from_execution_intent(
 mod tests {
     use super::snapshot_from_execution_intent;
     use crate::workflow::schema::{
-        CurrentPath, EntrySnapshotRef, ExecutionIntent, ManagementPlan, PriceZone,
-        ReevaluationTrigger, StopMigrationRule,
+        CurrentPath, EntrySnapshotRef, ExecutionIntent, PriceZone, ReevaluationTrigger,
     };
     use chrono::Utc;
 
@@ -62,7 +64,15 @@ mod tests {
     fn snapshot_captures_allowed_management_levels_from_path_contract() {
         let intent = ExecutionIntent {
             side: "LONG".to_string(),
+            entry_profile: Some("reclaim_then_hold".to_string()),
             intent_mode: "immediate".to_string(),
+            entry_activation_level: Some(PriceZone {
+                low: 100.0,
+                high: 101.0,
+                timeframe: None,
+                label: None,
+                reason: None,
+            }),
             entry_zone: PriceZone {
                 low: 100.0,
                 high: 101.0,
@@ -70,6 +80,13 @@ mod tests {
                 label: None,
                 reason: None,
             },
+            entry_invalidation_level: Some(PriceZone {
+                low: 99.0,
+                high: 99.5,
+                timeframe: None,
+                label: None,
+                reason: None,
+            }),
             trigger_price: Some(100.5),
             stop_loss: 99.0,
             take_profit_1: 103.0,
@@ -82,6 +99,7 @@ mod tests {
                 path_id: "path_a".to_string(),
             },
             reason: None,
+            quantity_override: None,
         };
         let path = CurrentPath {
             id: "path_a".to_string(),
@@ -123,23 +141,10 @@ mod tests {
             failure_switch: Some("alt".to_string()),
             setup_type: "A_continuation".to_string(),
             reevaluation_trigger: ReevaluationTrigger::default(),
-            management_plan: ManagementPlan {
-                take_profit_1_basis: "first_path_target".to_string(),
-                take_profit_2_basis: "next_path_target".to_string(),
-                take_profit_1_level: 103.0,
-                take_profit_2_level: 105.0,
-                stop_migration_rules: vec![StopMigrationRule {
-                    after_target: "take_profit_1".to_string(),
-                    new_stop_basis: "activation_level".to_string(),
-                    new_stop_level: 101.0,
-                }],
-                reduce_on_driver_deterioration: vec![],
-                exit_full_on_driver_deterioration: vec![],
-            },
             tracked_zones: vec![],
         };
         let snapshot = snapshot_from_execution_intent("ETHUSDT", &intent, &path, Utc::now());
-        assert_eq!(snapshot.allowed_stop_loss_levels, vec![99.0, 101.0]);
+        assert_eq!(snapshot.allowed_stop_loss_levels, vec![99.0]);
         assert_eq!(snapshot.allowed_take_profit_levels, vec![103.0, 105.0]);
     }
 }

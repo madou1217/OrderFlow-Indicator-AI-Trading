@@ -15,6 +15,7 @@ pub struct AdaptedExecutionIntent {
     pub path_id: String,
     pub context_key: String,
     pub reason: Option<String>,
+    pub quantity_override: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -66,6 +67,7 @@ pub fn adapt_execution_intent(intent: &ExecutionIntent) -> Result<AdaptedExecuti
         path_id: intent.path_id.clone(),
         context_key: intent.entry_snapshot.context_key.clone(),
         reason: intent.reason.clone(),
+        quantity_override: intent.quantity_override,
     })
 }
 
@@ -128,11 +130,6 @@ pub fn adapt_management_action(
                     "UPDATE_TAKE_PROFIT requires take_profit_1 or take_profit_2"
                 ));
             }
-            if action.take_profit_1.is_some() && action.take_profit_2.is_some() {
-                return Err(anyhow!(
-                    "UPDATE_TAKE_PROFIT cannot include both take_profit_1 and take_profit_2"
-                ));
-            }
         }
         other => return Err(anyhow!("unsupported management action {}", other)),
     }
@@ -161,7 +158,15 @@ mod tests {
     fn execution_adapter_preserves_exact_workflow_levels() {
         let intent = ExecutionIntent {
             side: "LONG".to_string(),
+            entry_profile: Some("reclaim_then_hold".to_string()),
             intent_mode: "immediate".to_string(),
+            entry_activation_level: Some(PriceZone {
+                low: 100.0,
+                high: 101.0,
+                timeframe: None,
+                label: None,
+                reason: None,
+            }),
             entry_zone: PriceZone {
                 low: 100.0,
                 high: 102.0,
@@ -169,6 +174,13 @@ mod tests {
                 label: None,
                 reason: None,
             },
+            entry_invalidation_level: Some(PriceZone {
+                low: 99.0,
+                high: 99.5,
+                timeframe: None,
+                label: None,
+                reason: None,
+            }),
             trigger_price: Some(101.0),
             stop_loss: 99.0,
             take_profit_1: 104.0,
@@ -181,6 +193,7 @@ mod tests {
                 path_id: "path_a".to_string(),
             },
             reason: Some("execute".to_string()),
+            quantity_override: None,
         };
         let adapted = adapt_execution_intent(&intent).expect("adapt");
         assert_eq!(adapted.side, "LONG");
@@ -196,6 +209,30 @@ mod tests {
             context_key: "ETHUSDT:LONG:path_a".to_string(),
             path_id: "path_a".to_string(),
             side: "LONG".to_string(),
+            entry_profile: Some("reclaim_then_hold".to_string()),
+            intent_mode: Some("immediate".to_string()),
+            entry_activation_level: Some(PriceZone {
+                low: 100.0,
+                high: 101.0,
+                timeframe: None,
+                label: None,
+                reason: None,
+            }),
+            entry_zone: Some(PriceZone {
+                low: 100.0,
+                high: 102.0,
+                timeframe: None,
+                label: None,
+                reason: None,
+            }),
+            entry_invalidation_level: Some(PriceZone {
+                low: 99.0,
+                high: 99.5,
+                timeframe: None,
+                label: None,
+                reason: None,
+            }),
+            max_drift_pct: Some(0.2),
             stop_loss: 99.0,
             take_profit_1: 104.0,
             take_profit_2: 107.0,
@@ -228,6 +265,30 @@ mod tests {
             context_key: "ETHUSDT:LONG:path_a".to_string(),
             path_id: "path_a".to_string(),
             side: "LONG".to_string(),
+            entry_profile: Some("reclaim_then_hold".to_string()),
+            intent_mode: Some("immediate".to_string()),
+            entry_activation_level: Some(PriceZone {
+                low: 100.0,
+                high: 101.0,
+                timeframe: None,
+                label: None,
+                reason: None,
+            }),
+            entry_zone: Some(PriceZone {
+                low: 100.0,
+                high: 102.0,
+                timeframe: None,
+                label: None,
+                reason: None,
+            }),
+            entry_invalidation_level: Some(PriceZone {
+                low: 99.0,
+                high: 99.5,
+                timeframe: None,
+                label: None,
+                reason: None,
+            }),
+            max_drift_pct: Some(0.2),
             stop_loss: 99.0,
             take_profit_1: 104.0,
             take_profit_2: 107.0,
@@ -249,5 +310,61 @@ mod tests {
             reason: None,
         };
         assert!(adapt_management_action(&action, &snapshot).is_err());
+    }
+
+    #[test]
+    fn management_adapter_allows_take_profit_patch_with_both_targets() {
+        let snapshot = EntrySnapshot {
+            symbol: "ETHUSDT".to_string(),
+            context_key: "ETHUSDT:LONG:path_a".to_string(),
+            path_id: "path_a".to_string(),
+            side: "LONG".to_string(),
+            entry_profile: Some("reclaim_then_hold".to_string()),
+            intent_mode: Some("immediate".to_string()),
+            entry_activation_level: Some(PriceZone {
+                low: 100.0,
+                high: 101.0,
+                timeframe: None,
+                label: None,
+                reason: None,
+            }),
+            entry_zone: Some(PriceZone {
+                low: 100.0,
+                high: 102.0,
+                timeframe: None,
+                label: None,
+                reason: None,
+            }),
+            entry_invalidation_level: Some(PriceZone {
+                low: 99.0,
+                high: 99.5,
+                timeframe: None,
+                label: None,
+                reason: None,
+            }),
+            max_drift_pct: Some(0.2),
+            stop_loss: 99.0,
+            take_profit_1: 104.0,
+            take_profit_2: 107.0,
+            allowed_stop_loss_levels: vec![99.0, 100.0],
+            allowed_take_profit_levels: vec![104.0, 107.0],
+            tp1_realized: false,
+            applied_driver_deterioration_signals: vec![],
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let action = ManagementAction {
+            action_type: "UPDATE_TAKE_PROFIT".to_string(),
+            context_key: snapshot.context_key.clone(),
+            path_id: snapshot.path_id.clone(),
+            reduce_ratio: None,
+            new_stop_loss: None,
+            take_profit_1: Some(105.0),
+            take_profit_2: Some(108.0),
+            reason: Some("roll targets".to_string()),
+        };
+        let adapted = adapt_management_action(&action, &snapshot).expect("adapt");
+        assert_eq!(adapted.take_profit_1, Some(105.0));
+        assert_eq!(adapted.take_profit_2, Some(108.0));
     }
 }

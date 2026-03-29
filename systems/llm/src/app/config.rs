@@ -540,6 +540,10 @@ pub struct WorkflowConfig {
     #[serde(default = "default_workflow_persist_prompt_inputs")]
     pub persist_prompt_inputs: bool,
     #[serde(default)]
+    pub stage1: WorkflowStage1Config,
+    #[serde(default)]
+    pub limits: WorkflowLimitsConfig,
+    #[serde(default)]
     pub watcher: WorkflowWatcherConfig,
 }
 
@@ -551,7 +555,42 @@ impl Default for WorkflowConfig {
             stage2_review_minutes: default_workflow_stage2_review_minutes(),
             state_dir: default_workflow_state_dir(),
             persist_prompt_inputs: default_workflow_persist_prompt_inputs(),
+            stage1: WorkflowStage1Config::default(),
+            limits: WorkflowLimitsConfig::default(),
             watcher: WorkflowWatcherConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct WorkflowStage1Config {
+    #[serde(default = "default_stage1_min_overall_quality_for_new_entry_dispatch")]
+    pub min_overall_quality_for_new_entry_dispatch: String,
+}
+
+impl Default for WorkflowStage1Config {
+    fn default() -> Self {
+        Self {
+            min_overall_quality_for_new_entry_dispatch:
+                default_stage1_min_overall_quality_for_new_entry_dispatch(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct WorkflowLimitsConfig {
+    #[serde(default = "default_workflow_max_live_positions_per_direction")]
+    pub max_live_positions_per_direction: usize,
+    #[serde(default = "default_workflow_max_live_entry_orders_per_direction")]
+    pub max_live_entry_orders_per_direction: usize,
+}
+
+impl Default for WorkflowLimitsConfig {
+    fn default() -> Self {
+        Self {
+            max_live_positions_per_direction: default_workflow_max_live_positions_per_direction(),
+            max_live_entry_orders_per_direction:
+                default_workflow_max_live_entry_orders_per_direction(),
         }
     }
 }
@@ -562,6 +601,8 @@ pub struct WorkflowWatcherConfig {
     pub evaluate_on: String,
     #[serde(default = "default_watcher_entry_attempt_window")]
     pub entry_attempt_window: String,
+    #[serde(default = "default_watcher_entry_ttl_minutes")]
+    pub entry_ttl_minutes: u64,
     #[serde(default = "default_watcher_max_filled_stopout_attempts")]
     pub max_filled_stopout_attempts: u8,
     #[serde(default = "default_watcher_count_unfilled_attempts")]
@@ -579,6 +620,7 @@ impl Default for WorkflowWatcherConfig {
         Self {
             evaluate_on: default_watcher_evaluate_on(),
             entry_attempt_window: default_watcher_entry_attempt_window(),
+            entry_ttl_minutes: default_watcher_entry_ttl_minutes(),
             max_filled_stopout_attempts: default_watcher_max_filled_stopout_attempts(),
             count_unfilled_attempts: default_watcher_count_unfilled_attempts(),
             price_predicates: WorkflowWatcherPricePredicatesConfig::default(),
@@ -938,12 +980,28 @@ fn default_workflow_persist_prompt_inputs() -> bool {
     true
 }
 
+fn default_stage1_min_overall_quality_for_new_entry_dispatch() -> String {
+    "medium".to_string()
+}
+
+fn default_workflow_max_live_positions_per_direction() -> usize {
+    1
+}
+
+fn default_workflow_max_live_entry_orders_per_direction() -> usize {
+    1
+}
+
 fn default_watcher_evaluate_on() -> String {
     "1m_close".to_string()
 }
 
 fn default_watcher_entry_attempt_window() -> String {
     "same_15m_window".to_string()
+}
+
+fn default_watcher_entry_ttl_minutes() -> u64 {
+    15
 }
 
 fn default_watcher_max_filled_stopout_attempts() -> u8 {
@@ -1108,6 +1166,11 @@ fn validate_workflow_watcher_config(cfg: &WorkflowWatcherConfig) -> Result<()> {
     if cfg.entry_attempt_window.trim() != "same_15m_window" {
         return Err(anyhow!(
             "llm.workflow.watcher.entry_attempt_window must be same_15m_window"
+        ));
+    }
+    if cfg.entry_ttl_minutes == 0 {
+        return Err(anyhow!(
+            "llm.workflow.watcher.entry_ttl_minutes must be > 0"
         ));
     }
     if cfg.max_filled_stopout_attempts == 0 {
@@ -1377,6 +1440,7 @@ mod tests {
         let watcher = WorkflowWatcherConfig::default();
         assert_eq!(watcher.evaluate_on, "1m_close");
         assert_eq!(watcher.entry_attempt_window, "same_15m_window");
+        assert_eq!(watcher.entry_ttl_minutes, 15);
         assert_eq!(watcher.max_filled_stopout_attempts, 2);
         assert!(!watcher.count_unfilled_attempts);
         assert_eq!(
@@ -1438,6 +1502,16 @@ mod tests {
         assert!(err
             .to_string()
             .contains("breakout_confirmed.min_break_bps must be > 0"));
+    }
+
+    #[test]
+    fn workflow_watcher_rejects_non_positive_entry_ttl() {
+        let mut watcher = WorkflowWatcherConfig::default();
+        watcher.entry_ttl_minutes = 0;
+        let err = validate_workflow_watcher_config(&watcher).expect_err("expected validation err");
+        assert!(err
+            .to_string()
+            .contains("llm.workflow.watcher.entry_ttl_minutes must be > 0"));
     }
 
     #[test]
@@ -1722,6 +1796,28 @@ fn validate_config(cfg: &RootConfig) -> Result<()> {
     )?;
     if cfg.llm.workflow.state_dir.trim().is_empty() {
         return Err(anyhow!("llm.workflow.state_dir is empty"));
+    }
+    if !matches!(
+        cfg.llm
+            .workflow
+            .stage1
+            .min_overall_quality_for_new_entry_dispatch
+            .trim(),
+        "high" | "medium" | "low"
+    ) {
+        return Err(anyhow!(
+            "llm.workflow.stage1.min_overall_quality_for_new_entry_dispatch must be one of [high, medium, low]"
+        ));
+    }
+    if cfg.llm.workflow.limits.max_live_positions_per_direction == 0 {
+        return Err(anyhow!(
+            "llm.workflow.limits.max_live_positions_per_direction must be > 0"
+        ));
+    }
+    if cfg.llm.workflow.limits.max_live_entry_orders_per_direction == 0 {
+        return Err(anyhow!(
+            "llm.workflow.limits.max_live_entry_orders_per_direction must be > 0"
+        ));
     }
     validate_workflow_watcher_config(&cfg.llm.workflow.watcher)?;
     validate_telegram_signal_decisions(&cfg.llm.telegram_signal_decisions)?;

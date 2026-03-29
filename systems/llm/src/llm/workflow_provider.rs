@@ -20,14 +20,18 @@ pub struct WorkflowModelOutput {
 fn workflow_stage_name(stage: WorkflowPromptStage) -> &'static str {
     match stage {
         WorkflowPromptStage::Stage1 => "workflow_stage1",
-        WorkflowPromptStage::Stage2 => "workflow_stage2",
+        WorkflowPromptStage::Stage2A => "workflow_stage2a",
+        WorkflowPromptStage::Stage2B => "workflow_stage2b",
+        WorkflowPromptStage::Stage2C => "workflow_stage2c",
     }
 }
 
 fn workflow_stage_schema(stage: WorkflowPromptStage) -> Value {
     match stage {
         WorkflowPromptStage::Stage1 => workflow_stage1_schema(),
-        WorkflowPromptStage::Stage2 => workflow_stage2_schema(),
+        WorkflowPromptStage::Stage2A => workflow_stage2a_schema(),
+        WorkflowPromptStage::Stage2B => workflow_stage2b_schema(),
+        WorkflowPromptStage::Stage2C => workflow_stage2c_schema(),
     }
 }
 
@@ -43,30 +47,21 @@ fn nullable(inner: Value) -> Value {
 fn any_object_schema() -> Value {
     json!({
         "type": "object",
-        "additionalProperties": false,
-        "required": ["summary", "notes"],
-        "properties": {
-            "summary": {"type": "string"},
-            "notes": {"type": "array", "items": {"type": "string"}}
-        }
+        "additionalProperties": true
     })
 }
 
 fn key_levels_schema() -> Value {
     json!({
         "type": "object",
-        "additionalProperties": false,
-        "required": ["levels"],
-        "properties": {
-            "levels": {"type": "array", "items": tracked_zone_schema()}
-        }
+        "additionalProperties": true
     })
 }
 
 fn opportunity_quality_schema() -> Value {
     json!({
-        "type": "string",
-        "enum": ["high", "medium", "low"]
+        "type": ["string", "null"],
+        "enum": ["high", "medium", "low", null]
     })
 }
 
@@ -95,21 +90,6 @@ fn opportunity_assessment_schema() -> Value {
     })
 }
 
-fn script_rejection_schema() -> Value {
-    json!({
-        "type": "object",
-        "additionalProperties": false,
-        "required": ["script", "reason"],
-        "properties": {
-            "script": {
-                "type": "string",
-                "enum": ["continuation", "crowded_reversal", "value_return"]
-            },
-            "reason": {"type": "string"}
-        }
-    })
-}
-
 fn zone_reevaluation_trigger_schema() -> Value {
     json!({
         "type": "object",
@@ -124,17 +104,18 @@ fn zone_reevaluation_trigger_schema() -> Value {
         ],
         "properties": {
             "kind": {
-                "type": "string",
+                "type": ["string", "null"],
                 "enum": [
                     "accepted_into_zone",
                     "accepted_beyond_zone",
                     "rejected_from_zone",
-                    "reaccepted_through_zone"
+                    "reaccepted_through_zone",
+                    null
                 ]
             },
-            "zone_id": {"type": "string"},
-            "timeframe": {"type": "string", "enum": ["15m", "4h", "1d"]},
-            "min_confirmed_bars": {"type": "integer", "minimum": 1},
+            "zone_id": {"type": ["string", "null"]},
+            "timeframe": {"type": ["string", "null"], "enum": ["4h", "1d", "4h-1d", null]},
+            "min_confirmed_bars": {"type": ["integer", "null"], "minimum": 1},
             "summary": {"type": "string"},
             "evidence": {"type": "array", "items": {"type": "string"}}
         }
@@ -157,17 +138,18 @@ fn driver_reevaluation_trigger_schema() -> Value {
         ],
         "properties": {
             "kind": {
-                "type": "string",
+                "type": ["string", "null"],
                 "enum": [
                     "driver_flip",
                     "spot_confirmation_lost",
                     "oi_support_lost",
-                    "state_regime_conflict"
+                    "state_regime_conflict",
+                    null
                 ]
             },
             "expected_flow_driver": {
-                "type": "string",
-                "enum": ["spot_led", "futures_led", "mixed"]
+                "type": ["string", "null"],
+                "enum": ["spot_led", "futures_led", "mixed", null]
             },
             "invalidate_when_drivers": {
                 "type": "array",
@@ -176,24 +158,30 @@ fn driver_reevaluation_trigger_schema() -> Value {
                     "enum": ["spot_led", "futures_led", "mixed"]
                 }
             },
-            "require_spot_confirmation": {"type": "boolean"},
+            "require_spot_confirmation": {"type": ["boolean", "null"]},
             "driver_signal": {
-                "type": "string",
+                "type": ["string", "null"],
                 "enum": [
                     "spot_confirmation_lost",
                     "oi_support_lost",
                     "fake_order_risk_rising",
-                    "driver_flip_confirmed"
+                    "driver_flip_confirmed",
+                    null
                 ]
             },
-            "min_confirmed_windows": {"type": "integer", "minimum": 1},
+            "min_confirmed_windows": {"type": ["integer", "null"], "minimum": 1},
             "summary": {"type": "string"},
             "evidence": {"type": "array", "items": {"type": "string"}}
         }
     })
 }
 
-fn price_zone_schema() -> Value {
+fn price_zone_schema(timeframes: &[&str]) -> Value {
+    let mut enums = timeframes
+        .iter()
+        .map(|value| Value::String((*value).to_string()))
+        .collect::<Vec<_>>();
+    enums.push(Value::Null);
     json!({
         "type": "object",
         "additionalProperties": false,
@@ -201,7 +189,7 @@ fn price_zone_schema() -> Value {
         "properties": {
             "low": {"type": "number"},
             "high": {"type": "number"},
-            "timeframe": {"type": ["string", "null"]},
+            "timeframe": {"type": ["string", "null"], "enum": enums},
             "label": {"type": ["string", "null"]},
             "reason": {"type": ["string", "null"]}
         }
@@ -224,79 +212,11 @@ fn tracked_zone_schema() -> Value {
     })
 }
 
-fn stop_migration_rule_schema() -> Value {
-    json!({
-        "type": "object",
-        "additionalProperties": false,
-        "required": ["after_target", "new_stop_basis", "new_stop_level"],
-        "properties": {
-            "after_target": {
-                "type": "string",
-                "enum": ["take_profit_1", "take_profit_2"]
-            },
-            "new_stop_basis": {
-                "type": "string",
-                "enum": ["activation_level", "first_path_target", "next_path_target"]
-            },
-            "new_stop_level": {"type": "number"}
-        }
-    })
-}
-
-fn driver_deterioration_rule_schema() -> Value {
-    json!({
-        "type": "object",
-        "additionalProperties": false,
-        "required": ["driver_signal", "reduce_ratio"],
-        "properties": {
-            "driver_signal": {
-                "type": "string",
-                "enum": [
-                    "spot_confirmation_lost",
-                    "oi_support_lost",
-                    "fake_order_risk_rising",
-                    "driver_flip_confirmed"
-                ]
-            },
-            "reduce_ratio": {"type": ["number", "null"]}
-        }
-    })
-}
-
-fn management_plan_schema() -> Value {
-    json!({
-        "type": "object",
-        "additionalProperties": false,
-        "required": [
-            "take_profit_1_basis",
-            "take_profit_2_basis",
-            "take_profit_1_level",
-            "take_profit_2_level",
-            "stop_migration_rules",
-            "reduce_on_driver_deterioration",
-            "exit_full_on_driver_deterioration"
-        ],
-        "properties": {
-            "take_profit_1_basis": {"type": "string", "enum": ["first_path_target"]},
-            "take_profit_2_basis": {"type": "string", "enum": ["next_path_target"]},
-            "take_profit_1_level": {"type": "number"},
-            "take_profit_2_level": {"type": "number"},
-            "stop_migration_rules": {"type": "array", "items": stop_migration_rule_schema()},
-            "reduce_on_driver_deterioration": {"type": "array", "items": driver_deterioration_rule_schema()},
-            "exit_full_on_driver_deterioration": {"type": "array", "items": driver_deterioration_rule_schema()}
-        }
-    })
-}
-
 fn reevaluation_trigger_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": [
-            "extreme_location",
-            "reverse_confirmation",
-            "driver_change"
-        ],
+        "required": ["extreme_location", "reverse_confirmation", "driver_change"],
         "properties": {
             "extreme_location": zone_reevaluation_trigger_schema(),
             "reverse_confirmation": zone_reevaluation_trigger_schema(),
@@ -310,14 +230,14 @@ fn map_summary_schema() -> Value {
         "type": "object",
         "additionalProperties": false,
         "required": [
-            "regime_3d",
+            "location_3d",
             "location_1d",
             "location_4h",
             "price_location_class",
             "key_levels"
         ],
         "properties": {
-            "regime_3d": any_object_schema(),
+            "location_3d": any_object_schema(),
             "location_1d": any_object_schema(),
             "location_4h": any_object_schema(),
             "price_location_class": {
@@ -365,7 +285,6 @@ fn current_path_schema() -> Value {
             "failure_switch",
             "setup_type",
             "reevaluation_trigger",
-            "management_plan",
             "tracked_zones"
         ],
         "properties": {
@@ -376,21 +295,20 @@ fn current_path_schema() -> Value {
                 "type": "string",
                 "enum": ["aligned_trend", "countertrend_repair", "high_conflict_repair"]
             },
-            "activation_anchor_id": {"type": "string"},
-            "activation_level": price_zone_schema(),
-            "first_path_target_anchor_id": {"type": "string"},
-            "first_path_target": price_zone_schema(),
-            "next_path_target_anchor_id": {"type": "string"},
-            "next_path_target": price_zone_schema(),
-            "failure_anchor_id": {"type": "string"},
-            "failure_level": price_zone_schema(),
+            "activation_anchor_id": {"type": ["string", "null"]},
+            "activation_level": price_zone_schema(&["4h", "1d", "4h-1d"]),
+            "first_path_target_anchor_id": {"type": ["string", "null"]},
+            "first_path_target": price_zone_schema(&["4h", "1d", "4h-1d"]),
+            "next_path_target_anchor_id": {"type": ["string", "null"]},
+            "next_path_target": price_zone_schema(&["4h", "1d", "4h-1d"]),
+            "failure_anchor_id": {"type": ["string", "null"]},
+            "failure_level": price_zone_schema(&["4h", "1d", "4h-1d"]),
             "failure_switch": {"type": ["string", "null"]},
             "setup_type": {
                 "type": "string",
                 "enum": ["A_continuation", "B_reversal", "C_value_return"]
             },
             "reevaluation_trigger": reevaluation_trigger_schema(),
-            "management_plan": management_plan_schema(),
             "tracked_zones": {"type": "array", "items": tracked_zone_schema()}
         }
     })
@@ -407,7 +325,6 @@ fn workflow_stage1_schema() -> Value {
             "refresh_hints",
             "map_summary",
             "opportunity_assessment",
-            "script_rejections",
             "current_script",
             "driver_attribution",
             "current_path"
@@ -434,26 +351,12 @@ fn workflow_stage1_schema() -> Value {
             "refresh_hints": {"type": "array", "items": {"type": "string"}},
             "map_summary": map_summary_schema(),
             "opportunity_assessment": opportunity_assessment_schema(),
-            "script_rejections": {"type": "array", "items": script_rejection_schema()},
             "current_script": {
                 "type": ["string", "null"],
                 "enum": ["continuation", "crowded_reversal", "value_return", null]
             },
             "driver_attribution": nullable(driver_attribution_schema()),
             "current_path": nullable(current_path_schema())
-        }
-    })
-}
-
-fn tactical_entry_snapshot_schema() -> Value {
-    json!({
-        "type": "object",
-        "additionalProperties": false,
-        "required": ["context_key", "path_id", "plan_role"],
-        "properties": {
-            "context_key": {"type": "string"},
-            "path_id": {"type": "string"},
-            "plan_role": {"type": "string", "enum": ["primary", "secondary"]}
         }
     })
 }
@@ -470,11 +373,7 @@ fn entry_plan_schema() -> Value {
             "entry_zone",
             "entry_invalidation_level",
             "stop_loss",
-            "take_profit_1",
-            "take_profit_2",
-            "ttl_minutes",
             "max_drift_pct",
-            "entry_snapshot",
             "entry_note"
         ],
         "properties": {
@@ -488,33 +387,12 @@ fn entry_plan_schema() -> Value {
                 ]
             },
             "intent_mode": {"type": "string", "enum": ["immediate", "pullback", "breakout"]},
-            "entry_activation_level": price_zone_schema(),
-            "entry_zone": price_zone_schema(),
-            "entry_invalidation_level": price_zone_schema(),
+            "entry_activation_level": price_zone_schema(&["15m", "15m-4h"]),
+            "entry_zone": price_zone_schema(&["15m", "15m-4h"]),
+            "entry_invalidation_level": price_zone_schema(&["15m", "15m-4h"]),
             "stop_loss": {"type": "number"},
-            "take_profit_1": {"type": "number"},
-            "take_profit_2": {"type": "number"},
-            "ttl_minutes": {"type": "integer", "minimum": 1},
             "max_drift_pct": {"type": "number", "minimum": 0},
-            "entry_snapshot": tactical_entry_snapshot_schema(),
             "entry_note": {"type": "string"}
-        }
-    })
-}
-
-fn attempt_policy_schema() -> Value {
-    json!({
-        "type": "object",
-        "additionalProperties": false,
-        "required": [
-            "max_filled_stopout_attempts",
-            "count_unfilled_attempts",
-            "time_window"
-        ],
-        "properties": {
-            "max_filled_stopout_attempts": {"type": "integer", "enum": [2]},
-            "count_unfilled_attempts": {"type": "boolean", "enum": [false]},
-            "time_window": {"type": "string", "enum": ["same_15m_window"]}
         }
     })
 }
@@ -523,30 +401,19 @@ fn tactical_entry_plan_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": [
-            "path_id",
-            "primary_entry_plan",
-            "secondary_entry_plan",
-            "attempt_policy"
-        ],
+        "required": ["path_id", "entry_plan"],
         "properties": {
             "path_id": {"type": "string"},
-            "primary_entry_plan": entry_plan_schema(),
-            "secondary_entry_plan": entry_plan_schema(),
-            "attempt_policy": attempt_policy_schema()
+            "entry_plan": entry_plan_schema()
         }
     })
 }
 
-fn workflow_stage2_schema() -> Value {
+fn workflow_stage2a_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": [
-            "stage2_decision",
-            "tactical_entry_plan",
-            "reevaluation_reason"
-        ],
+        "required": ["stage2_decision", "tactical_entry_plan", "reevaluation_reason"],
         "properties": {
             "stage2_decision": {
                 "type": "string",
@@ -554,6 +421,177 @@ fn workflow_stage2_schema() -> Value {
             },
             "tactical_entry_plan": nullable(tactical_entry_plan_schema()),
             "reevaluation_reason": {"type": ["string", "null"]}
+        }
+    })
+}
+
+fn watcher_trigger_condition_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["trigger_type", "trigger_level", "note"],
+        "properties": {
+            "trigger_type": {
+                "type": "string",
+                "enum": ["price_above_on_close", "price_below_on_close"]
+            },
+            "trigger_level": {"type": "number"},
+            "note": {"type": "string"}
+        }
+    })
+}
+
+fn position_management_action_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "action_type",
+            "context_key",
+            "path_id",
+            "watcher_trigger_condition",
+            "add_ratio",
+            "reuse_current_entry_template",
+            "reduce_ratio",
+            "new_stop_loss",
+            "reuse_current_bracket_template",
+            "take_profit_1",
+            "take_profit_2",
+            "reason"
+        ],
+        "properties": {
+            "action_type": {
+                "type": "string",
+                "enum": ["hold", "add", "reduce", "exit_full", "move_stop", "update_take_profit"]
+            },
+            "context_key": {"type": "string"},
+            "path_id": {"type": "string"},
+            "watcher_trigger_condition": nullable(watcher_trigger_condition_schema()),
+            "add_ratio": {"type": ["number", "null"]},
+            "reuse_current_entry_template": {"type": ["boolean", "null"]},
+            "reduce_ratio": {"type": ["number", "null"]},
+            "new_stop_loss": {"type": ["number", "null"]},
+            "reuse_current_bracket_template": {"type": ["boolean", "null"]},
+            "take_profit_1": {"type": ["number", "null"]},
+            "take_profit_2": {"type": ["number", "null"]},
+            "reason": {"type": "string"}
+        }
+    })
+}
+
+fn position_management_plan_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "path_id",
+            "exposure_state",
+            "path_live_assessment",
+            "path_assessment_reason",
+            "actions",
+            "management_note"
+        ],
+        "properties": {
+            "path_id": {"type": "string"},
+            "exposure_state": {"type": "string", "enum": ["in_position"]},
+            "path_live_assessment": {"type": "string", "enum": ["live", "degraded", "invalidated"]},
+            "path_assessment_reason": {"type": ["string", "null"]},
+            "actions": {"type": "array", "items": position_management_action_schema()},
+            "management_note": {"type": "string"}
+        }
+    })
+}
+
+fn workflow_stage2b_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["stage2b_decision", "position_management_plan"],
+        "properties": {
+            "stage2b_decision": {"type": "string", "enum": ["MANAGE_POSITION"]},
+            "position_management_plan": position_management_plan_schema()
+        }
+    })
+}
+
+fn post_fill_bracket_template_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["take_profit_1", "take_profit_2", "stop_loss"],
+        "properties": {
+            "take_profit_1": {"type": "number"},
+            "take_profit_2": {"type": "number"},
+            "stop_loss": {"type": "number"}
+        }
+    })
+}
+
+fn pending_order_management_action_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "action_type",
+            "context_key",
+            "path_id",
+            "watcher_trigger_condition",
+            "replacement_entry_zone",
+            "replacement_entry_invalidation_level",
+            "replacement_stop_loss",
+            "reuse_current_entry_template",
+            "post_fill_bracket_template",
+            "reason"
+        ],
+        "properties": {
+            "action_type": {
+                "type": "string",
+                "enum": ["keep_order", "cancel_pending_order", "replace_entry", "update_post_fill_bracket_template"]
+            },
+            "context_key": {"type": "string"},
+            "path_id": {"type": "string"},
+            "watcher_trigger_condition": nullable(watcher_trigger_condition_schema()),
+            "replacement_entry_zone": nullable(price_zone_schema(&["15m", "15m-4h"])),
+            "replacement_entry_invalidation_level": nullable(price_zone_schema(&["15m", "15m-4h"])),
+            "replacement_stop_loss": {"type": ["number", "null"]},
+            "reuse_current_entry_template": {"type": ["boolean", "null"]},
+            "post_fill_bracket_template": nullable(post_fill_bracket_template_schema()),
+            "reason": {"type": "string"}
+        }
+    })
+}
+
+fn pending_order_management_plan_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "path_id",
+            "exposure_state",
+            "path_live_assessment",
+            "path_assessment_reason",
+            "actions",
+            "management_note"
+        ],
+        "properties": {
+            "path_id": {"type": "string"},
+            "exposure_state": {"type": "string", "enum": ["flat_with_live_entry_orders"]},
+            "path_live_assessment": {"type": "string", "enum": ["live", "degraded", "invalidated"]},
+            "path_assessment_reason": {"type": ["string", "null"]},
+            "actions": {"type": "array", "items": pending_order_management_action_schema()},
+            "management_note": {"type": "string"}
+        }
+    })
+}
+
+fn workflow_stage2c_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["stage2c_decision", "pending_order_management_plan"],
+        "properties": {
+            "stage2c_decision": {"type": "string", "enum": ["MANAGE_PENDING_ORDERS"]},
+            "pending_order_management_plan": pending_order_management_plan_schema()
         }
     })
 }
@@ -636,7 +674,7 @@ fn should_retry_workflow_stage_once(
     model: &LlmModelConfig,
     error: Option<&str>,
 ) -> bool {
-    if stage != WorkflowPromptStage::Stage2 || !model.provider.eq_ignore_ascii_case("custom_llm") {
+    if stage == WorkflowPromptStage::Stage1 || !model.provider.eq_ignore_ascii_case("custom_llm") {
         return false;
     }
     let Some(error) = error else {
@@ -791,159 +829,158 @@ async fn invoke_one_model_stage(
     }
 }
 
+async fn invoke_models_for_stage(
+    http_client: &Client,
+    loopback_http_client: &Client,
+    config: &RootConfig,
+    input: &Value,
+    symbol: &str,
+    stage: WorkflowPromptStage,
+) -> Vec<WorkflowModelOutput> {
+    let models = selected_models(config);
+    if models.is_empty() {
+        return vec![WorkflowModelOutput {
+            model_name: workflow_stage_name(stage).to_string(),
+            provider: config.active_default_model(),
+            model: String::new(),
+            latency_ms: 0,
+            raw_response_text: None,
+            parsed_value: None,
+            error: Some(format!(
+                "workflow provider requires an enabled model or a configured default provider, got {}",
+                config.active_default_model()
+            )),
+        }];
+    }
+    let mut outputs = Vec::with_capacity(models.len());
+    for model in models {
+        outputs.push(
+            invoke_one_model_stage(
+                http_client,
+                loopback_http_client,
+                config,
+                &model,
+                &config.llm.prompt_template,
+                symbol,
+                stage,
+                input,
+            )
+            .await,
+        );
+    }
+    outputs
+}
+
+pub async fn invoke_stage1_models(
+    http_client: &Client,
+    loopback_http_client: &Client,
+    config: &RootConfig,
+    input: &Value,
+    symbol: &str,
+) -> Vec<WorkflowModelOutput> {
+    invoke_models_for_stage(
+        http_client,
+        loopback_http_client,
+        config,
+        input,
+        symbol,
+        WorkflowPromptStage::Stage1,
+    )
+    .await
+}
+
+pub async fn invoke_stage2a_models(
+    http_client: &Client,
+    loopback_http_client: &Client,
+    config: &RootConfig,
+    input: &Value,
+    symbol: &str,
+) -> Vec<WorkflowModelOutput> {
+    invoke_models_for_stage(
+        http_client,
+        loopback_http_client,
+        config,
+        input,
+        symbol,
+        WorkflowPromptStage::Stage2A,
+    )
+    .await
+}
+
+pub async fn invoke_stage2b_models(
+    http_client: &Client,
+    loopback_http_client: &Client,
+    config: &RootConfig,
+    input: &Value,
+    symbol: &str,
+) -> Vec<WorkflowModelOutput> {
+    invoke_models_for_stage(
+        http_client,
+        loopback_http_client,
+        config,
+        input,
+        symbol,
+        WorkflowPromptStage::Stage2B,
+    )
+    .await
+}
+
+pub async fn invoke_stage2c_models(
+    http_client: &Client,
+    loopback_http_client: &Client,
+    config: &RootConfig,
+    input: &Value,
+    symbol: &str,
+) -> Vec<WorkflowModelOutput> {
+    invoke_models_for_stage(
+        http_client,
+        loopback_http_client,
+        config,
+        input,
+        symbol,
+        WorkflowPromptStage::Stage2C,
+    )
+    .await
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{should_retry_workflow_stage_once, workflow_stage1_schema, workflow_stage2_schema};
+    use super::{should_retry_workflow_stage_once, workflow_stage1_schema, workflow_stage2b_schema};
     use crate::app::config::LlmModelConfig;
     use crate::llm::prompt::WorkflowPromptStage;
 
     #[test]
-    fn stage1_schema_keeps_current_path_strict() {
+    fn stage1_schema_requires_location_3d() {
         let schema = workflow_stage1_schema();
-        let current_path = schema["properties"]["current_path"]["anyOf"][0].clone();
-        assert_eq!(current_path["type"], "object");
-        assert_eq!(current_path["additionalProperties"], false);
-        assert!(current_path["required"]
-            .as_array()
-            .expect("required array")
-            .iter()
-            .any(|item| item == "risk_grade"));
-        assert!(current_path["required"]
-            .as_array()
-            .expect("required array")
-            .iter()
-            .any(|item| item == "activation_anchor_id"));
-        assert!(current_path["required"]
-            .as_array()
-            .expect("required array")
-            .iter()
-            .any(|item| item == "failure_anchor_id"));
-    }
-
-    #[test]
-    fn stage2_schema_keeps_tactical_plan_strict() {
-        let schema = workflow_stage2_schema();
-        assert_eq!(schema["type"], "object");
-        let tactical_plan = schema["properties"]["tactical_entry_plan"]["anyOf"][0].clone();
-        assert_eq!(tactical_plan["type"], "object");
-        assert_eq!(tactical_plan["additionalProperties"], false);
-        let primary = tactical_plan["properties"]["primary_entry_plan"].clone();
-        assert_eq!(primary["type"], "object");
-        assert_eq!(primary["additionalProperties"], false);
-    }
-
-    #[test]
-    fn stage1_schema_requires_new_map_summary_shape() {
-        let schema = workflow_stage1_schema();
-        let map_summary = schema["properties"]["map_summary"].clone();
-        let required = map_summary["required"]
+        let required = schema["properties"]["map_summary"]["required"]
             .as_array()
             .expect("required array")
             .iter()
             .filter_map(|value| value.as_str())
             .collect::<Vec<_>>();
-        assert!(required.contains(&"regime_3d"));
+        assert!(required.contains(&"location_3d"));
         assert!(required.contains(&"location_1d"));
         assert!(required.contains(&"location_4h"));
-        assert!(required.contains(&"price_location_class"));
-        let stage1_required = schema["required"]
-            .as_array()
-            .expect("stage1 required array")
-            .iter()
-            .filter_map(|value| value.as_str())
-            .collect::<Vec<_>>();
-        assert!(stage1_required.contains(&"opportunity_assessment"));
-        assert!(stage1_required.contains(&"script_rejections"));
     }
 
     #[test]
-    fn stage1_schema_structures_reevaluation_triggers() {
-        let schema = workflow_stage1_schema();
-        let current_path = schema["properties"]["current_path"]["anyOf"][0].clone();
-        let reevaluation = current_path["properties"]["reevaluation_trigger"].clone();
-        let extreme_required = reevaluation["properties"]["extreme_location"]["required"]
-            .as_array()
-            .expect("extreme required array")
-            .iter()
-            .filter_map(|value| value.as_str())
-            .collect::<Vec<_>>();
-        assert!(extreme_required.contains(&"kind"));
-        assert!(extreme_required.contains(&"zone_id"));
-        assert!(extreme_required.contains(&"min_confirmed_bars"));
-
-        let driver_required = reevaluation["properties"]["driver_change"]["required"]
-            .as_array()
-            .expect("driver required array")
-            .iter()
-            .filter_map(|value| value.as_str())
-            .collect::<Vec<_>>();
-        assert!(driver_required.contains(&"expected_flow_driver"));
-        assert!(driver_required.contains(&"invalidate_when_drivers"));
-        assert!(driver_required.contains(&"min_confirmed_windows"));
-    }
-
-    #[test]
-    fn stage2_schema_requires_new_decision_fields() {
-        let schema = workflow_stage2_schema();
-        let required = schema["required"]
+    fn stage2b_schema_requires_conditional_actions() {
+        let schema = workflow_stage2b_schema();
+        let action = schema["properties"]["position_management_plan"]["properties"]["actions"]
+            ["items"]
+            .clone();
+        let required = action["required"]
             .as_array()
             .expect("required array")
             .iter()
             .filter_map(|value| value.as_str())
             .collect::<Vec<_>>();
-        assert!(required.contains(&"stage2_decision"));
-        assert!(required.contains(&"tactical_entry_plan"));
-        assert!(required.contains(&"reevaluation_reason"));
+        assert!(required.contains(&"watcher_trigger_condition"));
+        assert!(required.contains(&"reuse_current_bracket_template"));
     }
 
     #[test]
-    fn stage1_schema_constrains_management_plan_contract_enums() {
-        let schema = workflow_stage1_schema();
-        let current_path = schema["properties"]["current_path"]["anyOf"][0].clone();
-        let stop_rule = current_path["properties"]["management_plan"]["properties"]
-            ["stop_migration_rules"]["items"]
-            .clone();
-        let after_target = stop_rule["properties"]["after_target"]["enum"]
-            .as_array()
-            .expect("after_target enum");
-        assert!(after_target.iter().any(|value| value == "take_profit_1"));
-        assert!(after_target.iter().any(|value| value == "take_profit_2"));
-
-        let driver_rule = current_path["properties"]["management_plan"]["properties"]
-            ["reduce_on_driver_deterioration"]["items"]
-            .clone();
-        let driver_signal = driver_rule["properties"]["driver_signal"]["enum"]
-            .as_array()
-            .expect("driver_signal enum");
-        assert!(driver_signal
-            .iter()
-            .any(|value| value == "spot_confirmation_lost"));
-        assert!(driver_signal
-            .iter()
-            .any(|value| value == "driver_flip_confirmed"));
-    }
-
-    #[test]
-    fn stage2_schema_constrains_attempt_policy_and_entry_profile() {
-        let schema = workflow_stage2_schema();
-        let tactical_plan = schema["properties"]["tactical_entry_plan"]["anyOf"][0].clone();
-        let attempt_policy = tactical_plan["properties"]["attempt_policy"]["properties"].clone();
-        assert_eq!(attempt_policy["max_filled_stopout_attempts"]["enum"][0], 2);
-        assert_eq!(attempt_policy["count_unfilled_attempts"]["enum"][0], false);
-        let entry_profile = tactical_plan["properties"]["primary_entry_plan"]["properties"]
-            ["entry_profile"]["enum"]
-            .as_array()
-            .expect("entry_profile enum");
-        assert!(entry_profile
-            .iter()
-            .any(|value| value == "reclaim_then_hold"));
-        assert!(entry_profile
-            .iter()
-            .any(|value| value == "failed_auction_reentry"));
-    }
-
-    #[test]
-    fn retry_policy_only_retries_stage2_custom_llm_errors_once() {
+    fn retry_policy_retries_non_stage1_custom_llm_errors_once() {
         let custom_llm = LlmModelConfig {
             name: "custom_llm_default".to_string(),
             provider: "custom_llm".to_string(),
@@ -956,117 +993,15 @@ mod tests {
             stage2_reasoning: None,
             reasoning: None,
         };
-        let qwen = LlmModelConfig {
-            provider: "qwen".to_string(),
-            ..custom_llm.clone()
-        };
-
         assert!(should_retry_workflow_stage_once(
-            WorkflowPromptStage::Stage2,
+            WorkflowPromptStage::Stage2A,
             &custom_llm,
-            Some("workflow custom_llm status=400 body={\"error\":{\"message\":\"Invalid schema for response_format 'workflow_stage2'\"}}"),
-        ));
-        assert!(should_retry_workflow_stage_once(
-            WorkflowPromptStage::Stage2,
-            &custom_llm,
-            Some("call workflow custom_llm api: connection reset by peer"),
+            Some("workflow custom_llm status=400 body={\"error\":{\"message\":\"Invalid schema for response_format 'workflow_stage2a'\"}}"),
         ));
         assert!(!should_retry_workflow_stage_once(
             WorkflowPromptStage::Stage1,
             &custom_llm,
-            Some("workflow custom_llm status=400 body={\"error\":{\"message\":\"Invalid schema for response_format 'workflow_stage2'\"}}"),
-        ));
-        assert!(!should_retry_workflow_stage_once(
-            WorkflowPromptStage::Stage2,
-            &qwen,
-            Some("workflow qwen status=400 body={\"error\":{\"message\":\"Invalid schema for response_format 'workflow_stage2'\"}}"),
-        ));
-        assert!(!should_retry_workflow_stage_once(
-            WorkflowPromptStage::Stage2,
-            &custom_llm,
-            Some("workflow custom_llm status=401 body=unauthorized"),
+            Some("workflow custom_llm status=400 body={\"error\":{\"message\":\"Invalid schema for response_format 'workflow_stage1'\"}}"),
         ));
     }
-}
-
-pub async fn invoke_stage1_models(
-    http_client: &Client,
-    loopback_http_client: &Client,
-    config: &RootConfig,
-    input: &Value,
-    symbol: &str,
-) -> Vec<WorkflowModelOutput> {
-    let models = selected_models(config);
-    if models.is_empty() {
-        return vec![WorkflowModelOutput {
-            model_name: "workflow_stage1".to_string(),
-            provider: config.active_default_model(),
-            model: String::new(),
-            latency_ms: 0,
-            raw_response_text: None,
-            parsed_value: None,
-            error: Some(format!(
-                "workflow provider requires an enabled model or a configured default provider, got {}",
-                config.active_default_model()
-            )),
-        }];
-    }
-    let mut outputs = Vec::with_capacity(models.len());
-    for model in models {
-        outputs.push(
-            invoke_one_model_stage(
-                http_client,
-                loopback_http_client,
-                config,
-                &model,
-                &config.llm.prompt_template,
-                symbol,
-                WorkflowPromptStage::Stage1,
-                input,
-            )
-            .await,
-        );
-    }
-    outputs
-}
-
-pub async fn invoke_stage2_models(
-    http_client: &Client,
-    loopback_http_client: &Client,
-    config: &RootConfig,
-    input: &Value,
-    symbol: &str,
-) -> Vec<WorkflowModelOutput> {
-    let models = selected_models(config);
-    if models.is_empty() {
-        return vec![WorkflowModelOutput {
-            model_name: "workflow_stage2".to_string(),
-            provider: config.active_default_model(),
-            model: String::new(),
-            latency_ms: 0,
-            raw_response_text: None,
-            parsed_value: None,
-            error: Some(format!(
-                "workflow provider requires an enabled model or a configured default provider, got {}",
-                config.active_default_model()
-            )),
-        }];
-    }
-    let mut outputs = Vec::with_capacity(models.len());
-    for model in models {
-        outputs.push(
-            invoke_one_model_stage(
-                http_client,
-                loopback_http_client,
-                config,
-                &model,
-                &config.llm.prompt_template,
-                symbol,
-                WorkflowPromptStage::Stage2,
-                input,
-            )
-            .await,
-        );
-    }
-    outputs
 }

@@ -1,7 +1,10 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::workflow::schema::TacticalEntryPlan;
+use crate::workflow::schema::{
+    PendingOrderManagementPlan, PositionManagementPlan, PostFillBracketTemplate,
+    TacticalEntryPlan,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(deny_unknown_fields)]
@@ -16,11 +19,19 @@ pub struct WorkflowState {
     #[serde(default)]
     pub approved_tactical_plan_updated_at: Option<DateTime<Utc>>,
     #[serde(default)]
+    pub approved_position_management_plan: Option<PositionManagementPlan>,
+    #[serde(default)]
+    pub approved_position_management_plan_updated_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub approved_pending_order_management_plan: Option<PendingOrderManagementPlan>,
+    #[serde(default)]
+    pub approved_pending_order_management_plan_updated_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub pending_entry_bracket_template_override: Option<PostFillBracketTemplate>,
+    #[serde(default)]
     pub active_15m_window_start: Option<DateTime<Utc>>,
     #[serde(default)]
     pub filled_stopout_attempts: u8,
     #[serde(default)]
     pub last_filled_context_key: Option<String>,
-    #[serde(default)]
-    pub last_executed_plan_role: Option<String>,
 }

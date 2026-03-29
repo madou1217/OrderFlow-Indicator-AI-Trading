@@ -1164,12 +1164,24 @@ pub async fn execute_workflow_execution_intent(
     }
     let maker_entry_price =
         derive_maker_entry_price(decision, entry_price, &book_ticker, &symbol_filters);
-    let quantity = compute_order_quantity(
-        &symbol_filters,
-        margin_budget_usdt,
-        maker_entry_price,
-        leverage,
-    )?;
+    let quantity = if let Some(quantity_override) = intent.quantity_override {
+        let normalized_qty = round_down_to_step(quantity_override.abs(), symbol_filters.step_size);
+        if normalized_qty < symbol_filters.min_qty {
+            return Err(anyhow!(
+                "quantity_override {:.8} is below exchange minQty {:.8}",
+                normalized_qty,
+                symbol_filters.min_qty
+            ));
+        }
+        normalized_qty
+    } else {
+        compute_order_quantity(
+            &symbol_filters,
+            margin_budget_usdt,
+            maker_entry_price,
+            leverage,
+        )?
+    };
     let quantity_str = format_decimal(quantity, symbol_filters.qty_precision);
     let maker_entry_price_str = format_decimal(maker_entry_price, symbol_filters.price_precision);
 
@@ -1572,8 +1584,8 @@ pub async fn execute_workflow_management_action(
                 ));
             }
             let new_take_profit = action
-                .take_profit_1
-                .or(action.take_profit_2)
+                .take_profit_2
+                .or(action.take_profit_1)
                 .ok_or_else(|| anyhow!("workflow UPDATE_TAKE_PROFIT requires take_profit level"))?;
             let cancel_candidates = collect_exit_orders_for_side_and_kind(
                 &state.open_orders,
@@ -1610,6 +1622,41 @@ pub async fn execute_workflow_management_action(
         }
         _ => unreachable!(),
     }
+}
+
+pub async fn cancel_workflow_pending_entry_orders(
+    http_client: &Client,
+    api_config: &BinanceApiConfig,
+    exec_config: &LlmExecutionConfig,
+    symbol: &str,
+    snapshot_side: &str,
+) -> Result<Vec<i64>> {
+    let state = fetch_symbol_trading_state(http_client, api_config, exec_config, symbol).await?;
+    let target_position_side = workflow_target_position_side(snapshot_side, exec_config.hedge_mode)?;
+    let has_active_positions = !matching_active_positions_for_workflow_context(
+        &state.active_positions,
+        snapshot_side,
+        exec_config.hedge_mode,
+    )
+    .is_empty();
+
+    let cancel_candidates = collect_tracked_orders_for_position_side(
+        &state.open_orders,
+        target_position_side,
+        exec_config.hedge_mode,
+        true,
+        !has_active_positions,
+    );
+    let canceled_ids = cancel_candidates
+        .iter()
+        .map(|order| order.order_id)
+        .collect::<Vec<_>>();
+    if exec_config.dry_run || cancel_candidates.is_empty() {
+        return Ok(canceled_ids);
+    }
+    cancel_tracked_exit_orders(http_client, api_config, exec_config, symbol, &cancel_candidates)
+        .await?;
+    Ok(canceled_ids)
 }
 
 fn collect_orphan_exit_orders_to_cancel(
@@ -3644,7 +3691,15 @@ mod tests {
     ) -> AdaptedExecutionIntent {
         crate::execution::intent_adapter::adapt_execution_intent(&ExecutionIntent {
             side: side.to_string(),
+            entry_profile: Some("reclaim_then_hold".to_string()),
             intent_mode: intent_mode.to_string(),
+            entry_activation_level: Some(PriceZone {
+                low: 100.0,
+                high: 101.0,
+                timeframe: None,
+                label: None,
+                reason: None,
+            }),
             entry_zone: PriceZone {
                 low: 100.0,
                 high: 102.0,
@@ -3652,6 +3707,13 @@ mod tests {
                 label: None,
                 reason: None,
             },
+            entry_invalidation_level: Some(PriceZone {
+                low: 98.0,
+                high: 99.0,
+                timeframe: None,
+                label: None,
+                reason: None,
+            }),
             trigger_price,
             stop_loss: 98.0,
             take_profit_1: 106.0,
@@ -3664,6 +3726,7 @@ mod tests {
                 path_id: "path_a".to_string(),
             },
             reason: Some("test".to_string()),
+            quantity_override: None,
         })
         .expect("adapt workflow execution intent")
     }
@@ -4554,5 +4617,22 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(formatted, vec!["0.15", "0.10", "0.10", "0.10"]);
+    }
+
+    #[test]
+    fn update_take_profit_prefers_outer_target_when_both_targets_are_patched() {
+        let action = crate::execution::intent_adapter::AdaptedManagementAction {
+            action_type: "UPDATE_TAKE_PROFIT".to_string(),
+            context_key: "TESTUSDT:LONG:path_a".to_string(),
+            path_id: "path_a".to_string(),
+            reduce_ratio: None,
+            new_stop_loss: None,
+            take_profit_1: Some(107.0),
+            take_profit_2: Some(111.0),
+            reason: Some("raise both targets".to_string()),
+        };
+
+        let selected_take_profit = action.take_profit_2.or(action.take_profit_1);
+        assert_eq!(selected_take_profit, Some(111.0));
     }
 }
