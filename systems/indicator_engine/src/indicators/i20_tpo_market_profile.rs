@@ -415,6 +415,7 @@ fn session_window_minutes(code: &str) -> Option<i64> {
     match code {
         "4h" => Some(240),
         "1d" => Some(1440),
+        "3d" => Some(4320),
         _ => None,
     }
 }
@@ -429,7 +430,9 @@ fn output_window_minutes(code: &str) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_profile, merge_primary_session_fields, MinuteRangeBar};
+    use super::{
+        build_profile, merge_primary_session_fields, session_window_minutes, MinuteRangeBar,
+    };
     use chrono::{TimeZone, Utc};
     use serde_json::{json, Map, Value};
 
@@ -514,5 +517,10 @@ mod tests {
             Some("4h")
         );
         assert_eq!(out.get("tpo_poc").and_then(Value::as_f64), Some(101.0));
+    }
+
+    #[test]
+    fn session_window_minutes_supports_3d() {
+        assert_eq!(session_window_minutes("3d"), Some(4320));
     }
 }

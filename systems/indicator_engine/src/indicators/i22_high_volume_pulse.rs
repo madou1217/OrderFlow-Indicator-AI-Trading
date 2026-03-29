@@ -273,13 +273,14 @@ fn window_to_minutes(code: &str) -> Option<i64> {
         "1h" => Some(60),
         "4h" => Some(240),
         "1d" => Some(1440),
+        "3d" => Some(4320),
         _ => None,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::intrabar_poc_from_profile;
+    use super::{intrabar_poc_from_profile, window_to_minutes};
     use crate::runtime::state_store::LevelAgg;
     use std::collections::BTreeMap;
 
@@ -304,5 +305,10 @@ mod tests {
         let (price, volume) = intrabar_poc_from_profile(&profile);
         assert_eq!(price, Some(1.01));
         assert!((volume - 5.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn high_volume_pulse_window_to_minutes_supports_3d() {
+        assert_eq!(window_to_minutes("3d"), Some(4320));
     }
 }

@@ -549,7 +549,7 @@ fn default_tpo_value_area_pct() -> f64 {
 }
 
 fn default_tpo_session_windows() -> Vec<String> {
-    vec!["4h".to_string(), "1d".to_string()]
+    vec!["4h".to_string(), "1d".to_string(), "3d".to_string()]
 }
 
 fn default_tpo_ib_minutes() -> i64 {
@@ -561,7 +561,12 @@ fn default_tpo_dev_output_windows() -> Vec<String> {
 }
 
 fn default_rvwap_windows() -> Vec<String> {
-    vec!["15m".to_string(), "4h".to_string(), "1d".to_string()]
+    vec![
+        "15m".to_string(),
+        "4h".to_string(),
+        "1d".to_string(),
+        "3d".to_string(),
+    ]
 }
 
 fn default_rvwap_output_windows() -> Vec<String> {
@@ -573,7 +578,12 @@ fn default_rvwap_min_samples() -> usize {
 }
 
 fn default_high_volume_pulse_z_windows() -> Vec<String> {
-    vec!["1h".to_string(), "4h".to_string(), "1d".to_string()]
+    vec![
+        "1h".to_string(),
+        "4h".to_string(),
+        "1d".to_string(),
+        "3d".to_string(),
+    ]
 }
 
 fn default_high_volume_pulse_summary_windows() -> Vec<String> {
@@ -1364,7 +1374,7 @@ fn validate_config(cfg: &RootConfig) -> Result<()> {
     }
     for code in &cfg.indicator.tpo_market_profile.session_windows {
         match code.as_str() {
-            "4h" | "1d" => {}
+            "4h" | "1d" | "3d" => {}
             other => {
                 return Err(anyhow!(
                     "unsupported indicator.tpo_market_profile.session_windows value: {}",
@@ -1401,7 +1411,7 @@ fn validate_config(cfg: &RootConfig) -> Result<()> {
     }
     for code in &cfg.indicator.rvwap_sigma_bands.windows {
         match code.as_str() {
-            "15m" | "4h" | "1d" => {}
+            "15m" | "4h" | "1d" | "3d" => {}
             other => {
                 return Err(anyhow!(
                     "unsupported indicator.rvwap_sigma_bands.windows value: {}",
@@ -1438,7 +1448,7 @@ fn validate_config(cfg: &RootConfig) -> Result<()> {
     }
     for code in &cfg.indicator.high_volume_pulse.z_windows {
         match code.as_str() {
-            "1h" | "4h" | "1d" => {}
+            "1h" | "4h" | "1d" | "3d" => {}
             other => {
                 return Err(anyhow!(
                     "unsupported indicator.high_volume_pulse.z_windows value: {}",

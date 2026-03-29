@@ -1,129 +1,134 @@
 {
   "meta": {
-    "stage1_ts": "2026-03-28T18:00:00Z"
+    "stage1_ts": "2026-03-29T08:00:00Z"
   },
   "monitoring_status": "no_edge",
-  "no_trade_reason": "conflict_no_edge",
+  "no_trade_reason": "path_not_actionable",
   "refresh_hints": [
-    "Refresh if 4H price is accepted below 2018.57-2019.97; that would resolve the lower-edge decision toward 2004.84-2006.44 first and 1985.0-1990.0 next.",
-    "Refresh if price reclaims and holds 2022.56-2025.0; that would negate immediate downside acceptance and clarify a lower-edge rotation back toward 2027.40-2028.77.",
-    "Refresh if price reaches 2004.84-2006.44 or 2027.40-2028.77; those are the next higher-timeframe decision zones where geometry becomes cleaner."
+    "Refresh on a confirmed 4H acceptance below z_1d_val_support and then z_4h_session_low; that would create real downside continuation geometry instead of mid-value chop.",
+    "Refresh on a confirmed 4H acceptance above z_1d_vah_resistance with hold above z_1d_poc; that would show upside balance resolution instead of another value rotation.",
+    "Refresh if futures-led flow gains durable strategic spot confirmation or if the OI/CVD profile flips away from the current mixed long-unwind plus fresh short-build backdrop."
   ],
   "map_summary": {
     "regime_3d": {
-      "summary": "The 3D backdrop remains a damaged repair inside broader balance, not a clean higher-timeframe continuation. ETH is still inside the 1967.88-2048.0 composite value area, but it remains materially below the 7d anchored VWAP near 2098.2 and below the 4H EMA100/200 resistance regime.",
+      "summary": "The multi-day backdrop is still a bearish repair regime after a sharp drop from the 2200 area into 1966, but price has since stabilized back into a tight 2005-2006 balance. That leaves the higher-timeframe picture as compressed repair inside a larger down-leg, not a clean trend continuation or a clean reversal edge.",
       "notes": [
-        "3D composite value spans 1967.88 to 2048.0 with major composite interest centered around 1990.0 and 1985.0.",
-        "3D open interest remains in long_unwind, which keeps the larger move classified as deleveraging repair rather than renewed trend acceptance.",
-        "3D whale flow is still net negative over the wider window, reinforcing that the broader structure remains damaged despite the intraday recovery from the 1980s/1990s base.",
-        "Price is above the long-term daily EMA floor, so the deeper base is not broken, but the medium-term structure is still capped by higher-timeframe supply overhead."
+        "Price remains well below the 4H EMA100/200 cluster at 2094.28/2072.37, so medium-term pressure is still lower.",
+        "Price is still above the 1D EMA100/200 at 1972.00/1913.65, so macro support remains underneath and the larger downside impulse is not fully extended into breakdown territory.",
+        "3D structural confirmation is incomplete and no fresh 3D imbalance is available to turn this balance into a high-conviction directional map."
       ]
     },
     "location_1d": {
-      "summary": "On the 1D map ETH is sitting at the top of daily TPO value and inside the broader daily volume value, so the market is near a daily value edge but not in a clean daily expansion. Today's recovery is still being carried by leverage rather than decisive higher-timeframe acceptance.",
+      "summary": "Price at 2005.73 is inside the 1D value area, almost on the 7D futures AVWAP at 2005.76, and only modestly below the 1D POC near 2006.31. This is fair-value territory rather than a higher-timeframe edge location.",
       "notes": [
-        "1D volume value spans 1992.46 to 2049.36, while 1D TPO value spans 1981.52 to 2018.62; current price is only marginally above daily TPO value high.",
-        "1D POC remains 2025.0, so price is below the main daily volume pivot even though it is above the 1D RVWAP at 2005.23.",
-        "1D open interest is still leveraged_long_build, which means the recovery off the recent lows is being sponsored by leverage and is vulnerable if lower-value support fails.",
-        "Daily downside magnets remain 2004.84-2006.44 first and then the 1985.0-1990.0 composite base."
+        "Composite 1D value is 2005.19-2006.47, while 1D TPO value is 2005.3164-2006.59 with POC at 2006.3124.",
+        "1D RVWAP is 2005.83 and price is only about -0.97 sigma from it, which is not a meaningful stretch.",
+        "The nearest strategic support is the 2005.19-2005.32 value-low cluster; the nearest strategic resistance is the 2006.47-2006.59 value-high cluster."
       ]
     },
     "location_4h": {
-      "summary": "The 4H map is at a real edge, but not yet one-directional. Price has rotated from the 2027.4-2028.77 upper-value rejection down into the lower-value decision shelf defined by 2018.57-2019.97, after a washout probe into 2014.57-2016.15 that was bought back.",
+      "summary": "The new 4H session is still immature, ranging 2004.50-2005.77 so far, and the entire session remains nested inside the broader 1D balance. There is no resolved 4H acceptance beyond higher-timeframe value.",
       "notes": [
-        "4H volume value spans 2018.57 to 2028.77 with POC at 2025.0; 4H TPO value spans 2019.97 to 2027.395 with POC at 2022.5575.",
-        "Current price is sitting between 4H volume VAL and 4H TPO VAL, which makes this a lower-edge decision zone rather than clean accepted downside or clean reaccepted balance.",
-        "The current 4H bar shows fresh_short_build in open interest, but price has also responded to lower-edge support, so state is directional only if acceptance resolves one way or the other.",
-        "The rejection from 2028.97 keeps upper-value supply relevant, but the bounce from 2014.57-2016.15 prevents a clean immediate breakdown read."
+        "The current 4H TPO profile is too young and effectively single-print across the early session, so its directional information is weak.",
+        "Local EMAs are flat around 2005.76, showing compression rather than expansion.",
+        "Liquidity walls bracket the balance with a large bid wall near 2000 and a nearby ask wall near 2010.4, reinforcing the current bracketed auction."
       ]
     },
-    "price_location_class": "value_edge",
+    "price_location_class": "inside_value_middle",
     "key_levels": {
       "levels": [
         {
-          "zone_id": "Z_4H_LOWER_VALUE_EDGE",
-          "timeframe": "4h",
-          "role": "decision",
-          "low": 2018.57,
-          "high": 2019.97,
-          "reason": "Confluence of 4H volume VAL, 4H TPO VAL, and the 4H RVWAP -1 band; current strategic decision shelf."
-        },
-        {
-          "zone_id": "Z_4H_WASHOUT_LOW",
-          "timeframe": "4h",
-          "role": "support",
-          "low": 2014.57,
-          "high": 2016.15,
-          "reason": "4H single-print washout zone and session downside probe; loss of this pocket would strengthen downside acceptance."
-        },
-        {
-          "zone_id": "Z_4H_BALANCE_POC",
-          "timeframe": "4h",
-          "role": "decision",
-          "low": 2022.56,
-          "high": 2025.0,
-          "reason": "4H TPO POC to volume POC cluster; reclaim would signal re-entry into 4H balance."
-        },
-        {
-          "zone_id": "Z_4H_UPPER_VALUE",
-          "timeframe": "4h",
-          "role": "resistance",
-          "low": 2027.4,
-          "high": 2028.77,
-          "reason": "4H upper value edge and recent rejection area."
-        },
-        {
-          "zone_id": "Z_1D_VALUE_MAGNET",
+          "zone_id": "z_1d_val_support",
           "timeframe": "1d",
           "role": "support",
-          "low": 2004.84,
-          "high": 2006.44,
-          "reason": "Daily TPO/volume value-high magnet below the market and first clean downside objective if 4H lower value fails."
+          "low": 2005.19,
+          "high": 2005.32,
+          "reason": "Composite 1D VAL at 2005.19 overlaps 1D TPO VAL at 2005.3164; lower edge of current balance."
         },
         {
-          "zone_id": "Z_3D_COMPOSITE_BASE",
-          "timeframe": "3d",
+          "zone_id": "z_1d_poc",
+          "timeframe": "1d",
+          "role": "magnet",
+          "low": 2006.28,
+          "high": 2006.32,
+          "reason": "Composite and TPO POC cluster around 2006.31; fair-value magnet inside the current auction."
+        },
+        {
+          "zone_id": "z_1d_vah_resistance",
+          "timeframe": "1d",
+          "role": "resistance",
+          "low": 2006.47,
+          "high": 2006.59,
+          "reason": "Composite VAH at 2006.47 aligns with 1D TPO VAH at 2006.59; upper edge of current value."
+        },
+        {
+          "zone_id": "z_4h_session_low",
+          "timeframe": "4h",
           "role": "support",
-          "low": 1985.0,
-          "high": 1990.0,
-          "reason": "3D composite support built around the broader balance POC and repair origin."
+          "low": 2004.5,
+          "high": 2004.73,
+          "reason": "Current 4H session low and lower single-print boundary of the still-young session."
+        },
+        {
+          "zone_id": "z_4h_session_high",
+          "timeframe": "4h",
+          "role": "resistance",
+          "low": 2005.73,
+          "high": 2005.77,
+          "reason": "Current 4H session high / local upper boundary, but not yet a decisive higher-timeframe breakout."
+        },
+        {
+          "zone_id": "z_bidwall_2000",
+          "timeframe": "4h",
+          "role": "support",
+          "low": 1999.9,
+          "high": 2000.1,
+          "reason": "Nearest large bid liquidity wall below the current balance."
+        },
+        {
+          "zone_id": "z_askwall_2010",
+          "timeframe": "4h",
+          "role": "resistance",
+          "low": 2010.4,
+          "high": 2010.75,
+          "reason": "Nearest major ask liquidity wall above the current balance."
         }
       ]
     }
   },
   "opportunity_assessment": {
-    "location_quality": "high",
+    "location_quality": "low",
     "state_quality": "medium",
     "driver_quality": "low",
-    "geometry_quality": "high",
-    "uniqueness_quality": "low",
+    "geometry_quality": "low",
+    "uniqueness_quality": "medium",
     "overall_quality": "low",
     "disqualifiers": [
-      "Price is at a higher-timeframe edge, but it is trapped inside an unresolved lower-value decision shelf rather than in clear accepted direction.",
-      "1D state is still leveraged_long_build while 4H state is fresh_short_build, so the higher-timeframe state stack is conflicted.",
-      "Driver evidence is mixed: futures are still setting the move, but spot is absorbing the lower-edge test, so sponsorship is not uniquely bearish or bullish.",
-      "A downside value-return below 2018.57-2019.97 and a lower-edge bounce back into 2022.56-2025.0 are both still structurally plausible, which fails the uniqueness standard."
+      "Price is in the middle of 1D value and near AVWAP/POC rather than at a higher-timeframe edge.",
+      "The 4H session is too immature to provide clean acceptance or rejection geometry.",
+      "Strategic flow is futures-led but mixed, with weak higher-timeframe spot confirmation and no confirmed trigger event.",
+      "Crowding is balanced and there are no liquidation, exhaustion, or absorption extremes to support a reversal script."
     ]
   },
   "script_rejections": [
     {
       "script": "continuation",
-      "reason": "This is not a true higher-timeframe continuation setup. The 3D structure is still repair inside damaged context, price remains far below the 7d AVWAP and below the 4H EMA100/200 resistance regime, and current location is at lower-value support rather than in clean upside expansion."
+      "reason": "The broader 4H backdrop still leans bearish, but any short here would be a mid-value repair narrative rather than a true higher-timeframe continuation. A real continuation needs confirmed acceptance below z_1d_val_support and ideally below z_4h_session_low, or a clean rejection from z_1d_vah_resistance; neither is present."
     },
     {
       "script": "crowded_reversal",
-      "reason": "Crowding is balanced, funding is only mildly negative, and there is no clear positioning or liquidation extreme to support a genuine crowded reversal script."
+      "reason": "Negative funding and prior long unwind alone are not enough for a reversal setup. Crowding is balanced, liquidation density is not informative, no exhaustion/absorption event is confirmed, and price is not testing an extreme higher-timeframe support zone."
     },
     {
       "script": "value_return",
-      "reason": "This is the closest script type, but it is not uniquely actionable yet. A 4H acceptance below 2018.57-2019.97 would open a clean downside value-return toward 2004.84-2006.44, while a reclaim of 2022.56-2025.0 would instead reopen rotation back into 4H balance. The zone is strategic, but the current directional path is unresolved."
+      "reason": "The value-return move has already happened. Price is already back inside 1D/3D value and sitting near AVWAP and POC, so there is no outside-value reversion edge left to capture."
     }
   ],
   "current_script": null,
   "driver_attribution": {
-    "flow_driver": "mixed",
-    "spot_confirming": true,
-    "driver_note": "Futures are still driving the broader intraday move, but the lower-edge defense has spot participation and absorption characteristics. That leaves the driver stack conflicted rather than one-sided enough for a high-quality strategic path."
+    "flow_driver": "futures_led",
+    "spot_confirming": false,
+    "driver_note": "Whale flow, OI behavior, and cross-market attribution remain primarily futures-led, but strategic spot confirmation is too thin/incomplete and 4H flow signals are mixed rather than cleanly directional."
   },
   "current_path": null
 }

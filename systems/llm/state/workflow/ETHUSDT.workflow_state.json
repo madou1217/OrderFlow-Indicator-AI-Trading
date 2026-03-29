@@ -1,10 +1,10 @@
 {
   "symbol": "ETHUSDT",
   "pending_stage1_refresh_reason": null,
-  "last_stage1_ts": "2026-03-28T18:00:00Z",
+  "last_stage1_ts": "2026-03-29T08:00:00Z",
   "approved_tactical_plan": null,
   "approved_tactical_plan_updated_at": null,
-  "active_15m_window_start": "2026-03-28T15:30:00Z",
+  "active_15m_window_start": null,
   "filled_stopout_attempts": 0,
   "last_filled_context_key": null,
   "last_executed_plan_role": null

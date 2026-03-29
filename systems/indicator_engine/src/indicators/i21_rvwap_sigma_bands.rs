@@ -262,13 +262,14 @@ fn window_to_minutes(code: &str) -> Option<i64> {
         "1h" => Some(60),
         "4h" => Some(240),
         "1d" => Some(1440),
+        "3d" => Some(4320),
         _ => None,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{compute_stats_at, ohlcv_typical_price, WeightedSeries};
+    use super::{compute_stats_at, ohlcv_typical_price, window_to_minutes, WeightedSeries};
     use chrono::{TimeZone, Utc};
 
     #[test]
@@ -300,5 +301,10 @@ mod tests {
         let p = ohlcv_typical_price(Some(12.0), Some(6.0), Some(9.0)).expect("price");
         assert!((p - 9.0).abs() < 1e-12);
         assert!(ohlcv_typical_price(Some(12.0), None, Some(9.0)).is_none());
+    }
+
+    #[test]
+    fn rvwap_window_to_minutes_supports_3d() {
+        assert_eq!(window_to_minutes("3d"), Some(4320));
     }
 }
