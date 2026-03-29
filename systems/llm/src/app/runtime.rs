@@ -2479,6 +2479,15 @@ async fn maybe_refresh_stage1(
         return Ok(Stage1RefreshAttempt::default());
     }
 
+    info!(
+        symbol = %symbol,
+        ts_bucket = %bundle.raw.ts_bucket,
+        trigger = trigger,
+        refresh_reason = %refresh_reason,
+        had_cached_stage1 = stage1_output.is_some(),
+        "invoking workflow stage1 models"
+    );
+
     let outputs = crate::llm::workflow_provider::invoke_stage1_models(
         http_client,
         loopback_http_client,
