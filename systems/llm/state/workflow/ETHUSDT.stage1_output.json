@@ -1,0 +1,116 @@
+{
+  "meta": {
+    "stage1_ts": "2026-03-29T08:00:00Z"
+  },
+  "monitoring_status": "no_edge",
+  "no_trade_reason": "path_not_actionable",
+  "refresh_hints": [
+    "Refresh on a confirmed 4H acceptance below z_1d_val_support and then z_4h_session_low; that would create real downside continuation geometry instead of mid-value chop.",
+    "Refresh on a confirmed 4H acceptance above z_1d_vah_resistance with hold above z_1d_poc; that would show upside balance resolution instead of another value rotation.",
+    "Refresh if futures-led flow gains durable strategic spot confirmation or if the OI/CVD profile flips away from the current mixed long-unwind plus fresh short-build backdrop."
+  ],
+  "map_summary": {
+    "location_3d": {
+      "summary": "The multi-day backdrop is still a bearish repair regime after a sharp drop from the 2200 area into 1966, but price has since stabilized back into a tight 2005-2006 balance. That leaves the higher-timeframe picture as compressed repair inside a larger down-leg, not a clean trend continuation or a clean reversal edge.",
+      "notes": [
+        "Price remains well below the 4H EMA100/200 cluster at 2094.28/2072.37, so medium-term pressure is still lower.",
+        "Price is still above the 1D EMA100/200 at 1972.00/1913.65, so macro support remains underneath and the larger downside impulse is not fully extended into breakdown territory.",
+        "3D structural confirmation is incomplete and no fresh 3D imbalance is available to turn this balance into a high-conviction directional map."
+      ]
+    },
+    "location_1d": {
+      "summary": "Price at 2005.73 is inside the 1D value area, almost on the 7D futures AVWAP at 2005.76, and only modestly below the 1D POC near 2006.31. This is fair-value territory rather than a higher-timeframe edge location.",
+      "notes": [
+        "Composite 1D value is 2005.19-2006.47, while 1D TPO value is 2005.3164-2006.59 with POC at 2006.3124.",
+        "1D RVWAP is 2005.83 and price is only about -0.97 sigma from it, which is not a meaningful stretch.",
+        "The nearest strategic support is the 2005.19-2005.32 value-low cluster; the nearest strategic resistance is the 2006.47-2006.59 value-high cluster."
+      ]
+    },
+    "location_4h": {
+      "summary": "The new 4H session is still immature, ranging 2004.50-2005.77 so far, and the entire session remains nested inside the broader 1D balance. There is no resolved 4H acceptance beyond higher-timeframe value.",
+      "notes": [
+        "The current 4H TPO profile is too young and effectively single-print across the early session, so its directional information is weak.",
+        "Local EMAs are flat around 2005.76, showing compression rather than expansion.",
+        "Liquidity walls bracket the balance with a large bid wall near 2000 and a nearby ask wall near 2010.4, reinforcing the current bracketed auction."
+      ]
+    },
+    "price_location_class": "inside_value_middle",
+    "key_levels": {
+      "levels": [
+        {
+          "zone_id": "z_1d_val_support",
+          "timeframe": "1d",
+          "role": "support",
+          "low": 2005.19,
+          "high": 2005.32,
+          "reason": "Composite 1D VAL at 2005.19 overlaps 1D TPO VAL at 2005.3164; lower edge of current balance."
+        },
+        {
+          "zone_id": "z_1d_poc",
+          "timeframe": "1d",
+          "role": "magnet",
+          "low": 2006.28,
+          "high": 2006.32,
+          "reason": "Composite and TPO POC cluster around 2006.31; fair-value magnet inside the current auction."
+        },
+        {
+          "zone_id": "z_1d_vah_resistance",
+          "timeframe": "1d",
+          "role": "resistance",
+          "low": 2006.47,
+          "high": 2006.59,
+          "reason": "Composite VAH at 2006.47 aligns with 1D TPO VAH at 2006.59; upper edge of current value."
+        },
+        {
+          "zone_id": "z_4h_session_low",
+          "timeframe": "4h",
+          "role": "support",
+          "low": 2004.5,
+          "high": 2004.73,
+          "reason": "Current 4H session low and lower single-print boundary of the still-young session."
+        },
+        {
+          "zone_id": "z_4h_session_high",
+          "timeframe": "4h",
+          "role": "resistance",
+          "low": 2005.73,
+          "high": 2005.77,
+          "reason": "Current 4H session high / local upper boundary, but not yet a decisive higher-timeframe breakout."
+        },
+        {
+          "zone_id": "z_bidwall_2000",
+          "timeframe": "4h",
+          "role": "support",
+          "low": 1999.9,
+          "high": 2000.1,
+          "reason": "Nearest large bid liquidity wall below the current balance."
+        },
+        {
+          "zone_id": "z_askwall_2010",
+          "timeframe": "4h",
+          "role": "resistance",
+          "low": 2010.4,
+          "high": 2010.75,
+          "reason": "Nearest major ask liquidity wall above the current balance."
+        }
+      ]
+    }
+  },
+  "opportunity_assessment": {
+    "location_quality": "low",
+    "state_quality": "medium",
+    "driver_quality": "low",
+    "geometry_quality": "low",
+    "uniqueness_quality": "medium",
+    "overall_quality": "low",
+    "disqualifiers": [
+      "Price is in the middle of 1D value and near AVWAP/POC rather than at a higher-timeframe edge.",
+      "The 4H session is too immature to provide clean acceptance or rejection geometry.",
+      "Strategic flow is futures-led but mixed, with weak higher-timeframe spot confirmation and no confirmed trigger event.",
+      "Crowding is balanced and there are no liquidation, exhaustion, or absorption extremes to support a reversal script."
+    ]
+  },
+  "current_script": null,
+  "driver_attribution": null,
+  "current_path": null
+}
