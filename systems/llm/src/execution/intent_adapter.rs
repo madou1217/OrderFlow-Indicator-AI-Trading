@@ -201,6 +201,8 @@ mod tests {
             take_profit_2: 107.0,
             allowed_stop_loss_levels: vec![99.0, 100.0],
             allowed_take_profit_levels: vec![104.0, 107.0],
+            tp1_realized: false,
+            applied_driver_deterioration_signals: vec![],
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -231,6 +233,8 @@ mod tests {
             take_profit_2: 107.0,
             allowed_stop_loss_levels: vec![99.0, 100.0],
             allowed_take_profit_levels: vec![104.0, 107.0],
+            tp1_realized: false,
+            applied_driver_deterioration_signals: vec![],
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };

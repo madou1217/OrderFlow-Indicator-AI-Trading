@@ -1,4 +1,4 @@
-use crate::workflow::schema::{CurrentPath, EntrySnapshot, ExecutionIntent, ManagementAction};
+use crate::workflow::schema::{CurrentPath, EntrySnapshot, ExecutionIntent};
 use chrono::{DateTime, Utc};
 
 fn dedup_levels(levels: impl IntoIterator<Item = f64>) -> Vec<f64> {
@@ -42,33 +42,11 @@ pub fn snapshot_from_execution_intent(
             ),
         ),
         allowed_take_profit_levels: dedup_levels([intent.take_profit_1, intent.take_profit_2]),
+        tp1_realized: false,
+        applied_driver_deterioration_signals: Vec::new(),
         created_at: now,
         updated_at: now,
     }
-}
-
-pub fn apply_management_action(
-    snapshot: &EntrySnapshot,
-    action: &ManagementAction,
-    now: DateTime<Utc>,
-) -> Option<EntrySnapshot> {
-    if action.action_type == "FLATTEN_POSITION" {
-        return None;
-    }
-
-    let mut next = snapshot.clone();
-    next.updated_at = now;
-    next.path_id = action.path_id.clone();
-    if let Some(new_stop_loss) = action.new_stop_loss {
-        next.stop_loss = new_stop_loss;
-    }
-    if let Some(take_profit_1) = action.take_profit_1 {
-        next.take_profit_1 = take_profit_1;
-    }
-    if let Some(take_profit_2) = action.take_profit_2 {
-        next.take_profit_2 = take_profit_2;
-    }
-    Some(next)
 }
 
 #[cfg(test)]
@@ -109,6 +87,8 @@ mod tests {
             id: "path_a".to_string(),
             side: "LONG".to_string(),
             thesis: "continuation".to_string(),
+            risk_grade: "aligned_trend".to_string(),
+            activation_anchor_id: None,
             activation_level: PriceZone {
                 low: 100.0,
                 high: 101.0,
@@ -116,6 +96,7 @@ mod tests {
                 label: None,
                 reason: None,
             },
+            first_path_target_anchor_id: None,
             first_path_target: PriceZone {
                 low: 103.0,
                 high: 103.0,
@@ -123,6 +104,7 @@ mod tests {
                 label: None,
                 reason: None,
             },
+            next_path_target_anchor_id: None,
             next_path_target: PriceZone {
                 low: 105.0,
                 high: 105.0,
@@ -130,6 +112,7 @@ mod tests {
                 label: None,
                 reason: None,
             },
+            failure_anchor_id: None,
             failure_level: PriceZone {
                 low: 99.0,
                 high: 99.0,
@@ -137,11 +120,9 @@ mod tests {
                 label: None,
                 reason: None,
             },
-            failure_switch: "alt".to_string(),
+            failure_switch: Some("alt".to_string()),
             setup_type: "A_continuation".to_string(),
-            reevaluation_trigger: ReevaluationTrigger {
-                signals: vec!["driver_change".to_string()],
-            },
+            reevaluation_trigger: ReevaluationTrigger::default(),
             management_plan: ManagementPlan {
                 take_profit_1_basis: "first_path_target".to_string(),
                 take_profit_2_basis: "next_path_target".to_string(),

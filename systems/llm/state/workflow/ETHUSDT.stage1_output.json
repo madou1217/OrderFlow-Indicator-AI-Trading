@@ -1,165 +1,129 @@
 {
   "meta": {
-    "stage1_ts": "2026-03-28T02:00:00Z"
+    "stage1_ts": "2026-03-28T18:00:00Z"
   },
-  "monitoring_status": "active",
-  "no_trade_reason": null,
+  "monitoring_status": "no_edge",
+  "no_trade_reason": "conflict_no_edge",
   "refresh_hints": [
-    "Sustained acceptance through 1990.0-1990.98 keeps the return-to-value rotation extending toward 1992.9475-1994.3.",
-    "A rejection back through 1987.726875-1988.6528125 weakens the repair, but the long map only fully fails on renewed loss of 1985.245-1986.006953125.",
-    "Monitor spot confirmation and 4H OI support as price works through the 1988.62-1990.5 local bear FVG and nearby POC resistance."
+    "Refresh if 4H price is accepted below 2018.57-2019.97; that would resolve the lower-edge decision toward 2004.84-2006.44 first and 1985.0-1990.0 next.",
+    "Refresh if price reclaims and holds 2022.56-2025.0; that would negate immediate downside acceptance and clarify a lower-edge rotation back toward 2027.40-2028.77.",
+    "Refresh if price reaches 2004.84-2006.44 or 2027.40-2028.77; those are the next higher-timeframe decision zones where geometry becomes cleaner."
   ],
   "map_summary": {
-    "market_tradeable": true,
-    "location_bias": "above_lower_value_reclaim_below_poc_band",
-    "state_summary": "ETH has repaired from the 1983.67-1984.16828125 washout support back above the 1987.726875-1988.6528125 lower-value reclaim shelf and into 4H value, but it is still below the 1990.0-1990.98 POC return band and 1992.9475-1994.3 VAH/IB-high supply while remaining far under the bearish 7d AVWAP and fresh 4H bear FVG.",
-    "driver_summary": "The active edge is a responsive value-return long: selling exhaustion and bullish absorption defended the washout low, spot-confirmed orderbook support and negative funding favor squeeze continuation, and 4H OI has shifted to leveraged long build. The cap is the still-bearish 4H/1D trend and persistent higher-timeframe futures whale selling.",
-    "notes": [
-      "Price is already accepted above the lower-value reclaim shelf, so the active question is whether it can complete the rotation into the 1990.0-1990.98 POC band and then 1992.9475-1994.3.",
-      "A rejection back through 1987.726875-1988.6528125 weakens the repair, but the script only fully fails on renewed loss of 1985.245-1986.006953125.",
-      "This remains a C_value_return repair inside a bearish higher-timeframe backdrop, not a confirmed higher-timeframe trend reversal."
+    "regime_3d": {
+      "summary": "The 3D backdrop remains a damaged repair inside broader balance, not a clean higher-timeframe continuation. ETH is still inside the 1967.88-2048.0 composite value area, but it remains materially below the 7d anchored VWAP near 2098.2 and below the 4H EMA100/200 resistance regime.",
+      "notes": [
+        "3D composite value spans 1967.88 to 2048.0 with major composite interest centered around 1990.0 and 1985.0.",
+        "3D open interest remains in long_unwind, which keeps the larger move classified as deleveraging repair rather than renewed trend acceptance.",
+        "3D whale flow is still net negative over the wider window, reinforcing that the broader structure remains damaged despite the intraday recovery from the 1980s/1990s base.",
+        "Price is above the long-term daily EMA floor, so the deeper base is not broken, but the medium-term structure is still capped by higher-timeframe supply overhead."
+      ]
+    },
+    "location_1d": {
+      "summary": "On the 1D map ETH is sitting at the top of daily TPO value and inside the broader daily volume value, so the market is near a daily value edge but not in a clean daily expansion. Today's recovery is still being carried by leverage rather than decisive higher-timeframe acceptance.",
+      "notes": [
+        "1D volume value spans 1992.46 to 2049.36, while 1D TPO value spans 1981.52 to 2018.62; current price is only marginally above daily TPO value high.",
+        "1D POC remains 2025.0, so price is below the main daily volume pivot even though it is above the 1D RVWAP at 2005.23.",
+        "1D open interest is still leveraged_long_build, which means the recovery off the recent lows is being sponsored by leverage and is vulnerable if lower-value support fails.",
+        "Daily downside magnets remain 2004.84-2006.44 first and then the 1985.0-1990.0 composite base."
+      ]
+    },
+    "location_4h": {
+      "summary": "The 4H map is at a real edge, but not yet one-directional. Price has rotated from the 2027.4-2028.77 upper-value rejection down into the lower-value decision shelf defined by 2018.57-2019.97, after a washout probe into 2014.57-2016.15 that was bought back.",
+      "notes": [
+        "4H volume value spans 2018.57 to 2028.77 with POC at 2025.0; 4H TPO value spans 2019.97 to 2027.395 with POC at 2022.5575.",
+        "Current price is sitting between 4H volume VAL and 4H TPO VAL, which makes this a lower-edge decision zone rather than clean accepted downside or clean reaccepted balance.",
+        "The current 4H bar shows fresh_short_build in open interest, but price has also responded to lower-edge support, so state is directional only if acceptance resolves one way or the other.",
+        "The rejection from 2028.97 keeps upper-value supply relevant, but the bounce from 2014.57-2016.15 prevents a clean immediate breakdown read."
+      ]
+    },
+    "price_location_class": "value_edge",
+    "key_levels": {
+      "levels": [
+        {
+          "zone_id": "Z_4H_LOWER_VALUE_EDGE",
+          "timeframe": "4h",
+          "role": "decision",
+          "low": 2018.57,
+          "high": 2019.97,
+          "reason": "Confluence of 4H volume VAL, 4H TPO VAL, and the 4H RVWAP -1 band; current strategic decision shelf."
+        },
+        {
+          "zone_id": "Z_4H_WASHOUT_LOW",
+          "timeframe": "4h",
+          "role": "support",
+          "low": 2014.57,
+          "high": 2016.15,
+          "reason": "4H single-print washout zone and session downside probe; loss of this pocket would strengthen downside acceptance."
+        },
+        {
+          "zone_id": "Z_4H_BALANCE_POC",
+          "timeframe": "4h",
+          "role": "decision",
+          "low": 2022.56,
+          "high": 2025.0,
+          "reason": "4H TPO POC to volume POC cluster; reclaim would signal re-entry into 4H balance."
+        },
+        {
+          "zone_id": "Z_4H_UPPER_VALUE",
+          "timeframe": "4h",
+          "role": "resistance",
+          "low": 2027.4,
+          "high": 2028.77,
+          "reason": "4H upper value edge and recent rejection area."
+        },
+        {
+          "zone_id": "Z_1D_VALUE_MAGNET",
+          "timeframe": "1d",
+          "role": "support",
+          "low": 2004.84,
+          "high": 2006.44,
+          "reason": "Daily TPO/volume value-high magnet below the market and first clean downside objective if 4H lower value fails."
+        },
+        {
+          "zone_id": "Z_3D_COMPOSITE_BASE",
+          "timeframe": "3d",
+          "role": "support",
+          "low": 1985.0,
+          "high": 1990.0,
+          "reason": "3D composite support built around the broader balance POC and repair origin."
+        }
+      ]
+    }
+  },
+  "opportunity_assessment": {
+    "location_quality": "high",
+    "state_quality": "medium",
+    "driver_quality": "low",
+    "geometry_quality": "high",
+    "uniqueness_quality": "low",
+    "overall_quality": "low",
+    "disqualifiers": [
+      "Price is at a higher-timeframe edge, but it is trapped inside an unresolved lower-value decision shelf rather than in clear accepted direction.",
+      "1D state is still leveraged_long_build while 4H state is fresh_short_build, so the higher-timeframe state stack is conflicted.",
+      "Driver evidence is mixed: futures are still setting the move, but spot is absorbing the lower-edge test, so sponsorship is not uniquely bearish or bullish.",
+      "A downside value-return below 2018.57-2019.97 and a lower-edge bounce back into 2022.56-2025.0 are both still structurally plausible, which fails the uniqueness standard."
     ]
   },
-  "current_script": "Position: ETH is back above the 1987.726875-1988.6528125 lower-value reclaim shelf and trading just under the 1990.0-1990.98 4H POC return band after defending the 1983.67-1984.16828125 washout support; State: the 4H/1D backdrop remains bearish below the 7d AVWAP and fresh 4H bear imbalance, but the immediate auction has repaired back inside 4H value above RVWAP and the short-term EMA band; Driver: selling exhaustion and bullish absorption around 1983.48-1984.9, spot-confirmed orderbook support, negative funding, and 4H leveraged long build are driving a responsive return-to-value squeeze while higher-timeframe whale/CVD pressure still limits trend quality; Trigger: holding acceptance above 1987.726875-1988.6528125 keeps 1990.0-1990.98 in play first and 1992.9475-1994.3 next, while a loss of 1985.245-1986.006953125 flips the repair back into downside continuation; Execution: run C_value_return LONG while lower-value reclaim holds and switch to reevaluate_short if composite support fails.",
+  "script_rejections": [
+    {
+      "script": "continuation",
+      "reason": "This is not a true higher-timeframe continuation setup. The 3D structure is still repair inside damaged context, price remains far below the 7d AVWAP and below the 4H EMA100/200 resistance regime, and current location is at lower-value support rather than in clean upside expansion."
+    },
+    {
+      "script": "crowded_reversal",
+      "reason": "Crowding is balanced, funding is only mildly negative, and there is no clear positioning or liquidation extreme to support a genuine crowded reversal script."
+    },
+    {
+      "script": "value_return",
+      "reason": "This is the closest script type, but it is not uniquely actionable yet. A 4H acceptance below 2018.57-2019.97 would open a clean downside value-return toward 2004.84-2006.44, while a reclaim of 2022.56-2025.0 would instead reopen rotation back into 4H balance. The zone is strategic, but the current directional path is unresolved."
+    }
+  ],
+  "current_script": null,
   "driver_attribution": {
-    "driver_bias": "bullish_value_return",
-    "primary_driver": "responsive_reclaim_after_selling_exhaustion",
-    "supporting_evidence": [
-      "Selling exhaustion confirmed at 1983.48-1983.67 and bullish absorption confirmed at 1984.9, showing responsive demand at the washout low.",
-      "Auction state is accepted above the 1987.726875-1988.6528125 lower-value reclaim shelf and above the 1985.245-1986.006953125 composite support band.",
-      "Price is above 4H RVWAP 1987.3185112571168 and above the short-term EMA band, consistent with repair back into 4H value.",
-      "Orderbook conditions remain spot-confirmed with positive imbalance and low fake-order risk, while funding stays negative and 4H OI reflects leveraged long build."
-    ],
-    "conflicting_evidence": [
-      "The 4H/1D structure is still bearish under the 7d AVWAP near 2029.314603269646 and below the fresh 4H bear FVG at 2009.46-2043.22.",
-      "1h/4h/1d futures whale flow remains net negative and the broader 1d/3d OI regime is still long unwind.",
-      "Price is pressing into the 1988.62-1990.5 local bear FVG and nearby POC resistance, with additional ask liquidity stacked near 1995.4837099272563 and above."
-    ]
+    "flow_driver": "mixed",
+    "spot_confirming": true,
+    "driver_note": "Futures are still driving the broader intraday move, but the lower-edge defense has spot participation and absorption characteristics. That leaves the driver stack conflicted rather than one-sided enough for a high-quality strategic path."
   },
-  "current_path": {
-    "id": "ethusdt_4h1d_value_return_long_20260328t0200z",
-    "side": "LONG",
-    "thesis": "ETH defended the 1983.67-1984.16828125 washout support, reclaimed the 1985.245-1986.006953125 composite support band, and has now accepted above the 1987.726875-1988.6528125 lower-value reclaim shelf. In a still-bearish higher-timeframe backdrop, the clean active path is a responsive return through the 1990.0-1990.98 POC band first and then into 1992.9475-1994.3 VAH/IB-high supply, as long as composite support is not lost again.",
-    "activation_level": {
-      "low": 1987.726875,
-      "high": 1988.6528125,
-      "timeframe": "4h",
-      "label": "lower_value_reclaim",
-      "reason": "This lower-value reclaim shelf is the structural acceptance zone that validates the return-to-value long."
-    },
-    "first_path_target": {
-      "low": 1990.0,
-      "high": 1990.98,
-      "timeframe": "4h",
-      "label": "poc_return_band",
-      "reason": "The 1990 bearish-initiation pivot and 4H POC return band form the first structural upside magnet."
-    },
-    "next_path_target": {
-      "low": 1992.9475,
-      "high": 1994.3,
-      "timeframe": "4h",
-      "label": "vah_ib_high_supply",
-      "reason": "4H VAH and the session IB high / recent buying-exhaustion zone define the next structural upside objective."
-    },
-    "failure_level": {
-      "low": 1985.245,
-      "high": 1986.006953125,
-      "timeframe": "4h-1d",
-      "label": "composite_support_loss",
-      "reason": "Loss of the reclaimed composite support band shows the responsive bid failed and reopens downside continuation."
-    },
-    "failure_switch": "reevaluate_short",
-    "setup_type": "C_value_return",
-    "reevaluation_trigger": {
-      "signals": [
-        "extreme_location",
-        "reverse_confirmation",
-        "driver_change"
-      ]
-    },
-    "management_plan": {
-      "take_profit_1_basis": "first_path_target",
-      "take_profit_2_basis": "next_path_target",
-      "take_profit_1_level": 1990.98,
-      "take_profit_2_level": 1994.3,
-      "stop_migration_rules": [
-        {
-          "after_target": "take_profit_1",
-          "new_stop_basis": "activation_level",
-          "new_stop_level": 1987.726875
-        },
-        {
-          "after_target": "take_profit_2",
-          "new_stop_basis": "first_path_target",
-          "new_stop_level": 1990.0
-        }
-      ],
-      "reduce_on_driver_deterioration": [
-        {
-          "driver_signal": "spot_confirmation_lost",
-          "reduce_ratio": 0.25
-        },
-        {
-          "driver_signal": "oi_support_lost",
-          "reduce_ratio": 0.25
-        }
-      ],
-      "exit_full_on_driver_deterioration": [
-        {
-          "driver_signal": "driver_flip_confirmed",
-          "reduce_ratio": null
-        }
-      ]
-    },
-    "tracked_zones": [
-      {
-        "zone_id": "Z_ACT_1987_726875_1988_6528125_LOWER_VALUE_RECLAIM",
-        "timeframe": "4h",
-        "role": "activation",
-        "low": 1987.726875,
-        "high": 1988.6528125,
-        "reason": "Lower-value reclaim shelf that must accept to confirm the return-to-value path."
-      },
-      {
-        "zone_id": "Z_T1_1990_0_1990_98_POC_RETURN_BAND",
-        "timeframe": "4h",
-        "role": "target",
-        "low": 1990.0,
-        "high": 1990.98,
-        "reason": "First structural magnet formed by the recent bearish-initiation pivot and 4H return-to-value/Poc band."
-      },
-      {
-        "zone_id": "Z_T2_1992_9475_1994_3_VAH_IB_HIGH_SUPPLY",
-        "timeframe": "4h",
-        "role": "target",
-        "low": 1992.9475,
-        "high": 1994.3,
-        "reason": "4H VAH and IB high / recent buying-exhaustion zone."
-      },
-      {
-        "zone_id": "Z_FAIL_1985_245_1986_006953125_COMPOSITE_SUPPORT_LOSS",
-        "timeframe": "4h-1d",
-        "role": "failure",
-        "low": 1985.245,
-        "high": 1986.006953125,
-        "reason": "Reclaimed composite support band whose loss invalidates the long value-return script."
-      },
-      {
-        "zone_id": "Z_CTX_1983_67_1984_16828125_WASHOUT_SUPPORT",
-        "timeframe": "4h",
-        "role": "context",
-        "low": 1983.67,
-        "high": 1984.16828125,
-        "reason": "Washout/single-print support zone where selling exhaustion and bullish response formed."
-      },
-      {
-        "zone_id": "Z_CTX_1988_62_1990_5_LOCAL_SUPPLY_FVG",
-        "timeframe": "15m",
-        "role": "context",
-        "low": 1988.62,
-        "high": 1990.5,
-        "reason": "Local bear FVG and supply band that price must traverse on the way back into value."
-      }
-    ]
-  }
+  "current_path": null
 }

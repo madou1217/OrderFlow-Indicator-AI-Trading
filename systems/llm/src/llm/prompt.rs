@@ -32,10 +32,10 @@ pub fn workflow_system_prompt(
 pub fn workflow_user_prompt_prefix(stage: WorkflowPromptStage) -> &'static str {
     match stage {
         WorkflowPromptStage::Stage1 => {
-            "You are in workflow Stage1 mode. Build exactly one current script and exactly one current path object. Return only the workflow Stage1 JSON.\n\n"
+            "You are in workflow Stage1 mode. Build exactly one current script and exactly one strategic path object. Return only the workflow Stage1 JSON.\n\n"
         }
         WorkflowPromptStage::Stage2 => {
-            "You are in workflow Stage2 mode. You may only WAIT, EXECUTE the current path, or REQUEST_STAGE1_REEVALUATION. Return only the workflow Stage2 JSON.\n\n"
+            "You are in workflow Stage2 mode. Audit whether the current path is still alive, then either confirm the path with a tactical entry plan or request Stage1 reevaluation. Return only the workflow Stage2 JSON.\n\n"
         }
     }
 }

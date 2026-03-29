@@ -3,7 +3,8 @@ use crate::llm::{
     input::ModelInvocationInput,
 };
 use crate::workflow::schema::{
-    AuctionContext, IndicatorSummary, RecentBar, TrackedZone, ZoneState,
+    AuctionContext, RecentBar, StrategicIndicatorSummary, StrategicSummaryMeta, TrackedZone,
+    ZoneState,
 };
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -91,6 +92,10 @@ fn indicator_payload(indicators: &Value, key: &str) -> Value {
     normalize_indicator_payload(&raw_indicator_payload(indicators, key))
 }
 
+fn object_get<'a>(value: &'a Value, key: &str) -> &'a Value {
+    value.get(key).unwrap_or(&Value::Null)
+}
+
 fn is_effectively_missing(value: &Value) -> bool {
     match value {
         Value::Null => true,
@@ -115,6 +120,69 @@ fn preferred_indicator_payload(
 
 fn wrap_filtered_payload(payload: Value) -> Value {
     json!({ "payload": payload })
+}
+
+fn summarize_options_surface_window(window: &Value) -> Value {
+    json!({
+        "is_ready": window.get("is_ready").cloned().unwrap_or(Value::Bool(false)),
+        "front_expiry_ts": window.get("front_expiry_ts").cloned().unwrap_or(Value::Null),
+        "second_expiry_ts": window.get("second_expiry_ts").cloned().unwrap_or(Value::Null),
+        "atm_iv_front": window.get("atm_iv_front").cloned().unwrap_or(Value::Null),
+        "atm_iv_second": window.get("atm_iv_second").cloned().unwrap_or(Value::Null),
+        "atm_iv_30d_proxy": window.get("atm_iv_30d_proxy").cloned().unwrap_or(Value::Null),
+        "atm_iv_regime": window.get("atm_iv_regime").cloned().unwrap_or(Value::Null),
+        "rr_25d_front": window.get("rr_25d_front").cloned().unwrap_or(Value::Null),
+        "rr_25d_second": window.get("rr_25d_second").cloned().unwrap_or(Value::Null),
+        "atm_iv_front_change": window.get("atm_iv_front_change").cloned().unwrap_or(Value::Null),
+        "rr_25d_front_change": window.get("rr_25d_front_change").cloned().unwrap_or(Value::Null),
+        "skew_state": window.get("skew_state").cloned().unwrap_or(Value::Null),
+        "term_structure_state": window.get("term_structure_state").cloned().unwrap_or(Value::Null)
+    })
+}
+
+fn options_surface_summary(raw: &Value) -> Value {
+    let by_window = object_get(raw, "by_window");
+    let strategic_windows = ["4h", "1d", "3d"]
+        .into_iter()
+        .filter_map(|window| {
+            by_window
+                .get(window)
+                .map(|value| (window.to_string(), summarize_options_surface_window(value)))
+        })
+        .collect::<Map<_, _>>();
+    let tactical_windows = ["15m", "4h", "1d"]
+        .into_iter()
+        .filter_map(|window| {
+            by_window
+                .get(window)
+                .map(|value| (window.to_string(), summarize_options_surface_window(value)))
+        })
+        .collect::<Map<_, _>>();
+
+    let ready_windows = |windows: &Map<String, Value>| {
+        windows
+            .iter()
+            .filter_map(|(window, value)| {
+                value
+                    .get("is_ready")
+                    .and_then(Value::as_bool)
+                    .filter(|ready| *ready)
+                    .map(|_| Value::String(window.clone()))
+            })
+            .collect::<Vec<_>>()
+    };
+
+    json!({
+        "as_of_ts": raw.get("as_of_ts").cloned().unwrap_or(Value::Null),
+        "strategic_summary": {
+            "windows": strategic_windows.clone(),
+            "ready_windows": ready_windows(&strategic_windows)
+        },
+        "tactical_guardrail": {
+            "windows": tactical_windows.clone(),
+            "ready_windows": ready_windows(&tactical_windows)
+        }
+    })
 }
 
 fn filtered_indicator_set(input: &ModelInvocationInput) -> Result<Value> {
@@ -253,65 +321,69 @@ fn compute_zone_state(zone: &TrackedZone, bars: &[RecentBar]) -> ZoneState {
 pub fn build_indicator_summary(
     input: &ModelInvocationInput,
     tracked_zones: &[TrackedZone],
-) -> Result<IndicatorSummary> {
+) -> Result<StrategicIndicatorSummary> {
     let filtered_indicators = filtered_indicator_set(input)?;
+    let options_surface = indicator_payload(&input.indicators, "options_surface");
     let bars = extract_recent_15m_bars(&input.indicators);
     let zone_states = tracked_zones
         .iter()
         .map(|zone| compute_zone_state(zone, &bars))
         .collect();
 
-    let position_context = json!({
+    let position_layer = json!({
         "price_volume_structure": preferred_indicator_payload(&filtered_indicators, &input.indicators, "price_volume_structure"),
         "rvwap_sigma_bands": preferred_indicator_payload(&filtered_indicators, &input.indicators, "rvwap_sigma_bands"),
         "avwap": preferred_indicator_payload(&filtered_indicators, &input.indicators, "avwap"),
         "tpo_market_profile": preferred_indicator_payload(&filtered_indicators, &input.indicators, "tpo_market_profile"),
         "fvg": preferred_indicator_payload(&filtered_indicators, &input.indicators, "fvg"),
         "liquidation_density": preferred_indicator_payload(&filtered_indicators, &input.indicators, "liquidation_density"),
-        "kline_history": preferred_indicator_payload(&filtered_indicators, &input.indicators, "kline_history")
+        "ema_trend_regime": preferred_indicator_payload(&filtered_indicators, &input.indicators, "ema_trend_regime")
     });
-    let state_context = json!({
+    let state_layer = json!({
         "open_interest": indicator_payload(&input.indicators, "open_interest"),
         "long_short_ratios": indicator_payload(&input.indicators, "long_short_ratios"),
         "funding_rate": preferred_indicator_payload(&filtered_indicators, &input.indicators, "funding_rate"),
         "vpin": preferred_indicator_payload(&filtered_indicators, &input.indicators, "vpin")
     });
-    let driver_context = json!({
+    let driver_layer = json!({
         "whale_trades": preferred_indicator_payload(&filtered_indicators, &input.indicators, "whale_trades"),
         "cvd_pack": preferred_indicator_payload(&filtered_indicators, &input.indicators, "cvd_pack"),
+        "divergence": preferred_indicator_payload(&filtered_indicators, &input.indicators, "divergence")
+    });
+    let trigger_layer = json!({
+        "selling_exhaustion": preferred_indicator_payload(&filtered_indicators, &input.indicators, "selling_exhaustion"),
+        "buying_exhaustion": preferred_indicator_payload(&filtered_indicators, &input.indicators, "buying_exhaustion"),
+        "footprint": preferred_indicator_payload(&filtered_indicators, &input.indicators, "footprint"),
+        "high_volume_pulse": preferred_indicator_payload(&filtered_indicators, &input.indicators, "high_volume_pulse"),
         "orderbook_depth": preferred_indicator_payload(&filtered_indicators, &input.indicators, "orderbook_depth"),
         "absorption": preferred_indicator_payload(&filtered_indicators, &input.indicators, "absorption"),
         "initiation": preferred_indicator_payload(&filtered_indicators, &input.indicators, "initiation"),
         "bullish_initiation": preferred_indicator_payload(&filtered_indicators, &input.indicators, "bullish_initiation"),
         "bearish_initiation": preferred_indicator_payload(&filtered_indicators, &input.indicators, "bearish_initiation"),
         "bullish_absorption": preferred_indicator_payload(&filtered_indicators, &input.indicators, "bullish_absorption"),
-        "bearish_absorption": preferred_indicator_payload(&filtered_indicators, &input.indicators, "bearish_absorption")
-    });
-    let trigger_context = json!({
-        "selling_exhaustion": preferred_indicator_payload(&filtered_indicators, &input.indicators, "selling_exhaustion"),
-        "buying_exhaustion": preferred_indicator_payload(&filtered_indicators, &input.indicators, "buying_exhaustion"),
-        "divergence": preferred_indicator_payload(&filtered_indicators, &input.indicators, "divergence"),
-        "footprint": preferred_indicator_payload(&filtered_indicators, &input.indicators, "footprint"),
-        "high_volume_pulse": preferred_indicator_payload(&filtered_indicators, &input.indicators, "high_volume_pulse")
+        "bearish_absorption": preferred_indicator_payload(&filtered_indicators, &input.indicators, "bearish_absorption"),
+        "divergence": preferred_indicator_payload(&filtered_indicators, &input.indicators, "divergence")
     });
     let aux_context = json!({
-        "ema_trend_regime": preferred_indicator_payload(&filtered_indicators, &input.indicators, "ema_trend_regime"),
         "atr_context": preferred_indicator_payload(&filtered_indicators, &input.indicators, "atr_context"),
         "events_summary": preferred_indicator_payload(&filtered_indicators, &input.indicators, "events_summary"),
         "position_evidence": preferred_indicator_payload(&filtered_indicators, &input.indicators, "position_evidence"),
-        "options_surface": indicator_payload(&input.indicators, "options_surface"),
+        "kline_history": preferred_indicator_payload(&filtered_indicators, &input.indicators, "kline_history"),
+        "options_surface": options_surface_summary(&options_surface),
     });
 
-    Ok(IndicatorSummary {
-        symbol: input.symbol.clone(),
-        ts_bucket: input.ts_bucket,
-        source_routing_key: input.source_routing_key.clone(),
-        indicator_count: input.indicator_count,
-        missing_indicator_codes: input.missing_indicator_codes.clone(),
-        position_context,
-        state_context,
-        driver_context,
-        trigger_context,
+    Ok(StrategicIndicatorSummary {
+        meta: StrategicSummaryMeta {
+            symbol: input.symbol.clone(),
+            ts_bucket: input.ts_bucket,
+            source_routing_key: input.source_routing_key.clone(),
+            indicator_count: input.indicator_count,
+            missing_indicator_codes: input.missing_indicator_codes.clone(),
+        },
+        position_layer,
+        state_layer,
+        driver_layer,
+        trigger_layer,
         auction_context: AuctionContext {
             tracked_zones: tracked_zones.to_vec(),
             zone_states,
@@ -376,11 +448,11 @@ mod tests {
 
         let summary = build_indicator_summary(&input, &[]).expect("build indicator summary");
         assert_eq!(
-            summary.driver_context["initiation"]["confirmed_at"],
+            summary.trigger_layer["initiation"]["confirmed_at"],
             json!("2026-03-27T12:00:00Z")
         );
         assert_eq!(
-            summary.driver_context["initiation"]["confirmed_price"],
+            summary.trigger_layer["initiation"]["confirmed_price"],
             json!(2010.5)
         );
     }
@@ -415,7 +487,28 @@ mod tests {
                 },
                 "options_surface": {
                     "payload": {
-                        "skew": 0.12
+                        "as_of_ts": "2026-03-27T12:00:00Z",
+                        "by_window": {
+                            "15m": {
+                                "is_ready": true,
+                                "skew_state": "put_skew",
+                                "term_structure_state": "flat"
+                            },
+                            "4h": {
+                                "is_ready": true,
+                                "atm_iv_front": 0.55,
+                                "atm_iv_30d_proxy": 0.50,
+                                "atm_iv_regime": "elevated",
+                                "skew_state": "put_skew",
+                                "term_structure_state": "flat"
+                            },
+                            "1d": {
+                                "is_ready": false,
+                                "atm_iv_regime": "neutral",
+                                "skew_state": "neutral",
+                                "term_structure_state": "contango"
+                            }
+                        }
                     }
                 },
                 "kline_history": {
@@ -447,11 +540,19 @@ mod tests {
 
         let summary = build_indicator_summary(&input, &[]).expect("build indicator summary");
         assert!(summary
-            .position_context
+            .position_layer
             .pointer("/price_volume_structure/value_area_levels")
             .is_none());
-        assert_eq!(summary.aux_context["options_surface"]["skew"], json!(0.12));
-        assert!(summary.position_context.get("options_surface").is_none());
+        assert_eq!(
+            summary.aux_context["options_surface"]["strategic_summary"]["windows"]["4h"]
+                ["atm_iv_regime"],
+            json!("elevated")
+        );
+        assert_eq!(
+            summary.aux_context["options_surface"]["tactical_guardrail"]["ready_windows"],
+            json!(["15m", "4h"])
+        );
+        assert!(summary.position_layer.get("options_surface").is_none());
         assert!(summary.aux_context.get("raw_indicators").is_none());
     }
 }

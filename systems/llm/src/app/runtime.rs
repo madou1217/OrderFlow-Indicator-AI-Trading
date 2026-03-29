@@ -4,7 +4,7 @@ use crate::app::telegram::{TelegramOperator, TradeSignalNotification};
 use crate::app::x::XOperator;
 use crate::execution::binance::{
     execute_workflow_execution_intent, execute_workflow_management_action,
-    fetch_symbol_trading_state, ActivePositionSnapshot, ExecutionReport,
+    fetch_symbol_trading_state, ActivePositionSnapshot, ExecutionReport, ManagementExecutionReport,
     TradeExecutionBlockedByCurrentPriceBeyondStopLoss, TradingStateSnapshot,
 };
 use crate::execution::intent_adapter::{adapt_execution_intent, adapt_management_action};
@@ -29,7 +29,6 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
-use tokio::sync::Mutex;
 use tokio::time::{sleep_until, Duration, Instant, Sleep};
 use tracing::{debug, error, info, warn};
 
@@ -41,10 +40,84 @@ const LLM_JOURNAL_FILE: &str = "systems/llm/journal/llm_trade_journal.jsonl";
 const KLINE_DB_BACKFILL_INTERVALS: [(&str, i64); 2] = [("4h", 240), ("1d", 1440)];
 const KLINE_RANGE_CACHE_TTL_MINUTES: i64 = 30;
 const KLINE_RANGE_CACHE_MAX_SERIES: usize = 8;
+const TP1_DEFAULT_REDUCE_RATIO: f64 = 0.5;
+
+#[derive(Debug, Clone, Copy)]
+enum WorkflowStageKind {
+    Stage1,
+    Stage2,
+}
+
+#[derive(Debug, Default, Clone)]
+struct WorkflowStageFlights {
+    stage1: bool,
+    stage2: bool,
+}
+
+static WORKFLOW_STAGE_FLIGHTS: OnceLock<StdMutex<HashMap<String, WorkflowStageFlights>>> =
+    OnceLock::new();
+
+fn workflow_stage_flights() -> &'static StdMutex<HashMap<String, WorkflowStageFlights>> {
+    WORKFLOW_STAGE_FLIGHTS.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+struct WorkflowStageFlightGuard {
+    symbol: String,
+    stage: WorkflowStageKind,
+}
+
+impl Drop for WorkflowStageFlightGuard {
+    fn drop(&mut self) {
+        if let Ok(mut flights) = workflow_stage_flights().lock() {
+            if let Some(entry) = flights.get_mut(&self.symbol) {
+                match self.stage {
+                    WorkflowStageKind::Stage1 => entry.stage1 = false,
+                    WorkflowStageKind::Stage2 => entry.stage2 = false,
+                }
+                if !entry.stage1 && !entry.stage2 {
+                    flights.remove(&self.symbol);
+                }
+            }
+        }
+    }
+}
+
+fn try_acquire_workflow_stage(
+    symbol: &str,
+    stage: WorkflowStageKind,
+) -> Option<WorkflowStageFlightGuard> {
+    let mut flights = workflow_stage_flights().lock().ok()?;
+    let entry = flights.entry(symbol.to_string()).or_default();
+    let occupied = match stage {
+        WorkflowStageKind::Stage1 => &mut entry.stage1,
+        WorkflowStageKind::Stage2 => &mut entry.stage2,
+    };
+    if *occupied {
+        return None;
+    }
+    *occupied = true;
+    Some(WorkflowStageFlightGuard {
+        symbol: symbol.to_string(),
+        stage,
+    })
+}
+
+fn workflow_stage_inflight(symbol: &str, stage: WorkflowStageKind) -> bool {
+    workflow_stage_flights()
+        .lock()
+        .ok()
+        .and_then(|flights| flights.get(symbol).cloned())
+        .map(|entry| match stage {
+            WorkflowStageKind::Stage1 => entry.stage1,
+            WorkflowStageKind::Stage2 => entry.stage2,
+        })
+        .unwrap_or(false)
+}
 
 #[derive(Debug, Default)]
-struct InvokeThrottleState {
-    last_invoke_at: Option<Instant>,
+struct Stage1RefreshAttempt {
+    refreshed: bool,
+    inflight_suppressed: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -113,13 +186,6 @@ pub async fn run(ctx: AppContext) -> Result<()> {
 
     let mut pending_invoke_bundle: Option<LatestBundle> = None;
     let mut last_invoked_ts_bucket: Option<DateTime<Utc>> = None;
-    let invoke_throttle = Arc::new(Mutex::new(InvokeThrottleState::default()));
-    let active_provider = ctx.config.active_default_model();
-    let schedule_minutes = effective_schedule_minutes(&ctx.config, &active_provider);
-    let min_invoke_interval_secs =
-        effective_min_invoke_interval_secs(&ctx.config, &active_provider);
-    let min_invoke_interval = Duration::from_secs(min_invoke_interval_secs);
-    let apply_min_invoke_interval_throttle = schedule_minutes.is_empty();
     let disabled_deadline = Instant::now() + Duration::from_secs(365 * 24 * 60 * 60);
     let mut settle_timer: Pin<Box<Sleep>> = Box::pin(sleep_until(disabled_deadline));
 
@@ -127,13 +193,10 @@ pub async fn run(ctx: AppContext) -> Result<()> {
         queue = %ctx.consume_queue_name,
         symbol = %ctx.config.llm.symbol,
         request_enabled = ctx.config.llm.request_enabled,
-        active_provider = %active_provider,
+        active_provider = %ctx.config.active_default_model(),
         prompt_template = %ctx.config.llm.prompt_template,
         purge_queue_on_start = ctx.config.llm.purge_queue_on_start,
-        call_schedule_minutes = ?schedule_minutes,
         bundle_settle_ms = ctx.config.llm.bundle_settle_ms,
-        min_invoke_interval_secs = min_invoke_interval_secs,
-        apply_min_invoke_interval_throttle = apply_min_invoke_interval_throttle,
         "llm runtime started"
     );
 
@@ -148,9 +211,6 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                     &ctx,
                     &pending_invoke_bundle,
                     &mut last_invoked_ts_bucket,
-                    &invoke_throttle,
-                    min_invoke_interval,
-                    apply_min_invoke_interval_throttle,
                     "scheduled_bundle",
                 );
                 pending_invoke_bundle = None;
@@ -234,12 +294,11 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                                     "llm received minute indicator bundle"
                                 );
 
-                                if bundle_matches_call_schedule(&bundle, &schedule_minutes) {
-                                    pending_invoke_bundle = Some(current_bundle);
-                                    settle_timer.as_mut().reset(
-                                        Instant::now() + Duration::from_millis(ctx.config.llm.bundle_settle_ms)
-                                    );
-                                }
+                                pending_invoke_bundle = Some(current_bundle);
+                                settle_timer.as_mut().reset(
+                                    Instant::now()
+                                        + Duration::from_millis(ctx.config.llm.bundle_settle_ms)
+                                );
                             }
                             Err(err) => {
                                 warn!(
@@ -263,25 +322,6 @@ pub async fn run(ctx: AppContext) -> Result<()> {
     }
 
     Ok(())
-}
-
-fn effective_schedule_minutes(config: &RootConfig, provider: &str) -> Vec<u8> {
-    let _ = provider;
-    config.llm.workflow.stage2_refresh_minutes.clone()
-}
-
-fn effective_min_invoke_interval_secs(config: &RootConfig, provider: &str) -> u64 {
-    config
-        .llm
-        .min_invoke_interval_secs_by_model
-        .iter()
-        .find_map(|(key, v)| key.eq_ignore_ascii_case(provider).then_some(*v))
-        .unwrap_or(config.llm.call_interval_secs.max(1))
-}
-
-fn bundle_matches_call_schedule(bundle: &MinuteBundleEnvelope, schedule_minutes: &[u8]) -> bool {
-    let minute = bundle.ts_bucket.minute() as u8;
-    schedule_minutes.contains(&minute)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -1096,9 +1136,6 @@ fn queue_latest_bundle_invoke(
     ctx: &AppContext,
     latest_bundle: &Option<LatestBundle>,
     last_invoked_ts_bucket: &mut Option<DateTime<Utc>>,
-    invoke_throttle: &Arc<Mutex<InvokeThrottleState>>,
-    min_invoke_interval: Duration,
-    apply_min_invoke_interval_throttle: bool,
     trigger: &str,
 ) {
     let Some(bundle) = latest_bundle.clone() else {
@@ -1135,49 +1172,18 @@ fn queue_latest_bundle_invoke(
     let http_client = ctx.http_client.clone();
     let loopback_http_client = ctx.loopback_http_client.clone();
     let print_response = ctx.config.llm.print_response;
-    let invoke_throttle = Arc::clone(invoke_throttle);
     let trigger = Arc::<str>::from(trigger.to_string());
-    let ts_bucket = bundle.raw.ts_bucket;
     tokio::spawn(async move {
-        let should_invoke = if apply_min_invoke_interval_throttle {
-            let mut gate = invoke_throttle.lock().await;
-            let now = Instant::now();
-            match gate.last_invoke_at {
-                Some(last) => {
-                    if now.duration_since(last) < min_invoke_interval {
-                        false
-                    } else {
-                        gate.last_invoke_at = Some(now);
-                        true
-                    }
-                }
-                None => {
-                    gate.last_invoke_at = Some(now);
-                    true
-                }
-            }
-        } else {
-            true
-        };
-        if should_invoke {
-            invoke_bundle_models(
-                config,
-                db_pool,
-                http_client,
-                loopback_http_client,
-                print_response,
-                bundle,
-                trigger,
-            )
-            .await;
-        } else {
-            debug!(
-                ts_bucket = %ts_bucket,
-                trigger = %trigger,
-                min_invoke_interval_secs = min_invoke_interval.as_secs(),
-                "llm invoke skipped: min_invoke_interval throttle active"
-            );
-        }
+        invoke_bundle_models(
+            config,
+            db_pool,
+            http_client,
+            loopback_http_client,
+            print_response,
+            bundle,
+            trigger,
+        )
+        .await;
     });
 }
 
@@ -1218,30 +1224,855 @@ fn workflow_stage1_refresh_reason(
     config: &RootConfig,
     bundle: &LatestBundle,
     workflow_state: &crate::workflow::state::WorkflowState,
-    stage1_output: Option<&crate::workflow::schema::Stage1Output>,
 ) -> Option<String> {
     if let Some(reason) = workflow_state.pending_stage1_refresh_reason.as_ref() {
         return Some(reason.clone());
     }
-    if stage1_output.is_none() {
-        return Some("scheduled_4h".to_string());
-    }
     let hour = bundle.raw.ts_bucket.hour() as u8;
     let minute = bundle.raw.ts_bucket.minute() as u8;
     if minute == 0 && config.llm.workflow.stage1_refresh_hours.contains(&hour) {
-        return Some("scheduled_4h".to_string());
+        return Some("scheduled_2h".to_string());
     }
     None
 }
 
-fn workflow_code_allows_execution(eval: &crate::workflow::stage2::Stage2RuntimeEvaluation) -> bool {
-    eval.monitoring_status == "active"
-        && !eval.no_edge_reentered
-        && !eval.failure_level_breached
-        && !eval.reevaluation_trigger_hit
-        && eval.hard_gate.location_valid
-        && eval.hard_gate.trigger_confirmed
-        && eval.soft_gate.passed_count >= eval.soft_gate_min_required
+fn consume_pending_stage1_refresh_reason(
+    workflow_state: &mut crate::workflow::state::WorkflowState,
+    refresh_reason: &str,
+) -> bool {
+    if workflow_state.pending_stage1_refresh_reason.as_deref() == Some(refresh_reason) {
+        workflow_state.pending_stage1_refresh_reason = None;
+        return true;
+    }
+    false
+}
+
+fn workflow_stage2_review_due(
+    config: &RootConfig,
+    bundle: &LatestBundle,
+    stage1_output: Option<&crate::workflow::schema::Stage1Output>,
+    stage1_refresh_blocking: bool,
+) -> bool {
+    if stage1_refresh_blocking {
+        return false;
+    }
+    let Some(stage1_output) = stage1_output else {
+        return false;
+    };
+    if stage1_output.monitoring_status != "active" || stage1_output.current_path.is_none() {
+        return false;
+    }
+    let minute = bundle.raw.ts_bucket.minute() as u8;
+    config.llm.workflow.stage2_review_minutes.contains(&minute)
+}
+
+fn default_workflow_state(symbol: &str) -> crate::workflow::state::WorkflowState {
+    crate::workflow::state::WorkflowState {
+        symbol: symbol.to_string(),
+        ..crate::workflow::state::WorkflowState::default()
+    }
+}
+
+fn floor_to_15m_window_start(ts: DateTime<Utc>) -> DateTime<Utc> {
+    let epoch = ts.timestamp();
+    let floored = epoch - epoch.rem_euclid(15 * 60);
+    DateTime::<Utc>::from_timestamp(floored, 0).unwrap_or(ts)
+}
+
+fn reset_watcher_window_if_needed(
+    workflow_state: &mut crate::workflow::state::WorkflowState,
+    ts: DateTime<Utc>,
+) -> Option<crate::workflow::schema::TacticalEntryPlan> {
+    let window_start = floor_to_15m_window_start(ts);
+    if workflow_state.active_15m_window_start == Some(window_start) {
+        return None;
+    }
+    let expired_tactical_plan = workflow_state.approved_tactical_plan.clone();
+    workflow_state.active_15m_window_start = Some(window_start);
+    workflow_state.filled_stopout_attempts = 0;
+    workflow_state.last_filled_context_key = None;
+    workflow_state.last_executed_plan_role = None;
+    workflow_state.approved_tactical_plan = None;
+    workflow_state.approved_tactical_plan_updated_at = None;
+    expired_tactical_plan
+}
+
+fn clear_approved_tactical_plan(workflow_state: &mut crate::workflow::state::WorkflowState) {
+    workflow_state.approved_tactical_plan = None;
+    workflow_state.approved_tactical_plan_updated_at = None;
+    workflow_state.last_filled_context_key = None;
+    workflow_state.last_executed_plan_role = None;
+    workflow_state.filled_stopout_attempts = 0;
+}
+
+fn scheduled_stage2_candidate_event(
+    bundle: &LatestBundle,
+    path_runtime_state: &crate::workflow::schema::PathRuntimeState,
+    derived: Option<crate::workflow::schema::CandidateEvent>,
+) -> crate::workflow::schema::CandidateEvent {
+    derived.unwrap_or_else(|| crate::workflow::schema::CandidateEvent {
+        event_type: "path_review_candidate".to_string(),
+        event_ts: bundle.raw.ts_bucket,
+        latest_price: path_runtime_state.latest_price,
+        reason: "scheduled_15m_review".to_string(),
+        details: json!({
+            "scheduled_review": true,
+            "review_minute": bundle.raw.ts_bucket.minute(),
+        }),
+    })
+}
+
+#[derive(Debug, Clone)]
+struct ManagementExecutionPlan {
+    action: crate::workflow::schema::ManagementAction,
+    action_snapshot: crate::workflow::schema::EntrySnapshot,
+    next_snapshot: Option<crate::workflow::schema::EntrySnapshot>,
+    reason: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SelectedEntryPlan<'a> {
+    plan: &'a crate::workflow::schema::EntryPlan,
+    trigger_price: f64,
+}
+
+fn execution_intent_from_entry_plan(
+    plan: &crate::workflow::schema::EntryPlan,
+    trigger_price: f64,
+) -> crate::workflow::schema::ExecutionIntent {
+    crate::workflow::schema::ExecutionIntent {
+        side: plan.side.clone(),
+        intent_mode: plan.intent_mode.clone(),
+        entry_zone: plan.entry_zone.clone(),
+        trigger_price: Some(trigger_price),
+        stop_loss: plan.stop_loss,
+        take_profit_1: plan.take_profit_1,
+        take_profit_2: plan.take_profit_2,
+        ttl_minutes: plan.ttl_minutes,
+        max_drift_pct: plan.max_drift_pct,
+        path_id: plan.entry_snapshot.path_id.clone(),
+        entry_snapshot: crate::workflow::schema::EntrySnapshotRef {
+            context_key: plan.entry_snapshot.context_key.clone(),
+            path_id: plan.entry_snapshot.path_id.clone(),
+        },
+        reason: Some(plan.entry_note.clone()),
+    }
+}
+
+fn watcher_reference_price(indicators: &Value, fallback_price: f64) -> f64 {
+    latest_closed_1m_price(indicators).unwrap_or(fallback_price)
+}
+
+fn select_entry_plan<'a>(
+    tactical_plan: &'a crate::workflow::schema::TacticalEntryPlan,
+    workflow_state: &crate::workflow::state::WorkflowState,
+    path_runtime_state: &crate::workflow::schema::PathRuntimeState,
+    trading_state: &TradingStateSnapshot,
+    entry_snapshots: &HashMap<String, crate::workflow::schema::EntrySnapshot>,
+    indicators: &Value,
+    watcher_cfg: &crate::app::config::WorkflowWatcherConfig,
+) -> Option<SelectedEntryPlan<'a>> {
+    if path_runtime_state.monitoring_status != "active" || path_runtime_state.hard_invalidation {
+        return None;
+    }
+    let side = tactical_plan.primary_entry_plan.side.as_str();
+    if has_active_position_for_side(trading_state, side) {
+        return None;
+    }
+    if workflow_state.filled_stopout_attempts
+        >= tactical_plan.attempt_policy.max_filled_stopout_attempts
+    {
+        return None;
+    }
+    let candidate = if workflow_state.filled_stopout_attempts == 0 {
+        &tactical_plan.primary_entry_plan
+    } else {
+        &tactical_plan.secondary_entry_plan
+    };
+    let watch_price = watcher_reference_price(indicators, path_runtime_state.latest_price);
+    let watch_facts = build_watcher_price_facts(indicators, watch_price);
+    if !watcher_entry_ready(candidate, &watch_facts, watcher_cfg) {
+        return None;
+    }
+    if entry_snapshots.contains_key(&candidate.entry_snapshot.context_key) {
+        return None;
+    }
+    if path_runtime_state
+        .active_entry_context_keys
+        .iter()
+        .any(|key| key == &candidate.entry_snapshot.context_key)
+    {
+        return None;
+    }
+    Some(SelectedEntryPlan {
+        plan: candidate,
+        trigger_price: watch_price,
+    })
+}
+
+#[derive(Debug, Clone)]
+struct WatcherPriceFacts {
+    current_price: f64,
+    recent_bars: Vec<WatcherBar>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct WatcherBar {
+    close: f64,
+    high: f64,
+    low: f64,
+}
+
+fn latest_closed_1m_price(indicators: &Value) -> Option<f64> {
+    extract_kline_history_bars(indicators, "futures", "1m")
+        .into_iter()
+        .rev()
+        .find(|bar| {
+            bar.get("is_closed")
+                .and_then(Value::as_bool)
+                .unwrap_or(true)
+        })
+        .and_then(|bar| bar.get("close").and_then(Value::as_f64))
+}
+
+fn build_watcher_price_facts(indicators: &Value, fallback_price: f64) -> WatcherPriceFacts {
+    let closed_bars = extract_kline_history_bars(indicators, "futures", "1m")
+        .into_iter()
+        .filter(|bar| {
+            bar.get("is_closed")
+                .and_then(Value::as_bool)
+                .unwrap_or(true)
+        })
+        .filter_map(|bar| {
+            Some(WatcherBar {
+                close: bar.get("close").and_then(Value::as_f64)?,
+                high: bar.get("high").and_then(Value::as_f64)?,
+                low: bar.get("low").and_then(Value::as_f64)?,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    WatcherPriceFacts {
+        current_price: closed_bars
+            .last()
+            .map(|bar| bar.close)
+            .unwrap_or(fallback_price),
+        recent_bars: closed_bars,
+    }
+}
+
+fn recent_bars<'a>(facts: &'a WatcherPriceFacts, count: u8) -> Option<&'a [WatcherBar]> {
+    let count = count as usize;
+    if count == 0 || facts.recent_bars.len() < count {
+        return None;
+    }
+    Some(&facts.recent_bars[facts.recent_bars.len() - count..])
+}
+
+fn price_above_on_close(
+    facts: &WatcherPriceFacts,
+    level: f64,
+    predicate: &crate::app::config::ClosePredicateConfig,
+) -> bool {
+    let threshold = level * (1.0 + predicate.min_close_bps / 10_000.0);
+    recent_bars(facts, predicate.confirm_bars)
+        .map(|bars| bars.iter().all(|bar| bar.close >= threshold))
+        .unwrap_or(false)
+}
+
+fn price_below_on_close(
+    facts: &WatcherPriceFacts,
+    level: f64,
+    predicate: &crate::app::config::ClosePredicateConfig,
+) -> bool {
+    let threshold = level * (1.0 - predicate.min_close_bps / 10_000.0);
+    recent_bars(facts, predicate.confirm_bars)
+        .map(|bars| bars.iter().all(|bar| bar.close <= threshold))
+        .unwrap_or(false)
+}
+
+fn entry_reclaim_confirmed(
+    side: &str,
+    level: &crate::workflow::schema::PriceZone,
+    facts: &WatcherPriceFacts,
+    predicate: &crate::app::config::EntryReclaimPredicateConfig,
+) -> bool {
+    match side {
+        "LONG" => recent_bars(facts, predicate.confirm_bars)
+            .map(|bars| {
+                bars.iter().all(|bar| {
+                    if predicate.allow_equal {
+                        bar.close >= level.high
+                    } else {
+                        bar.close > level.high
+                    }
+                })
+            })
+            .unwrap_or(false),
+        "SHORT" => recent_bars(facts, predicate.confirm_bars)
+            .map(|bars| {
+                bars.iter().all(|bar| {
+                    if predicate.allow_equal {
+                        bar.close <= level.low
+                    } else {
+                        bar.close < level.low
+                    }
+                })
+            })
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+fn entry_hold_confirmed(
+    side: &str,
+    level: &crate::workflow::schema::PriceZone,
+    facts: &WatcherPriceFacts,
+    predicate: &crate::app::config::EntryHoldPredicateConfig,
+) -> bool {
+    let tolerance = predicate.retest_tolerance_bps / 10_000.0;
+    match side {
+        "LONG" => recent_bars(facts, predicate.hold_bars)
+            .map(|bars| {
+                let hold_floor = level.high * (1.0 - tolerance);
+                bars.iter().all(|bar| bar.close >= hold_floor)
+            })
+            .unwrap_or(false),
+        "SHORT" => recent_bars(facts, predicate.hold_bars)
+            .map(|bars| {
+                let hold_ceiling = level.low * (1.0 + tolerance);
+                bars.iter().all(|bar| bar.close <= hold_ceiling)
+            })
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+fn pullback_acceptance_confirmed(
+    plan: &crate::workflow::schema::EntryPlan,
+    facts: &WatcherPriceFacts,
+    predicate: &crate::app::config::PullbackAcceptancePredicateConfig,
+) -> bool {
+    let overshoot = predicate.max_overshoot_bps / 10_000.0;
+    recent_bars(facts, predicate.confirm_bars)
+        .map(|bars| match plan.side.as_str() {
+            "LONG" => {
+                let touched = !predicate.require_touch_entry_zone
+                    || bars.iter().any(|bar| bar.low <= plan.entry_zone.high);
+                let floor = plan.entry_zone.low * (1.0 - overshoot);
+                touched && bars.iter().all(|bar| bar.close >= floor)
+            }
+            "SHORT" => {
+                let touched = !predicate.require_touch_entry_zone
+                    || bars.iter().any(|bar| bar.high >= plan.entry_zone.low);
+                let ceiling = plan.entry_zone.high * (1.0 + overshoot);
+                touched && bars.iter().all(|bar| bar.close <= ceiling)
+            }
+            _ => false,
+        })
+        .unwrap_or(false)
+}
+
+fn breakout_confirmed(
+    plan: &crate::workflow::schema::EntryPlan,
+    facts: &WatcherPriceFacts,
+    predicate: &crate::app::config::BreakoutPredicateConfig,
+) -> bool {
+    let threshold = predicate.min_break_bps / 10_000.0;
+    recent_bars(facts, predicate.confirm_bars)
+        .map(|bars| match plan.side.as_str() {
+            "LONG" => {
+                let breakout_level = plan.entry_zone.high * (1.0 + threshold);
+                bars.iter().all(|bar| bar.close >= breakout_level)
+            }
+            "SHORT" => {
+                let breakout_level = plan.entry_zone.low * (1.0 - threshold);
+                bars.iter().all(|bar| bar.close <= breakout_level)
+            }
+            _ => false,
+        })
+        .unwrap_or(false)
+}
+
+fn failed_auction_reentry_confirmed(
+    plan: &crate::workflow::schema::EntryPlan,
+    facts: &WatcherPriceFacts,
+    predicate: &crate::app::config::FailedAuctionReentryPredicateConfig,
+    pullback_predicate: &crate::app::config::PullbackAcceptancePredicateConfig,
+) -> bool {
+    let invalidation_probe = if predicate.require_probe_invalidation {
+        recent_bars(facts, predicate.probe_lookback_bars)
+            .map(|bars| match plan.side.as_str() {
+                "LONG" => bars
+                    .iter()
+                    .any(|bar| bar.low <= plan.entry_invalidation_level.high),
+                "SHORT" => bars
+                    .iter()
+                    .any(|bar| bar.high >= plan.entry_invalidation_level.low),
+                _ => false,
+            })
+            .unwrap_or(false)
+    } else {
+        true
+    };
+    if !invalidation_probe {
+        return false;
+    }
+    let reaccept_predicate = crate::app::config::PullbackAcceptancePredicateConfig {
+        confirm_bars: predicate.reaccept_confirm_bars,
+        ..pullback_predicate.clone()
+    };
+    pullback_acceptance_confirmed(plan, facts, &reaccept_predicate)
+}
+
+fn evaluate_watcher_predicate(
+    name: &str,
+    plan: &crate::workflow::schema::EntryPlan,
+    facts: &WatcherPriceFacts,
+    watcher_cfg: &crate::app::config::WorkflowWatcherConfig,
+) -> bool {
+    match name {
+        "price_above_on_close" => price_above_on_close(
+            facts,
+            plan.entry_activation_level.high,
+            &watcher_cfg.price_predicates.price_above_on_close,
+        ),
+        "price_below_on_close" => price_below_on_close(
+            facts,
+            plan.entry_activation_level.low,
+            &watcher_cfg.price_predicates.price_below_on_close,
+        ),
+        "entry_reclaim_confirmed" => entry_reclaim_confirmed(
+            &plan.side,
+            &plan.entry_activation_level,
+            facts,
+            &watcher_cfg.price_predicates.entry_reclaim_confirmed,
+        ),
+        "entry_hold_confirmed" => entry_hold_confirmed(
+            &plan.side,
+            &plan.entry_activation_level,
+            facts,
+            &watcher_cfg.price_predicates.entry_hold_confirmed,
+        ),
+        "breakout_confirmed" => breakout_confirmed(
+            plan,
+            facts,
+            &watcher_cfg.price_predicates.breakout_confirmed,
+        ),
+        "pullback_acceptance_confirmed" => pullback_acceptance_confirmed(
+            plan,
+            facts,
+            &watcher_cfg.price_predicates.pullback_acceptance_confirmed,
+        ),
+        "failed_auction_reentry_confirmed" => failed_auction_reentry_confirmed(
+            plan,
+            facts,
+            &watcher_cfg
+                .price_predicates
+                .failed_auction_reentry_confirmed,
+            &watcher_cfg.price_predicates.pullback_acceptance_confirmed,
+        ),
+        _ => false,
+    }
+}
+
+fn all_required_predicates(
+    names: &[String],
+    plan: &crate::workflow::schema::EntryPlan,
+    facts: &WatcherPriceFacts,
+    watcher_cfg: &crate::app::config::WorkflowWatcherConfig,
+) -> bool {
+    names
+        .iter()
+        .all(|name| evaluate_watcher_predicate(name, plan, facts, watcher_cfg))
+}
+
+fn watcher_entry_ready(
+    plan: &crate::workflow::schema::EntryPlan,
+    facts: &WatcherPriceFacts,
+    watcher_cfg: &crate::app::config::WorkflowWatcherConfig,
+) -> bool {
+    let price_within_or_beyond_entry = plan.entry_activation_level.contains(facts.current_price)
+        || plan.entry_zone.contains(facts.current_price)
+        || match plan.side.as_str() {
+            "LONG" => facts.current_price >= plan.entry_zone.high,
+            "SHORT" => facts.current_price <= plan.entry_zone.low,
+            _ => false,
+        };
+    if !price_within_or_beyond_entry {
+        return false;
+    }
+    let profile_rule = match plan.entry_profile.as_str() {
+        "reclaim_then_hold" => {
+            &watcher_cfg
+                .entry_profile_rules
+                .reclaim_then_hold
+                .required_predicates
+        }
+        "pullback_acceptance" => {
+            &watcher_cfg
+                .entry_profile_rules
+                .pullback_acceptance
+                .required_predicates
+        }
+        "failed_auction_reentry" => {
+            &watcher_cfg
+                .entry_profile_rules
+                .failed_auction_reentry
+                .required_predicates
+        }
+        _ => return false,
+    };
+    if !all_required_predicates(profile_rule, plan, facts, watcher_cfg) {
+        return false;
+    }
+
+    let intent_rule = match plan.intent_mode.as_str() {
+        "immediate" => &watcher_cfg.intent_mode_rules.immediate,
+        "pullback" => &watcher_cfg.intent_mode_rules.pullback,
+        "breakout" => &watcher_cfg.intent_mode_rules.breakout,
+        _ => return false,
+    };
+    if !all_required_predicates(&intent_rule.required_predicates, plan, facts, watcher_cfg) {
+        return false;
+    }
+    if intent_rule.require_price_inside_entry_zone && !plan.entry_zone.contains(facts.current_price)
+    {
+        return false;
+    }
+    if intent_rule.disallow_breakout_chase {
+        match plan.side.as_str() {
+            "LONG" if facts.current_price > plan.entry_zone.high => return false,
+            "SHORT" if facts.current_price < plan.entry_zone.low => return false,
+            _ => {}
+        }
+    }
+    true
+}
+
+fn stop_loss_hit(plan: &crate::workflow::schema::EntryPlan, latest_price: f64) -> bool {
+    match plan.side.as_str() {
+        "LONG" => latest_price <= plan.stop_loss,
+        "SHORT" => latest_price >= plan.stop_loss,
+        _ => false,
+    }
+}
+
+fn side_level_hit(side: &str, latest_price: f64, level: f64) -> bool {
+    match side {
+        "LONG" => latest_price >= level,
+        "SHORT" => latest_price <= level,
+        _ => false,
+    }
+}
+
+fn find_bool_in_value(value: &Value, target: &str) -> Option<bool> {
+    match value {
+        Value::Object(map) => map.iter().find_map(|(key, child)| {
+            if key.eq_ignore_ascii_case(target) {
+                child.as_bool()
+            } else {
+                find_bool_in_value(child, target)
+            }
+        }),
+        Value::Array(items) => items
+            .iter()
+            .find_map(|child| find_bool_in_value(child, target)),
+        _ => None,
+    }
+}
+
+fn find_f64_in_value(value: &Value, target: &str) -> Option<f64> {
+    match value {
+        Value::Object(map) => map.iter().find_map(|(key, child)| {
+            if key.eq_ignore_ascii_case(target) {
+                child.as_f64()
+            } else {
+                find_f64_in_value(child, target)
+            }
+        }),
+        Value::Array(items) => items
+            .iter()
+            .find_map(|child| find_f64_in_value(child, target)),
+        _ => None,
+    }
+}
+
+fn workflow_entry_snapshot_for_path<'a>(
+    current_path: &crate::workflow::schema::CurrentPath,
+    entry_snapshots: &'a HashMap<String, crate::workflow::schema::EntrySnapshot>,
+) -> Option<&'a crate::workflow::schema::EntrySnapshot> {
+    entry_snapshots.values().find(|snapshot| {
+        snapshot.path_id == current_path.id
+            && snapshot.side.eq_ignore_ascii_case(&current_path.side)
+    })
+}
+
+fn migrated_stop_level_for_target(
+    current_path: &crate::workflow::schema::CurrentPath,
+    after_target: &str,
+) -> Option<f64> {
+    current_path
+        .management_plan
+        .stop_migration_rules
+        .iter()
+        .find(|rule| rule.after_target == after_target)
+        .map(|rule| rule.new_stop_level)
+}
+
+fn management_driver_signal_triggered(
+    signal: &str,
+    summary: &crate::workflow::schema::StrategicIndicatorSummary,
+    path_runtime_state: &crate::workflow::schema::PathRuntimeState,
+    side: &str,
+) -> bool {
+    let orderbook_depth = summary
+        .trigger_layer
+        .get("orderbook_depth")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let orderbook_blob = orderbook_depth.to_string().to_ascii_lowercase();
+    let state_blob = json!({
+        "open_interest": summary.state_layer.get("open_interest"),
+        "long_short_ratios": summary.state_layer.get("long_short_ratios"),
+        "funding_rate": summary.state_layer.get("funding_rate"),
+        "vpin": summary.state_layer.get("vpin"),
+    })
+    .to_string()
+    .to_ascii_lowercase();
+
+    match signal {
+        "spot_confirmation_lost" => {
+            find_bool_in_value(&orderbook_depth, "spot_confirm") == Some(false)
+        }
+        "oi_support_lost" => {
+            path_runtime_state.opposing_pressure_detected
+                || match side {
+                    "LONG" => {
+                        state_blob.contains("fresh_short_build")
+                            || state_blob.contains("crowded_long")
+                            || state_blob.contains("negative_ofi")
+                    }
+                    "SHORT" => {
+                        state_blob.contains("fresh_long_build")
+                            || state_blob.contains("crowded_short")
+                            || state_blob.contains("positive_ofi")
+                    }
+                    _ => false,
+                }
+        }
+        "fake_order_risk_rising" => find_f64_in_value(&orderbook_depth, "fake_order_risk_fut")
+            .or_else(|| find_f64_in_value(&orderbook_depth, "fake_order_risk"))
+            .map(|value| value >= 0.6)
+            .unwrap_or_else(|| orderbook_blob.contains("fake_order_risk_rising")),
+        "driver_flip_confirmed" => {
+            path_runtime_state.audit_flags.reverse_confirmation
+                && path_runtime_state.audit_flags.driver_change
+        }
+        _ => false,
+    }
+}
+
+fn build_management_execution_plan(
+    stage1_output: &crate::workflow::schema::Stage1Output,
+    summary: &crate::workflow::schema::StrategicIndicatorSummary,
+    path_runtime_state: &crate::workflow::schema::PathRuntimeState,
+    trading_state: &TradingStateSnapshot,
+    entry_snapshots: &HashMap<String, crate::workflow::schema::EntrySnapshot>,
+) -> Option<ManagementExecutionPlan> {
+    let current_path = stage1_output.current_path.as_ref()?;
+    let active_position = find_active_position_for_side(trading_state, &current_path.side)?;
+    let snapshot = workflow_entry_snapshot_for_path(current_path, entry_snapshots)?.clone();
+    let latest_price = active_position.mark_price;
+    let now = Utc::now();
+
+    if path_runtime_state.hard_invalidation || path_runtime_state.failure_level_breached {
+        return Some(ManagementExecutionPlan {
+            action: crate::workflow::schema::ManagementAction {
+                action_type: "FLATTEN_POSITION".to_string(),
+                context_key: snapshot.context_key.clone(),
+                path_id: snapshot.path_id.clone(),
+                reduce_ratio: None,
+                new_stop_loss: None,
+                take_profit_1: None,
+                take_profit_2: None,
+                reason: Some("hard_invalidation".to_string()),
+            },
+            action_snapshot: snapshot,
+            next_snapshot: None,
+            reason: "hard_invalidation".to_string(),
+        });
+    }
+
+    if side_level_hit(
+        &snapshot.side,
+        latest_price,
+        current_path.management_plan.take_profit_2_level,
+    ) {
+        return Some(ManagementExecutionPlan {
+            action: crate::workflow::schema::ManagementAction {
+                action_type: "FLATTEN_POSITION".to_string(),
+                context_key: snapshot.context_key.clone(),
+                path_id: snapshot.path_id.clone(),
+                reduce_ratio: None,
+                new_stop_loss: None,
+                take_profit_1: None,
+                take_profit_2: None,
+                reason: Some("take_profit_2_reached".to_string()),
+            },
+            action_snapshot: snapshot,
+            next_snapshot: None,
+            reason: "take_profit_2_reached".to_string(),
+        });
+    }
+
+    for rule in &current_path
+        .management_plan
+        .exit_full_on_driver_deterioration
+    {
+        if management_driver_signal_triggered(
+            &rule.driver_signal,
+            summary,
+            path_runtime_state,
+            &snapshot.side,
+        ) && !snapshot
+            .applied_driver_deterioration_signals
+            .iter()
+            .any(|item| item == &rule.driver_signal)
+        {
+            return Some(ManagementExecutionPlan {
+                action: crate::workflow::schema::ManagementAction {
+                    action_type: "FLATTEN_POSITION".to_string(),
+                    context_key: snapshot.context_key.clone(),
+                    path_id: snapshot.path_id.clone(),
+                    reduce_ratio: None,
+                    new_stop_loss: None,
+                    take_profit_1: None,
+                    take_profit_2: None,
+                    reason: Some(rule.driver_signal.clone()),
+                },
+                action_snapshot: snapshot,
+                next_snapshot: None,
+                reason: rule.driver_signal.clone(),
+            });
+        }
+    }
+
+    if !snapshot.tp1_realized
+        && side_level_hit(
+            &snapshot.side,
+            latest_price,
+            current_path.management_plan.take_profit_1_level,
+        )
+    {
+        let mut next_snapshot = snapshot.clone();
+        next_snapshot.tp1_realized = true;
+        next_snapshot.updated_at = now;
+        next_snapshot.take_profit_1 = current_path.management_plan.take_profit_2_level;
+        if let Some(new_stop_level) = migrated_stop_level_for_target(current_path, "take_profit_1")
+        {
+            next_snapshot.stop_loss = new_stop_level;
+        }
+        return Some(ManagementExecutionPlan {
+            action: crate::workflow::schema::ManagementAction {
+                action_type: "REDUCE_POSITION".to_string(),
+                context_key: snapshot.context_key.clone(),
+                path_id: snapshot.path_id.clone(),
+                reduce_ratio: Some(TP1_DEFAULT_REDUCE_RATIO),
+                new_stop_loss: None,
+                take_profit_1: None,
+                take_profit_2: None,
+                reason: Some("take_profit_1_reached".to_string()),
+            },
+            action_snapshot: next_snapshot.clone(),
+            next_snapshot: Some(next_snapshot),
+            reason: "take_profit_1_reached".to_string(),
+        });
+    }
+
+    for rule in &current_path.management_plan.reduce_on_driver_deterioration {
+        let Some(reduce_ratio) = rule.reduce_ratio else {
+            continue;
+        };
+        if management_driver_signal_triggered(
+            &rule.driver_signal,
+            summary,
+            path_runtime_state,
+            &snapshot.side,
+        ) && !snapshot
+            .applied_driver_deterioration_signals
+            .iter()
+            .any(|item| item == &rule.driver_signal)
+        {
+            let mut next_snapshot = snapshot.clone();
+            next_snapshot.updated_at = now;
+            next_snapshot
+                .applied_driver_deterioration_signals
+                .push(rule.driver_signal.clone());
+            return Some(ManagementExecutionPlan {
+                action: crate::workflow::schema::ManagementAction {
+                    action_type: "REDUCE_POSITION".to_string(),
+                    context_key: snapshot.context_key.clone(),
+                    path_id: snapshot.path_id.clone(),
+                    reduce_ratio: Some(reduce_ratio),
+                    new_stop_loss: None,
+                    take_profit_1: None,
+                    take_profit_2: None,
+                    reason: Some(rule.driver_signal.clone()),
+                },
+                action_snapshot: next_snapshot.clone(),
+                next_snapshot: Some(next_snapshot),
+                reason: rule.driver_signal.clone(),
+            });
+        }
+    }
+
+    None
+}
+
+fn maybe_record_stopout_and_cleanup(
+    workflow_state: &mut crate::workflow::state::WorkflowState,
+    approved_tactical_plan: Option<&crate::workflow::schema::TacticalEntryPlan>,
+    trading_state: &TradingStateSnapshot,
+    latest_price: f64,
+    entry_snapshots: &mut HashMap<String, crate::workflow::schema::EntrySnapshot>,
+    state_dir: &str,
+    symbol: &str,
+) -> Result<()> {
+    let Some(tactical_plan) = approved_tactical_plan else {
+        return Ok(());
+    };
+    let Some(last_context_key) = workflow_state.last_filled_context_key.clone() else {
+        return Ok(());
+    };
+    let Some(last_role) = workflow_state.last_executed_plan_role.clone() else {
+        return Ok(());
+    };
+    let watched_plan = match last_role.as_str() {
+        "primary" => &tactical_plan.primary_entry_plan,
+        "secondary" => &tactical_plan.secondary_entry_plan,
+        _ => return Ok(()),
+    };
+    if watched_plan.entry_snapshot.context_key != last_context_key {
+        return Ok(());
+    }
+    if has_active_position_for_side(trading_state, &watched_plan.side) {
+        return Ok(());
+    }
+    if !stop_loss_hit(watched_plan, latest_price) {
+        return Ok(());
+    }
+
+    workflow_state.filled_stopout_attempts = workflow_state
+        .filled_stopout_attempts
+        .saturating_add(1)
+        .min(tactical_plan.attempt_policy.max_filled_stopout_attempts);
+    workflow_state.last_filled_context_key = None;
+    workflow_state.last_executed_plan_role = None;
+    if entry_snapshots.remove(&last_context_key).is_some() {
+        crate::workflow::persistence::delete_entry_snapshot(state_dir, symbol, &last_context_key)?;
+    }
+    Ok(())
 }
 
 async fn persist_workflow_prompt_input_to_disk(
@@ -1295,6 +2126,166 @@ fn append_workflow_journal_event(
     }
 }
 
+async fn maybe_refresh_stage1(
+    config: &RootConfig,
+    http_client: &Client,
+    loopback_http_client: &Client,
+    print_response: bool,
+    bundle: &LatestBundle,
+    trigger: &str,
+    symbol: &str,
+    state_dir: &str,
+    retention_minutes: u64,
+    input: &ModelInvocationInput,
+    workflow_state: &mut crate::workflow::state::WorkflowState,
+    stage1_output: &mut Option<crate::workflow::schema::Stage1Output>,
+    tracked_zones: &mut Vec<crate::workflow::schema::TrackedZone>,
+    refresh_reason: Option<String>,
+) -> Result<Stage1RefreshAttempt> {
+    let Some(refresh_reason) = refresh_reason else {
+        return Ok(Stage1RefreshAttempt::default());
+    };
+
+    let Some(stage1_guard) = try_acquire_workflow_stage(symbol, WorkflowStageKind::Stage1) else {
+        append_workflow_journal_event(
+            "workflow_stage1_suppressed",
+            symbol,
+            bundle.raw.ts_bucket,
+            json!({
+                "trigger": trigger,
+                "refresh_reason": refresh_reason,
+                "reason": "stage1_inflight",
+            }),
+        );
+        return Ok(Stage1RefreshAttempt {
+            refreshed: false,
+            inflight_suppressed: true,
+        });
+    };
+
+    if consume_pending_stage1_refresh_reason(workflow_state, &refresh_reason) {
+        crate::workflow::persistence::save_workflow_state(state_dir, workflow_state)?;
+    }
+
+    let indicator_summary =
+        crate::workflow::code_layer::build_indicator_summary(input, tracked_zones)?;
+    let prompt_input = crate::workflow::stage1::build_stage1_prompt_input(
+        indicator_summary,
+        stage1_output.clone(),
+        refresh_reason.clone(),
+    );
+    let prompt_input_value =
+        serde_json::to_value(&prompt_input).context("serialize workflow stage1 prompt input")?;
+    if config.llm.workflow.persist_prompt_inputs {
+        let path = persist_workflow_prompt_input_to_disk(
+            &bundle.raw,
+            "workflow_stage1",
+            &prompt_input_value,
+            retention_minutes,
+        )
+        .await?;
+        debug!(
+            symbol = %symbol,
+            ts_bucket = %bundle.raw.ts_bucket,
+            path = %path.display(),
+            "persisted workflow stage1 prompt input"
+        );
+    }
+
+    if !config.llm.request_enabled {
+        info!(
+            symbol = %symbol,
+            ts_bucket = %bundle.raw.ts_bucket,
+            refresh_reason = %refresh_reason,
+            "workflow stage1 skipped because llm.request_enabled=false"
+        );
+        drop(stage1_guard);
+        return Ok(Stage1RefreshAttempt::default());
+    }
+
+    let outputs = crate::llm::workflow_provider::invoke_stage1_models(
+        http_client,
+        loopback_http_client,
+        config,
+        &prompt_input_value,
+        symbol,
+    )
+    .await;
+
+    let mut parsed_stage1: Option<crate::workflow::schema::Stage1Output> = None;
+    for out in outputs {
+        let payload = json!({
+            "trigger": trigger,
+            "refresh_reason": refresh_reason,
+            "model_name": out.model_name,
+            "provider": out.provider,
+            "model_id": out.model,
+            "latency_ms": out.latency_ms,
+            "raw_response_text": out.raw_response_text,
+            "parsed_value": out.parsed_value,
+            "error": out.error,
+        });
+        append_workflow_journal_event(
+            "workflow_stage1_response",
+            symbol,
+            bundle.raw.ts_bucket,
+            payload.clone(),
+        );
+        if print_response {
+            println!(
+                "WORKFLOW_STAGE1_RESPONSE ts_bucket={} trigger={} symbol={} payload={}",
+                bundle.raw.ts_bucket,
+                trigger,
+                symbol,
+                render_pretty_json_value(&payload)
+            );
+        }
+
+        if parsed_stage1.is_some() {
+            continue;
+        }
+        let Some(value) = payload.get("parsed_value").cloned() else {
+            continue;
+        };
+        match crate::workflow::parser::parse_stage1_output(value) {
+            Ok(parsed) => parsed_stage1 = Some(parsed),
+            Err(err) => {
+                append_workflow_journal_event(
+                    "workflow_stage1_parse_error",
+                    symbol,
+                    bundle.raw.ts_bucket,
+                    json!({
+                        "trigger": trigger,
+                        "refresh_reason": refresh_reason,
+                        "error": format!("{err:#}"),
+                    }),
+                );
+            }
+        }
+    }
+
+    let parsed_stage1 =
+        parsed_stage1.ok_or_else(|| anyhow!("workflow stage1 produced no valid output"))?;
+    *tracked_zones = parsed_stage1
+        .current_path
+        .as_ref()
+        .map(|path| path.tracked_zones.clone())
+        .unwrap_or_default();
+    workflow_state.last_stage1_ts = Some(parsed_stage1.meta.stage1_ts);
+    workflow_state.pending_stage1_refresh_reason = None;
+    clear_approved_tactical_plan(workflow_state);
+    crate::workflow::persistence::save_stage1_output(state_dir, symbol, &parsed_stage1)?;
+    crate::workflow::persistence::save_tracked_zones(state_dir, symbol, tracked_zones)?;
+    crate::workflow::persistence::save_workflow_state(state_dir, workflow_state)?;
+    *stage1_output = Some(parsed_stage1);
+    drop(stage1_guard);
+
+    Ok(Stage1RefreshAttempt {
+        refreshed: true,
+        inflight_suppressed: false,
+    })
+}
+
 async fn invoke_workflow_bundle_models(
     config: Arc<RootConfig>,
     db_pool: PgPool,
@@ -1316,145 +2307,72 @@ async fn invoke_workflow_bundle_models(
     )
     .await?;
 
-    let mut workflow_state = crate::workflow::persistence::load_workflow_state(
-        &state_dir, &symbol,
-    )?
-    .unwrap_or(crate::workflow::state::WorkflowState {
-        symbol: symbol.clone(),
-        pending_stage1_refresh_reason: None,
-        last_stage1_ts: None,
-    });
+    let mut workflow_state =
+        crate::workflow::persistence::load_workflow_state(&state_dir, &symbol)?
+            .unwrap_or_else(|| default_workflow_state(&symbol));
     workflow_state.symbol = symbol.clone();
 
     let mut stage1_output = crate::workflow::persistence::load_stage1_output(&state_dir, &symbol)?;
     let mut tracked_zones = crate::workflow::persistence::load_tracked_zones(&state_dir, &symbol)?;
 
-    let stage1_refresh_reason =
-        workflow_stage1_refresh_reason(&config, &bundle, &workflow_state, stage1_output.as_ref());
+    let stage1_refresh_reason = workflow_stage1_refresh_reason(&config, &bundle, &workflow_state);
+    let stage1_attempt = maybe_refresh_stage1(
+        &config,
+        &http_client,
+        &loopback_http_client,
+        print_response,
+        &bundle,
+        trigger.as_ref(),
+        &symbol,
+        &state_dir,
+        retention_minutes,
+        &input,
+        &mut workflow_state,
+        &mut stage1_output,
+        &mut tracked_zones,
+        stage1_refresh_reason.clone(),
+    )
+    .await?;
+    let stage1_refreshed_this_bundle = stage1_attempt.refreshed;
 
-    if let Some(refresh_reason) = stage1_refresh_reason.clone() {
-        let indicator_summary =
-            crate::workflow::code_layer::build_indicator_summary(&input, &tracked_zones)?;
-        let prompt_input = crate::workflow::stage1::build_stage1_prompt_input(
-            indicator_summary,
-            stage1_output.clone(),
-            refresh_reason.clone(),
-        );
-        let prompt_input_value = serde_json::to_value(&prompt_input)
-            .context("serialize workflow stage1 prompt input")?;
-        if config.llm.workflow.persist_prompt_inputs {
-            let path = persist_workflow_prompt_input_to_disk(
-                &bundle.raw,
-                "workflow_stage1",
-                &prompt_input_value,
-                retention_minutes,
-            )
-            .await?;
-            debug!(
-                symbol = %symbol,
-                ts_bucket = %bundle.raw.ts_bucket,
-                path = %path.display(),
-                "persisted workflow stage1 prompt input"
-            );
-        }
-
-        if !config.llm.request_enabled {
-            info!(
-                symbol = %symbol,
-                ts_bucket = %bundle.raw.ts_bucket,
-                refresh_reason = %refresh_reason,
-                "workflow stage1 skipped because llm.request_enabled=false"
+    if stage1_output.is_none() {
+        if stage1_attempt.inflight_suppressed
+            || workflow_stage_inflight(&symbol, WorkflowStageKind::Stage1)
+        {
+            append_workflow_journal_event(
+                "workflow_stage1_waiting",
+                &symbol,
+                bundle.raw.ts_bucket,
+                json!({
+                    "trigger": &*trigger,
+                    "reason": "stage1_inflight",
+                }),
             );
             return Ok(());
         }
-
-        let outputs = crate::llm::workflow_provider::invoke_stage1_models(
-            &http_client,
-            &loopback_http_client,
-            &config,
-            &prompt_input_value,
+        append_workflow_journal_event(
+            "workflow_stage1_unavailable",
             &symbol,
-        )
-        .await;
-
-        let mut parsed_stage1: Option<crate::workflow::schema::Stage1Output> = None;
-        for out in outputs {
-            let payload = json!({
+            bundle.raw.ts_bucket,
+            json!({
                 "trigger": &*trigger,
-                "refresh_reason": refresh_reason,
-                "model_name": out.model_name,
-                "provider": out.provider,
-                "model_id": out.model,
-                "latency_ms": out.latency_ms,
-                "raw_response_text": out.raw_response_text,
-                "parsed_value": out.parsed_value,
-                "error": out.error,
-            });
-            append_workflow_journal_event(
-                "workflow_stage1_response",
-                &symbol,
-                bundle.raw.ts_bucket,
-                payload.clone(),
-            );
-            if print_response {
-                println!(
-                    "WORKFLOW_STAGE1_RESPONSE ts_bucket={} trigger={} symbol={} payload={}",
-                    bundle.raw.ts_bucket,
-                    &*trigger,
-                    symbol,
-                    render_pretty_json_value(&payload)
-                );
-            }
-
-            if parsed_stage1.is_some() {
-                continue;
-            }
-            let Some(value) = payload.get("parsed_value").cloned() else {
-                continue;
-            };
-            match crate::workflow::parser::parse_stage1_output(value) {
-                Ok(parsed) => parsed_stage1 = Some(parsed),
-                Err(err) => {
-                    append_workflow_journal_event(
-                        "workflow_stage1_parse_error",
-                        &symbol,
-                        bundle.raw.ts_bucket,
-                        json!({
-                            "trigger": &*trigger,
-                            "refresh_reason": refresh_reason,
-                            "error": format!("{err:#}"),
-                        }),
-                    );
-                }
-            }
-        }
-
-        let parsed_stage1 =
-            parsed_stage1.ok_or_else(|| anyhow!("workflow stage1 produced no valid output"))?;
-        tracked_zones = parsed_stage1
-            .current_path
-            .as_ref()
-            .map(|path| path.tracked_zones.clone())
-            .unwrap_or_default();
-        workflow_state.last_stage1_ts = Some(parsed_stage1.meta.stage1_ts);
-        workflow_state.pending_stage1_refresh_reason = None;
-        crate::workflow::persistence::save_stage1_output(&state_dir, &symbol, &parsed_stage1)?;
-        crate::workflow::persistence::save_tracked_zones(&state_dir, &symbol, &tracked_zones)?;
-        crate::workflow::persistence::save_workflow_state(&state_dir, &workflow_state)?;
-        stage1_output = Some(parsed_stage1);
+                "reason": "no_stage1_output_off_schedule",
+            }),
+        );
+        return Ok(());
     }
 
-    let stage1_output =
+    let mut stage1_output =
         stage1_output.ok_or_else(|| anyhow!("workflow stage1 output missing after refresh"))?;
 
-    let trading_state = fetch_symbol_trading_state(
+    let mut trading_state = fetch_symbol_trading_state(
         &http_client,
         &config.api.binance,
         &config.llm.execution,
         &symbol,
     )
     .await?;
-    let entry_snapshots =
+    let mut entry_snapshots =
         crate::workflow::persistence::load_entry_snapshots_for_symbol(&state_dir, &symbol)?
             .into_iter()
             .map(|snapshot| (snapshot.context_key.clone(), snapshot))
@@ -1463,161 +2381,205 @@ async fn invoke_workflow_bundle_models(
     input.management_snapshot =
         build_workflow_management_snapshot(&trading_state, &symbol, &entry_snapshots);
 
-    if stage1_output.monitoring_status == "no_edge"
-        && !trading_state.has_active_positions
-        && !trading_state.has_open_orders
+    if stage1_output.monitoring_status == "no_edge" {
+        clear_approved_tactical_plan(&mut workflow_state);
+        crate::workflow::persistence::save_workflow_state(&state_dir, &workflow_state)?;
+        if !trading_state.has_active_positions && !trading_state.has_open_orders {
+            append_workflow_journal_event(
+                "workflow_no_edge_skip",
+                &symbol,
+                bundle.raw.ts_bucket,
+                json!({
+                    "trigger": &*trigger,
+                    "reason": stage1_output.no_trade_reason,
+                }),
+            );
+            return Ok(());
+        }
+    }
+
+    let mut indicator_summary =
+        crate::workflow::code_layer::build_indicator_summary(&input, &tracked_zones)?;
+    let previous_tactical_plan_for_review =
+        reset_watcher_window_if_needed(&mut workflow_state, bundle.raw.ts_bucket)
+            .or_else(|| workflow_state.approved_tactical_plan.clone());
+    if let Some(expired_tactical_plan) = previous_tactical_plan_for_review
+        .as_ref()
+        .filter(|_| workflow_state.approved_tactical_plan.is_none())
     {
+        crate::workflow::persistence::save_workflow_state(&state_dir, &workflow_state)?;
         append_workflow_journal_event(
-            "workflow_no_edge_skip",
+            "workflow_tactical_plan_cleared",
             &symbol,
             bundle.raw.ts_bucket,
             json!({
                 "trigger": &*trigger,
-                "reason": stage1_output.no_trade_reason,
+                "path_id": expired_tactical_plan.path_id,
+                "reason": "same_15m_window_expired",
             }),
         );
-        return Ok(());
     }
 
-    let indicator_summary =
-        crate::workflow::code_layer::build_indicator_summary(&input, &tracked_zones)?;
-    let stage2_runtime_eval = crate::workflow::stage2::evaluate_stage2_runtime(
+    let mut path_runtime_state = crate::workflow::stage2::build_path_runtime_state(
         &indicator_summary,
         &stage1_output,
-        &config.llm.workflow.soft_gate_min_pass,
+        &entry_snapshots,
+    )?;
+    let approved_plan_before_review = workflow_state.approved_tactical_plan.clone();
+    maybe_record_stopout_and_cleanup(
+        &mut workflow_state,
+        approved_plan_before_review.as_ref(),
+        &trading_state,
+        path_runtime_state.latest_price,
+        &mut entry_snapshots,
+        &state_dir,
+        &symbol,
+    )?;
+    path_runtime_state = crate::workflow::stage2::build_path_runtime_state(
+        &indicator_summary,
+        &stage1_output,
+        &entry_snapshots,
     )?;
     append_workflow_journal_event(
-        "workflow_stage2_runtime_eval",
+        "workflow_path_runtime_state",
         &symbol,
         bundle.raw.ts_bucket,
         json!({
             "trigger": &*trigger,
-            "monitoring_status": stage2_runtime_eval.monitoring_status,
-            "latest_price": stage2_runtime_eval.latest_price,
-            "no_edge_reentered": stage2_runtime_eval.no_edge_reentered,
-            "failure_level_breached": stage2_runtime_eval.failure_level_breached,
-            "reevaluation_trigger_hit": stage2_runtime_eval.reevaluation_trigger_hit,
-            "activation_level_active": stage2_runtime_eval.activation_level_active,
-            "setup_confirmed": stage2_runtime_eval.setup_confirmed,
-            "hard_gate": {
-                "location_valid": stage2_runtime_eval.hard_gate.location_valid,
-                "trigger_confirmed": stage2_runtime_eval.hard_gate.trigger_confirmed,
-            },
-            "soft_gate": {
-                "state_clear": stage2_runtime_eval.soft_gate.state_clear,
-                "driver_clear": stage2_runtime_eval.soft_gate.driver_clear,
-                "orderflow_real": stage2_runtime_eval.soft_gate.orderflow_real,
-                "invalidation_clear": stage2_runtime_eval.soft_gate.invalidation_clear,
-                "passed_count": stage2_runtime_eval.soft_gate.passed_count,
-                "min_required": stage2_runtime_eval.soft_gate_min_required,
-            }
+            "path_runtime_state": path_runtime_state,
         }),
     );
-    let runtime_contract = crate::workflow::stage2::runtime_contract_from_evaluation(
-        &indicator_summary,
-        &stage1_output,
-        &stage2_runtime_eval,
-    );
-    let mut entry_snapshots = entry_snapshots;
-    let signal_entry_snapshots = entry_snapshots.clone();
 
-    let stage2_prompt_input = crate::workflow::stage2::build_stage2_prompt_input(
-        indicator_summary,
-        stage1_output.clone(),
-        runtime_contract.clone(),
+    let mut management_signal_report: Option<ManagementExecutionReport> = None;
+    let mut management_signal_action: Option<crate::workflow::schema::ManagementAction> = None;
+    if let Some(plan) = build_management_execution_plan(
+        &stage1_output,
+        &indicator_summary,
+        &path_runtime_state,
         &trading_state,
         &entry_snapshots,
-    );
-    let stage2_prompt_input_value = serde_json::to_value(&stage2_prompt_input)
-        .context("serialize workflow stage2 prompt input")?;
-    if config.llm.workflow.persist_prompt_inputs {
-        let path = persist_workflow_prompt_input_to_disk(
-            &bundle.raw,
-            "workflow_stage2",
-            &stage2_prompt_input_value,
-            retention_minutes,
-        )
-        .await?;
-        debug!(
-            symbol = %symbol,
-            ts_bucket = %bundle.raw.ts_bucket,
-            path = %path.display(),
-            "persisted workflow stage2 prompt input"
-        );
-    }
+    ) {
+        match adapt_management_action(&plan.action, &plan.action_snapshot) {
+            Ok(adapted_action) => {
+                match execute_workflow_management_action(
+                    &http_client,
+                    &config.api.binance,
+                    &config.llm.execution,
+                    &symbol,
+                    &plan.action_snapshot,
+                    &adapted_action,
+                )
+                .await
+                {
+                    Ok(report) => {
+                        append_workflow_journal_event(
+                            "workflow_management_report",
+                            &symbol,
+                            bundle.raw.ts_bucket,
+                            json!({
+                                "trigger": &*trigger,
+                                "reason": plan.reason,
+                                "action_type": plan.action.action_type,
+                                "context_key": plan.action.context_key,
+                                "path_id": plan.action.path_id,
+                                "report": {
+                                    "action": report.action,
+                                    "dry_run": report.dry_run,
+                                    "position_count": report.position_count,
+                                    "open_order_count": report.open_order_count,
+                                    "canceled_open_orders": report.canceled_open_orders,
+                                    "reduce_order_ids": report.reduce_order_ids,
+                                    "close_order_ids": report.close_order_ids,
+                                    "modify_take_profit_order_ids": report.modify_take_profit_order_ids,
+                                    "modify_stop_loss_order_ids": report.modify_stop_loss_order_ids,
+                                    "realized_pnl_usdt": report.realized_pnl_usdt,
+                                }
+                            }),
+                        );
+                        management_signal_action = Some(plan.action.clone());
+                        management_signal_report = Some(report.clone());
 
-    if !config.llm.request_enabled {
-        info!(
-            symbol = %symbol,
-            ts_bucket = %bundle.raw.ts_bucket,
-            "workflow stage2 skipped because llm.request_enabled=false"
-        );
-        return Ok(());
-    }
+                        if !report.dry_run {
+                            match plan.next_snapshot {
+                                Some(next_snapshot) => {
+                                    crate::workflow::persistence::save_entry_snapshot(
+                                        &state_dir,
+                                        &next_snapshot,
+                                    )?;
+                                    entry_snapshots
+                                        .insert(next_snapshot.context_key.clone(), next_snapshot);
+                                }
+                                None => {
+                                    entry_snapshots.remove(&plan.action.context_key);
+                                    crate::workflow::persistence::delete_entry_snapshot(
+                                        &state_dir,
+                                        &symbol,
+                                        &plan.action.context_key,
+                                    )?;
+                                }
+                            }
 
-    let outputs = crate::llm::workflow_provider::invoke_stage2_models(
-        &http_client,
-        &loopback_http_client,
-        &config,
-        &stage2_prompt_input_value,
-        &symbol,
-    )
-    .await;
+                            if matches!(
+                                plan.reason.as_str(),
+                                "hard_invalidation" | "driver_flip_confirmed"
+                            ) {
+                                clear_approved_tactical_plan(&mut workflow_state);
+                            }
 
-    let mut stage2_decision: Option<crate::workflow::schema::Stage2Decision> = None;
-    let mut selected_stage2_model_name: Option<String> = None;
-    for out in outputs {
-        let payload = json!({
-            "trigger": &*trigger,
-            "model_name": out.model_name,
-            "provider": out.provider,
-            "model_id": out.model,
-            "latency_ms": out.latency_ms,
-            "raw_response_text": out.raw_response_text,
-            "parsed_value": out.parsed_value,
-            "error": out.error,
-        });
-        append_workflow_journal_event(
-            "workflow_stage2_response",
-            &symbol,
-            bundle.raw.ts_bucket,
-            payload.clone(),
-        );
-        if print_response {
-            println!(
-                "WORKFLOW_STAGE2_RESPONSE ts_bucket={} trigger={} symbol={} payload={}",
-                bundle.raw.ts_bucket,
-                &*trigger,
-                symbol,
-                render_pretty_json_value(&payload)
-            );
-        }
-
-        if stage2_decision.is_some() {
-            continue;
-        }
-        let Some(value) = payload.get("parsed_value").cloned() else {
-            continue;
-        };
-        match crate::workflow::parser::parse_stage2_decision(
-            value,
-            &symbol,
-            &stage1_output,
-            &runtime_contract,
-            trading_state.has_active_positions,
-            &entry_snapshots,
-        ) {
-            Ok(parsed) => {
-                selected_stage2_model_name = Some(out.model_name.clone());
-                stage2_decision = Some(parsed);
+                            trading_state = fetch_symbol_trading_state(
+                                &http_client,
+                                &config.api.binance,
+                                &config.llm.execution,
+                                &symbol,
+                            )
+                            .await?;
+                            input.trading_state = Some(trading_state.clone());
+                            input.management_snapshot = build_workflow_management_snapshot(
+                                &trading_state,
+                                &symbol,
+                                &entry_snapshots,
+                            );
+                            indicator_summary =
+                                crate::workflow::code_layer::build_indicator_summary(
+                                    &input,
+                                    &tracked_zones,
+                                )?;
+                            path_runtime_state = crate::workflow::stage2::build_path_runtime_state(
+                                &indicator_summary,
+                                &stage1_output,
+                                &entry_snapshots,
+                            )?;
+                        }
+                    }
+                    Err(err) => {
+                        append_workflow_journal_event(
+                            "workflow_management_error",
+                            &symbol,
+                            bundle.raw.ts_bucket,
+                            json!({
+                                "trigger": &*trigger,
+                                "reason": plan.reason,
+                                "action_type": plan.action.action_type,
+                                "context_key": plan.action.context_key,
+                                "path_id": plan.action.path_id,
+                                "error": format!("{err:#}"),
+                            }),
+                        );
+                    }
+                }
             }
             Err(err) => {
                 append_workflow_journal_event(
-                    "workflow_stage2_parse_error",
+                    "workflow_management_error",
                     &symbol,
                     bundle.raw.ts_bucket,
                     json!({
                         "trigger": &*trigger,
+                        "reason": plan.reason,
+                        "action_type": plan.action.action_type,
+                        "context_key": plan.action.context_key,
+                        "path_id": plan.action.path_id,
+                        "phase": "intent_adapter",
                         "error": format!("{err:#}"),
                     }),
                 );
@@ -1625,55 +2587,233 @@ async fn invoke_workflow_bundle_models(
         }
     }
 
-    let stage2_decision =
-        stage2_decision.ok_or_else(|| anyhow!("workflow stage2 produced no valid output"))?;
-
-    if stage2_decision.hard_gate.as_ref() != Some(&stage2_runtime_eval.hard_gate)
-        || stage2_decision.soft_gate.as_ref() != Some(&stage2_runtime_eval.soft_gate)
-    {
+    let mut stage2_output: Option<crate::workflow::schema::Stage2Output> = None;
+    let mut selected_stage2_model_name: Option<String> = None;
+    if path_runtime_state.hard_invalidation && workflow_state.approved_tactical_plan.is_some() {
+        clear_approved_tactical_plan(&mut workflow_state);
+        crate::workflow::persistence::save_workflow_state(&state_dir, &workflow_state)?;
         append_workflow_journal_event(
-            "workflow_stage2_gate_mismatch",
+            "workflow_tactical_plan_cleared",
             &symbol,
             bundle.raw.ts_bucket,
             json!({
                 "trigger": &*trigger,
-                "runtime_hard_gate": stage2_runtime_eval.hard_gate,
-                "runtime_soft_gate": stage2_runtime_eval.soft_gate,
-                "model_hard_gate": stage2_decision.hard_gate,
-                "model_soft_gate": stage2_decision.soft_gate,
+                "path_id": path_runtime_state.path_id,
+                "reason": "hard_invalidation",
+                "audit_flags": path_runtime_state.audit_flags,
             }),
         );
     }
 
-    if let Some(request) = stage2_decision.request_stage1_reevaluation.as_ref() {
-        workflow_state.pending_stage1_refresh_reason = Some(request.refresh_reason.clone());
-        crate::workflow::persistence::save_workflow_state(&state_dir, &workflow_state)?;
-        append_workflow_journal_event(
-            "workflow_stage1_reevaluation_requested",
-            &symbol,
-            bundle.raw.ts_bucket,
-            json!({
-                "trigger": &*trigger,
-                "refresh_reason": request.refresh_reason,
-                "trigger_source": request.trigger_source,
-            }),
-        );
-    }
+    let stage1_refresh_blocking = (stage1_refresh_reason.is_some()
+        && !stage1_refreshed_this_bundle)
+        || workflow_stage_inflight(&symbol, WorkflowStageKind::Stage1);
+    let stage2_review_due = workflow_stage2_review_due(
+        &config,
+        &bundle,
+        Some(&stage1_output),
+        stage1_refresh_blocking,
+    );
 
-    if stage2_runtime_eval.failure_level_breached || stage2_runtime_eval.reevaluation_trigger_hit {
-        workflow_state.pending_stage1_refresh_reason = Some("thesis_invalidated".to_string());
-        crate::workflow::persistence::save_workflow_state(&state_dir, &workflow_state)?;
+    if stage2_review_due {
+        let candidate_event = scheduled_stage2_candidate_event(
+            &bundle,
+            &path_runtime_state,
+            crate::workflow::stage2::build_candidate_event(
+                &indicator_summary,
+                &stage1_output,
+                &path_runtime_state,
+            )?,
+        );
         append_workflow_journal_event(
-            "workflow_stage2_forced_reevaluation",
+            "workflow_candidate_event",
             &symbol,
             bundle.raw.ts_bucket,
             json!({
                 "trigger": &*trigger,
-                "refresh_reason": "thesis_invalidated",
-                "failure_level_breached": stage2_runtime_eval.failure_level_breached,
-                "reevaluation_trigger_hit": stage2_runtime_eval.reevaluation_trigger_hit,
+                "candidate_event": candidate_event.clone(),
             }),
         );
+
+        if let Some(_stage2_guard) = try_acquire_workflow_stage(&symbol, WorkflowStageKind::Stage2)
+        {
+            let stage2_prompt_input = crate::workflow::stage2::build_stage2_prompt_input(
+                indicator_summary.clone(),
+                stage1_output.clone(),
+                candidate_event,
+                path_runtime_state.clone(),
+                previous_tactical_plan_for_review.clone(),
+                &trading_state,
+                &entry_snapshots,
+            );
+            let stage2_prompt_input_value = serde_json::to_value(&stage2_prompt_input)
+                .context("serialize workflow stage2 prompt input")?;
+            if config.llm.workflow.persist_prompt_inputs {
+                let path = persist_workflow_prompt_input_to_disk(
+                    &bundle.raw,
+                    "workflow_stage2",
+                    &stage2_prompt_input_value,
+                    retention_minutes,
+                )
+                .await?;
+                debug!(
+                    symbol = %symbol,
+                    ts_bucket = %bundle.raw.ts_bucket,
+                    path = %path.display(),
+                    "persisted workflow stage2 prompt input"
+                );
+            }
+
+            if config.llm.request_enabled {
+                let outputs = crate::llm::workflow_provider::invoke_stage2_models(
+                    &http_client,
+                    &loopback_http_client,
+                    &config,
+                    &stage2_prompt_input_value,
+                    &symbol,
+                )
+                .await;
+
+                for out in outputs {
+                    let payload = json!({
+                        "trigger": &*trigger,
+                        "model_name": out.model_name,
+                        "provider": out.provider,
+                        "model_id": out.model,
+                        "latency_ms": out.latency_ms,
+                        "raw_response_text": out.raw_response_text,
+                        "parsed_value": out.parsed_value,
+                        "error": out.error,
+                    });
+                    append_workflow_journal_event(
+                        "workflow_stage2_response",
+                        &symbol,
+                        bundle.raw.ts_bucket,
+                        payload.clone(),
+                    );
+                    if print_response {
+                        println!(
+                            "WORKFLOW_STAGE2_RESPONSE ts_bucket={} trigger={} symbol={} payload={}",
+                            bundle.raw.ts_bucket,
+                            &*trigger,
+                            symbol,
+                            render_pretty_json_value(&payload)
+                        );
+                    }
+
+                    if stage2_output.is_some() {
+                        continue;
+                    }
+                    let Some(value) = payload.get("parsed_value").cloned() else {
+                        continue;
+                    };
+                    match crate::workflow::parser::parse_stage2_output(
+                        value,
+                        &stage1_output,
+                        &path_runtime_state,
+                    ) {
+                        Ok(parsed) => {
+                            selected_stage2_model_name = Some(out.model_name.clone());
+                            stage2_output = Some(parsed);
+                        }
+                        Err(err) => {
+                            append_workflow_journal_event(
+                                "workflow_stage2_parse_error",
+                                &symbol,
+                                bundle.raw.ts_bucket,
+                                json!({
+                                    "trigger": &*trigger,
+                                    "error": format!("{err:#}"),
+                                }),
+                            );
+                        }
+                    }
+                }
+
+                let parsed_stage2 = stage2_output
+                    .clone()
+                    .ok_or_else(|| anyhow!("workflow stage2 produced no valid output"))?;
+                match parsed_stage2.stage2_decision.as_str() {
+                    "REQUEST_STAGE1_REEVALUATION" => {
+                        workflow_state.pending_stage1_refresh_reason =
+                            Some("thesis_invalidated".to_string());
+                        clear_approved_tactical_plan(&mut workflow_state);
+                        crate::workflow::persistence::save_workflow_state(
+                            &state_dir,
+                            &workflow_state,
+                        )?;
+                        append_workflow_journal_event(
+                            "workflow_stage1_reevaluation_requested",
+                            &symbol,
+                            bundle.raw.ts_bucket,
+                            json!({
+                                "trigger": &*trigger,
+                                "reevaluation_reason": parsed_stage2.reevaluation_reason,
+                                "path_id": stage1_output.current_path.as_ref().map(|path| path.id.clone()),
+                            }),
+                        );
+
+                        let mut refreshed_stage1_output = Some(stage1_output.clone());
+                        let _ = maybe_refresh_stage1(
+                            &config,
+                            &http_client,
+                            &loopback_http_client,
+                            print_response,
+                            &bundle,
+                            trigger.as_ref(),
+                            &symbol,
+                            &state_dir,
+                            retention_minutes,
+                            &input,
+                            &mut workflow_state,
+                            &mut refreshed_stage1_output,
+                            &mut tracked_zones,
+                            Some("thesis_invalidated".to_string()),
+                        )
+                        .await?;
+                        if let Some(updated_stage1_output) = refreshed_stage1_output {
+                            stage1_output = updated_stage1_output;
+                        }
+                    }
+                    "PATH_CONFIRMED" => {
+                        workflow_state.approved_tactical_plan =
+                            parsed_stage2.tactical_entry_plan.clone();
+                        workflow_state.approved_tactical_plan_updated_at = Some(Utc::now());
+                        workflow_state.pending_stage1_refresh_reason = None;
+                        crate::workflow::persistence::save_workflow_state(
+                            &state_dir,
+                            &workflow_state,
+                        )?;
+                        append_workflow_journal_event(
+                            "workflow_tactical_plan_approved",
+                            &symbol,
+                            bundle.raw.ts_bucket,
+                            json!({
+                                "trigger": &*trigger,
+                                "tactical_entry_plan": parsed_stage2.tactical_entry_plan,
+                            }),
+                        );
+                    }
+                    other => return Err(anyhow!("unsupported stage2 decision {}", other)),
+                }
+            } else {
+                info!(
+                    symbol = %symbol,
+                    ts_bucket = %bundle.raw.ts_bucket,
+                    "workflow stage2 skipped because llm.request_enabled=false"
+                );
+            }
+        } else {
+            append_workflow_journal_event(
+                "workflow_stage2_suppressed",
+                &symbol,
+                bundle.raw.ts_bucket,
+                json!({
+                    "trigger": &*trigger,
+                    "reason": "stage2_inflight",
+                }),
+            );
+        }
     }
 
     let post_invoke_data_age_secs = Utc::now()
@@ -1695,75 +2835,132 @@ async fn invoke_workflow_bundle_models(
         );
     }
 
+    let mut trade_signals = Vec::new();
+    let signal_model_name = selected_stage2_model_name
+        .clone()
+        .unwrap_or_else(|| "workflow_stage2".to_string());
+
+    if let Some(output) = stage2_output.as_ref() {
+        if output.stage2_decision == "REQUEST_STAGE1_REEVALUATION" {
+            trade_signals.push(build_stage2_reevaluation_trade_signal(
+                bundle.raw.ts_bucket,
+                trigger.as_ref(),
+                &symbol,
+                &signal_model_name,
+                output
+                    .reevaluation_reason
+                    .as_deref()
+                    .unwrap_or("path_invalidated"),
+            ));
+        }
+    }
+
     let mut execution_signal_report: Option<ExecutionReport> = None;
-    if let Some(intent) = stage2_decision.execution_intent.as_ref() {
-        let code_allows_execution = workflow_code_allows_execution(&stage2_runtime_eval);
-        if config.llm.execution.enabled && !execution_blocked_due_to_stale && code_allows_execution
+    let mut execution_signal_intent: Option<crate::workflow::schema::ExecutionIntent> = None;
+    if let Some(tactical_plan) = workflow_state.approved_tactical_plan.as_ref() {
+        if management_signal_action.is_none()
+            && config.llm.execution.enabled
+            && !execution_blocked_due_to_stale
         {
-            let adapted_intent = adapt_execution_intent(intent);
-            match adapted_intent {
-                Ok(adapted_intent) => match execute_workflow_execution_intent(
-                    &http_client,
-                    &config.api.binance,
-                    &config.llm.execution,
-                    &symbol,
-                    &adapted_intent,
-                )
-                .await
-                {
-                    Ok(report) => {
-                        execution_signal_report = Some(report.clone());
-                        append_workflow_journal_event(
-                            "workflow_execution_report",
-                            &symbol,
-                            bundle.raw.ts_bucket,
-                            json!({
-                                "trigger": &*trigger,
-                                "path_id": intent.path_id,
-                                "context_key": intent.entry_snapshot.context_key,
-                                "report": {
-                                    "decision": report.decision,
-                                    "quantity": report.quantity,
-                                    "leverage": report.leverage,
-                                    "position_side": report.position_side,
-                                    "maker_entry_price": report.maker_entry_price,
-                                    "take_profit": report.actual_take_profit,
-                                    "stop_loss": report.actual_stop_loss,
-                                    "risk_reward_ratio": report.actual_risk_reward_ratio,
-                                    "dry_run": report.dry_run,
-                                }
-                            }),
-                        );
-                        if !report.dry_run {
-                            let snapshot = crate::workflow::management::snapshot_from_execution_intent(
-                            &symbol,
-                            intent,
-                            stage1_output
-                                .current_path
-                                .as_ref()
-                                .ok_or_else(|| anyhow!("workflow stage1 current_path missing during snapshot persistence"))?,
-                            Utc::now(),
-                        );
-                            crate::workflow::persistence::save_entry_snapshot(
-                                &state_dir, &snapshot,
-                            )?;
-                            entry_snapshots.insert(snapshot.context_key.clone(), snapshot);
-                        }
-                    }
-                    Err(err) => {
-                        let blocked = err
-                            .downcast_ref::<TradeExecutionBlockedByCurrentPriceBeyondStopLoss>()
-                            .map(|item| {
+            if let Some(entry_plan) = select_entry_plan(
+                tactical_plan,
+                &workflow_state,
+                &path_runtime_state,
+                &trading_state,
+                &entry_snapshots,
+                &input.indicators,
+                &config.llm.workflow.watcher,
+            ) {
+                let intent =
+                    execution_intent_from_entry_plan(entry_plan.plan, entry_plan.trigger_price);
+                match adapt_execution_intent(&intent) {
+                    Ok(adapted_intent) => match execute_workflow_execution_intent(
+                        &http_client,
+                        &config.api.binance,
+                        &config.llm.execution,
+                        &symbol,
+                        &adapted_intent,
+                    )
+                    .await
+                    {
+                        Ok(report) => {
+                            append_workflow_journal_event(
+                                "workflow_execution_report",
+                                &symbol,
+                                bundle.raw.ts_bucket,
                                 json!({
-                                    "decision": item.decision.as_str(),
-                                    "current_reference_price": item.current_reference_price,
-                                    "current_price_source": item.current_price_source,
-                                    "entry_price": item.entry_price,
-                                    "stop_loss": item.stop_loss,
-                                    "best_bid_price": item.best_bid_price,
-                                    "best_ask_price": item.best_ask_price,
-                                })
-                            });
+                                    "trigger": &*trigger,
+                                    "path_id": intent.path_id,
+                                    "context_key": intent.entry_snapshot.context_key,
+                                    "plan_role": entry_plan.plan.entry_snapshot.plan_role,
+                                    "report": {
+                                        "decision": report.decision,
+                                        "quantity": report.quantity,
+                                        "leverage": report.leverage,
+                                        "position_side": report.position_side,
+                                        "maker_entry_price": report.maker_entry_price,
+                                        "take_profit": report.actual_take_profit,
+                                        "stop_loss": report.actual_stop_loss,
+                                        "risk_reward_ratio": report.actual_risk_reward_ratio,
+                                        "dry_run": report.dry_run,
+                                    }
+                                }),
+                            );
+                            if !report.dry_run {
+                                let snapshot = crate::workflow::management::snapshot_from_execution_intent(
+                                    &symbol,
+                                    &intent,
+                                    stage1_output
+                                        .current_path
+                                        .as_ref()
+                                        .ok_or_else(|| anyhow!("workflow stage1 current_path missing during snapshot persistence"))?,
+                                    Utc::now(),
+                                );
+                                crate::workflow::persistence::save_entry_snapshot(
+                                    &state_dir, &snapshot,
+                                )?;
+                                entry_snapshots.insert(snapshot.context_key.clone(), snapshot);
+                                workflow_state.last_filled_context_key =
+                                    Some(intent.entry_snapshot.context_key.clone());
+                                workflow_state.last_executed_plan_role =
+                                    Some(entry_plan.plan.entry_snapshot.plan_role.clone());
+                                crate::workflow::persistence::save_workflow_state(
+                                    &state_dir,
+                                    &workflow_state,
+                                )?;
+                            }
+                            execution_signal_intent = Some(intent);
+                            execution_signal_report = Some(report);
+                        }
+                        Err(err) => {
+                            let blocked = err
+                                .downcast_ref::<TradeExecutionBlockedByCurrentPriceBeyondStopLoss>()
+                                .map(|item| {
+                                    json!({
+                                        "decision": item.decision.as_str(),
+                                        "current_reference_price": item.current_reference_price,
+                                        "current_price_source": item.current_price_source,
+                                        "entry_price": item.entry_price,
+                                        "stop_loss": item.stop_loss,
+                                        "best_bid_price": item.best_bid_price,
+                                        "best_ask_price": item.best_ask_price,
+                                    })
+                                });
+                            append_workflow_journal_event(
+                                "workflow_execution_error",
+                                &symbol,
+                                bundle.raw.ts_bucket,
+                                json!({
+                                    "trigger": &*trigger,
+                                    "path_id": intent.path_id,
+                                    "context_key": intent.entry_snapshot.context_key,
+                                    "error": format!("{err:#}"),
+                                    "blocked": blocked,
+                                }),
+                            );
+                        }
+                    },
+                    Err(err) => {
                         append_workflow_journal_event(
                             "workflow_execution_error",
                             &symbol,
@@ -1773,173 +2970,65 @@ async fn invoke_workflow_bundle_models(
                                 "path_id": intent.path_id,
                                 "context_key": intent.entry_snapshot.context_key,
                                 "error": format!("{err:#}"),
-                                "blocked": blocked,
+                                "phase": "intent_adapter",
                             }),
                         );
                     }
-                },
-                Err(err) => {
-                    append_workflow_journal_event(
-                        "workflow_execution_error",
-                        &symbol,
-                        bundle.raw.ts_bucket,
-                        json!({
-                            "trigger": &*trigger,
-                            "path_id": intent.path_id,
-                            "context_key": intent.entry_snapshot.context_key,
-                            "error": format!("{err:#}"),
-                            "phase": "intent_adapter",
-                        }),
-                    );
                 }
-            }
-        } else {
-            append_workflow_journal_event(
-                "workflow_execution_skipped",
-                &symbol,
-                bundle.raw.ts_bucket,
-                json!({
-                    "trigger": &*trigger,
-                    "execution_enabled": config.llm.execution.enabled,
-                    "execution_blocked_due_to_stale": execution_blocked_due_to_stale,
-                    "code_allows_execution": code_allows_execution,
-                    "failure_level_breached": stage2_runtime_eval.failure_level_breached,
-                    "reevaluation_trigger_hit": stage2_runtime_eval.reevaluation_trigger_hit,
-                    "hard_gate": stage2_runtime_eval.hard_gate,
-                    "soft_gate": stage2_runtime_eval.soft_gate,
-                    "soft_gate_min_required": stage2_runtime_eval.soft_gate_min_required,
-                    "path_id": intent.path_id,
-                    "context_key": intent.entry_snapshot.context_key,
-                }),
-            );
-        }
-    }
-
-    for action in &stage2_decision.management_actions {
-        let snapshot = entry_snapshots.get(&action.context_key).cloned();
-        if !config.llm.execution.enabled {
-            append_workflow_journal_event(
-                "workflow_management_skipped",
-                &symbol,
-                bundle.raw.ts_bucket,
-                json!({
-                    "trigger": &*trigger,
-                    "execution_enabled": false,
-                    "action": action,
-                }),
-            );
-            continue;
-        }
-        let snapshot = snapshot.ok_or_else(|| {
-            anyhow!(
-                "workflow management snapshot missing for context_key={}",
-                action.context_key
-            )
-        })?;
-        let adapted_action = adapt_management_action(action, &snapshot);
-        match adapted_action {
-            Ok(adapted_action) => match execute_workflow_management_action(
-                &http_client,
-                &config.api.binance,
-                &config.llm.execution,
-                &symbol,
-                &snapshot,
-                &adapted_action,
-            )
-            .await
-            {
-                Ok(report) => {
-                    append_workflow_journal_event(
-                        "workflow_management_report",
-                        &symbol,
-                        bundle.raw.ts_bucket,
-                        json!({
-                            "trigger": &*trigger,
-                            "context_key": action.context_key,
-                            "path_id": action.path_id,
-                            "action_type": action.action_type,
-                            "report": {
-                                "action": report.action,
-                                "dry_run": report.dry_run,
-                                "position_count": report.position_count,
-                                "open_order_count": report.open_order_count,
-                                "canceled_open_orders": report.canceled_open_orders,
-                                "realized_pnl_usdt": report.realized_pnl_usdt,
-                            }
-                        }),
-                    );
-                    if !report.dry_run {
-                        match crate::workflow::management::apply_management_action(
-                            &snapshot,
-                            action,
-                            Utc::now(),
-                        ) {
-                            Some(next_snapshot) => {
-                                crate::workflow::persistence::save_entry_snapshot(
-                                    &state_dir,
-                                    &next_snapshot,
-                                )?;
-                                entry_snapshots
-                                    .insert(next_snapshot.context_key.clone(), next_snapshot);
-                            }
-                            None => {
-                                crate::workflow::persistence::delete_entry_snapshot(
-                                    &state_dir,
-                                    &symbol,
-                                    &action.context_key,
-                                )?;
-                                entry_snapshots.remove(&action.context_key);
-                            }
-                        }
-                    }
-                }
-                Err(err) => {
-                    append_workflow_journal_event(
-                        "workflow_management_error",
-                        &symbol,
-                        bundle.raw.ts_bucket,
-                        json!({
-                            "trigger": &*trigger,
-                            "context_key": action.context_key,
-                            "path_id": action.path_id,
-                            "action_type": action.action_type,
-                            "error": format!("{err:#}"),
-                        }),
-                    );
-                }
-            },
-            Err(err) => {
+            } else {
                 append_workflow_journal_event(
-                    "workflow_management_error",
+                    "workflow_execution_skipped",
                     &symbol,
                     bundle.raw.ts_bucket,
                     json!({
                         "trigger": &*trigger,
-                        "context_key": action.context_key,
-                        "path_id": action.path_id,
-                        "action_type": action.action_type,
-                        "error": format!("{err:#}"),
-                        "phase": "intent_adapter",
+                        "execution_enabled": config.llm.execution.enabled,
+                        "execution_blocked_due_to_stale": execution_blocked_due_to_stale,
+                        "path_alive": path_runtime_state.path_alive,
+                        "activation_level_touched": path_runtime_state.activation_level_touched,
+                        "opposing_pressure_detected": path_runtime_state.opposing_pressure_detected,
+                        "filled_stopout_attempts": workflow_state.filled_stopout_attempts,
+                        "path_id": tactical_plan.path_id,
                     }),
                 );
             }
         }
     }
 
+    if let (Some(intent), Some(report)) = (
+        execution_signal_intent.as_ref(),
+        execution_signal_report.as_ref(),
+    ) {
+        trade_signals.push(build_execution_trade_signal(
+            bundle.raw.ts_bucket,
+            trigger.as_ref(),
+            &symbol,
+            &signal_model_name,
+            &trading_state,
+            intent,
+            Some(report),
+            intent.reason.as_deref(),
+        ));
+    }
+
+    if let (Some(action), Some(report)) = (
+        management_signal_action.as_ref(),
+        management_signal_report.as_ref(),
+    ) {
+        trade_signals.push(build_management_trade_signal(
+            bundle.raw.ts_bucket,
+            trigger.as_ref(),
+            &symbol,
+            &signal_model_name,
+            action,
+            report,
+        ));
+    }
+
+    crate::workflow::persistence::save_workflow_state(&state_dir, &workflow_state)?;
+
     let telegram_operator = TelegramOperator::from_config(&config.api.telegram);
     let x_operator = XOperator::from_config(&config.api.x);
-    let signal_model_name =
-        selected_stage2_model_name.unwrap_or_else(|| "workflow_stage2".to_string());
-    let trade_signals = build_workflow_trade_signal_notifications(
-        bundle.raw.ts_bucket,
-        trigger.as_ref(),
-        &symbol,
-        &signal_model_name,
-        &stage2_decision,
-        &trading_state,
-        &signal_entry_snapshots,
-        execution_signal_report.as_ref(),
-    );
     for signal in &trade_signals {
         send_trade_signal_notifications(
             telegram_operator.as_ref(),
@@ -1955,67 +3044,29 @@ async fn invoke_workflow_bundle_models(
     Ok(())
 }
 
-fn build_workflow_trade_signal_notifications(
+fn build_stage2_reevaluation_trade_signal(
     ts_bucket: DateTime<Utc>,
     trigger: &str,
     symbol: &str,
     model_name: &str,
-    stage2_decision: &crate::workflow::schema::Stage2Decision,
-    trading_state: &TradingStateSnapshot,
-    entry_snapshots: &HashMap<String, crate::workflow::schema::EntrySnapshot>,
-    execution_report: Option<&ExecutionReport>,
-) -> Vec<TradeSignalNotification> {
-    let mut signals = Vec::new();
-
-    if let Some(intent) = stage2_decision.execution_intent.as_ref() {
-        signals.push(build_execution_trade_signal(
-            ts_bucket,
-            trigger,
-            symbol,
-            model_name,
-            stage2_decision,
-            trading_state,
-            intent,
-            execution_report,
-        ));
+    reason: &str,
+) -> TradeSignalNotification {
+    TradeSignalNotification {
+        ts_bucket,
+        trigger: trigger.to_string(),
+        symbol: symbol.to_string(),
+        model_name: model_name.to_string(),
+        decision: "NO_TRADE".to_string(),
+        context_key: None,
+        path_id: None,
+        entry_price: None,
+        leverage: None,
+        risk_reward_ratio: None,
+        take_profit_1: None,
+        take_profit_2: None,
+        stop_loss: None,
+        reason: reason.to_string(),
     }
-
-    for action in &stage2_decision.management_actions {
-        signals.push(build_management_trade_signal(
-            ts_bucket,
-            trigger,
-            symbol,
-            model_name,
-            stage2_decision,
-            trading_state,
-            entry_snapshots,
-            action,
-        ));
-    }
-
-    if signals.is_empty()
-        && stage2_decision.decision == "WAIT"
-        && stage2_decision.request_stage1_reevaluation.is_none()
-    {
-        signals.push(TradeSignalNotification {
-            ts_bucket,
-            trigger: trigger.to_string(),
-            symbol: symbol.to_string(),
-            model_name: model_name.to_string(),
-            decision: "NO_TRADE".to_string(),
-            context_key: None,
-            path_id: None,
-            entry_price: None,
-            leverage: None,
-            risk_reward_ratio: None,
-            take_profit_1: None,
-            take_profit_2: None,
-            stop_loss: None,
-            reason: stage2_decision.reason.clone(),
-        });
-    }
-
-    signals
 }
 
 fn build_execution_trade_signal(
@@ -2023,10 +3074,10 @@ fn build_execution_trade_signal(
     trigger: &str,
     symbol: &str,
     model_name: &str,
-    stage2_decision: &crate::workflow::schema::Stage2Decision,
     trading_state: &TradingStateSnapshot,
     intent: &crate::workflow::schema::ExecutionIntent,
     execution_report: Option<&ExecutionReport>,
+    secondary_reason: Option<&str>,
 ) -> TradeSignalNotification {
     let decision = if has_active_position_for_side(trading_state, &intent.side) {
         "ADD".to_string()
@@ -2063,7 +3114,10 @@ fn build_execution_trade_signal(
         take_profit_1,
         take_profit_2,
         stop_loss,
-        reason: workflow_signal_reason(&stage2_decision.reason, intent.reason.as_deref()),
+        reason: workflow_signal_reason(
+            secondary_reason.unwrap_or("workflow_execution"),
+            intent.reason.as_deref(),
+        ),
     }
 }
 
@@ -2072,53 +3126,34 @@ fn build_management_trade_signal(
     trigger: &str,
     symbol: &str,
     model_name: &str,
-    stage2_decision: &crate::workflow::schema::Stage2Decision,
-    trading_state: &TradingStateSnapshot,
-    entry_snapshots: &HashMap<String, crate::workflow::schema::EntrySnapshot>,
     action: &crate::workflow::schema::ManagementAction,
+    report: &ManagementExecutionReport,
 ) -> TradeSignalNotification {
     let decision = match action.action_type.as_str() {
-        "HOLD" => "HOLD",
         "REDUCE_POSITION" => "REDUCE",
         "FLATTEN_POSITION" => "CLOSE",
         "MOVE_STOP" | "UPDATE_TAKE_PROFIT" => "MODIFY_TPSL",
-        other => other,
-    }
-    .to_string();
-    let snapshot = entry_snapshots.get(&action.context_key);
-    let side = snapshot
-        .map(|item| item.side.as_str())
-        .or_else(|| context_key_side(&action.context_key))
-        .unwrap_or("LONG");
-    let active_position = find_active_position_for_side(trading_state, side);
-    let entry_price = active_position.map(|position| position.entry_price);
-    let leverage = active_position.map(|position| position.leverage as f64);
-    let take_profit_1 = action
-        .take_profit_1
-        .or_else(|| snapshot.map(|item| item.take_profit_1));
-    let take_profit_2 = action
-        .take_profit_2
-        .or_else(|| snapshot.map(|item| item.take_profit_2));
-    let stop_loss = action
-        .new_stop_loss
-        .or_else(|| snapshot.map(|item| item.stop_loss));
-    let risk_reward_ratio = compute_signal_rr(entry_price, stop_loss, take_profit_1);
+        _ => "HOLD",
+    };
 
     TradeSignalNotification {
         ts_bucket,
         trigger: trigger.to_string(),
         symbol: symbol.to_string(),
         model_name: model_name.to_string(),
-        decision,
+        decision: decision.to_string(),
         context_key: Some(action.context_key.clone()),
         path_id: Some(action.path_id.clone()),
-        entry_price,
-        leverage,
-        risk_reward_ratio,
-        take_profit_1,
-        take_profit_2,
-        stop_loss,
-        reason: workflow_signal_reason(&stage2_decision.reason, action.reason.as_deref()),
+        entry_price: None,
+        leverage: None,
+        risk_reward_ratio: None,
+        take_profit_1: action.take_profit_1,
+        take_profit_2: action.take_profit_2,
+        stop_loss: action.new_stop_loss,
+        reason: workflow_signal_reason(
+            action.reason.as_deref().unwrap_or("workflow_management"),
+            Some(report.action),
+        ),
     }
 }
 
@@ -2252,12 +3287,6 @@ fn active_position_side(position: &ActivePositionSnapshot) -> Option<&'static st
     } else {
         None
     }
-}
-
-fn context_key_side(context_key: &str) -> Option<&str> {
-    let mut parts = context_key.split(':');
-    let _symbol = parts.next()?;
-    parts.next()
 }
 
 async fn send_trade_signal_notifications(
@@ -2620,7 +3649,11 @@ fn sanitize_filename_component(raw: &str) -> String {
 mod tests {
     use super::*;
     use crate::app::config::load_config;
-    use crate::workflow::schema::{Stage1Meta, Stage1Output};
+    use crate::execution::binance::TradingStateSnapshot;
+    use crate::workflow::schema::{
+        AttemptPolicy, MapSummary, PathAuditFlags, PathRuntimeState, PriceZone, Stage1Meta,
+        Stage1Output, TacticalEntryPlan, TacticalEntrySnapshot,
+    };
     use crate::workflow::state::WorkflowState;
 
     fn workflow_test_config() -> RootConfig {
@@ -2656,6 +3689,148 @@ mod tests {
             "is_closed": true,
             "minutes_covered": 1,
             "expected_minutes": 1
+        })
+    }
+
+    fn empty_map_summary() -> MapSummary {
+        MapSummary {
+            regime_3d: json!({}),
+            location_1d: json!({}),
+            location_4h: json!({}),
+            price_location_class: "value_edge".to_string(),
+            key_levels: json!({}),
+        }
+    }
+
+    fn sample_tactical_plan() -> TacticalEntryPlan {
+        TacticalEntryPlan {
+            path_id: "path_a".to_string(),
+            primary_entry_plan: crate::workflow::schema::EntryPlan {
+                side: "LONG".to_string(),
+                entry_profile: "reclaim_then_hold".to_string(),
+                intent_mode: "breakout".to_string(),
+                entry_activation_level: PriceZone {
+                    low: 100.0,
+                    high: 101.0,
+                    timeframe: None,
+                    label: None,
+                    reason: None,
+                },
+                entry_zone: PriceZone {
+                    low: 101.0,
+                    high: 102.0,
+                    timeframe: None,
+                    label: None,
+                    reason: None,
+                },
+                entry_invalidation_level: PriceZone {
+                    low: 98.0,
+                    high: 99.0,
+                    timeframe: None,
+                    label: None,
+                    reason: None,
+                },
+                stop_loss: 98.8,
+                take_profit_1: 104.0,
+                take_profit_2: 106.0,
+                ttl_minutes: 15,
+                max_drift_pct: 0.2,
+                entry_snapshot: TacticalEntrySnapshot {
+                    context_key: "ETHUSDT:LONG:path_a:primary".to_string(),
+                    path_id: "path_a".to_string(),
+                    plan_role: "primary".to_string(),
+                },
+                entry_note: String::new(),
+            },
+            secondary_entry_plan: crate::workflow::schema::EntryPlan {
+                side: "LONG".to_string(),
+                entry_profile: "failed_auction_reentry".to_string(),
+                intent_mode: "pullback".to_string(),
+                entry_activation_level: PriceZone {
+                    low: 99.0,
+                    high: 100.0,
+                    timeframe: None,
+                    label: None,
+                    reason: None,
+                },
+                entry_zone: PriceZone {
+                    low: 99.0,
+                    high: 100.5,
+                    timeframe: None,
+                    label: None,
+                    reason: None,
+                },
+                entry_invalidation_level: PriceZone {
+                    low: 97.8,
+                    high: 98.5,
+                    timeframe: None,
+                    label: None,
+                    reason: None,
+                },
+                stop_loss: 98.2,
+                take_profit_1: 104.0,
+                take_profit_2: 106.0,
+                ttl_minutes: 15,
+                max_drift_pct: 0.25,
+                entry_snapshot: TacticalEntrySnapshot {
+                    context_key: "ETHUSDT:LONG:path_a:secondary".to_string(),
+                    path_id: "path_a".to_string(),
+                    plan_role: "secondary".to_string(),
+                },
+                entry_note: String::new(),
+            },
+            attempt_policy: AttemptPolicy {
+                max_filled_stopout_attempts: 2,
+                count_unfilled_attempts: false,
+                time_window: "same_15m_window".to_string(),
+            },
+        }
+    }
+
+    fn sample_flat_trading_state() -> TradingStateSnapshot {
+        TradingStateSnapshot {
+            symbol: "ETHUSDT".to_string(),
+            has_active_context: false,
+            has_active_positions: false,
+            has_open_orders: false,
+            active_positions: Vec::new(),
+            open_orders: Vec::new(),
+            total_wallet_balance: 0.0,
+            available_balance: 0.0,
+        }
+    }
+
+    fn sample_watcher_indicators(bars: &[(f64, f64, f64)]) -> Value {
+        let bars = bars
+            .iter()
+            .enumerate()
+            .map(|(idx, (close, high, low))| {
+                let minute = idx.to_string().chars().last().unwrap_or('0');
+                json!({
+                    "open_time": format!("2026-03-28T05:0{}:00Z", minute),
+                    "close_time": format!("2026-03-28T05:0{}:59Z", minute),
+                    "open": close,
+                    "high": high,
+                    "low": low,
+                    "close": close,
+                    "is_closed": true
+                })
+            })
+            .collect::<Vec<_>>();
+        json!({
+            "kline_history": {
+                "payload": {
+                    "intervals": {
+                        "1m": {
+                            "markets": {
+                                "futures": {
+                                    "bars": bars
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         })
     }
 
@@ -2801,11 +3976,39 @@ mod tests {
             symbol: "ETHUSDT".to_string(),
             pending_stage1_refresh_reason: Some("thesis_invalidated".to_string()),
             last_stage1_ts: None,
+            ..WorkflowState::default()
         };
         assert_eq!(
-            workflow_stage1_refresh_reason(&config, &bundle, &state, None).as_deref(),
+            workflow_stage1_refresh_reason(&config, &bundle, &state).as_deref(),
             Some("thesis_invalidated")
         );
+    }
+
+    #[test]
+    fn consume_pending_stage1_refresh_reason_is_one_shot() {
+        let mut state = WorkflowState {
+            symbol: "ETHUSDT".to_string(),
+            pending_stage1_refresh_reason: Some("thesis_invalidated".to_string()),
+            ..WorkflowState::default()
+        };
+
+        assert!(!consume_pending_stage1_refresh_reason(
+            &mut state,
+            "scheduled_2h"
+        ));
+        assert_eq!(
+            state.pending_stage1_refresh_reason.as_deref(),
+            Some("thesis_invalidated")
+        );
+        assert!(consume_pending_stage1_refresh_reason(
+            &mut state,
+            "thesis_invalidated"
+        ));
+        assert!(state.pending_stage1_refresh_reason.is_none());
+        assert!(!consume_pending_stage1_refresh_reason(
+            &mut state,
+            "thesis_invalidated"
+        ));
     }
 
     #[test]
@@ -2832,24 +4035,12 @@ mod tests {
         let state = WorkflowState {
             symbol: "ETHUSDT".to_string(),
             pending_stage1_refresh_reason: None,
-            last_stage1_ts: Some(ts_bucket - ChronoDuration::hours(4)),
-        };
-        let stage1_output = Stage1Output {
-            meta: Stage1Meta {
-                stage1_ts: ts_bucket - ChronoDuration::hours(4),
-            },
-            monitoring_status: "active".to_string(),
-            no_trade_reason: None,
-            refresh_hints: vec![],
-            map_summary: None,
-            current_script: None,
-            driver_attribution: None,
-            current_path: None,
+            last_stage1_ts: Some(ts_bucket - ChronoDuration::hours(2)),
+            ..WorkflowState::default()
         };
         assert_eq!(
-            workflow_stage1_refresh_reason(&config, &bundle, &state, Some(&stage1_output))
-                .as_deref(),
-            Some("scheduled_4h")
+            workflow_stage1_refresh_reason(&config, &bundle, &state).as_deref(),
+            Some("scheduled_2h")
         );
     }
 
@@ -2878,6 +4069,31 @@ mod tests {
             symbol: "ETHUSDT".to_string(),
             pending_stage1_refresh_reason: None,
             last_stage1_ts: Some(ts_bucket - ChronoDuration::minutes(15)),
+            ..WorkflowState::default()
+        };
+        assert!(workflow_stage1_refresh_reason(&config, &bundle, &state).is_none());
+    }
+
+    #[test]
+    fn workflow_stage2_review_due_runs_only_on_configured_15m_boundary_for_active_path() {
+        let config = workflow_test_config();
+        let ts_bucket = DateTime::parse_from_rfc3339("2026-03-28T05:15:00Z")
+            .expect("ts")
+            .with_timezone(&Utc);
+        let bundle = LatestBundle {
+            raw: MinuteBundleEnvelope {
+                msg_type: "bundle".to_string(),
+                routing_key: "test.route".to_string(),
+                symbol: "ETHUSDT".to_string(),
+                ts_bucket,
+                window_code: "1m".to_string(),
+                indicator_count: 0,
+                published_at: None,
+                indicators: json!({}),
+            },
+            indicators: json!({}),
+            missing_indicator_codes: vec![],
+            received_at: ts_bucket,
         };
         let stage1_output = Stage1Output {
             meta: Stage1Meta {
@@ -2886,71 +4102,354 @@ mod tests {
             monitoring_status: "active".to_string(),
             no_trade_reason: None,
             refresh_hints: vec![],
-            map_summary: None,
+            map_summary: empty_map_summary(),
+            opportunity_assessment: crate::workflow::schema::OpportunityAssessment::default(),
+            script_rejections: vec![],
+            current_script: Some("script".to_string()),
+            driver_attribution: None,
+            current_path: Some(crate::workflow::schema::CurrentPath {
+                id: "path_a".to_string(),
+                side: "LONG".to_string(),
+                thesis: "thesis".to_string(),
+                risk_grade: "aligned_trend".to_string(),
+                activation_anchor_id: None,
+                activation_level: crate::workflow::schema::PriceZone {
+                    low: 100.0,
+                    high: 101.0,
+                    timeframe: None,
+                    label: None,
+                    reason: None,
+                },
+                first_path_target_anchor_id: None,
+                first_path_target: crate::workflow::schema::PriceZone {
+                    low: 103.0,
+                    high: 104.0,
+                    timeframe: None,
+                    label: None,
+                    reason: None,
+                },
+                next_path_target_anchor_id: None,
+                next_path_target: crate::workflow::schema::PriceZone {
+                    low: 105.0,
+                    high: 106.0,
+                    timeframe: None,
+                    label: None,
+                    reason: None,
+                },
+                failure_anchor_id: None,
+                failure_level: crate::workflow::schema::PriceZone {
+                    low: 98.0,
+                    high: 99.0,
+                    timeframe: None,
+                    label: None,
+                    reason: None,
+                },
+                failure_switch: Some("reevaluate_short".to_string()),
+                setup_type: "continuation".to_string(),
+                reevaluation_trigger: crate::workflow::schema::ReevaluationTrigger::default(),
+                management_plan: crate::workflow::schema::ManagementPlan {
+                    take_profit_1_basis: "first_path_target".to_string(),
+                    take_profit_2_basis: "next_path_target".to_string(),
+                    take_profit_1_level: 103.0,
+                    take_profit_2_level: 105.0,
+                    stop_migration_rules: vec![],
+                    reduce_on_driver_deterioration: vec![],
+                    exit_full_on_driver_deterioration: vec![],
+                },
+                tracked_zones: vec![],
+            }),
+        };
+
+        assert!(workflow_stage2_review_due(
+            &config,
+            &bundle,
+            Some(&stage1_output),
+            false,
+        ));
+        assert!(!workflow_stage2_review_due(
+            &config,
+            &bundle,
+            Some(&stage1_output),
+            true,
+        ));
+    }
+
+    #[test]
+    fn workflow_stage2_review_due_is_false_for_no_edge() {
+        let config = workflow_test_config();
+        let ts_bucket = DateTime::parse_from_rfc3339("2026-03-28T05:15:00Z")
+            .expect("ts")
+            .with_timezone(&Utc);
+        let bundle = LatestBundle {
+            raw: MinuteBundleEnvelope {
+                msg_type: "bundle".to_string(),
+                routing_key: "test.route".to_string(),
+                symbol: "ETHUSDT".to_string(),
+                ts_bucket,
+                window_code: "1m".to_string(),
+                indicator_count: 0,
+                published_at: None,
+                indicators: json!({}),
+            },
+            indicators: json!({}),
+            missing_indicator_codes: vec![],
+            received_at: ts_bucket,
+        };
+        let stage1_output = Stage1Output {
+            meta: Stage1Meta {
+                stage1_ts: ts_bucket,
+            },
+            monitoring_status: "no_edge".to_string(),
+            no_trade_reason: Some("conflict_no_edge".to_string()),
+            refresh_hints: vec![],
+            map_summary: empty_map_summary(),
+            opportunity_assessment: crate::workflow::schema::OpportunityAssessment::default(),
+            script_rejections: vec![],
             current_script: None,
             driver_attribution: None,
             current_path: None,
         };
-        assert!(
-            workflow_stage1_refresh_reason(&config, &bundle, &state, Some(&stage1_output))
-                .is_none()
-        );
+        assert!(!workflow_stage2_review_due(
+            &config,
+            &bundle,
+            Some(&stage1_output),
+            false,
+        ));
     }
 
     #[test]
-    fn workflow_stage2_schedule_follows_15m_refresh_minutes() {
-        let config = workflow_test_config();
-        let schedule = effective_schedule_minutes(&config, "custom_llm");
-        assert_eq!(schedule, vec![0, 15, 30, 45]);
+    fn watcher_entry_ready_requires_reclaim_then_hold_confirmation() {
+        let watcher_cfg = workflow_test_config().llm.workflow.watcher;
+        let plan = crate::workflow::schema::EntryPlan {
+            side: "LONG".to_string(),
+            entry_profile: "reclaim_then_hold".to_string(),
+            intent_mode: "breakout".to_string(),
+            entry_activation_level: crate::workflow::schema::PriceZone {
+                low: 100.0,
+                high: 101.0,
+                timeframe: None,
+                label: None,
+                reason: None,
+            },
+            entry_zone: crate::workflow::schema::PriceZone {
+                low: 101.0,
+                high: 102.0,
+                timeframe: None,
+                label: None,
+                reason: None,
+            },
+            entry_invalidation_level: crate::workflow::schema::PriceZone {
+                low: 98.0,
+                high: 99.0,
+                timeframe: None,
+                label: None,
+                reason: None,
+            },
+            stop_loss: 98.8,
+            take_profit_1: 104.0,
+            take_profit_2: 106.0,
+            ttl_minutes: 15,
+            max_drift_pct: 0.2,
+            entry_snapshot: crate::workflow::schema::TacticalEntrySnapshot {
+                context_key: "ETHUSDT:LONG:path_a:primary".to_string(),
+                path_id: "path_a".to_string(),
+                plan_role: "primary".to_string(),
+            },
+            entry_note: String::new(),
+        };
 
-        let matching = MinuteBundleEnvelope {
-            msg_type: "bundle".to_string(),
-            routing_key: "test.route".to_string(),
+        let weak_facts = WatcherPriceFacts {
+            current_price: 100.6,
+            recent_bars: vec![
+                WatcherBar {
+                    close: 100.2,
+                    high: 100.4,
+                    low: 99.9,
+                },
+                WatcherBar {
+                    close: 100.4,
+                    high: 100.6,
+                    low: 100.0,
+                },
+                WatcherBar {
+                    close: 100.6,
+                    high: 100.8,
+                    low: 100.1,
+                },
+            ],
+        };
+        assert!(!watcher_entry_ready(&plan, &weak_facts, &watcher_cfg));
+
+        let confirmed_facts = WatcherPriceFacts {
+            current_price: 102.4,
+            recent_bars: vec![
+                WatcherBar {
+                    close: 102.15,
+                    high: 102.3,
+                    low: 100.8,
+                },
+                WatcherBar {
+                    close: 102.2,
+                    high: 102.4,
+                    low: 100.7,
+                },
+                WatcherBar {
+                    close: 102.3,
+                    high: 102.5,
+                    low: 100.9,
+                },
+                WatcherBar {
+                    close: 102.4,
+                    high: 102.6,
+                    low: 101.0,
+                },
+            ],
+        };
+        assert!(watcher_entry_ready(&plan, &confirmed_facts, &watcher_cfg));
+    }
+
+    #[test]
+    fn entry_hold_confirmation_uses_reclaimed_edge_not_activation_floor() {
+        let predicate = crate::app::config::EntryHoldPredicateConfig {
+            hold_bars: 3,
+            retest_tolerance_bps: 0.0,
+        };
+        let level = PriceZone {
+            low: 100.0,
+            high: 101.0,
+            timeframe: None,
+            label: None,
+            reason: None,
+        };
+        let facts = WatcherPriceFacts {
+            current_price: 101.2,
+            recent_bars: vec![
+                WatcherBar {
+                    close: 100.4,
+                    high: 100.6,
+                    low: 100.2,
+                },
+                WatcherBar {
+                    close: 101.1,
+                    high: 101.2,
+                    low: 100.9,
+                },
+                WatcherBar {
+                    close: 101.2,
+                    high: 101.3,
+                    low: 101.0,
+                },
+            ],
+        };
+
+        assert!(!entry_hold_confirmed("LONG", &level, &facts, &predicate));
+    }
+
+    #[test]
+    fn reset_watcher_window_if_needed_resets_attempts_on_new_window() {
+        let ts = DateTime::parse_from_rfc3339("2026-03-28T05:17:00Z")
+            .expect("ts")
+            .with_timezone(&Utc);
+        let tactical_plan = sample_tactical_plan();
+        let mut state = WorkflowState {
             symbol: "ETHUSDT".to_string(),
-            ts_bucket: DateTime::parse_from_rfc3339("2026-03-28T05:15:00Z")
-                .expect("ts")
-                .with_timezone(&Utc),
-            window_code: "15m".to_string(),
-            indicator_count: 0,
-            published_at: None,
-            indicators: json!({}),
-        };
-        let non_matching = MinuteBundleEnvelope {
-            ts_bucket: DateTime::parse_from_rfc3339("2026-03-28T05:10:00Z")
-                .expect("ts")
-                .with_timezone(&Utc),
-            ..matching.clone()
+            active_15m_window_start: Some(
+                DateTime::parse_from_rfc3339("2026-03-28T05:00:00Z")
+                    .expect("window")
+                    .with_timezone(&Utc),
+            ),
+            approved_tactical_plan: Some(tactical_plan.clone()),
+            approved_tactical_plan_updated_at: Some(ts - ChronoDuration::minutes(5)),
+            filled_stopout_attempts: 2,
+            last_filled_context_key: Some("ETHUSDT:LONG:path_a:primary".to_string()),
+            last_executed_plan_role: Some("secondary".to_string()),
+            ..WorkflowState::default()
         };
 
-        assert!(bundle_matches_call_schedule(&matching, &schedule));
-        assert!(!bundle_matches_call_schedule(&non_matching, &schedule));
+        let expired_plan = reset_watcher_window_if_needed(&mut state, ts);
+
+        assert_eq!(
+            state.active_15m_window_start,
+            Some(
+                DateTime::parse_from_rfc3339("2026-03-28T05:15:00Z")
+                    .expect("window")
+                    .with_timezone(&Utc)
+            )
+        );
+        assert_eq!(expired_plan, Some(tactical_plan));
+        assert!(state.approved_tactical_plan.is_none());
+        assert!(state.approved_tactical_plan_updated_at.is_none());
+        assert_eq!(state.filled_stopout_attempts, 0);
+        assert!(state.last_filled_context_key.is_none());
+        assert!(state.last_executed_plan_role.is_none());
     }
 
     #[test]
-    fn workflow_execution_is_blocked_when_reevaluation_trigger_hits() {
-        let eval = crate::workflow::stage2::Stage2RuntimeEvaluation {
-            monitoring_status: "active".to_string(),
-            latest_price: 2000.0,
-            no_edge_reentered: false,
-            failure_level_breached: false,
-            reevaluation_trigger_hit: true,
-            activation_level_active: true,
-            setup_confirmed: true,
-            hard_gate: crate::workflow::schema::HardGateEvaluation {
-                location_valid: true,
-                trigger_confirmed: true,
-            },
-            soft_gate: crate::workflow::schema::SoftGateEvaluation {
-                state_clear: true,
-                driver_clear: true,
-                orderflow_real: true,
-                invalidation_clear: true,
-                passed_count: 4,
-            },
-            soft_gate_min_required: 3,
+    fn select_entry_plan_keeps_stage2_approved_plan_executable_until_hard_invalidation() {
+        let tactical_plan = sample_tactical_plan();
+        let workflow_state = WorkflowState {
+            symbol: "ETHUSDT".to_string(),
+            ..WorkflowState::default()
         };
+        let soft_only_runtime_state = PathRuntimeState {
+            path_id: "path_a".to_string(),
+            monitoring_status: "active".to_string(),
+            latest_price: 115.0,
+            hard_invalidation: false,
+            failure_level_breached: false,
+            path_alive: false,
+            activation_level_touched: false,
+            opposing_pressure_detected: true,
+            audit_flags: PathAuditFlags {
+                extreme_location: true,
+                reverse_confirmation: true,
+                driver_change: true,
+            },
+            active_entry_context_keys: Vec::new(),
+            notes: Vec::new(),
+        };
+        let indicators = sample_watcher_indicators(&[
+            (102.15, 102.3, 100.8),
+            (102.2, 102.4, 100.7),
+            (102.3, 102.5, 100.9),
+            (102.4, 102.6, 101.0),
+        ]);
+        let watcher_cfg = workflow_test_config().llm.workflow.watcher;
 
-        assert!(!workflow_code_allows_execution(&eval));
+        let selected = select_entry_plan(
+            &tactical_plan,
+            &workflow_state,
+            &soft_only_runtime_state,
+            &sample_flat_trading_state(),
+            &std::collections::HashMap::new(),
+            &indicators,
+            &watcher_cfg,
+        );
+        assert_eq!(
+            selected
+                .as_ref()
+                .map(|selected| selected.plan.entry_snapshot.plan_role.as_str()),
+            Some("primary")
+        );
+        assert_eq!(
+            selected.as_ref().map(|selected| selected.trigger_price),
+            Some(102.4)
+        );
+
+        let hard_invalidated_state = PathRuntimeState {
+            hard_invalidation: true,
+            ..soft_only_runtime_state
+        };
+        assert!(select_entry_plan(
+            &tactical_plan,
+            &workflow_state,
+            &hard_invalidated_state,
+            &sample_flat_trading_state(),
+            &std::collections::HashMap::new(),
+            &indicators,
+            &watcher_cfg,
+        )
+        .is_none());
     }
 
     #[test]
@@ -3220,40 +4719,32 @@ mod tests {
     }
 
     #[test]
-    fn workflow_trade_signal_notifications_mark_same_side_execution_as_add() {
+    fn build_execution_trade_signal_marks_same_side_execution_as_add() {
         let ts_bucket = DateTime::parse_from_rfc3339("2026-03-28T05:15:00Z")
             .expect("ts")
             .with_timezone(&Utc);
-        let decision = crate::workflow::schema::Stage2Decision {
-            decision: "EXECUTE".to_string(),
-            reason: "confirmed".to_string(),
-            request_stage1_reevaluation: None,
-            execution_intent: Some(crate::workflow::schema::ExecutionIntent {
-                side: "LONG".to_string(),
-                intent_mode: "immediate".to_string(),
-                entry_zone: crate::workflow::schema::PriceZone {
-                    low: 1999.0,
-                    high: 2001.0,
-                    timeframe: Some("15m".to_string()),
-                    label: Some("entry".to_string()),
-                    reason: None,
-                },
-                trigger_price: Some(2000.0),
-                stop_loss: 1980.0,
-                take_profit_1: 2040.0,
-                take_profit_2: 2080.0,
-                ttl_minutes: 15,
-                max_drift_pct: 0.2,
+        let intent = crate::workflow::schema::ExecutionIntent {
+            side: "LONG".to_string(),
+            intent_mode: "immediate".to_string(),
+            entry_zone: crate::workflow::schema::PriceZone {
+                low: 1999.0,
+                high: 2001.0,
+                timeframe: Some("15m".to_string()),
+                label: Some("entry".to_string()),
+                reason: None,
+            },
+            trigger_price: Some(2000.0),
+            stop_loss: 1980.0,
+            take_profit_1: 2040.0,
+            take_profit_2: 2080.0,
+            ttl_minutes: 15,
+            max_drift_pct: 0.2,
+            path_id: "path_a".to_string(),
+            entry_snapshot: crate::workflow::schema::EntrySnapshotRef {
+                context_key: "ETHUSDT:LONG:path_a:primary".to_string(),
                 path_id: "path_a".to_string(),
-                entry_snapshot: crate::workflow::schema::EntrySnapshotRef {
-                    context_key: "ETHUSDT:LONG:path_a".to_string(),
-                    path_id: "path_a".to_string(),
-                },
-                reason: Some("driver aligned".to_string()),
-            }),
-            management_actions: Vec::new(),
-            hard_gate: None,
-            soft_gate: None,
+            },
+            reason: Some("driver aligned".to_string()),
         };
         let trading_state = TradingStateSnapshot {
             symbol: "ETHUSDT".to_string(),
@@ -3272,102 +4763,41 @@ mod tests {
             total_wallet_balance: 1000.0,
             available_balance: 500.0,
         };
-
-        let signals = build_workflow_trade_signal_notifications(
+        let signal = build_execution_trade_signal(
             ts_bucket,
             "schedule",
             "ETHUSDT",
             "custom_llm",
-            &decision,
             &trading_state,
-            &HashMap::new(),
+            &intent,
             None,
+            Some("path confirmed"),
         );
 
-        assert_eq!(signals.len(), 1);
-        assert_eq!(signals[0].decision, "ADD");
-        assert_eq!(signals[0].entry_price, Some(2000.0));
-        assert_eq!(signals[0].take_profit_1, Some(2040.0));
-        assert_eq!(signals[0].take_profit_2, Some(2080.0));
-        assert_eq!(signals[0].stop_loss, Some(1980.0));
-        assert_eq!(signals[0].risk_reward_ratio, Some(2.0));
+        assert_eq!(signal.decision, "ADD");
+        assert_eq!(signal.entry_price, Some(2000.0));
+        assert_eq!(signal.take_profit_1, Some(2040.0));
+        assert_eq!(signal.take_profit_2, Some(2080.0));
+        assert_eq!(signal.stop_loss, Some(1980.0));
+        assert_eq!(signal.risk_reward_ratio, Some(2.0));
     }
 
     #[test]
-    fn workflow_trade_signal_notifications_map_move_stop_to_modify_tpsl() {
+    fn build_stage2_reevaluation_trade_signal_maps_to_no_trade() {
         let ts_bucket = DateTime::parse_from_rfc3339("2026-03-28T05:15:00Z")
             .expect("ts")
             .with_timezone(&Utc);
-        let decision = crate::workflow::schema::Stage2Decision {
-            decision: "WAIT".to_string(),
-            reason: "manage open context".to_string(),
-            request_stage1_reevaluation: None,
-            execution_intent: None,
-            management_actions: vec![crate::workflow::schema::ManagementAction {
-                action_type: "MOVE_STOP".to_string(),
-                context_key: "ETHUSDT:LONG:path_a".to_string(),
-                path_id: "path_a".to_string(),
-                reduce_ratio: None,
-                new_stop_loss: Some(2010.0),
-                take_profit_1: None,
-                take_profit_2: None,
-                reason: Some("lock gains".to_string()),
-            }],
-            hard_gate: None,
-            soft_gate: None,
-        };
-        let trading_state = TradingStateSnapshot {
-            symbol: "ETHUSDT".to_string(),
-            has_active_context: true,
-            has_active_positions: true,
-            has_open_orders: true,
-            active_positions: vec![ActivePositionSnapshot {
-                position_side: "LONG".to_string(),
-                position_amt: 1.0,
-                entry_price: 2000.0,
-                mark_price: 2020.0,
-                unrealized_pnl: 20.0,
-                leverage: 8,
-            }],
-            open_orders: Vec::new(),
-            total_wallet_balance: 1000.0,
-            available_balance: 500.0,
-        };
-        let mut entry_snapshots = HashMap::new();
-        entry_snapshots.insert(
-            "ETHUSDT:LONG:path_a".to_string(),
-            crate::workflow::schema::EntrySnapshot {
-                symbol: "ETHUSDT".to_string(),
-                context_key: "ETHUSDT:LONG:path_a".to_string(),
-                path_id: "path_a".to_string(),
-                side: "LONG".to_string(),
-                stop_loss: 1980.0,
-                take_profit_1: 2040.0,
-                take_profit_2: 2080.0,
-                allowed_stop_loss_levels: vec![1980.0, 2010.0],
-                allowed_take_profit_levels: vec![2040.0, 2080.0],
-                created_at: ts_bucket,
-                updated_at: ts_bucket,
-            },
-        );
-
-        let signals = build_workflow_trade_signal_notifications(
+        let signal = build_stage2_reevaluation_trade_signal(
             ts_bucket,
             "schedule",
             "ETHUSDT",
             "custom_llm",
-            &decision,
-            &trading_state,
-            &entry_snapshots,
-            None,
+            "soft_invalidation_triplet",
         );
 
-        assert_eq!(signals.len(), 1);
-        assert_eq!(signals[0].decision, "MODIFY_TPSL");
-        assert_eq!(signals[0].entry_price, Some(2000.0));
-        assert_eq!(signals[0].stop_loss, Some(2010.0));
-        assert_eq!(signals[0].take_profit_1, Some(2040.0));
-        assert_eq!(signals[0].take_profit_2, Some(2080.0));
+        assert_eq!(signal.decision, "NO_TRADE");
+        assert_eq!(signal.reason, "soft_invalidation_triplet");
+        assert!(signal.entry_price.is_none());
     }
 
     #[test]
@@ -3402,6 +4832,8 @@ mod tests {
                 take_profit_2: 2080.0,
                 allowed_stop_loss_levels: vec![1980.0, 2010.0],
                 allowed_take_profit_levels: vec![2040.0, 2080.0],
+                tp1_realized: false,
+                applied_driver_deterioration_signals: vec![],
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
             },

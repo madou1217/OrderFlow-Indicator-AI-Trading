@@ -410,8 +410,7 @@ pub(crate) async fn invoke_openai_compatible_json_stage(
                 .map(|choice| choice.message.content.trim().to_string())
                 .filter(|text| !text.is_empty())
                 .ok_or_else(|| anyhow!("workflow response text is empty"))?;
-            let parsed = parse_json_from_text(&text)
-                .ok_or_else(|| anyhow!("workflow output is not valid json"))?;
+            let parsed = parse_json_from_text(&text)?;
             Ok((text, parsed))
         },
     )
@@ -501,8 +500,7 @@ pub(crate) async fn invoke_claude_json_stage(
         if text.is_empty() {
             return Err(anyhow!("workflow claude response text is empty"));
         }
-        let parsed = parse_json_from_text(&text)
-            .ok_or_else(|| anyhow!("workflow output is not valid json"))?;
+        let parsed = parse_json_from_text(&text)?;
         Ok((text, parsed))
     })
     .await
@@ -593,8 +591,7 @@ pub(crate) async fn invoke_gemini_json_stage(
         if text.is_empty() {
             return Err(anyhow!("workflow gemini response text is empty"));
         }
-        let parsed = parse_json_from_text(&text)
-            .ok_or_else(|| anyhow!("workflow output is not valid json"))?;
+        let parsed = parse_json_from_text(&text)?;
         Ok((text, parsed))
     })
     .await
@@ -675,8 +672,7 @@ pub(crate) async fn invoke_grok_json_stage(
                     .unwrap_or_else(|| "null".to_string())
             )
         })?;
-        let parsed = parse_json_from_text(&text)
-            .ok_or_else(|| anyhow!("workflow output is not valid json"))?;
+        let parsed = parse_json_from_text(&text)?;
         Ok((text, parsed))
     })
     .await
@@ -759,13 +755,13 @@ mod tests {
             output: vec![GrokResponseOutputItem {
                 content: vec![GrokResponseContentItem {
                     kind: Some("output_text".to_string()),
-                    text: Some("{\"decision\":\"WAIT\"}".to_string()),
+                    text: Some("{\"stage2_decision\":\"PATH_CONFIRMED\"}".to_string()),
                 }],
             }],
         };
         assert_eq!(
             extract_grok_response_text(&body).as_deref(),
-            Some("{\"decision\":\"WAIT\"}")
+            Some("{\"stage2_decision\":\"PATH_CONFIRMED\"}")
         );
     }
 }
