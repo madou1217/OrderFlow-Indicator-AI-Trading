@@ -62,27 +62,17 @@ impl Indicator for I16FundingRate {
 fn build_recent_7d_payload(ctx: &IndicatorContext) -> Vec<Value> {
     let end = ctx.ts_bucket + Duration::minutes(1);
     let recent_cutoff = end - Duration::days(7);
-    let mut recent_changes = ctx
+    ctx
         .funding_changes_recent
         .iter()
         .filter(|c| c.ts_change >= recent_cutoff && c.ts_change < end)
-        .collect::<Vec<_>>();
-    recent_changes.sort_by_key(|c| c.ts_change);
-    recent_changes
-        .iter()
         .map(|c| funding_change_json(c))
         .collect()
 }
 
 fn compute_window_metrics(ctx: &IndicatorContext, mins: i64, label: &str) -> Value {
     let metrics = compute_funding_window_metrics(ctx, mins);
-    let mut changes = metrics.changes_json.as_array().cloned().unwrap_or_default();
-    changes.sort_by_key(|row| {
-        row.get("change_ts")
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-            .unwrap_or_default()
-    });
+    let changes = metrics.changes_json.as_array().cloned().unwrap_or_default();
 
     json!({
         "window": label,

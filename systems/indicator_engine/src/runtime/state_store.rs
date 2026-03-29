@@ -284,8 +284,8 @@ pub struct WindowBundle {
     pub symbol: String,
     pub futures: MinuteWindowData,
     pub spot: MinuteWindowData,
-    pub history_futures: Vec<MinuteHistory>,
-    pub history_spot: Vec<MinuteHistory>,
+    pub history_futures: Arc<Vec<MinuteHistory>>,
+    pub history_spot: Arc<Vec<MinuteHistory>>,
     pub trade_history_futures: Vec<MinuteHistory>,
     pub trade_history_spot: Vec<MinuteHistory>,
     pub latest_mark: Option<LatestMarkState>,
@@ -293,11 +293,11 @@ pub struct WindowBundle {
     pub funding_changes_in_window: Vec<FundingChange>,
     pub funding_points_in_window: Vec<LatestFundingState>,
     pub mark_points_in_window: Vec<LatestMarkState>,
-    pub funding_changes_recent: Vec<FundingChange>,
-    pub funding_recent_7d_payload: Vec<Value>,
-    pub funding_points_recent: Vec<LatestFundingState>,
-    pub mark_points_recent: Vec<LatestMarkState>,
-    pub liquidation_recent_7d_payload: Vec<Value>,
+    pub funding_changes_recent: Arc<Vec<FundingChange>>,
+    pub funding_recent_7d_payload: Arc<Vec<Value>>,
+    pub funding_points_recent: Arc<Vec<LatestFundingState>>,
+    pub mark_points_recent: Arc<Vec<LatestMarkState>>,
+    pub liquidation_recent_7d_payload: Arc<Vec<Value>>,
     pub(crate) divergence_all_events: Arc<Vec<DivergenceEventData>>,
     pub(crate) exhaustion_all_events: Arc<Vec<ExhaustionEventData>>,
     pub latest_common_oi_ratio_bucket: Option<DateTime<Utc>>,
@@ -1249,6 +1249,8 @@ pub struct StateStore {
     canonical_minutes: BTreeMap<i64, CanonicalMinuteByMarket>,
     history_futures: VecDeque<MinuteHistory>,
     history_spot: VecDeque<MinuteHistory>,
+    history_futures_shared: Arc<Vec<MinuteHistory>>,
+    history_spot_shared: Arc<Vec<MinuteHistory>>,
     finalized_vpin_futures: VecDeque<FinalizedVpinState>,
     finalized_vpin_spot: VecDeque<FinalizedVpinState>,
     cvd_futures: f64,
@@ -1264,6 +1266,11 @@ pub struct StateStore {
     mark_timeline: VecDeque<LatestMarkState>,
     funding_timeline: VecDeque<LatestFundingState>,
     liquidation_recent_7d_payload: VecDeque<TimedJsonPayload>,
+    funding_changes_recent_shared: Arc<Vec<FundingChange>>,
+    funding_recent_7d_payload_shared: Arc<Vec<Value>>,
+    funding_points_recent_shared: Arc<Vec<LatestFundingState>>,
+    mark_points_recent_shared: Arc<Vec<LatestMarkState>>,
+    liquidation_recent_7d_payload_shared: Arc<Vec<Value>>,
     divergence_all_events: Arc<Vec<DivergenceEventData>>,
     exhaustion_all_events: Arc<Vec<ExhaustionEventData>>,
     current_open_interest_timeline: VecDeque<OpenInterestCurrentSidecar>,
@@ -1306,6 +1313,8 @@ impl StateStore {
             canonical_minutes: BTreeMap::new(),
             history_futures: VecDeque::new(),
             history_spot: VecDeque::new(),
+            history_futures_shared: Arc::new(Vec::new()),
+            history_spot_shared: Arc::new(Vec::new()),
             finalized_vpin_futures: VecDeque::new(),
             finalized_vpin_spot: VecDeque::new(),
             cvd_futures: 0.0,
@@ -1321,6 +1330,11 @@ impl StateStore {
             mark_timeline: VecDeque::new(),
             funding_timeline: VecDeque::new(),
             liquidation_recent_7d_payload: VecDeque::new(),
+            funding_changes_recent_shared: Arc::new(Vec::new()),
+            funding_recent_7d_payload_shared: Arc::new(Vec::new()),
+            funding_points_recent_shared: Arc::new(Vec::new()),
+            mark_points_recent_shared: Arc::new(Vec::new()),
+            liquidation_recent_7d_payload_shared: Arc::new(Vec::new()),
             divergence_all_events: Arc::new(Vec::new()),
             exhaustion_all_events: Arc::new(Vec::new()),
             current_open_interest_timeline: VecDeque::new(),
@@ -1368,6 +1382,8 @@ impl StateStore {
     pub fn reset_finalized_state(&mut self) {
         self.history_futures.clear();
         self.history_spot.clear();
+        self.history_futures_shared = Arc::new(Vec::new());
+        self.history_spot_shared = Arc::new(Vec::new());
         self.finalized_vpin_futures.clear();
         self.finalized_vpin_spot.clear();
         self.cvd_futures = 0.0;
@@ -1381,6 +1397,11 @@ impl StateStore {
         self.mark_timeline.clear();
         self.funding_timeline.clear();
         self.liquidation_recent_7d_payload.clear();
+        self.funding_changes_recent_shared = Arc::new(Vec::new());
+        self.funding_recent_7d_payload_shared = Arc::new(Vec::new());
+        self.funding_points_recent_shared = Arc::new(Vec::new());
+        self.mark_points_recent_shared = Arc::new(Vec::new());
+        self.liquidation_recent_7d_payload_shared = Arc::new(Vec::new());
         self.divergence_all_events = Arc::new(Vec::new());
         self.exhaustion_all_events = Arc::new(Vec::new());
         self.current_open_interest_timeline.clear();
@@ -1425,6 +1446,36 @@ impl StateStore {
             .insert(MarketKind::Futures, OrderbookState::default());
         self.reset_finalized_state();
         self.effective_history_floor_ts = Some(start);
+    }
+
+    fn rebuild_shared_views(&mut self) {
+        self.history_futures_shared = Arc::new(self.history_futures.iter().cloned().collect());
+        self.history_spot_shared = Arc::new(self.history_spot.iter().cloned().collect());
+        self.funding_changes_recent_shared =
+            Arc::new(self.funding_changes.iter().cloned().collect());
+        self.funding_recent_7d_payload_shared = Arc::new(
+            self.funding_recent_7d_payload
+                .iter()
+                .map(|row| row.payload_json.clone())
+                .collect(),
+        );
+        self.funding_points_recent_shared =
+            Arc::new(self.funding_timeline.iter().cloned().collect());
+        self.mark_points_recent_shared = Arc::new(self.mark_timeline.iter().cloned().collect());
+        self.liquidation_recent_7d_payload_shared = Arc::new(
+            self.liquidation_recent_7d_payload
+                .iter()
+                .map(|row| row.payload_json.clone())
+                .collect(),
+        );
+    }
+
+    fn push_shared_with_limit<T: Clone>(shared: &mut Arc<Vec<T>>, value: T, limit: usize) {
+        let vec = Arc::make_mut(shared);
+        vec.push(value);
+        if vec.len() > limit {
+            vec.remove(0);
+        }
     }
 
     pub fn latest_contiguous_complete_canonical_minute_from(
@@ -1913,9 +1964,18 @@ impl StateStore {
             self.push_finalized_vpin_snapshot(market, ts_bucket);
         } else {
             self.cvd_spot = cvd_new;
-            self.history_spot.push_back(history);
+            self.history_spot.push_back(history.clone());
+            Self::push_shared_with_limit(
+                &mut self.history_spot_shared,
+                history,
+                HISTORY_LIMIT_MINUTES,
+            );
             while self.history_spot.len() > HISTORY_LIMIT_MINUTES {
                 self.history_spot.pop_front();
+                let shared = Arc::make_mut(&mut self.history_spot_shared);
+                if !shared.is_empty() {
+                    shared.remove(0);
+                }
             }
             self.push_finalized_vpin_snapshot(market, ts_bucket);
         }
@@ -1926,16 +1986,30 @@ impl StateStore {
     fn push_futures_history(&mut self, history: MinuteHistory) {
         let ts_bucket = history.ts_bucket;
         let payload_json = build_liquidation_recent_7d_entry(&history);
-        self.history_futures.push_back(history);
+        self.history_futures.push_back(history.clone());
+        Self::push_shared_with_limit(
+            &mut self.history_futures_shared,
+            history,
+            HISTORY_LIMIT_MINUTES,
+        );
         self.liquidation_recent_7d_payload
             .push_back(TimedJsonPayload {
                 ts: ts_bucket,
-                payload_json,
+                payload_json: payload_json.clone(),
             });
+        Self::push_shared_with_limit(
+            &mut self.liquidation_recent_7d_payload_shared,
+            payload_json,
+            HISTORY_LIMIT_MINUTES,
+        );
     }
 
     fn pop_oldest_futures_history(&mut self) {
         if let Some(removed) = self.history_futures.pop_front() {
+            let shared = Arc::make_mut(&mut self.history_futures_shared);
+            if !shared.is_empty() {
+                shared.remove(0);
+            }
             if self
                 .liquidation_recent_7d_payload
                 .front()
@@ -1943,15 +2017,26 @@ impl StateStore {
                 .unwrap_or(false)
             {
                 self.liquidation_recent_7d_payload.pop_front();
+                let liq_shared = Arc::make_mut(&mut self.liquidation_recent_7d_payload_shared);
+                if !liq_shared.is_empty() {
+                    liq_shared.remove(0);
+                }
             } else {
                 self.liquidation_recent_7d_payload
                     .retain(|row| row.ts != removed.ts_bucket);
+                self.liquidation_recent_7d_payload_shared = Arc::new(
+                    self.liquidation_recent_7d_payload
+                        .iter()
+                        .map(|row| row.payload_json.clone())
+                        .collect(),
+                );
             }
         }
     }
 
     fn prune_recent_7d_payloads(&mut self, ts_bucket: DateTime<Utc>) {
         let cutoff = (ts_bucket + Duration::minutes(1)) - Duration::days(7);
+        let mut funding_removed = false;
         while self
             .funding_recent_7d_payload
             .front()
@@ -1959,7 +2044,9 @@ impl StateStore {
             .unwrap_or(false)
         {
             self.funding_recent_7d_payload.pop_front();
+            funding_removed = true;
         }
+        let mut liq_removed = false;
         while self
             .liquidation_recent_7d_payload
             .front()
@@ -1967,6 +2054,23 @@ impl StateStore {
             .unwrap_or(false)
         {
             self.liquidation_recent_7d_payload.pop_front();
+            liq_removed = true;
+        }
+        if funding_removed {
+            self.funding_recent_7d_payload_shared = Arc::new(
+                self.funding_recent_7d_payload
+                    .iter()
+                    .map(|row| row.payload_json.clone())
+                    .collect(),
+            );
+        }
+        if liq_removed {
+            self.liquidation_recent_7d_payload_shared = Arc::new(
+                self.liquidation_recent_7d_payload
+                    .iter()
+                    .map(|row| row.payload_json.clone())
+                    .collect(),
+            );
         }
     }
 
@@ -2435,9 +2539,18 @@ impl StateStore {
                 next_funding_time: point.next_funding_time,
             };
             self.latest_mark = Some(state.clone());
-            self.mark_timeline.push_back(state);
+            self.mark_timeline.push_back(state.clone());
+            Self::push_shared_with_limit(
+                &mut self.mark_points_recent_shared,
+                state,
+                HISTORY_LIMIT_MINUTES * 2,
+            );
             while self.mark_timeline.len() > HISTORY_LIMIT_MINUTES * 2 {
                 self.mark_timeline.pop_front();
+                let shared = Arc::make_mut(&mut self.mark_points_recent_shared);
+                if !shared.is_empty() {
+                    shared.remove(0);
+                }
             }
             if let Some(funding_rate) = point.funding_rate {
                 self.record_funding_state(
@@ -2462,7 +2575,7 @@ impl StateStore {
     }
 
     fn build_window_bundle(
-        &self,
+        &mut self,
         ts_bucket: DateTime<Utc>,
         futures: MinuteWindowData,
         spot: MinuteWindowData,
@@ -2498,8 +2611,8 @@ impl StateStore {
             symbol: self.symbol.clone(),
             futures,
             spot,
-            history_futures: self.history_futures.iter().cloned().collect(),
-            history_spot: self.history_spot.iter().cloned().collect(),
+            history_futures: self.history_futures_shared.clone(),
+            history_spot: self.history_spot_shared.clone(),
             trade_history_futures: self
                 .build_trade_history_with_canonical_backfill(MarketKind::Futures),
             trade_history_spot: self.build_trade_history_with_canonical_backfill(MarketKind::Spot),
@@ -2508,19 +2621,11 @@ impl StateStore {
             funding_changes_in_window,
             funding_points_in_window,
             mark_points_in_window,
-            funding_changes_recent: self.funding_changes.iter().cloned().collect(),
-            funding_recent_7d_payload: self
-                .funding_recent_7d_payload
-                .iter()
-                .map(|row| row.payload_json.clone())
-                .collect(),
-            funding_points_recent: self.funding_timeline.iter().cloned().collect(),
-            mark_points_recent: self.mark_timeline.iter().cloned().collect(),
-            liquidation_recent_7d_payload: self
-                .liquidation_recent_7d_payload
-                .iter()
-                .map(|row| row.payload_json.clone())
-                .collect(),
+            funding_changes_recent: self.funding_changes_recent_shared.clone(),
+            funding_recent_7d_payload: self.funding_recent_7d_payload_shared.clone(),
+            funding_points_recent: self.funding_points_recent_shared.clone(),
+            mark_points_recent: self.mark_points_recent_shared.clone(),
+            liquidation_recent_7d_payload: self.liquidation_recent_7d_payload_shared.clone(),
             divergence_all_events: self.divergence_all_events.clone(),
             exhaustion_all_events: self.exhaustion_all_events.clone(),
             latest_common_oi_ratio_bucket: oi_ratio_view.latest_common_bucket,
@@ -2551,8 +2656,8 @@ impl StateStore {
             symbol: self.symbol.clone(),
             futures,
             spot,
-            history_futures: self.history_prefix(MarketKind::Futures, ts_bucket),
-            history_spot: self.history_prefix(MarketKind::Spot, ts_bucket),
+            history_futures: Arc::new(self.history_prefix(MarketKind::Futures, ts_bucket)),
+            history_spot: Arc::new(self.history_prefix(MarketKind::Spot, ts_bucket)),
             trade_history_futures: self
                 .build_trade_history_with_canonical_backfill_until(MarketKind::Futures, ts_bucket),
             trade_history_spot: self
@@ -2562,21 +2667,21 @@ impl StateStore {
             funding_changes_in_window: self.funding_changes_between(ts_bucket, as_of_ts),
             funding_points_in_window: self.funding_points_between(ts_bucket, as_of_ts),
             mark_points_in_window: self.mark_points_between(ts_bucket, as_of_ts),
-            funding_changes_recent: self.funding_changes_until(as_of_ts),
-            funding_recent_7d_payload: self
+            funding_changes_recent: Arc::new(self.funding_changes_until(as_of_ts)),
+            funding_recent_7d_payload: Arc::new(self
                 .funding_recent_7d_payload
                 .iter()
                 .filter(|row| row.ts < as_of_ts)
                 .map(|row| row.payload_json.clone())
-                .collect(),
-            funding_points_recent: self.funding_points_until(as_of_ts),
-            mark_points_recent: self.mark_points_until(as_of_ts),
-            liquidation_recent_7d_payload: self
+                .collect()),
+            funding_points_recent: Arc::new(self.funding_points_until(as_of_ts)),
+            mark_points_recent: Arc::new(self.mark_points_until(as_of_ts)),
+            liquidation_recent_7d_payload: Arc::new(self
                 .liquidation_recent_7d_payload
                 .iter()
                 .filter(|row| row.ts <= ts_bucket)
                 .map(|row| row.payload_json.clone())
-                .collect(),
+                .collect()),
             divergence_all_events: Arc::new(
                 self.divergence_all_events
                     .iter()
@@ -2989,6 +3094,7 @@ impl StateStore {
             .back()
             .map(|h| h.ts_bucket)
             .or_else(|| self.history_spot.back().map(|h| h.ts_bucket));
+        self.rebuild_shared_views();
     }
 
     fn record_funding_state(
@@ -3008,9 +3114,18 @@ impl StateStore {
             next_funding_time,
         };
         self.latest_funding = Some(state.clone());
-        self.funding_timeline.push_back(state);
+        self.funding_timeline.push_back(state.clone());
+        Self::push_shared_with_limit(
+            &mut self.funding_points_recent_shared,
+            state,
+            HISTORY_LIMIT_MINUTES * 2,
+        );
         while self.funding_timeline.len() > HISTORY_LIMIT_MINUTES * 2 {
             self.funding_timeline.pop_front();
+            let shared = Arc::make_mut(&mut self.funding_points_recent_shared);
+            if !shared.is_empty() {
+                shared.remove(0);
+            }
         }
 
         let changed = prev
@@ -3025,15 +3140,33 @@ impl StateStore {
                 mark_price_at_change: mark_price,
             };
             self.funding_changes.push_back(change.clone());
+            Self::push_shared_with_limit(
+                &mut self.funding_changes_recent_shared,
+                change.clone(),
+                HISTORY_LIMIT_MINUTES,
+            );
             self.funding_recent_7d_payload.push_back(TimedJsonPayload {
                 ts: change_ts,
                 payload_json: funding_change_json(&change),
             });
+            Self::push_shared_with_limit(
+                &mut self.funding_recent_7d_payload_shared,
+                funding_change_json(&change),
+                HISTORY_LIMIT_MINUTES,
+            );
             while self.funding_changes.len() > HISTORY_LIMIT_MINUTES {
                 self.funding_changes.pop_front();
+                let shared = Arc::make_mut(&mut self.funding_changes_recent_shared);
+                if !shared.is_empty() {
+                    shared.remove(0);
+                }
             }
             while self.funding_recent_7d_payload.len() > HISTORY_LIMIT_MINUTES {
                 self.funding_recent_7d_payload.pop_front();
+                let shared = Arc::make_mut(&mut self.funding_recent_7d_payload_shared);
+                if !shared.is_empty() {
+                    shared.remove(0);
+                }
             }
         }
     }
@@ -3145,6 +3278,7 @@ impl StateStore {
         self.top_position_ratio_5m = snap.top_position_ratio_5m.into_iter().collect();
         self.option_mark_greeks_5m = snap.option_mark_greeks_5m.into_iter().collect();
         self.rebuild_incremental_recent_7d_payloads();
+        self.rebuild_shared_views();
         // CVD must be derived from history tail (not stored value) to ensure accuracy.
         self.cvd_futures = self.history_futures.back().map(|h| h.cvd).unwrap_or(0.0);
         self.cvd_spot = self.history_spot.back().map(|h| h.cvd).unwrap_or(0.0);

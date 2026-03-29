@@ -309,6 +309,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                                 if let Err(err) = persist_bundle_to_disk(
                                     &bundle,
                                     &delivery.data,
+                                    content_encoding.as_deref(),
                                     ctx.config.llm.temp_cache_retention_minutes(),
                                 )
                                 .await
@@ -4469,11 +4470,14 @@ fn write_pretty_json_file(path: &Path, value: &Value) -> Result<()> {
 async fn persist_bundle_to_disk(
     bundle: &MinuteBundleEnvelope,
     raw: &[u8],
+    content_encoding: Option<&str>,
     retention_minutes: u64,
 ) -> Result<()> {
     ensure_temp_indicator_dir().await?;
 
-    let raw_json: Value = serde_json::from_slice(raw).context("parse minute bundle as json")?;
+    let decoded = decode_minute_bundle_body(raw, content_encoding)?;
+    let raw_json: Value =
+        serde_json::from_slice(decoded.as_ref()).context("parse minute bundle as json")?;
     write_pretty_json_file(&minute_bundle_path(bundle), &raw_json)
         .context("write raw minute bundle")?;
     let removed = prune_expired_temp_indicator_files(
@@ -4606,6 +4610,8 @@ mod tests {
     };
     use crate::workflow::state::WorkflowState;
     use chrono::Duration as ChronoDuration;
+    use flate2::{write::GzEncoder, Compression};
+    use std::fs;
     use std::collections::HashMap;
 
     fn sample_price_zone(low: f64, high: f64, timeframe: &str) -> PriceZone {
@@ -4658,6 +4664,24 @@ mod tests {
                 tracked_zones: Vec::new(),
             }),
         }
+    }
+
+    fn sample_minute_bundle_json() -> Value {
+        json!({
+            "msg_type": "ind.minute_bundle",
+            "routing_key": "bundle.1m.btcusdt",
+            "symbol": "BTCUSDT",
+            "ts_bucket": "2026-03-28T04:15:00Z",
+            "window_code": "1m",
+            "indicator_count": 2,
+            "published_at": "2026-03-28T04:15:08Z",
+            "indicators": {
+                "footprint": {
+                    "window_code": "1m",
+                    "payload": {"levels": [1, 2, 3]}
+                }
+            }
+        })
     }
 
     fn sample_tactical_plan() -> TacticalEntryPlan {
@@ -5178,6 +5202,63 @@ mod tests {
         assert_eq!(intent.reason.as_deref(), Some("replace"));
     }
 
+    #[test]
+    fn decode_minute_bundle_envelope_accepts_plain_json() {
+        let raw = serde_json::to_vec(&sample_minute_bundle_json()).expect("serialize bundle");
+        let decoded = decode_minute_bundle_envelope(&raw, None).expect("decode plain bundle");
+        assert_eq!(decoded.msg_type, "ind.minute_bundle");
+        assert_eq!(decoded.symbol, "BTCUSDT");
+        assert_eq!(decoded.window_code, "1m");
+    }
+
+    #[test]
+    fn decode_minute_bundle_envelope_accepts_gzip_json() {
+        let raw = serde_json::to_vec(&sample_minute_bundle_json()).expect("serialize bundle");
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(&raw).expect("gzip write");
+        let compressed = encoder.finish().expect("gzip finish");
+
+        let decoded =
+            decode_minute_bundle_envelope(&compressed, Some("gzip")).expect("decode gzip bundle");
+        assert_eq!(decoded.msg_type, "ind.minute_bundle");
+        assert_eq!(decoded.symbol, "BTCUSDT");
+        assert_eq!(decoded.window_code, "1m");
+    }
+
+    #[test]
+    fn persist_bundle_to_disk_accepts_gzip_json() {
+        let raw_json = sample_minute_bundle_json();
+        let raw = serde_json::to_vec(&raw_json).expect("serialize bundle");
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(&raw).expect("gzip write");
+        let compressed = encoder.finish().expect("gzip finish");
+        let bundle: MinuteBundleEnvelope =
+            serde_json::from_value(raw_json).expect("deserialize envelope");
+        let path = minute_bundle_path(&bundle);
+        if path.exists() {
+            fs::remove_file(&path).expect("cleanup existing minute bundle path");
+        }
+
+        let runtime = tokio::runtime::Runtime::new().expect("create tokio runtime");
+        runtime
+            .block_on(persist_bundle_to_disk(&bundle, &compressed, Some("gzip"), 10))
+            .expect("persist gzip bundle");
+
+        let persisted = fs::read_to_string(&path).expect("read persisted bundle");
+        let persisted_json: Value =
+            serde_json::from_str(&persisted).expect("parse persisted minute bundle");
+        assert_eq!(
+            persisted_json.get("msg_type").and_then(Value::as_str),
+            Some("ind.minute_bundle")
+        );
+        assert_eq!(
+            persisted_json.get("symbol").and_then(Value::as_str),
+            Some("BTCUSDT")
+        );
+
+        fs::remove_file(&path).expect("cleanup persisted minute bundle");
+    }
+
     /*
     use super::*;
     use crate::app::config::load_config;
@@ -5273,6 +5354,40 @@ mod tests {
         assert!(err
             .to_string()
             .contains("unsupported minute bundle content_encoding"));
+    }
+
+    #[test]
+    fn persist_bundle_to_disk_accepts_gzip_json() {
+        let raw_json = sample_minute_bundle_json();
+        let raw = serde_json::to_vec(&raw_json).expect("serialize bundle");
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(&raw).expect("gzip write");
+        let compressed = encoder.finish().expect("gzip finish");
+        let bundle: MinuteBundleEnvelope =
+            serde_json::from_value(raw_json).expect("deserialize envelope");
+        let path = minute_bundle_path(&bundle);
+        if path.exists() {
+            fs::remove_file(&path).expect("cleanup existing minute bundle path");
+        }
+
+        let runtime = tokio::runtime::Runtime::new().expect("create tokio runtime");
+        runtime
+            .block_on(persist_bundle_to_disk(&bundle, &compressed, Some("gzip"), 10))
+            .expect("persist gzip bundle");
+
+        let persisted = fs::read_to_string(&path).expect("read persisted bundle");
+        let persisted_json: Value =
+            serde_json::from_str(&persisted).expect("parse persisted minute bundle");
+        assert_eq!(
+            persisted_json.get("msg_type").and_then(Value::as_str),
+            Some("ind.minute_bundle")
+        );
+        assert_eq!(
+            persisted_json.get("symbol").and_then(Value::as_str),
+            Some("BTCUSDT")
+        );
+
+        fs::remove_file(&path).expect("cleanup persisted minute bundle");
     }
 
     fn empty_map_summary() -> MapSummary {
@@ -5408,9 +5523,27 @@ mod tests {
                             "markets": {
                                 "futures": {
                                     "bars": bars
-                                }
-                            }
-                        }
+            }
+        }
+    }
+
+    fn sample_minute_bundle_json() -> Value {
+        json!({
+            "msg_type": "ind.minute_bundle",
+            "routing_key": "bundle.1m.btcusdt",
+            "symbol": "BTCUSDT",
+            "ts_bucket": "2026-03-28T04:15:00Z",
+            "window_code": "1m",
+            "indicator_count": 2,
+            "published_at": "2026-03-28T04:15:08Z",
+            "indicators": {
+                "footprint": {
+                    "window_code": "1m",
+                    "payload": {"levels": [1, 2, 3]}
+                }
+            }
+        })
+    }
                     }
                 }
             }

@@ -75,7 +75,9 @@ fn collect_session_bars(
     session_start: DateTime<Utc>,
     session_end: DateTime<Utc>,
 ) -> Vec<MinuteRangeBar> {
-    ctx.history_futures
+    let start_idx = lower_bound_history_ts(&ctx.history_futures, session_start);
+    let end_idx = lower_bound_history_ts(&ctx.history_futures, session_end);
+    ctx.history_futures[start_idx..end_idx]
         .iter()
         .filter(|h| h.ts_bucket >= session_start && h.ts_bucket < session_end)
         .filter_map(|h| {
@@ -96,6 +98,23 @@ fn collect_session_bars(
             })
         })
         .collect()
+}
+
+fn lower_bound_history_ts(
+    history: &[crate::runtime::state_store::MinuteHistory],
+    target: DateTime<Utc>,
+) -> usize {
+    let mut l = 0usize;
+    let mut r = history.len();
+    while l < r {
+        let m = (l + r) / 2;
+        if history[m].ts_bucket < target {
+            l = m + 1;
+        } else {
+            r = m;
+        }
+    }
+    l
 }
 
 fn build_session_payload(

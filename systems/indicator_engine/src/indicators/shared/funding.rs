@@ -19,19 +19,17 @@ pub fn compute_funding_window_metrics(ctx: &IndicatorContext, mins: i64) -> Fund
     let end = ctx.ts_bucket + Duration::minutes(1);
     let start = end - Duration::minutes(mins);
 
-    let mut funding_points = ctx
+    let funding_points = ctx
         .funding_points_recent
         .iter()
         .map(|p| (p.ts, p.funding_rate))
         .collect::<Vec<_>>();
-    funding_points.sort_by_key(|(ts, _)| *ts);
 
-    let mut mark_points = ctx
+    let mark_points = ctx
         .mark_points_recent
         .iter()
         .filter_map(|p| p.mark_price.map(|v| (p.ts, v)))
         .collect::<Vec<_>>();
-    mark_points.sort_by_key(|(ts, _)| *ts);
 
     let funding_pair = funding_points
         .iter()
@@ -169,8 +167,8 @@ mod tests {
             symbol: "TESTUSDT".to_string(),
             futures: MinuteWindowData::empty(MarketKind::Futures, ts_bucket),
             spot: MinuteWindowData::empty(MarketKind::Spot, ts_bucket),
-            history_futures: Vec::new(),
-            history_spot: Vec::new(),
+            history_futures: Arc::new(Vec::new()),
+            history_spot: Arc::new(Vec::new()),
             trade_history_futures: Vec::new(),
             trade_history_spot: Vec::new(),
             latest_mark: Some(LatestMarkState {
@@ -206,34 +204,34 @@ mod tests {
                 funding_rate: Some(-0.00006),
                 next_funding_time: None,
             }],
-            funding_changes_recent: vec![FundingChange {
+            funding_changes_recent: Arc::new(vec![FundingChange {
                 ts_change: state_ts,
                 prev: Some(-0.00005),
                 new: -0.00006,
                 delta: Some(-0.00001),
                 mark_price_at_change: Some(2000.0),
-            }],
-            funding_recent_7d_payload: vec![funding_change_json(&FundingChange {
+            }]),
+            funding_recent_7d_payload: Arc::new(vec![funding_change_json(&FundingChange {
                 ts_change: state_ts,
                 prev: Some(-0.00005),
                 new: -0.00006,
                 delta: Some(-0.00001),
                 mark_price_at_change: Some(2000.0),
-            })],
-            funding_points_recent: vec![LatestFundingState {
+            })]),
+            funding_points_recent: Arc::new(vec![LatestFundingState {
                 ts: state_ts,
                 funding_rate: -0.00006,
                 mark_price: Some(2000.0),
                 next_funding_time: None,
-            }],
-            mark_points_recent: vec![LatestMarkState {
+            }]),
+            mark_points_recent: Arc::new(vec![LatestMarkState {
                 ts: state_ts,
                 mark_price: Some(2000.0),
                 index_price: Some(1999.0),
                 funding_rate: Some(-0.00006),
                 next_funding_time: None,
-            }],
-            liquidation_recent_7d_payload: Vec::new(),
+            }]),
+            liquidation_recent_7d_payload: Arc::new(Vec::new()),
             divergence_all_events: Arc::new(Vec::new()),
             exhaustion_all_events: Arc::new(Vec::new()),
             latest_common_oi_ratio_bucket: None,

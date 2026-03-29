@@ -14,8 +14,8 @@ impl Indicator for I21RvwapSigmaBands {
     }
 
     fn evaluate(&self, ctx: &IndicatorContext) -> crate::indicators::context::IndicatorComputation {
-        let points = collect_weighted_points(ctx);
-        let Some(last_idx) = points.len().checked_sub(1) else {
+        let series = collect_weighted_series(ctx);
+        let Some(last_idx) = series.len().checked_sub(1) else {
             return snapshot_only(
                 self.code(),
                 json!({
@@ -34,7 +34,7 @@ impl Indicator for I21RvwapSigmaBands {
             let Some(window_minutes) = window_to_minutes(window_code) else {
                 continue;
             };
-            let value = compute_stats_at(&points, last_idx, window_minutes, ctx.rvwap_min_samples)
+            let value = compute_stats_at(&series, last_idx, window_minutes, ctx.rvwap_min_samples)
                 .map(stats_to_json)
                 .unwrap_or_else(|| null_stats_json(window_minutes));
             by_window.insert(window_code.clone(), value);
@@ -45,9 +45,9 @@ impl Indicator for I21RvwapSigmaBands {
             let Some(out_minutes) = window_to_minutes(out_code) else {
                 continue;
             };
-            let mut series = Vec::new();
-            for idx in 0..points.len() {
-                let anchor = points[idx].ts_bucket + Duration::minutes(1);
+            let mut output_series = Vec::new();
+            for idx in 0..series.len() {
+                let anchor = series.ts_bucket[idx] + Duration::minutes(1);
                 if anchor.timestamp().rem_euclid(out_minutes * 60) != 0 {
                     continue;
                 }
@@ -58,18 +58,18 @@ impl Indicator for I21RvwapSigmaBands {
                         continue;
                     };
                     let value =
-                        compute_stats_at(&points, idx, rolling_minutes, ctx.rvwap_min_samples)
+                        compute_stats_at(&series, idx, rolling_minutes, ctx.rvwap_min_samples)
                             .map(stats_to_json)
                             .unwrap_or_else(|| null_stats_json(rolling_minutes));
                     row_windows.insert(rolling_code.clone(), value);
                 }
 
-                series.push(json!({
+                output_series.push(json!({
                     "ts": anchor.to_rfc3339(),
                     "by_window": row_windows,
                 }));
             }
-            series_by_output_window.insert(out_code.clone(), Value::Array(series));
+            series_by_output_window.insert(out_code.clone(), Value::Array(output_series));
         }
 
         snapshot_only(
@@ -87,10 +87,23 @@ impl Indicator for I21RvwapSigmaBands {
 }
 
 #[derive(Debug, Clone)]
-struct WeightedPoint {
-    ts_bucket: chrono::DateTime<chrono::Utc>,
-    price: f64,
-    weight: f64,
+struct WeightedSeries {
+    ts_bucket: Vec<chrono::DateTime<chrono::Utc>>,
+    price: Vec<f64>,
+    prefix_weight: Vec<f64>,
+    prefix_price_weight: Vec<f64>,
+    prefix_price_sq_weight: Vec<f64>,
+    prefix_positive_samples: Vec<usize>,
+}
+
+impl WeightedSeries {
+    fn len(&self) -> usize {
+        self.ts_bucket.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.ts_bucket.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -102,18 +115,45 @@ struct RvwapStats {
     sample_count: usize,
 }
 
-fn collect_weighted_points(ctx: &IndicatorContext) -> Vec<WeightedPoint> {
-    ctx.history_futures
-        .iter()
-        .filter_map(|h| {
-            let price = ohlcv_typical_price(h.high_price, h.low_price, h.close_price)?;
-            Some(WeightedPoint {
-                ts_bucket: h.ts_bucket,
-                price,
-                weight: h.total_qty.max(0.0),
-            })
-        })
-        .collect()
+fn collect_weighted_series(ctx: &IndicatorContext) -> WeightedSeries {
+    let mut ts_bucket = Vec::with_capacity(ctx.history_futures.len());
+    let mut price = Vec::with_capacity(ctx.history_futures.len());
+    let mut prefix_weight = Vec::with_capacity(ctx.history_futures.len());
+    let mut prefix_price_weight = Vec::with_capacity(ctx.history_futures.len());
+    let mut prefix_price_sq_weight = Vec::with_capacity(ctx.history_futures.len());
+    let mut prefix_positive_samples = Vec::with_capacity(ctx.history_futures.len());
+    let mut acc_weight = 0.0;
+    let mut acc_price_weight = 0.0;
+    let mut acc_price_sq_weight = 0.0;
+    let mut acc_positive_samples = 0usize;
+
+    for h in ctx.history_futures.iter() {
+        let Some(p) = ohlcv_typical_price(h.high_price, h.low_price, h.close_price) else {
+            continue;
+        };
+        let w = h.total_qty.max(0.0);
+        ts_bucket.push(h.ts_bucket);
+        price.push(p);
+        if w > 0.0 {
+            acc_weight += w;
+            acc_price_weight += p * w;
+            acc_price_sq_weight += p * p * w;
+            acc_positive_samples += 1;
+        }
+        prefix_weight.push(acc_weight);
+        prefix_price_weight.push(acc_price_weight);
+        prefix_price_sq_weight.push(acc_price_sq_weight);
+        prefix_positive_samples.push(acc_positive_samples);
+    }
+
+    WeightedSeries {
+        ts_bucket,
+        price,
+        prefix_weight,
+        prefix_price_weight,
+        prefix_price_sq_weight,
+        prefix_positive_samples,
+    }
 }
 
 fn ohlcv_typical_price(high: Option<f64>, low: Option<f64>, close: Option<f64>) -> Option<f64> {
@@ -121,7 +161,7 @@ fn ohlcv_typical_price(high: Option<f64>, low: Option<f64>, close: Option<f64>) 
 }
 
 fn compute_stats_at(
-    points: &[WeightedPoint],
+    points: &WeightedSeries,
     end_idx: usize,
     window_minutes: i64,
     min_samples: usize,
@@ -130,26 +170,27 @@ fn compute_stats_at(
         return None;
     }
 
-    let end_ts = points[end_idx].ts_bucket;
+    let end_ts = points.ts_bucket[end_idx];
     let start_ts = end_ts - Duration::minutes(window_minutes.max(1));
-
-    let mut sum_w = 0.0;
-    let mut sum_pv = 0.0;
-    let mut sum_p2v = 0.0;
-    let mut sample_count = 0usize;
-
-    for idx in (0..=end_idx).rev() {
-        let p = &points[idx];
-        if p.ts_bucket <= start_ts {
-            break;
-        }
-        if p.weight > 0.0 {
-            sum_w += p.weight;
-            sum_pv += p.price * p.weight;
-            sum_p2v += p.price * p.price * p.weight;
-            sample_count += 1;
-        }
+    let start_idx = lower_bound_ts(&points.ts_bucket, start_ts + Duration::minutes(1));
+    if start_idx > end_idx {
+        return None;
     }
+
+    let prefix_at = |values: &[f64], idx: usize| values.get(idx).copied().unwrap_or(0.0);
+    let prefix_count_at =
+        |values: &[usize], idx: usize| values.get(idx).copied().unwrap_or(0usize);
+    let before_idx = start_idx.checked_sub(1);
+    let sum_w =
+        prefix_at(&points.prefix_weight, end_idx) - before_idx.map(|idx| prefix_at(&points.prefix_weight, idx)).unwrap_or(0.0);
+    let sum_pv =
+        prefix_at(&points.prefix_price_weight, end_idx) - before_idx.map(|idx| prefix_at(&points.prefix_price_weight, idx)).unwrap_or(0.0);
+    let sum_p2v =
+        prefix_at(&points.prefix_price_sq_weight, end_idx) - before_idx.map(|idx| prefix_at(&points.prefix_price_sq_weight, idx)).unwrap_or(0.0);
+    let sample_count = prefix_count_at(&points.prefix_positive_samples, end_idx)
+        - before_idx
+            .map(|idx| prefix_count_at(&points.prefix_positive_samples, idx))
+            .unwrap_or(0);
 
     if sample_count < min_samples || sum_w <= EPS {
         return None;
@@ -158,7 +199,7 @@ fn compute_stats_at(
     let rvwap = sum_pv / sum_w;
     let variance = (sum_p2v / sum_w - rvwap * rvwap).max(0.0);
     let sigma = variance.sqrt();
-    let current_price = points[end_idx].price;
+    let current_price = points.price[end_idx];
     let z = (current_price - rvwap) / (sigma + EPS);
 
     Some(RvwapStats {
@@ -168,6 +209,23 @@ fn compute_stats_at(
         z,
         sample_count,
     })
+}
+
+fn lower_bound_ts(
+    values: &[chrono::DateTime<chrono::Utc>],
+    target: chrono::DateTime<chrono::Utc>,
+) -> usize {
+    let mut l = 0usize;
+    let mut r = values.len();
+    while l < r {
+        let m = (l + r) / 2;
+        if values[m] < target {
+            l = m + 1;
+        } else {
+            r = m;
+        }
+    }
+    l
 }
 
 fn stats_to_json(stats: RvwapStats) -> Value {
@@ -210,7 +268,7 @@ fn window_to_minutes(code: &str) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{compute_stats_at, ohlcv_typical_price, WeightedPoint};
+    use super::{compute_stats_at, ohlcv_typical_price, WeightedSeries};
     use chrono::{TimeZone, Utc};
 
     #[test]
@@ -219,23 +277,18 @@ mod tests {
             .with_ymd_and_hms(2026, 3, 5, 0, 0, 0)
             .single()
             .expect("valid ts");
-        let points = vec![
-            WeightedPoint {
-                ts_bucket: ts,
-                price: 100.0,
-                weight: 1.0,
-            },
-            WeightedPoint {
-                ts_bucket: ts + chrono::Duration::minutes(1),
-                price: 102.0,
-                weight: 1.0,
-            },
-            WeightedPoint {
-                ts_bucket: ts + chrono::Duration::minutes(2),
-                price: 104.0,
-                weight: 2.0,
-            },
-        ];
+        let points = WeightedSeries {
+            ts_bucket: vec![
+                ts,
+                ts + chrono::Duration::minutes(1),
+                ts + chrono::Duration::minutes(2),
+            ],
+            price: vec![100.0, 102.0, 104.0],
+            prefix_weight: vec![1.0, 2.0, 4.0],
+            prefix_price_weight: vec![100.0, 202.0, 410.0],
+            prefix_price_sq_weight: vec![10_000.0, 20_404.0, 42_036.0],
+            prefix_positive_samples: vec![1, 2, 3],
+        };
 
         let stats = compute_stats_at(&points, 2, 15, 2).expect("stats");
         assert!((stats.rvwap - 102.5).abs() < 1e-9);

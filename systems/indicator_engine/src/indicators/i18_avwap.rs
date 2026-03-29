@@ -21,18 +21,8 @@ impl Indicator for I18Avwap {
 
     fn evaluate(&self, ctx: &IndicatorContext) -> IndicatorComputation {
         let lookback_start = ctx.ts_bucket - Duration::days(LOOKBACK_DAYS);
-        let fut_window = ctx
-            .history_futures
-            .iter()
-            .filter(|h| h.ts_bucket > lookback_start && h.ts_bucket <= ctx.ts_bucket)
-            .cloned()
-            .collect::<Vec<_>>();
-        let spot_window = ctx
-            .history_spot
-            .iter()
-            .filter(|h| h.ts_bucket > lookback_start && h.ts_bucket <= ctx.ts_bucket)
-            .cloned()
-            .collect::<Vec<_>>();
+        let fut_window = history_window_slice(&ctx.history_futures, lookback_start, ctx.ts_bucket);
+        let spot_window = history_window_slice(&ctx.history_spot, lookback_start, ctx.ts_bucket);
 
         let fut_avwap = avwap_of_slice(&fut_window);
         let spot_avwap = avwap_of_slice(&spot_window);
@@ -171,6 +161,57 @@ fn build_series(
     }
 
     out
+}
+
+fn history_window_slice<'a>(
+    history: &'a [crate::runtime::state_store::MinuteHistory],
+    lookback_start: chrono::DateTime<chrono::Utc>,
+    end_ts: chrono::DateTime<chrono::Utc>,
+) -> &'a [crate::runtime::state_store::MinuteHistory] {
+    if history.is_empty() {
+        return &[];
+    }
+    let start_idx = lower_bound_history_ts(history, lookback_start + Duration::minutes(1));
+    let end_exclusive = upper_bound_history_ts(history, end_ts);
+    if start_idx >= end_exclusive {
+        &[]
+    } else {
+        &history[start_idx..end_exclusive]
+    }
+}
+
+fn lower_bound_history_ts(
+    history: &[crate::runtime::state_store::MinuteHistory],
+    target: chrono::DateTime<chrono::Utc>,
+) -> usize {
+    let mut l = 0usize;
+    let mut r = history.len();
+    while l < r {
+        let m = (l + r) / 2;
+        if history[m].ts_bucket < target {
+            l = m + 1;
+        } else {
+            r = m;
+        }
+    }
+    l
+}
+
+fn upper_bound_history_ts(
+    history: &[crate::runtime::state_store::MinuteHistory],
+    target: chrono::DateTime<chrono::Utc>,
+) -> usize {
+    let mut l = 0usize;
+    let mut r = history.len();
+    while l < r {
+        let m = (l + r) / 2;
+        if history[m].ts_bucket <= target {
+            l = m + 1;
+        } else {
+            r = m;
+        }
+    }
+    l
 }
 
 fn lower_bound_ts(

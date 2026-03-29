@@ -15,8 +15,8 @@ impl Indicator for I22HighVolumePulse {
     }
 
     fn evaluate(&self, ctx: &IndicatorContext) -> crate::indicators::context::IndicatorComputation {
-        let points = collect_minute_points(ctx);
-        let Some(last_idx) = points.len().checked_sub(1) else {
+        let series = collect_minute_points(ctx);
+        let Some(last_idx) = series.len().checked_sub(1) else {
             return snapshot_only(
                 self.code(),
                 json!({
@@ -31,7 +31,7 @@ impl Indicator for I22HighVolumePulse {
             );
         };
 
-        let current = &points[last_idx];
+        let current = series.point(last_idx);
 
         let mut by_z_window = Map::new();
         for code in &ctx.high_volume_pulse_z_windows {
@@ -39,7 +39,7 @@ impl Indicator for I22HighVolumePulse {
                 continue;
             };
             let value = volume_spike_stats(
-                &points,
+                &series,
                 last_idx,
                 window_minutes,
                 ctx.high_volume_pulse_min_samples,
@@ -72,7 +72,7 @@ impl Indicator for I22HighVolumePulse {
             let Some(window_minutes) = window_to_minutes(code) else {
                 continue;
             };
-            let value = intrabar_poc_max_in_window(&points, last_idx, window_minutes)
+            let value = intrabar_poc_max_in_window(&series, last_idx, window_minutes)
                 .map(|row| {
                     json!({
                         "window_minutes": window_minutes,
@@ -115,6 +115,22 @@ struct MinutePulsePoint {
     poc_volume: f64,
 }
 
+#[derive(Debug, Clone)]
+struct MinutePulseSeries {
+    points: Vec<MinutePulsePoint>,
+    prefix_volume: Vec<f64>,
+}
+
+impl MinutePulseSeries {
+    fn len(&self) -> usize {
+        self.points.len()
+    }
+
+    fn point(&self, idx: usize) -> &MinutePulsePoint {
+        &self.points[idx]
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct VolumeSpikeStats {
     window_minutes: i64,
@@ -123,19 +139,26 @@ struct VolumeSpikeStats {
     lookback_samples: usize,
 }
 
-fn collect_minute_points(ctx: &IndicatorContext) -> Vec<MinutePulsePoint> {
-    ctx.history_futures
-        .iter()
-        .map(|h| {
-            let (poc_price, poc_volume) = intrabar_poc_from_profile(&h.profile);
-            MinutePulsePoint {
-                ts_bucket: h.ts_bucket + Duration::minutes(1),
-                volume: h.total_qty.max(0.0),
-                poc_price,
-                poc_volume,
-            }
-        })
-        .collect()
+fn collect_minute_points(ctx: &IndicatorContext) -> MinutePulseSeries {
+    let mut points = Vec::with_capacity(ctx.history_futures.len());
+    let mut prefix_volume = Vec::with_capacity(ctx.history_futures.len());
+    let mut acc_volume = 0.0;
+    for h in ctx.history_futures.iter() {
+        let (poc_price, poc_volume) = intrabar_poc_from_profile(&h.profile);
+        let point = MinutePulsePoint {
+            ts_bucket: h.ts_bucket + Duration::minutes(1),
+            volume: h.total_qty.max(0.0),
+            poc_price,
+            poc_volume,
+        };
+        acc_volume += point.volume;
+        points.push(point);
+        prefix_volume.push(acc_volume);
+    }
+    MinutePulseSeries {
+        points,
+        prefix_volume,
+    }
 }
 
 fn intrabar_poc_from_profile(
@@ -152,29 +175,28 @@ fn intrabar_poc_from_profile(
         .unwrap_or((None, 0.0))
 }
 
-fn rolling_volume(points: &[MinutePulsePoint], end_idx: usize, window_minutes: i64) -> f64 {
-    let end_ts = points[end_idx].ts_bucket;
+fn rolling_volume(points: &MinutePulseSeries, end_idx: usize, window_minutes: i64) -> f64 {
+    let end_ts = points.points[end_idx].ts_bucket;
     let start_ts = end_ts - Duration::minutes(window_minutes.max(1));
-    let mut sum = 0.0;
-
-    for idx in (0..=end_idx).rev() {
-        let p = &points[idx];
-        if p.ts_bucket <= start_ts {
-            break;
-        }
-        sum += p.volume;
+    let start_idx = lower_bound_ts(points, start_ts + Duration::minutes(1));
+    if start_idx > end_idx {
+        return 0.0;
     }
-
-    sum
+    let current = points.prefix_volume[end_idx];
+    let before = start_idx
+        .checked_sub(1)
+        .and_then(|idx| points.prefix_volume.get(idx).copied())
+        .unwrap_or(0.0);
+    current - before
 }
 
 fn volume_spike_stats(
-    points: &[MinutePulsePoint],
+    points: &MinutePulseSeries,
     end_idx: usize,
     window_minutes: i64,
     min_samples: usize,
 ) -> Option<VolumeSpikeStats> {
-    if points.is_empty() {
+    if points.points.is_empty() {
         return None;
     }
 
@@ -210,23 +232,39 @@ fn volume_spike_stats(
 }
 
 fn intrabar_poc_max_in_window(
-    points: &[MinutePulsePoint],
+    points: &MinutePulseSeries,
     end_idx: usize,
     window_minutes: i64,
 ) -> Option<MinutePulsePoint> {
-    let end_ts = points[end_idx].ts_bucket;
+    let end_ts = points.points[end_idx].ts_bucket;
     let start_ts = end_ts - Duration::minutes(window_minutes.max(1));
+    let start_idx = lower_bound_ts(points, start_ts + Duration::minutes(1));
+    if start_idx > end_idx {
+        return None;
+    }
 
-    points
+    points.points[start_idx..=end_idx]
         .iter()
-        .take(end_idx + 1)
-        .filter(|p| p.ts_bucket > start_ts && p.ts_bucket <= end_ts)
         .max_by(|a, b| {
             a.poc_volume
                 .partial_cmp(&b.poc_volume)
                 .unwrap_or(std::cmp::Ordering::Equal)
         })
         .cloned()
+}
+
+fn lower_bound_ts(points: &MinutePulseSeries, target: chrono::DateTime<chrono::Utc>) -> usize {
+    let mut l = 0usize;
+    let mut r = points.points.len();
+    while l < r {
+        let m = (l + r) / 2;
+        if points.points[m].ts_bucket < target {
+            l = m + 1;
+        } else {
+            r = m;
+        }
+    }
+    l
 }
 
 fn window_to_minutes(code: &str) -> Option<i64> {

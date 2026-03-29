@@ -87,8 +87,8 @@ pub struct IndicatorContext {
     pub symbol: String,
     pub futures: MinuteWindowData,
     pub spot: MinuteWindowData,
-    pub history_futures: Vec<MinuteHistory>,
-    pub history_spot: Vec<MinuteHistory>,
+    pub history_futures: Arc<Vec<MinuteHistory>>,
+    pub history_spot: Arc<Vec<MinuteHistory>>,
     pub trade_history_futures: Vec<MinuteHistory>,
     pub trade_history_spot: Vec<MinuteHistory>,
     pub latest_mark: Option<LatestMarkState>,
@@ -96,9 +96,9 @@ pub struct IndicatorContext {
     pub funding_changes_in_window: Vec<FundingChange>,
     pub funding_points_in_window: Vec<LatestFundingState>,
     pub mark_points_in_window: Vec<LatestMarkState>,
-    pub funding_changes_recent: Vec<FundingChange>,
-    pub funding_points_recent: Vec<LatestFundingState>,
-    pub mark_points_recent: Vec<LatestMarkState>,
+    pub funding_changes_recent: Arc<Vec<FundingChange>>,
+    pub funding_points_recent: Arc<Vec<LatestFundingState>>,
+    pub mark_points_recent: Arc<Vec<LatestMarkState>>,
     pub latest_common_oi_ratio_bucket: Option<DateTime<Utc>>,
     pub current_open_interest: Option<OpenInterestCurrentSidecar>,
     pub open_interest_hist_5m: Vec<OpenInterestHistPoint>,
@@ -320,8 +320,6 @@ impl IndicatorContext {
             .or(latest_options_surface_bucket)
             .or(kline_history_supplement.latest_options_surface_bucket);
         let shared_caches = Arc::new(IndicatorSharedCaches::default());
-        let funding_recent_7d_payload = Arc::new(funding_recent_7d_payload);
-        let liquidation_recent_7d_payload = Arc::new(liquidation_recent_7d_payload);
         let _ = shared_caches
             .divergence_all_events
             .set(divergence_all_events);
