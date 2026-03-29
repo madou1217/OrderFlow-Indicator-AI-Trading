@@ -15,6 +15,9 @@ impl Indicator for I22HighVolumePulse {
     }
 
     fn evaluate(&self, ctx: &IndicatorContext) -> crate::indicators::context::IndicatorComputation {
+        if let Some(payload) = ctx.incremental_outputs.high_volume_pulse_snapshot.clone() {
+            return snapshot_only(self.code(), payload);
+        }
         let series = collect_minute_points(ctx);
         let Some(last_idx) = series.len().checked_sub(1) else {
             return snapshot_only(

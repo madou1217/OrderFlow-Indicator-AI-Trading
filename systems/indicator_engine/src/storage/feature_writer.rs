@@ -491,19 +491,38 @@ impl FeatureWriter {
     }
 
     async fn insert_avwap_feature_window(&self, ctx: &IndicatorContext, mins: i64) -> Result<()> {
+        let incremental = ctx.incremental_outputs.avwap_feature.as_ref();
         let lookback_start = avwap_lookback_start(ctx.ts_bucket);
         let (fut_window, spot_window) =
             avwap_7d_window_slices(&ctx.history_futures, &ctx.history_spot, ctx.ts_bucket);
-        let fut_avwap = avwap_of_slice(fut_window);
-        let spot_avwap = avwap_of_slice(spot_window);
-        let fut_last = ctx.futures.last_price;
-        let fut_mark = ctx.latest_mark.as_ref().and_then(|m| m.mark_price);
+        let fut_avwap = incremental
+            .and_then(|value| value.avwap_fut)
+            .or_else(|| avwap_of_slice(fut_window));
+        let spot_avwap = incremental
+            .and_then(|value| value.avwap_spot)
+            .or_else(|| avwap_of_slice(spot_window));
+        let fut_last = incremental
+            .and_then(|value| value.fut_last_price)
+            .or(ctx.futures.last_price);
+        let fut_mark = incremental
+            .and_then(|value| value.fut_mark_price)
+            .or_else(|| ctx.latest_mark.as_ref().and_then(|m| m.mark_price));
 
-        let price_minus_fut = fut_last.zip(fut_avwap).map(|(p, a)| p - a);
-        let price_minus_spot = fut_last.zip(spot_avwap).map(|(p, a)| p - a);
-        let mark_minus_spot = fut_mark.zip(spot_avwap).map(|(p, a)| p - a);
-        let avwap_gap = fut_avwap.zip(spot_avwap).map(|(f, s)| f - s);
-        let anchor_ts = Some(lookback_start);
+        let price_minus_fut = incremental
+            .and_then(|value| value.price_minus_avwap_fut)
+            .or_else(|| fut_last.zip(fut_avwap).map(|(p, a)| p - a));
+        let price_minus_spot = incremental
+            .and_then(|value| value.price_minus_spot_avwap_fut)
+            .or_else(|| fut_last.zip(spot_avwap).map(|(p, a)| p - a));
+        let mark_minus_spot = incremental
+            .and_then(|value| value.price_minus_spot_avwap_futmark)
+            .or_else(|| fut_mark.zip(spot_avwap).map(|(p, a)| p - a));
+        let avwap_gap = incremental
+            .and_then(|value| value.avwap_gap_fs)
+            .or_else(|| fut_avwap.zip(spot_avwap).map(|(f, s)| f - s));
+        let anchor_ts = incremental
+            .and_then(|value| value.anchor_ts)
+            .or(Some(lookback_start));
         let bar_interval = interval_text(mins);
 
         sqlx::query(
@@ -563,7 +582,11 @@ impl FeatureWriter {
         .bind(mark_minus_spot)
         .bind(avwap_gap)
         .bind(avwap_gap)
-        .bind(avwap_gap_zscore(fut_window, spot_window, avwap_gap))
+        .bind(
+            incremental
+                .and_then(|value| value.zavwap_gap)
+                .or_else(|| avwap_gap_zscore(fut_window, spot_window, avwap_gap)),
+        )
         .bind(json!({ "window_minutes": mins }))
         .execute(&self.pool)
         .await
@@ -578,7 +601,24 @@ impl FeatureWriter {
         window_code: &str,
         mins: i64,
     ) -> Result<()> {
-        let metrics = compute_funding_window_metrics(ctx, mins);
+        let metrics = ctx
+            .incremental_outputs
+            .funding_feature_windows
+            .get(&mins)
+            .cloned()
+            .unwrap_or_else(|| {
+                let metrics = compute_funding_window_metrics(ctx, mins);
+                crate::indicators::shared::incremental::FundingFeatureOutput {
+                    funding_current: metrics.funding_current,
+                    funding_current_effective_ts: metrics.funding_current_effective_ts,
+                    funding_twa: metrics.funding_twa,
+                    mark_price_last: metrics.mark_price_last,
+                    mark_price_last_ts: metrics.mark_price_last_ts,
+                    mark_price_twap: metrics.mark_price_twap,
+                    index_price_last: metrics.index_price_last,
+                    changes_json: metrics.changes_json,
+                }
+            });
         let bar_interval = interval_text(mins);
 
         sqlx::query(

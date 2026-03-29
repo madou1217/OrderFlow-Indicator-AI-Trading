@@ -4,6 +4,7 @@ use crate::indicators::shared::avwap::{
     avwap_7d_window_slices, avwap_gap_zscore, avwap_lookback_start, avwap_of_slice,
     AVWAP_LOOKBACK_DAYS,
 };
+use crate::indicators::shared::output_mapper::snapshot_only;
 use chrono::Duration;
 use serde_json::{json, Value};
 
@@ -23,6 +24,9 @@ impl Indicator for I18Avwap {
     }
 
     fn evaluate(&self, ctx: &IndicatorContext) -> IndicatorComputation {
+        if let Some(payload) = ctx.incremental_outputs.avwap_snapshot.clone() {
+            return snapshot_only(self.code(), payload);
+        }
         let lookback_start = avwap_lookback_start(ctx.ts_bucket);
         let (fut_window, spot_window) =
             avwap_7d_window_slices(&ctx.history_futures, &ctx.history_spot, ctx.ts_bucket);

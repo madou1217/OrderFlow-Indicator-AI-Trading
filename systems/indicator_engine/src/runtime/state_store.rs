@@ -9,6 +9,9 @@ use crate::indicators::i12_buying_exhaustion::{
     compute_exhaustion_all_history_from_histories, ExhaustionEventData,
     EXHAUSTION_INCREMENTAL_LOOKBACK_MINUTES,
 };
+use crate::indicators::shared::incremental::{
+    IncrementalIndicatorConfig, IncrementalIndicatorOutputs, IncrementalIndicatorState,
+};
 use crate::indicators::shared::funding::funding_change_json;
 use crate::indicators::shared::liquidation::build_recent_7d_entry as build_liquidation_recent_7d_entry;
 use crate::ingest::decoder::{
@@ -308,6 +311,7 @@ pub struct WindowBundle {
     pub top_position_ratio_5m: Vec<LongShortRatioPoint>,
     pub latest_options_surface_bucket: Option<DateTime<Utc>>,
     pub options_surface_5m: Vec<OptionsSurfacePoint>,
+    pub incremental_outputs: Arc<IncrementalIndicatorOutputs>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1279,6 +1283,7 @@ pub struct StateStore {
     top_account_ratio_5m: VecDeque<LongShortRatioPoint>,
     top_position_ratio_5m: VecDeque<LongShortRatioPoint>,
     option_mark_greeks_5m: VecDeque<OptionMarkGreeksPoint>,
+    incremental_indicator_state: IncrementalIndicatorState,
     dirty_recompute_from: Option<DateTime<Utc>>,
     // Fixed target end for the current dirty-recompute batch series.
     // Set when dirty is first triggered; extended if later minutes become dirty.
@@ -1343,6 +1348,7 @@ impl StateStore {
             top_account_ratio_5m: VecDeque::new(),
             top_position_ratio_5m: VecDeque::new(),
             option_mark_greeks_5m: VecDeque::new(),
+            incremental_indicator_state: IncrementalIndicatorState::default(),
             dirty_recompute_from: None,
             dirty_recompute_end: None,
             dirty_recompute_truncated: false,
@@ -1371,6 +1377,11 @@ impl StateStore {
         self.divergence_p_value_threshold = p_value_threshold;
     }
 
+    pub fn set_incremental_runtime_options(&mut self, config: IncrementalIndicatorConfig) {
+        self.incremental_indicator_state.configure(config);
+        self.rebuild_incremental_indicator_outputs();
+    }
+
     pub fn set_effective_history_floor(&mut self, ts: Option<DateTime<Utc>>) {
         self.effective_history_floor_ts = ts;
     }
@@ -1384,6 +1395,7 @@ impl StateStore {
         self.history_spot.clear();
         self.history_futures_shared = Arc::new(Vec::new());
         self.history_spot_shared = Arc::new(Vec::new());
+        self.incremental_indicator_state.reset();
         self.finalized_vpin_futures.clear();
         self.finalized_vpin_spot.clear();
         self.cvd_futures = 0.0;
@@ -1448,25 +1460,29 @@ impl StateStore {
         self.effective_history_floor_ts = Some(start);
     }
 
-    fn rebuild_shared_views(&mut self) {
-        self.history_futures_shared = Arc::new(self.history_futures.iter().cloned().collect());
-        self.history_spot_shared = Arc::new(self.history_spot.iter().cloned().collect());
-        self.funding_changes_recent_shared =
-            Arc::new(self.funding_changes.iter().cloned().collect());
-        self.funding_recent_7d_payload_shared = Arc::new(
-            self.funding_recent_7d_payload
-                .iter()
-                .map(|row| row.payload_json.clone())
-                .collect(),
+    fn rebuild_incremental_indicator_outputs(&mut self) {
+        self.incremental_indicator_state.rebuild(
+            self.last_finalized_minute,
+            self.history_futures_shared.as_ref(),
+            self.history_spot_shared.as_ref(),
+            self.latest_mark.as_ref(),
+            self.funding_changes_recent_shared.as_ref(),
+            self.funding_recent_7d_payload_shared.clone(),
+            self.funding_points_recent_shared.as_ref(),
+            self.mark_points_recent_shared.as_ref(),
         );
-        self.funding_points_recent_shared =
-            Arc::new(self.funding_timeline.iter().cloned().collect());
-        self.mark_points_recent_shared = Arc::new(self.mark_timeline.iter().cloned().collect());
-        self.liquidation_recent_7d_payload_shared = Arc::new(
-            self.liquidation_recent_7d_payload
-                .iter()
-                .map(|row| row.payload_json.clone())
-                .collect(),
+    }
+
+    fn refresh_incremental_indicator_outputs(&mut self, ts_bucket: DateTime<Utc>) {
+        self.incremental_indicator_state.on_finalized_minute(
+            ts_bucket,
+            self.history_futures_shared.as_ref(),
+            self.history_spot_shared.as_ref(),
+            self.latest_mark.as_ref(),
+            self.funding_changes_recent_shared.as_ref(),
+            self.funding_recent_7d_payload_shared.clone(),
+            self.funding_points_recent_shared.as_ref(),
+            self.mark_points_recent_shared.as_ref(),
         );
     }
 
@@ -1476,6 +1492,28 @@ impl StateStore {
         if vec.len() > limit {
             vec.remove(0);
         }
+    }
+
+    fn truncate_shared_suffix<T, F>(
+        shared: &mut Arc<Vec<T>>,
+        start: DateTime<Utc>,
+        ts_of: F,
+    ) where
+        T: Clone,
+        F: Fn(&T) -> DateTime<Utc>,
+    {
+        let vec = Arc::make_mut(shared);
+        while vec
+            .last()
+            .map(|item| ts_of(item) >= start)
+            .unwrap_or(false)
+        {
+            vec.pop();
+        }
+    }
+
+    fn truncate_shared_len<T: Clone>(shared: &mut Arc<Vec<T>>, new_len: usize) {
+        Arc::make_mut(shared).truncate(new_len);
     }
 
     pub fn latest_contiguous_complete_canonical_minute_from(
@@ -1751,22 +1789,30 @@ impl StateStore {
     pub fn finalize_minute(&mut self, ts_bucket: DateTime<Utc>) -> WindowBundle {
         let futures = self.finalize_market(MarketKind::Futures, ts_bucket);
         let spot = self.finalize_market(MarketKind::Spot, ts_bucket);
-        self.apply_canonical_funding_minute(ts_bucket);
-        self.last_finalized_minute = Some(ts_bucket);
-        self.trim_replay_retention(ts_bucket);
-        self.prune_recent_7d_payloads(ts_bucket);
-        self.refresh_incremental_indicator_event_caches(ts_bucket);
+        self.finish_finalize_minute_state(ts_bucket);
         self.build_window_bundle(ts_bucket, futures, spot)
+    }
+
+    pub fn finalize_minute_for_live_job(&mut self, ts_bucket: DateTime<Utc>) -> WindowBundle {
+        let futures = self.finalize_market(MarketKind::Futures, ts_bucket);
+        let spot = self.finalize_market(MarketKind::Spot, ts_bucket);
+        self.finish_finalize_minute_state(ts_bucket);
+        self.build_live_window_bundle(ts_bucket, futures, spot)
     }
 
     pub fn advance_finalized_state(&mut self, ts_bucket: DateTime<Utc>) {
         let _ = self.finalize_market(MarketKind::Futures, ts_bucket);
         let _ = self.finalize_market(MarketKind::Spot, ts_bucket);
+        self.finish_finalize_minute_state(ts_bucket);
+    }
+
+    fn finish_finalize_minute_state(&mut self, ts_bucket: DateTime<Utc>) {
         self.apply_canonical_funding_minute(ts_bucket);
         self.last_finalized_minute = Some(ts_bucket);
         self.trim_replay_retention(ts_bucket);
         self.prune_recent_7d_payloads(ts_bucket);
         self.refresh_incremental_indicator_event_caches(ts_bucket);
+        self.refresh_incremental_indicator_outputs(ts_bucket);
     }
 
     /// Process at most `max_batch` dirty-recompute windows per call, yielding
@@ -2636,6 +2682,76 @@ impl StateStore {
             top_position_ratio_5m: oi_ratio_view.top_position_ratio_5m,
             latest_options_surface_bucket: options_surface_view.latest_bucket,
             options_surface_5m: options_surface_view.points,
+            incremental_outputs: self.incremental_indicator_state.outputs(),
+        }
+    }
+
+    fn build_live_window_bundle(
+        &self,
+        ts_bucket: DateTime<Utc>,
+        futures: MinuteWindowData,
+        spot: MinuteWindowData,
+    ) -> WindowBundle {
+        let start = ts_bucket;
+        let end = ts_bucket + Duration::minutes(1);
+        let funding_changes_in_window = self
+            .funding_changes
+            .iter()
+            .filter(|c| c.ts_change >= start && c.ts_change < end)
+            .cloned()
+            .collect::<Vec<_>>();
+
+        let funding_points_in_window = self
+            .funding_timeline
+            .iter()
+            .filter(|v| v.ts >= start && v.ts < end)
+            .cloned()
+            .collect::<Vec<_>>();
+
+        let mark_points_in_window = self
+            .mark_timeline
+            .iter()
+            .filter(|v| v.ts >= start && v.ts < end)
+            .cloned()
+            .collect::<Vec<_>>();
+
+        let oi_ratio_view = self.build_oi_ratio_view_for_minute(ts_bucket);
+        let options_surface_view = self.build_options_surface_view_for_minute(ts_bucket);
+
+        WindowBundle {
+            ts_bucket,
+            symbol: self.symbol.clone(),
+            futures,
+            spot,
+            history_futures: self.history_futures_shared.clone(),
+            history_spot: self.history_spot_shared.clone(),
+            // Normal live minutes are emitted strictly in contiguous order.
+            // Rebuilding a full canonical trade-history shadow here is a pure
+            // fallback cost; keep it for replay/dirty rebuilds, but let live
+            // i01 fall back to the finalized minute history slice instead.
+            trade_history_futures: Vec::new(),
+            trade_history_spot: Vec::new(),
+            latest_mark: self.latest_mark.clone(),
+            latest_funding: self.latest_funding.clone(),
+            funding_changes_in_window,
+            funding_points_in_window,
+            mark_points_in_window,
+            funding_changes_recent: self.funding_changes_recent_shared.clone(),
+            funding_recent_7d_payload: self.funding_recent_7d_payload_shared.clone(),
+            funding_points_recent: self.funding_points_recent_shared.clone(),
+            mark_points_recent: self.mark_points_recent_shared.clone(),
+            liquidation_recent_7d_payload: self.liquidation_recent_7d_payload_shared.clone(),
+            divergence_all_events: self.divergence_all_events.clone(),
+            exhaustion_all_events: self.exhaustion_all_events.clone(),
+            latest_common_oi_ratio_bucket: oi_ratio_view.latest_common_bucket,
+            current_open_interest: oi_ratio_view.current_open_interest,
+            open_interest_hist_5m: oi_ratio_view.open_interest_hist_5m,
+            global_account_ratio_5m: oi_ratio_view.global_account_ratio_5m,
+            top_account_ratio_5m: oi_ratio_view.top_account_ratio_5m,
+            top_position_ratio_5m: oi_ratio_view.top_position_ratio_5m,
+            latest_options_surface_bucket: options_surface_view.latest_bucket,
+            options_surface_5m: options_surface_view.points,
+            incremental_outputs: self.incremental_indicator_state.outputs(),
         }
     }
 
@@ -2706,6 +2822,7 @@ impl StateStore {
             top_position_ratio_5m: oi_ratio_view.top_position_ratio_5m,
             latest_options_surface_bucket: options_surface_view.latest_bucket,
             options_surface_5m: options_surface_view.points,
+            incremental_outputs: self.incremental_indicator_state.outputs(),
         }
     }
 
@@ -3096,7 +3213,17 @@ impl StateStore {
             .back()
             .map(|h| h.ts_bucket)
             .or_else(|| self.history_spot.back().map(|h| h.ts_bucket));
-        self.rebuild_shared_views();
+        Self::truncate_shared_suffix(&mut self.history_futures_shared, start, |row| row.ts_bucket);
+        Self::truncate_shared_len(&mut self.liquidation_recent_7d_payload_shared, self.history_futures.len());
+        Self::truncate_shared_suffix(&mut self.history_spot_shared, start, |row| row.ts_bucket);
+        Self::truncate_shared_suffix(&mut self.funding_changes_recent_shared, start, |row| row.ts_change);
+        Self::truncate_shared_len(
+            &mut self.funding_recent_7d_payload_shared,
+            self.funding_changes.len(),
+        );
+        Self::truncate_shared_suffix(&mut self.funding_points_recent_shared, start, |row| row.ts);
+        Self::truncate_shared_suffix(&mut self.mark_points_recent_shared, start, |row| row.ts);
+        self.rebuild_incremental_indicator_outputs();
     }
 
     fn record_funding_state(
@@ -3260,27 +3387,58 @@ impl StateStore {
     }
 
     pub fn restore_from_snapshot(&mut self, snap: StateSnapshot) {
-        self.effective_history_floor_ts = snap.effective_history_floor_ts;
-        self.vpin_futures = snap.vpin_futures;
-        self.vpin_spot = snap.vpin_spot;
-        self.finalized_vpin_futures = snap.finalized_vpin_futures.into_iter().collect();
-        self.finalized_vpin_spot = snap.finalized_vpin_spot.into_iter().collect();
-        self.history_futures = snap.history_futures.into_iter().collect();
-        self.history_spot = snap.history_spot.into_iter().collect();
-        self.latest_mark = snap.latest_mark;
-        self.latest_funding = snap.latest_funding;
-        self.funding_changes = snap.funding_changes.into_iter().collect();
-        self.mark_timeline = snap.mark_timeline.into_iter().collect();
-        self.funding_timeline = snap.funding_timeline.into_iter().collect();
-        self.current_open_interest_timeline =
-            snap.current_open_interest_timeline.into_iter().collect();
-        self.open_interest_hist_5m = snap.open_interest_hist_5m.into_iter().collect();
-        self.global_account_ratio_5m = snap.global_account_ratio_5m.into_iter().collect();
-        self.top_account_ratio_5m = snap.top_account_ratio_5m.into_iter().collect();
-        self.top_position_ratio_5m = snap.top_position_ratio_5m.into_iter().collect();
-        self.option_mark_greeks_5m = snap.option_mark_greeks_5m.into_iter().collect();
+        let StateSnapshot {
+            effective_history_floor_ts,
+            vpin_futures,
+            vpin_spot,
+            finalized_vpin_futures,
+            finalized_vpin_spot,
+            history_futures,
+            history_spot,
+            latest_mark,
+            latest_funding,
+            funding_changes,
+            mark_timeline,
+            funding_timeline,
+            current_open_interest_timeline,
+            open_interest_hist_5m,
+            global_account_ratio_5m,
+            top_account_ratio_5m,
+            top_position_ratio_5m,
+            option_mark_greeks_5m,
+            ..
+        } = snap;
+
+        self.effective_history_floor_ts = effective_history_floor_ts;
+        self.vpin_futures = vpin_futures;
+        self.vpin_spot = vpin_spot;
+        self.finalized_vpin_futures = finalized_vpin_futures.into_iter().collect();
+        self.finalized_vpin_spot = finalized_vpin_spot.into_iter().collect();
+
+        self.history_futures_shared = Arc::new(history_futures.clone());
+        self.history_spot_shared = Arc::new(history_spot.clone());
+        self.history_futures = history_futures.into_iter().collect();
+        self.history_spot = history_spot.into_iter().collect();
+
+        self.latest_mark = latest_mark;
+        self.latest_funding = latest_funding;
+
+        self.funding_changes_recent_shared = Arc::new(funding_changes.clone());
+        self.funding_changes = funding_changes.into_iter().collect();
+
+        self.mark_points_recent_shared = Arc::new(mark_timeline.clone());
+        self.mark_timeline = mark_timeline.into_iter().collect();
+
+        self.funding_points_recent_shared = Arc::new(funding_timeline.clone());
+        self.funding_timeline = funding_timeline.into_iter().collect();
+
+        self.current_open_interest_timeline = current_open_interest_timeline.into_iter().collect();
+        self.open_interest_hist_5m = open_interest_hist_5m.into_iter().collect();
+        self.global_account_ratio_5m = global_account_ratio_5m.into_iter().collect();
+        self.top_account_ratio_5m = top_account_ratio_5m.into_iter().collect();
+        self.top_position_ratio_5m = top_position_ratio_5m.into_iter().collect();
+        self.option_mark_greeks_5m = option_mark_greeks_5m.into_iter().collect();
         self.rebuild_incremental_recent_7d_payloads();
-        self.rebuild_shared_views();
         // CVD must be derived from history tail (not stored value) to ensure accuracy.
         self.cvd_futures = self.history_futures.back().map(|h| h.cvd).unwrap_or(0.0);
         self.cvd_spot = self.history_spot.back().map(|h| h.cvd).unwrap_or(0.0);
@@ -3291,6 +3449,7 @@ impl StateStore {
         if let Some(ts_bucket) = self.last_finalized_minute {
             self.refresh_incremental_indicator_event_caches(ts_bucket);
         }
+        self.rebuild_incremental_indicator_outputs();
     }
 
     fn rebuild_incremental_recent_7d_payloads(&mut self) {
@@ -3319,6 +3478,19 @@ impl StateStore {
         {
             self.prune_recent_7d_payloads(ts_bucket);
         }
+
+        self.funding_recent_7d_payload_shared = Arc::new(
+            self.funding_recent_7d_payload
+                .iter()
+                .map(|row| row.payload_json.clone())
+                .collect(),
+        );
+        self.liquidation_recent_7d_payload_shared = Arc::new(
+            self.liquidation_recent_7d_payload
+                .iter()
+                .map(|row| row.payload_json.clone())
+                .collect(),
+        );
     }
 }
 
@@ -5528,6 +5700,37 @@ mod tests {
                 .map(|level| level.total())
                 .sum::<f64>(),
             4.0
+        );
+    }
+
+    #[test]
+    fn finalize_minute_for_live_job_skips_trade_history_shadow() {
+        let mut store = StateStore::new("TESTUSDT".to_string(), 1_000.0);
+        let ts_0 = Utc.with_ymd_and_hms(2026, 3, 7, 4, 16, 0).single().unwrap();
+        let ts_1 = ts_0 + ChronoDuration::minutes(1);
+
+        store.ingest(agg_trade_event_with_profile(ts_0, 1.0, 0.0, 2000.0, 0.10));
+        let _ = store.finalize_minute(ts_0);
+
+        store.ingest(agg_trade_event_with_profile(ts_1, 2.0, 1.0, 2001.0, 0.20));
+        let bundle = store.finalize_minute_for_live_job(ts_1);
+
+        assert!(bundle.trade_history_futures.is_empty());
+        assert!(bundle.trade_history_spot.is_empty());
+        assert_eq!(bundle.history_futures.len(), 2);
+        assert_eq!(
+            bundle.history_futures.last().map(|row| row.ts_bucket),
+            Some(ts_1)
+        );
+        assert_eq!(bundle.futures.ts_bucket, ts_1);
+        assert_eq!(
+            bundle
+                .futures
+                .profile
+                .values()
+                .map(|level| level.total())
+                .sum::<f64>(),
+            3.0
         );
     }
 

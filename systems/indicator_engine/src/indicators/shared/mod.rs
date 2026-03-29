@@ -4,6 +4,7 @@ pub mod event_ids;
 pub mod event_lifecycle;
 pub mod event_views;
 pub mod funding;
+pub mod incremental;
 pub mod input_views;
 pub mod liquidation;
 pub mod market_structure;

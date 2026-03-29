@@ -3,6 +3,7 @@ use crate::indicators::i05_orderbook_depth::OrderbookDepthPrecomputed;
 use crate::indicators::i06_absorption::AbsorptionEventData;
 use crate::indicators::i07_initiation::InitiationEventData;
 use crate::indicators::i12_buying_exhaustion::ExhaustionEventData;
+use crate::indicators::shared::incremental::IncrementalIndicatorOutputs;
 use crate::runtime::state_store::{
     FundingChange, LatestFundingState, LatestMarkState, LevelAgg, MinuteHistory, MinuteWindowData,
     WindowBundle,
@@ -107,6 +108,7 @@ pub struct IndicatorContext {
     pub top_position_ratio_5m: Vec<LongShortRatioPoint>,
     pub latest_options_surface_bucket: Option<DateTime<Utc>>,
     pub options_surface_5m: Vec<OptionsSurfacePoint>,
+    pub incremental_outputs: Arc<IncrementalIndicatorOutputs>,
     pub whale_threshold_usdt: f64,
     pub kline_history_bars_1m: usize,
     pub kline_history_bars_15m: usize,
@@ -309,6 +311,7 @@ impl IndicatorContext {
             top_position_ratio_5m,
             latest_options_surface_bucket,
             options_surface_5m,
+            incremental_outputs,
         } = bundle;
         let merged_options_surface_5m = merge_options_surface_history(
             &options_surface_5m,
@@ -357,6 +360,7 @@ impl IndicatorContext {
             top_position_ratio_5m,
             latest_options_surface_bucket,
             options_surface_5m: merged_options_surface_5m,
+            incremental_outputs,
             whale_threshold_usdt: options.whale_threshold_usdt,
             kline_history_bars_1m: options.kline_history_bars_1m,
             kline_history_bars_15m: options.kline_history_bars_15m,

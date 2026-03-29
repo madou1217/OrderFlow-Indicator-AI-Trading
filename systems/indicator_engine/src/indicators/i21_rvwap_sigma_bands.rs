@@ -14,6 +14,9 @@ impl Indicator for I21RvwapSigmaBands {
     }
 
     fn evaluate(&self, ctx: &IndicatorContext) -> crate::indicators::context::IndicatorComputation {
+        if let Some(payload) = ctx.incremental_outputs.rvwap_snapshot.clone() {
+            return snapshot_only(self.code(), payload);
+        }
         let series = collect_weighted_series(ctx);
         let Some(last_idx) = series.len().checked_sub(1) else {
             return snapshot_only(

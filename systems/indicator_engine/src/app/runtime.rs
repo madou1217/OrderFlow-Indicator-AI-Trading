@@ -5,6 +5,7 @@ use crate::indicators::context::{
 };
 use crate::indicators::i19_kline_history::build_interval_bar_records;
 use crate::indicators::i27_options_surface::OPTIONS_SURFACE_WINDOWS;
+use crate::indicators::shared::incremental::IncrementalIndicatorConfig;
 use crate::ingest::decoder::{decode_contract_body, EngineEvent, MdData};
 use crate::ingest::mq_consumer;
 use crate::ingest::watermark::floor_minute;
@@ -30,6 +31,7 @@ use sqlx::{postgres::PgRow, PgPool, Row};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -52,6 +54,7 @@ const DIRTY_RECOMPUTE_WINDOW_BUDGET_PER_TICK: usize = 50;
 const OI_RATIO_PATCH_BATCH_SIZE: usize = 6;
 const OI_RATIO_PATCH_WINDOW_BUDGET_PER_TICK: usize = 24;
 const PROCESS_READY_MINUTES_WARN_MS: u128 = 2_000;
+const LIVE_READY_JOB_QUEUE_CAPACITY: usize = 8;
 const LIVE_TAIL_RECONCILE_MAX_BACKLOG_MINUTES: i64 = 5;
 const OI_RATIO_PATCH_MAX_BACKLOG_MINUTES: i64 = 5;
 const STUCK_PROGRESS_IDLE_SECS: u64 = 60;
@@ -127,6 +130,20 @@ struct OiRatioPatchTask {
     minutes: Vec<DateTime<Utc>>,
     started_at: Instant,
     handle: JoinHandle<Result<usize>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadyJobSource {
+    Live,
+    DirtyRecompute,
+}
+
+struct ReadyMinuteJob {
+    ts_bucket: DateTime<Utc>,
+    mode: DispatchMode,
+    source: ReadyJobSource,
+    enqueued_at: Instant,
+    bundle: crate::runtime::state_store::WindowBundle,
 }
 
 impl LiveCanonicalRepairController {
@@ -330,6 +347,68 @@ pub fn build_indicator_runtime_options(
     }
 }
 
+fn build_incremental_indicator_config(
+    runtime_options: &IndicatorRuntimeOptions,
+) -> IncrementalIndicatorConfig {
+    IncrementalIndicatorConfig {
+        tpo_rows_nb: runtime_options.tpo_rows_nb,
+        tpo_value_area_pct: runtime_options.tpo_value_area_pct,
+        tpo_session_windows: runtime_options
+            .tpo_session_windows
+            .iter()
+            .filter_map(|code| match code.as_str() {
+                "4h" => Some((code.clone(), 240)),
+                "1d" => Some((code.clone(), 1440)),
+                "3d" => Some((code.clone(), 4320)),
+                _ => None,
+            })
+            .collect(),
+        tpo_ib_minutes: runtime_options.tpo_ib_minutes,
+        tpo_dev_output_windows: runtime_options
+            .tpo_dev_output_windows
+            .iter()
+            .filter_map(|code| match code.as_str() {
+                "15m" => Some((code.clone(), 15)),
+                "1h" => Some((code.clone(), 60)),
+                _ => None,
+            })
+            .collect(),
+        rvwap_windows: runtime_options
+            .rvwap_windows
+            .iter()
+            .filter_map(|code| window_code_minutes(code).map(|minutes| (code.clone(), minutes)))
+            .collect(),
+        rvwap_output_windows: runtime_options
+            .rvwap_output_windows
+            .iter()
+            .filter_map(|code| window_code_minutes(code).map(|minutes| (code.clone(), minutes)))
+            .collect(),
+        rvwap_min_samples: runtime_options.rvwap_min_samples,
+        high_volume_pulse_z_windows: runtime_options
+            .high_volume_pulse_z_windows
+            .iter()
+            .filter_map(|code| window_code_minutes(code).map(|minutes| (code.clone(), minutes)))
+            .collect(),
+        high_volume_pulse_summary_windows: runtime_options
+            .high_volume_pulse_summary_windows
+            .iter()
+            .filter_map(|code| window_code_minutes(code).map(|minutes| (code.clone(), minutes)))
+            .collect(),
+        high_volume_pulse_min_samples: runtime_options.high_volume_pulse_min_samples,
+    }
+}
+
+fn window_code_minutes(code: &str) -> Option<i64> {
+    match code {
+        "15m" => Some(15),
+        "1h" => Some(60),
+        "4h" => Some(240),
+        "1d" => Some(1440),
+        "3d" => Some(4320),
+        _ => None,
+    }
+}
+
 pub async fn run(ctx: AppContext) -> Result<()> {
     let ctx = Arc::new(ctx);
 
@@ -413,6 +492,20 @@ pub async fn run(ctx: AppContext) -> Result<()> {
         runtime_options.divergence_bootstrap_block_len,
         runtime_options.divergence_p_value_threshold,
     );
+    state_store.set_incremental_runtime_options(build_incremental_indicator_config(
+        &runtime_options,
+    ));
+    let (ready_job_tx_raw, ready_job_rx) = mpsc::channel(LIVE_READY_JOB_QUEUE_CAPACITY);
+    let mut ready_job_tx = Some(ready_job_tx_raw);
+    let ready_job_pending = Arc::new(AtomicUsize::new(0));
+    let mut materialize_handle = Some(tokio::spawn(run_live_materialize_loop(
+        ctx.clone(),
+        metrics.clone(),
+        dispatcher.clone(),
+        runtime_options.clone(),
+        ready_job_rx,
+        ready_job_pending.clone(),
+    )));
 
     let mut tick = interval(Duration::from_secs(1));
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -597,6 +690,26 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                     &metrics,
                 )
                 .await;
+                if materialize_handle
+                    .as_ref()
+                    .map(|handle| handle.is_finished())
+                    .unwrap_or(false)
+                {
+                    let handle = materialize_handle
+                        .take()
+                        .expect("finished materialize handle must exist");
+                    match handle.await {
+                        Ok(Ok(())) => {
+                            anyhow::bail!("live materialize worker exited unexpectedly");
+                        }
+                        Ok(Err(err)) => {
+                            return Err(err).context("live materialize worker failed");
+                        }
+                        Err(err) => {
+                            return Err(err).context("live materialize worker join failed");
+                        }
+                    }
+                }
 
                 let drain_result = drain_pending_ingest_events(
                     &mut trade_rx,
@@ -858,21 +971,22 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                     }
                     continue;
                 };
-                if let Err(err) = process_ready_minutes(
+                if let Err(err) = enqueue_live_ready_jobs(
                     &ctx,
                     metrics.clone(),
-                    dispatcher.as_ref(),
                     &mut state_store,
                     &mut scheduler,
-                    &runtime_options,
+                    ready_job_tx
+                        .as_ref()
+                        .expect("live ready job sender must exist while runtime loop is active"),
+                    &ready_job_pending,
                     ready_through_ts,
                     DispatchMode::Live,
-                    false,
                 )
                 .await
                 {
-                    error!(error = %err, "process ready indicator minutes failed");
-                    return Err(err).context("process ready indicator minutes failed");
+                    error!(error = %err, "enqueue ready indicator minutes failed");
+                    return Err(err).context("enqueue ready indicator minutes failed");
                 }
                 if state_store.has_pending_oi_ratio_patch()
                     && allow_oi_ratio_patches
@@ -900,6 +1014,18 @@ pub async fn run(ctx: AppContext) -> Result<()> {
         );
         for h in &consumer_handles {
             h.abort();
+        }
+        drop(ready_job_tx.take());
+        if let Some(handle) = materialize_handle.take() {
+            match handle.await {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    warn!(error = %err, "live materialize worker failed during shutdown drain");
+                }
+                Err(err) => {
+                    warn!(error = %err, "live materialize worker join failed during shutdown drain");
+                }
+            }
         }
         outbox_handle.abort();
         snapshot_fanout_handle.abort();
@@ -958,6 +1084,11 @@ pub async fn run(ctx: AppContext) -> Result<()> {
     }
 
     heartbeat_handle.abort();
+    drop(ready_job_tx.take());
+    if let Some(handle) = materialize_handle.take() {
+        handle.abort();
+        let _ = handle.await;
+    }
     outbox_handle.abort();
     snapshot_fanout_handle.abort();
     for h in consumer_handles {
@@ -2701,6 +2832,294 @@ async fn abort_oi_ratio_patch_task(
         windows_requeued = task.minutes.len(),
         "aborted in-flight oi_ratio patch task during shutdown and requeued batch"
     );
+}
+
+fn available_live_ready_job_slots(ready_job_pending: &Arc<AtomicUsize>) -> usize {
+    LIVE_READY_JOB_QUEUE_CAPACITY.saturating_sub(
+        ready_job_pending
+            .load(Ordering::Acquire)
+            .min(LIVE_READY_JOB_QUEUE_CAPACITY),
+    )
+}
+
+fn try_enqueue_ready_minute_job(
+    ready_job_tx: &mpsc::Sender<ReadyMinuteJob>,
+    ready_job_pending: &Arc<AtomicUsize>,
+    job: ReadyMinuteJob,
+) -> Result<bool> {
+    ready_job_pending.fetch_add(1, Ordering::AcqRel);
+    match ready_job_tx.try_send(job) {
+        Ok(()) => Ok(true),
+        Err(tokio::sync::mpsc::error::TrySendError::Full(_job)) => {
+            ready_job_pending.fetch_sub(1, Ordering::AcqRel);
+            Ok(false)
+        }
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_job)) => {
+            ready_job_pending.fetch_sub(1, Ordering::AcqRel);
+            anyhow::bail!("live materialize worker queue is closed");
+        }
+    }
+}
+
+fn log_materialized_coverage(
+    source: ReadyJobSource,
+    ts_bucket: DateTime<Utc>,
+    snapshots: &[IndicatorSnapshotRow],
+    enqueued_at: Instant,
+) {
+    let (computed, missing) = indicator_coverage(snapshots);
+    let source_label = match source {
+        ReadyJobSource::Live => "live",
+        ReadyJobSource::DirtyRecompute => "dirty_recompute",
+    };
+    let total_ms = enqueued_at.elapsed().as_millis();
+    if missing.is_empty() {
+        info!(
+            ts_bucket = %ts_bucket,
+            source = source_label,
+            computed_count = computed.len(),
+            missing_count = 0,
+            computed_indicators = %computed.join(","),
+            missing_indicators = "none",
+            total_ms = total_ms,
+            "indicator coverage"
+        );
+    } else {
+        let missing_indicators = missing.into_iter().collect::<Vec<_>>().join(",");
+        warn!(
+            ts_bucket = %ts_bucket,
+            source = source_label,
+            computed_count = computed.len(),
+            missing_count = missing_indicators.split(',').count(),
+            computed_indicators = %computed.join(","),
+            missing_indicators = %missing_indicators,
+            total_ms = total_ms,
+            "indicator coverage has missing indicators (warmup or data gap)"
+        );
+    }
+}
+
+async fn run_live_materialize_loop(
+    ctx: Arc<AppContext>,
+    metrics: Arc<AppMetrics>,
+    dispatcher: Arc<Dispatcher>,
+    runtime_options: IndicatorRuntimeOptions,
+    mut ready_job_rx: mpsc::Receiver<ReadyMinuteJob>,
+    ready_job_pending: Arc<AtomicUsize>,
+) -> Result<()> {
+    while let Some(job) = ready_job_rx.recv().await {
+        let ts_bucket = job.ts_bucket;
+        let source = job.source;
+        let enqueued_at = job.enqueued_at;
+        let result = process_window_bundle(
+            &ctx,
+            dispatcher.as_ref(),
+            &runtime_options,
+            job.bundle,
+            job.mode,
+        )
+        .await;
+        ready_job_pending.fetch_sub(1, Ordering::AcqRel);
+
+        match result {
+            Ok(snapshots) => {
+                metrics.inc_exported_window();
+                metrics.set_last_persisted_ts(Some(ts_bucket.timestamp_millis()));
+                if matches!(
+                    source,
+                    ReadyJobSource::Live | ReadyJobSource::DirtyRecompute
+                ) {
+                    metrics.set_live_ready_to_bundle_ms(enqueued_at.elapsed().as_millis());
+                }
+                log_materialized_coverage(source, ts_bucket, &snapshots, enqueued_at);
+            }
+            Err(err) => {
+                metrics.inc_db_error();
+                return Err(err).with_context(|| {
+                    format!(
+                        "live materialize worker failed for minute={} source={:?}",
+                        ts_bucket, source
+                    )
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn enqueue_live_ready_jobs(
+    ctx: &Arc<AppContext>,
+    metrics: Arc<AppMetrics>,
+    state_store: &mut StateStore,
+    scheduler: &mut WindowScheduler,
+    ready_job_tx: &mpsc::Sender<ReadyMinuteJob>,
+    ready_job_pending: &Arc<AtomicUsize>,
+    ready_through_ts: DateTime<Utc>,
+    dispatch_mode: DispatchMode,
+) -> Result<()> {
+    let batch_started_at = Instant::now();
+    let batch_start_minute = scheduler.next_minute_to_emit();
+    let planned_ready_minutes = batch_start_minute
+        .map(|start| (ready_through_ts - start).num_minutes().max(0) as usize + 1)
+        .unwrap_or(0);
+    let had_dirty_pending_at_start = state_store.has_pending_dirty_recompute();
+    let mut dirty_windows_enqueued = 0usize;
+    let mut live_windows_enqueued = 0usize;
+    let mut first_bucket: Option<DateTime<Utc>> = None;
+    let mut last_bucket: Option<DateTime<Utc>> = None;
+
+    loop {
+        let available_slots = available_live_ready_job_slots(ready_job_pending);
+        if available_slots == 0 || dirty_windows_enqueued >= DIRTY_RECOMPUTE_WINDOW_BUDGET_PER_TICK
+        {
+            break;
+        }
+        let remaining_budget =
+            DIRTY_RECOMPUTE_WINDOW_BUDGET_PER_TICK.saturating_sub(dirty_windows_enqueued);
+        if let Some((dirty_from, dirty_to)) = state_store.pending_dirty_recompute_batch_range(
+            DIRTY_RECOMPUTE_BATCH_SIZE
+                .min(remaining_budget)
+                .min(available_slots),
+        ) {
+            hydrate_futures_orderbook_heatmaps_for_range(
+                &ctx.db_pool,
+                &ctx.config.indicator.symbol,
+                state_store,
+                dirty_from,
+                dirty_to + ChronoDuration::minutes(1),
+                "live dirty recompute",
+            )
+            .await?;
+        }
+        let dirty_batch = state_store.recompute_dirty_finalized_minutes(
+            DIRTY_RECOMPUTE_BATCH_SIZE
+                .min(remaining_budget)
+                .min(available_slots),
+        );
+        if dirty_batch.is_empty() {
+            break;
+        }
+        for window in dirty_batch {
+            let minute = window.ts_bucket;
+            let enqueued = try_enqueue_ready_minute_job(
+                ready_job_tx,
+                ready_job_pending,
+                ReadyMinuteJob {
+                    ts_bucket: minute,
+                    mode: dispatch_mode,
+                    source: ReadyJobSource::DirtyRecompute,
+                    enqueued_at: Instant::now(),
+                    bundle: window,
+                },
+            )?;
+            if !enqueued {
+                break;
+            }
+            dirty_windows_enqueued += 1;
+            if first_bucket.is_none() {
+                first_bucket = Some(minute);
+            }
+            last_bucket = Some(minute);
+        }
+        if dirty_windows_enqueued >= DIRTY_RECOMPUTE_WINDOW_BUDGET_PER_TICK {
+            break;
+        }
+    }
+
+    if state_store.has_pending_dirty_recompute() {
+        let elapsed_ms = batch_started_at.elapsed().as_millis();
+        if dirty_windows_enqueued > 0 || elapsed_ms >= PROCESS_READY_MINUTES_WARN_MS {
+            warn!(
+                batch_start_minute = ?batch_start_minute,
+                ready_through_ts = %ready_through_ts,
+                dirty_windows_enqueued = dirty_windows_enqueued,
+                dirty_budget_per_tick = DIRTY_RECOMPUTE_WINDOW_BUDGET_PER_TICK,
+                planned_ready_minutes = planned_ready_minutes,
+                queue_pending = ready_job_pending.load(Ordering::Acquire),
+                elapsed_ms = elapsed_ms,
+                "live ready-minute enqueue yielded early with dirty recompute still pending"
+            );
+        }
+        return Ok(());
+    }
+
+    let available_slots = available_live_ready_job_slots(ready_job_pending);
+    if available_slots == 0 {
+        return Ok(());
+    }
+
+    let mut ready_minutes = Vec::new();
+    let mut next_minute = scheduler.next_minute_to_emit();
+    while ready_minutes.len() < available_slots {
+        let Some(minute) = next_minute else {
+            break;
+        };
+        if minute > ready_through_ts {
+            break;
+        }
+        ready_minutes.push(minute);
+        next_minute = Some(minute + ChronoDuration::minutes(1));
+    }
+
+    if let (Some(first_ready_minute), Some(last_ready_minute)) = (
+        ready_minutes.first().copied(),
+        ready_minutes.last().copied(),
+    ) {
+        hydrate_futures_orderbook_heatmaps_for_range(
+            &ctx.db_pool,
+            &ctx.config.indicator.symbol,
+            state_store,
+            first_ready_minute,
+            last_ready_minute + ChronoDuration::minutes(1),
+            "live ready minute materialization",
+        )
+        .await?;
+    }
+
+    for minute in ready_minutes {
+        let window = state_store.finalize_minute_for_live_job(minute);
+        let enqueued = try_enqueue_ready_minute_job(
+            ready_job_tx,
+            ready_job_pending,
+            ReadyMinuteJob {
+                ts_bucket: minute,
+                mode: dispatch_mode,
+                source: ReadyJobSource::Live,
+                enqueued_at: Instant::now(),
+                bundle: window,
+            },
+        )?;
+        if !enqueued {
+            break;
+        }
+        scheduler.mark_emitted_through(minute);
+        live_windows_enqueued += 1;
+        if first_bucket.is_none() {
+            first_bucket = Some(minute);
+        }
+        last_bucket = Some(minute);
+    }
+
+    if let Some(last_bucket) = last_bucket {
+        let first_bucket = first_bucket.unwrap_or(last_bucket);
+        let elapsed_ms = batch_started_at.elapsed().as_millis();
+        metrics.set_live_ready_to_bundle_ms(elapsed_ms);
+        info!(
+            ts_bucket_from = %first_bucket,
+            ts_bucket_to = %last_bucket,
+            live_windows_enqueued = live_windows_enqueued,
+            dirty_windows_enqueued = dirty_windows_enqueued,
+            planned_ready_minutes = planned_ready_minutes,
+            dirty_pending_at_start = had_dirty_pending_at_start,
+            ready_through_ts = %ready_through_ts,
+            queue_pending = ready_job_pending.load(Ordering::Acquire),
+            elapsed_ms = elapsed_ms,
+            "indicator ready-minute jobs enqueued"
+        );
+    }
+
+    Ok(())
 }
 
 fn replay_heatmap_hydration_batch_end(

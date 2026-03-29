@@ -1,6 +1,7 @@
 use crate::indicators::context::{IndicatorComputation, IndicatorContext, IndicatorSnapshotRow};
 use crate::indicators::indicator_trait::Indicator;
 use crate::indicators::shared::funding::{compute_funding_window_metrics, funding_change_json};
+use crate::indicators::shared::output_mapper::snapshot_only;
 use chrono::Duration;
 use serde_json::{json, Value};
 
@@ -20,6 +21,9 @@ impl Indicator for I16FundingRate {
     }
 
     fn evaluate(&self, ctx: &IndicatorContext) -> IndicatorComputation {
+        if let Some(payload) = ctx.incremental_outputs.funding_snapshot.clone() {
+            return snapshot_only(self.code(), payload);
+        }
         let mut by_window = serde_json::Map::new();
         for (label, mins) in WINDOWS {
             by_window.insert(label.to_string(), compute_window_metrics(ctx, mins, label));

@@ -14,6 +14,9 @@ impl Indicator for I20TpoMarketProfile {
     }
 
     fn evaluate(&self, ctx: &IndicatorContext) -> crate::indicators::context::IndicatorComputation {
+        if let Some(payload) = ctx.incremental_outputs.tpo_snapshot.clone() {
+            return snapshot_only(self.code(), payload);
+        }
         let mut by_session = Map::new();
         for session_code in &ctx.tpo_session_windows {
             let Some(session_minutes) = session_window_minutes(session_code) else {

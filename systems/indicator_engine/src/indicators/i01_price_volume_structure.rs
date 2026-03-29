@@ -1031,6 +1031,9 @@ mod tests {
             top_position_ratio_5m: Vec::new(),
             latest_options_surface_bucket: None,
             options_surface_5m: Vec::new(),
+            incremental_outputs: std::sync::Arc::new(
+                crate::indicators::shared::incremental::IncrementalIndicatorOutputs::default(),
+            ),
             whale_threshold_usdt: 300_000.0,
             kline_history_bars_1m: 1024,
             kline_history_bars_15m: 120,
@@ -1270,6 +1273,9 @@ mod tests {
             top_position_ratio_5m: Vec::new(),
             latest_options_surface_bucket: None,
             options_surface_5m: Vec::new(),
+            incremental_outputs: std::sync::Arc::new(
+                crate::indicators::shared::incremental::IncrementalIndicatorOutputs::default(),
+            ),
             whale_threshold_usdt: 300_000.0,
             kline_history_bars_1m: 1024,
             kline_history_bars_15m: 120,
@@ -1401,6 +1407,9 @@ mod tests {
             top_position_ratio_5m: Vec::new(),
             latest_options_surface_bucket: None,
             options_surface_5m: Vec::new(),
+            incremental_outputs: std::sync::Arc::new(
+                crate::indicators::shared::incremental::IncrementalIndicatorOutputs::default(),
+            ),
             whale_threshold_usdt: 300_000.0,
             kline_history_bars_1m: 1024,
             kline_history_bars_15m: 120,
@@ -1601,6 +1610,9 @@ mod tests {
             top_position_ratio_5m: Vec::new(),
             latest_options_surface_bucket: None,
             options_surface_5m: Vec::new(),
+            incremental_outputs: std::sync::Arc::new(
+                crate::indicators::shared::incremental::IncrementalIndicatorOutputs::default(),
+            ),
             whale_threshold_usdt: 300_000.0,
             kline_history_bars_1m: 1024,
             kline_history_bars_15m: 120,
