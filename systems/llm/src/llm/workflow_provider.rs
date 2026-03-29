@@ -44,17 +44,29 @@ fn nullable(inner: Value) -> Value {
     })
 }
 
-fn any_object_schema() -> Value {
+fn location_summary_schema() -> Value {
     json!({
         "type": "object",
-        "additionalProperties": true
+        "additionalProperties": false,
+        "required": ["summary", "notes"],
+        "properties": {
+            "summary": {"type": "string"},
+            "notes": {"type": "array", "items": {"type": "string"}}
+        }
     })
 }
 
 fn key_levels_schema() -> Value {
     json!({
         "type": "object",
-        "additionalProperties": true
+        "additionalProperties": false,
+        "required": ["levels"],
+        "properties": {
+            "levels": {
+                "type": "array",
+                "items": tracked_zone_schema()
+            }
+        }
     })
 }
 
@@ -237,9 +249,9 @@ fn map_summary_schema() -> Value {
             "key_levels"
         ],
         "properties": {
-            "location_3d": any_object_schema(),
-            "location_1d": any_object_schema(),
-            "location_4h": any_object_schema(),
+            "location_3d": location_summary_schema(),
+            "location_1d": location_summary_schema(),
+            "location_4h": location_summary_schema(),
             "price_location_class": {
                 "type": "string",
                 "enum": ["inside_value_middle", "value_edge", "outside_value_extended"]
@@ -575,7 +587,10 @@ fn pending_order_management_plan_schema() -> Value {
         ],
         "properties": {
             "path_id": {"type": "string"},
-            "exposure_state": {"type": "string", "enum": ["flat_with_live_entry_orders"]},
+            "exposure_state": {
+                "type": "string",
+                "enum": ["flat_with_live_entry_orders", "in_position_with_live_entry_orders"]
+            },
             "path_live_assessment": {"type": "string", "enum": ["live", "degraded", "invalidated"]},
             "path_assessment_reason": {"type": ["string", "null"]},
             "actions": {"type": "array", "items": pending_order_management_action_schema()},
@@ -946,10 +961,35 @@ pub async fn invoke_stage2c_models(
 #[cfg(test)]
 mod tests {
     use super::{
-        should_retry_workflow_stage_once, workflow_stage1_schema, workflow_stage2b_schema,
+        should_retry_workflow_stage_once, workflow_stage1_schema, workflow_stage2a_schema,
+        workflow_stage2b_schema, workflow_stage2c_schema,
     };
     use crate::app::config::LlmModelConfig;
     use crate::llm::prompt::WorkflowPromptStage;
+    use serde_json::{json, Value};
+
+    fn assert_closed_object_schemas(schema: &Value) {
+        match schema {
+            Value::Object(map) => {
+                if matches!(map.get("type"), Some(Value::String(kind)) if kind == "object") {
+                    assert_eq!(
+                        map.get("additionalProperties"),
+                        Some(&json!(false)),
+                        "object schema missing additionalProperties=false: {schema}"
+                    );
+                }
+                for value in map.values() {
+                    assert_closed_object_schemas(value);
+                }
+            }
+            Value::Array(values) => {
+                for value in values {
+                    assert_closed_object_schemas(value);
+                }
+            }
+            _ => {}
+        }
+    }
 
     #[test]
     fn stage1_schema_requires_location_3d() {
@@ -963,6 +1003,25 @@ mod tests {
         assert!(required.contains(&"location_3d"));
         assert!(required.contains(&"location_1d"));
         assert!(required.contains(&"location_4h"));
+        assert_eq!(
+            schema["properties"]["map_summary"]["properties"]["location_3d"]
+                ["additionalProperties"],
+            json!(false)
+        );
+        let location_required = schema["properties"]["map_summary"]["properties"]["location_3d"]
+            ["required"]
+            .as_array()
+            .expect("location required array")
+            .iter()
+            .filter_map(|value| value.as_str())
+            .collect::<Vec<_>>();
+        assert!(location_required.contains(&"summary"));
+        assert!(location_required.contains(&"notes"));
+        assert_eq!(
+            schema["properties"]["map_summary"]["properties"]["key_levels"]
+                ["additionalProperties"],
+            json!(false)
+        );
     }
 
     #[test]
@@ -979,6 +1038,32 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(required.contains(&"watcher_trigger_condition"));
         assert!(required.contains(&"reuse_current_bracket_template"));
+    }
+
+    #[test]
+    fn stage2a_schema_closes_all_object_nodes() {
+        assert_closed_object_schemas(&workflow_stage2a_schema());
+    }
+
+    #[test]
+    fn stage2b_schema_closes_all_object_nodes() {
+        assert_closed_object_schemas(&workflow_stage2b_schema());
+    }
+
+    #[test]
+    fn stage2c_schema_closes_all_object_nodes_and_supports_coexisting_exposure() {
+        let schema = workflow_stage2c_schema();
+        assert_closed_object_schemas(&schema);
+        let enum_values = schema["properties"]["pending_order_management_plan"]["properties"]
+            ["exposure_state"]["enum"]
+            .as_array()
+            .expect("exposure_state enum");
+        let variants = enum_values
+            .iter()
+            .filter_map(|value| value.as_str())
+            .collect::<Vec<_>>();
+        assert!(variants.contains(&"flat_with_live_entry_orders"));
+        assert!(variants.contains(&"in_position_with_live_entry_orders"));
     }
 
     #[test]
