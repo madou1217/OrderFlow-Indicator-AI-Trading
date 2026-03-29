@@ -53,10 +53,11 @@ const ALLOWED_DRIVER_SIGNALS: &[&str] = &[
     "driver_flip_confirmed",
 ];
 const ALLOWED_PATH_LIVE_ASSESSMENTS: &[&str] = &["live", "degraded", "invalidated"];
-const ALLOWED_WATCHER_TRIGGER_TYPES: &[&str] = &[
-    "price_above_on_close",
-    "price_below_on_close",
+const ALLOWED_PENDING_ORDER_EXPOSURE_STATES: &[&str] = &[
+    "flat_with_live_entry_orders",
+    "in_position_with_live_entry_orders",
 ];
+const ALLOWED_WATCHER_TRIGGER_TYPES: &[&str] = &["price_above_on_close", "price_below_on_close"];
 
 pub fn parse_json_from_text(text: &str) -> Result<Value> {
     let trimmed = text.trim();
@@ -217,9 +218,7 @@ fn validate_zone_reevaluation_trigger(
         .as_deref()
         .ok_or_else(|| anyhow!("{field}.timeframe is required"))?;
     if !ALLOWED_STRATEGIC_TIMEFRAMES.contains(&timeframe) {
-        return Err(anyhow!(
-            "{field}.timeframe must be one of [4h, 1d, 4h-1d]"
-        ));
+        return Err(anyhow!("{field}.timeframe must be one of [4h, 1d, 4h-1d]"));
     }
     let min_confirmed_bars = trigger
         .min_confirmed_bars
@@ -614,9 +613,7 @@ pub fn parse_stage2a_output(
         ));
     }
     if output.reevaluation_reason.is_some() {
-        return Err(anyhow!(
-            "PATH_CONFIRMED must set reevaluation_reason=null"
-        ));
+        return Err(anyhow!("PATH_CONFIRMED must set reevaluation_reason=null"));
     }
 
     let current_path = stage1_output
@@ -664,7 +661,9 @@ fn validate_position_management_action(
     path_id: &str,
 ) -> Result<()> {
     if action.context_key.trim().is_empty() {
-        return Err(anyhow!("position_management_plan.actions[].context_key must be non-empty"));
+        return Err(anyhow!(
+            "position_management_plan.actions[].context_key must be non-empty"
+        ));
     }
     if action.path_id != path_id {
         return Err(anyhow!(
@@ -689,9 +688,10 @@ fn validate_position_management_action(
         "add" => {
             validate_watcher_trigger_condition(
                 "position_management_plan.actions[].watcher_trigger_condition",
-                action.watcher_trigger_condition.as_ref().ok_or_else(|| {
-                    anyhow!("add requires watcher_trigger_condition")
-                })?,
+                action
+                    .watcher_trigger_condition
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("add requires watcher_trigger_condition"))?,
             )?;
             ensure_action_field_absent(
                 "position_management_plan.actions[].reduce_ratio",
@@ -731,9 +731,10 @@ fn validate_position_management_action(
         "reduce" => {
             validate_watcher_trigger_condition(
                 "position_management_plan.actions[].watcher_trigger_condition",
-                action.watcher_trigger_condition.as_ref().ok_or_else(|| {
-                    anyhow!("reduce requires watcher_trigger_condition")
-                })?,
+                action
+                    .watcher_trigger_condition
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("reduce requires watcher_trigger_condition"))?,
             )?;
             ensure_action_field_absent(
                 "position_management_plan.actions[].add_ratio",
@@ -775,9 +776,10 @@ fn validate_position_management_action(
         "exit_full" => {
             validate_watcher_trigger_condition(
                 "position_management_plan.actions[].watcher_trigger_condition",
-                action.watcher_trigger_condition.as_ref().ok_or_else(|| {
-                    anyhow!("exit_full requires watcher_trigger_condition")
-                })?,
+                action
+                    .watcher_trigger_condition
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("exit_full requires watcher_trigger_condition"))?,
             )?;
             ensure_action_field_absent(
                 "position_management_plan.actions[].add_ratio",
@@ -818,9 +820,10 @@ fn validate_position_management_action(
         "move_stop" => {
             validate_watcher_trigger_condition(
                 "position_management_plan.actions[].watcher_trigger_condition",
-                action.watcher_trigger_condition.as_ref().ok_or_else(|| {
-                    anyhow!("move_stop requires watcher_trigger_condition")
-                })?,
+                action
+                    .watcher_trigger_condition
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("move_stop requires watcher_trigger_condition"))?,
             )?;
             ensure_action_field_absent(
                 "position_management_plan.actions[].add_ratio",
@@ -907,6 +910,7 @@ fn validate_position_management_action(
 fn validate_position_management_plan(
     plan: &PositionManagementPlan,
     stage1_output: &Stage1Output,
+    expected_context_key: &str,
 ) -> Result<()> {
     let current_path = stage1_output
         .current_path
@@ -928,10 +932,17 @@ fn validate_position_management_plan(
         ));
     }
     if plan.actions.is_empty() {
-        return Err(anyhow!("position_management_plan.actions must be non-empty"));
+        return Err(anyhow!(
+            "position_management_plan.actions must be non-empty"
+        ));
     }
     for action in &plan.actions {
         validate_position_management_action(action, &plan.path_id)?;
+        if action.context_key != expected_context_key {
+            return Err(anyhow!(
+                "position_management_plan.actions[].context_key must match the current Stage2B context_key"
+            ));
+        }
     }
     if plan.path_live_assessment == "invalidated"
         && !plan
@@ -946,12 +957,20 @@ fn validate_position_management_plan(
     Ok(())
 }
 
-pub fn parse_stage2b_output(value: Value, stage1_output: &Stage1Output) -> Result<Stage2BOutput> {
+pub fn parse_stage2b_output(
+    value: Value,
+    stage1_output: &Stage1Output,
+    expected_context_key: &str,
+) -> Result<Stage2BOutput> {
     let output: Stage2BOutput = serde_json::from_value(value)?;
     if output.stage2b_decision != "MANAGE_POSITION" {
         return Err(anyhow!("stage2b_decision must be MANAGE_POSITION"));
     }
-    validate_position_management_plan(&output.position_management_plan, stage1_output)?;
+    validate_position_management_plan(
+        &output.position_management_plan,
+        stage1_output,
+        expected_context_key,
+    )?;
     Ok(output)
 }
 
@@ -1018,9 +1037,10 @@ fn validate_pending_order_management_action(
         "replace_entry" => {
             validate_watcher_trigger_condition(
                 "pending_order_management_plan.actions[].watcher_trigger_condition",
-                action.watcher_trigger_condition.as_ref().ok_or_else(|| {
-                    anyhow!("replace_entry requires watcher_trigger_condition")
-                })?,
+                action
+                    .watcher_trigger_condition
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("replace_entry requires watcher_trigger_condition"))?,
             )?;
             ensure_action_field_absent(
                 "pending_order_management_plan.actions[].post_fill_bracket_template",
@@ -1102,6 +1122,8 @@ fn validate_pending_order_management_action(
 fn validate_pending_order_management_plan(
     plan: &PendingOrderManagementPlan,
     stage1_output: &Stage1Output,
+    expected_exposure_state: &str,
+    expected_context_key: &str,
 ) -> Result<()> {
     let current_path = stage1_output
         .current_path
@@ -1112,9 +1134,14 @@ fn validate_pending_order_management_plan(
             "pending_order_management_plan.path_id must match Stage1 current_path.id"
         ));
     }
-    if plan.exposure_state != "flat_with_live_entry_orders" {
+    if !ALLOWED_PENDING_ORDER_EXPOSURE_STATES.contains(&plan.exposure_state.as_str()) {
         return Err(anyhow!(
-            "pending_order_management_plan.exposure_state must be flat_with_live_entry_orders"
+            "pending_order_management_plan.exposure_state must be one of [flat_with_live_entry_orders, in_position_with_live_entry_orders]"
+        ));
+    }
+    if plan.exposure_state != expected_exposure_state {
+        return Err(anyhow!(
+            "pending_order_management_plan.exposure_state must match the current Stage2C exposure_state"
         ));
     }
     if !ALLOWED_PATH_LIVE_ASSESSMENTS.contains(&plan.path_live_assessment.as_str()) {
@@ -1123,10 +1150,17 @@ fn validate_pending_order_management_plan(
         ));
     }
     if plan.actions.is_empty() {
-        return Err(anyhow!("pending_order_management_plan.actions must be non-empty"));
+        return Err(anyhow!(
+            "pending_order_management_plan.actions must be non-empty"
+        ));
     }
     for action in &plan.actions {
         validate_pending_order_management_action(action, &plan.path_id)?;
+        if action.context_key != expected_context_key {
+            return Err(anyhow!(
+                "pending_order_management_plan.actions[].context_key must match the current Stage2C context_key"
+            ));
+        }
     }
     if plan.path_live_assessment == "invalidated"
         && !plan
@@ -1141,12 +1175,22 @@ fn validate_pending_order_management_plan(
     Ok(())
 }
 
-pub fn parse_stage2c_output(value: Value, stage1_output: &Stage1Output) -> Result<Stage2COutput> {
+pub fn parse_stage2c_output(
+    value: Value,
+    stage1_output: &Stage1Output,
+    expected_exposure_state: &str,
+    expected_context_key: &str,
+) -> Result<Stage2COutput> {
     let output: Stage2COutput = serde_json::from_value(value)?;
     if output.stage2c_decision != "MANAGE_PENDING_ORDERS" {
         return Err(anyhow!("stage2c_decision must be MANAGE_PENDING_ORDERS"));
     }
-    validate_pending_order_management_plan(&output.pending_order_management_plan, stage1_output)?;
+    validate_pending_order_management_plan(
+        &output.pending_order_management_plan,
+        stage1_output,
+        expected_exposure_state,
+        expected_context_key,
+    )?;
     Ok(output)
 }
 
@@ -1305,7 +1349,7 @@ mod tests {
                 "management_note": "hold"
             }
         });
-        let parsed = parse_stage2b_output(value, &stage1_output).expect("parse");
+        let parsed = parse_stage2b_output(value, &stage1_output, "ctx_1").expect("parse");
         assert_eq!(parsed.stage2b_decision, "MANAGE_POSITION");
     }
 
@@ -1340,11 +1384,10 @@ mod tests {
                 "management_note": "bad add"
             }
         });
-        let err = parse_stage2b_output(value, &stage1_output).expect_err("should fail");
-        assert!(
-            err.to_string()
-                .contains("position_management_plan.actions[].take_profit_1 must be null for add")
-        );
+        let err = parse_stage2b_output(value, &stage1_output, "ctx_1").expect_err("should fail");
+        assert!(err
+            .to_string()
+            .contains("position_management_plan.actions[].take_profit_1 must be null for add"));
     }
 
     #[test]
@@ -1392,11 +1435,128 @@ mod tests {
                 "management_note": "bad replace"
             }
         });
-        let err = parse_stage2c_output(value, &stage1_output).expect_err("should fail");
+        let err = parse_stage2c_output(
+            value,
+            &stage1_output,
+            "flat_with_live_entry_orders",
+            "ctx_1",
+        )
+        .expect_err("should fail");
         assert!(
             err.to_string().contains(
                 "pending_order_management_plan.actions[].post_fill_bracket_template must be null for replace_entry"
             )
         );
+    }
+
+    #[test]
+    fn stage2c_parser_accepts_coexisting_position_and_pending_order_exposure_state() {
+        let stage1_output = sample_stage1_output();
+        let value = json!({
+            "stage2c_decision": "MANAGE_PENDING_ORDERS",
+            "pending_order_management_plan": {
+                "path_id": "path_1",
+                "exposure_state": "in_position_with_live_entry_orders",
+                "path_live_assessment": "degraded",
+                "path_assessment_reason": "pending order still valid while the live position is already on",
+                "actions": [{
+                    "action_type": "keep_order",
+                    "context_key": "ctx_1",
+                    "path_id": "path_1",
+                    "watcher_trigger_condition": null,
+                    "replacement_entry_zone": null,
+                    "replacement_entry_invalidation_level": null,
+                    "replacement_stop_loss": null,
+                    "reuse_current_entry_template": null,
+                    "post_fill_bracket_template": null,
+                    "reason": "keep secondary entry order active"
+                }],
+                "management_note": "coexisting pending order plan"
+            }
+        });
+
+        let parsed = parse_stage2c_output(
+            value,
+            &stage1_output,
+            "in_position_with_live_entry_orders",
+            "ctx_1",
+        )
+        .expect("coexisting exposure state should parse");
+        assert_eq!(
+            parsed.pending_order_management_plan.exposure_state,
+            "in_position_with_live_entry_orders"
+        );
+    }
+
+    #[test]
+    fn stage2b_parser_rejects_mixed_context_keys() {
+        let stage1_output = sample_stage1_output();
+        let value = json!({
+            "stage2b_decision": "MANAGE_POSITION",
+            "position_management_plan": {
+                "path_id": "path_1",
+                "exposure_state": "in_position",
+                "path_live_assessment": "live",
+                "path_assessment_reason": null,
+                "actions": [{
+                    "action_type": "hold",
+                    "context_key": "ctx_2",
+                    "path_id": "path_1",
+                    "watcher_trigger_condition": null,
+                    "add_ratio": null,
+                    "reuse_current_entry_template": null,
+                    "reduce_ratio": null,
+                    "new_stop_loss": null,
+                    "reuse_current_bracket_template": null,
+                    "take_profit_1": null,
+                    "take_profit_2": null,
+                    "reason": "hold"
+                }],
+                "management_note": "hold"
+            }
+        });
+
+        let err = parse_stage2b_output(value, &stage1_output, "ctx_1").expect_err("should fail");
+        assert!(err
+            .to_string()
+            .contains("position_management_plan.actions[].context_key must match the current Stage2B context_key"));
+    }
+
+    #[test]
+    fn stage2c_parser_rejects_mixed_context_keys() {
+        let stage1_output = sample_stage1_output();
+        let value = json!({
+            "stage2c_decision": "MANAGE_PENDING_ORDERS",
+            "pending_order_management_plan": {
+                "path_id": "path_1",
+                "exposure_state": "flat_with_live_entry_orders",
+                "path_live_assessment": "live",
+                "path_assessment_reason": null,
+                "actions": [{
+                    "action_type": "keep_order",
+                    "context_key": "ctx_2",
+                    "path_id": "path_1",
+                    "watcher_trigger_condition": null,
+                    "replacement_entry_zone": null,
+                    "replacement_entry_invalidation_level": null,
+                    "replacement_stop_loss": null,
+                    "reuse_current_entry_template": null,
+                    "post_fill_bracket_template": null,
+                    "reason": "keep"
+                }],
+                "management_note": "keep"
+            }
+        });
+
+        let err = parse_stage2c_output(
+            value,
+            &stage1_output,
+            "flat_with_live_entry_orders",
+            "ctx_1",
+        )
+        .expect_err("should fail");
+        assert!(err
+            .to_string()
+            .contains("pending_order_management_plan.actions[].context_key must match the current Stage2C context_key"));
     }
 }

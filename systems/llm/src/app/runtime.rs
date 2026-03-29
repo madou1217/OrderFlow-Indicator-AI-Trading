@@ -26,7 +26,7 @@ use serde_json::{json, Value};
 use sqlx::{PgPool, Row};
 use std::borrow::Cow;
 use std::cmp::Ordering as CmpOrdering;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -1454,8 +1454,7 @@ fn build_fallback_entry_snapshot(
         intent_mode: fallback_plan.map(|plan| plan.intent_mode.clone()),
         entry_activation_level: fallback_plan.map(|plan| plan.entry_activation_level.clone()),
         entry_zone: fallback_plan.map(|plan| plan.entry_zone.clone()),
-        entry_invalidation_level: fallback_plan
-            .map(|plan| plan.entry_invalidation_level.clone()),
+        entry_invalidation_level: fallback_plan.map(|plan| plan.entry_invalidation_level.clone()),
         max_drift_pct: fallback_plan.map(|plan| plan.max_drift_pct),
         stop_loss: bracket_override
             .map(|item| item.stop_loss)
@@ -1487,16 +1486,21 @@ fn snapshot_for_management_context(
     context_key: &str,
     path_id: &str,
 ) -> crate::workflow::schema::EntrySnapshot {
-    entry_snapshots.get(context_key).cloned().unwrap_or_else(|| {
-        build_fallback_entry_snapshot(
-            symbol,
-            context_key,
-            path_id,
-            current_path,
-            matching_tactical_entry_plan(workflow_state, path_id),
-            workflow_state.pending_entry_bracket_template_override.as_ref(),
-        )
-    })
+    entry_snapshots
+        .get(context_key)
+        .cloned()
+        .unwrap_or_else(|| {
+            build_fallback_entry_snapshot(
+                symbol,
+                context_key,
+                path_id,
+                current_path,
+                matching_tactical_entry_plan(workflow_state, path_id),
+                workflow_state
+                    .pending_entry_bracket_template_override
+                    .as_ref(),
+            )
+        })
 }
 
 fn entry_plan_from_snapshot_template(
@@ -1507,12 +1511,22 @@ fn entry_plan_from_snapshot_template(
         .entry_profile
         .clone()
         .or_else(|| fallback_plan.map(|plan| plan.entry_profile.clone()))
-        .ok_or_else(|| anyhow!("entry template missing entry_profile for {}", snapshot.context_key))?;
+        .ok_or_else(|| {
+            anyhow!(
+                "entry template missing entry_profile for {}",
+                snapshot.context_key
+            )
+        })?;
     let intent_mode = snapshot
         .intent_mode
         .clone()
         .or_else(|| fallback_plan.map(|plan| plan.intent_mode.clone()))
-        .ok_or_else(|| anyhow!("entry template missing intent_mode for {}", snapshot.context_key))?;
+        .ok_or_else(|| {
+            anyhow!(
+                "entry template missing intent_mode for {}",
+                snapshot.context_key
+            )
+        })?;
     let entry_activation_level = snapshot
         .entry_activation_level
         .clone()
@@ -1527,7 +1541,12 @@ fn entry_plan_from_snapshot_template(
         .entry_zone
         .clone()
         .or_else(|| fallback_plan.map(|plan| plan.entry_zone.clone()))
-        .ok_or_else(|| anyhow!("entry template missing entry_zone for {}", snapshot.context_key))?;
+        .ok_or_else(|| {
+            anyhow!(
+                "entry template missing entry_zone for {}",
+                snapshot.context_key
+            )
+        })?;
     let entry_invalidation_level = snapshot
         .entry_invalidation_level
         .clone()
@@ -1541,7 +1560,12 @@ fn entry_plan_from_snapshot_template(
     let max_drift_pct = snapshot
         .max_drift_pct
         .or_else(|| fallback_plan.map(|plan| plan.max_drift_pct))
-        .ok_or_else(|| anyhow!("entry template missing max_drift_pct for {}", snapshot.context_key))?;
+        .ok_or_else(|| {
+            anyhow!(
+                "entry template missing max_drift_pct for {}",
+                snapshot.context_key
+            )
+        })?;
 
     Ok(crate::workflow::schema::EntryPlan {
         side: snapshot.side.clone(),
@@ -1664,6 +1688,138 @@ fn has_pending_order_management_actions(
     plan.actions
         .iter()
         .any(|action| action.action_type != "keep_order")
+}
+
+fn position_management_plan_for_context(
+    plan: Option<crate::workflow::schema::PositionManagementPlan>,
+    path_id: &str,
+    context_key: &str,
+) -> Option<crate::workflow::schema::PositionManagementPlan> {
+    let mut plan = plan?;
+    if plan.path_id != path_id {
+        return None;
+    }
+    plan.actions
+        .retain(|action| action.context_key == context_key);
+    if plan.actions.is_empty() {
+        None
+    } else {
+        Some(plan)
+    }
+}
+
+fn pending_order_management_plan_for_context(
+    plan: Option<crate::workflow::schema::PendingOrderManagementPlan>,
+    path_id: &str,
+    context_key: &str,
+) -> Option<crate::workflow::schema::PendingOrderManagementPlan> {
+    let mut plan = plan?;
+    if plan.path_id != path_id {
+        return None;
+    }
+    plan.actions
+        .retain(|action| action.context_key == context_key);
+    if plan.actions.is_empty() {
+        None
+    } else {
+        Some(plan)
+    }
+}
+
+fn clear_position_management_plans(workflow_state: &mut crate::workflow::state::WorkflowState) {
+    workflow_state.approved_position_management_plans.clear();
+    workflow_state
+        .approved_position_management_plans_updated_at
+        .clear();
+}
+
+fn clear_pending_order_management_plans(
+    workflow_state: &mut crate::workflow::state::WorkflowState,
+) {
+    workflow_state
+        .approved_pending_order_management_plans
+        .clear();
+    workflow_state
+        .approved_pending_order_management_plans_updated_at
+        .clear();
+}
+
+fn replace_position_management_plans(
+    workflow_state: &mut crate::workflow::state::WorkflowState,
+    plans: BTreeMap<String, crate::workflow::schema::PositionManagementPlan>,
+) {
+    let now = Utc::now();
+    workflow_state.approved_position_management_plans = plans;
+    workflow_state.approved_position_management_plans_updated_at = workflow_state
+        .approved_position_management_plans
+        .keys()
+        .cloned()
+        .map(|context_key| (context_key, now))
+        .collect();
+}
+
+fn replace_pending_order_management_plans(
+    workflow_state: &mut crate::workflow::state::WorkflowState,
+    plans: BTreeMap<String, crate::workflow::schema::PendingOrderManagementPlan>,
+) {
+    let now = Utc::now();
+    workflow_state.approved_pending_order_management_plans = plans;
+    workflow_state.approved_pending_order_management_plans_updated_at = workflow_state
+        .approved_pending_order_management_plans
+        .keys()
+        .cloned()
+        .map(|context_key| (context_key, now))
+        .collect();
+}
+
+fn remove_position_management_plan(
+    workflow_state: &mut crate::workflow::state::WorkflowState,
+    context_key: &str,
+) {
+    workflow_state
+        .approved_position_management_plans
+        .remove(context_key);
+    workflow_state
+        .approved_position_management_plans_updated_at
+        .remove(context_key);
+}
+
+fn remove_pending_order_management_plan(
+    workflow_state: &mut crate::workflow::state::WorkflowState,
+    context_key: &str,
+) {
+    workflow_state
+        .approved_pending_order_management_plans
+        .remove(context_key);
+    workflow_state
+        .approved_pending_order_management_plans_updated_at
+        .remove(context_key);
+}
+
+fn upsert_position_management_plan(
+    workflow_state: &mut crate::workflow::state::WorkflowState,
+    context_key: &str,
+    plan: crate::workflow::schema::PositionManagementPlan,
+) {
+    workflow_state
+        .approved_position_management_plans
+        .insert(context_key.to_string(), plan);
+    workflow_state
+        .approved_position_management_plans_updated_at
+        .insert(context_key.to_string(), Utc::now());
+}
+
+fn upsert_pending_order_management_plan(
+    workflow_state: &mut crate::workflow::state::WorkflowState,
+    context_key: &str,
+    plan: crate::workflow::schema::PendingOrderManagementPlan,
+) {
+    workflow_state
+        .approved_pending_order_management_plans
+        .insert(context_key.to_string(), plan);
+    workflow_state
+        .approved_pending_order_management_plans_updated_at
+        .insert(context_key.to_string(), Utc::now());
 }
 
 fn remove_position_management_action(
@@ -2177,7 +2333,8 @@ fn maybe_record_stopout_and_cleanup(
         return Ok(());
     };
     let watched_plan = &tactical_plan.entry_plan;
-    let expected_context_key = workflow_entry_context_key(symbol, &watched_plan.side, &tactical_plan.path_id);
+    let expected_context_key =
+        workflow_entry_context_key(symbol, &watched_plan.side, &tactical_plan.path_id);
     if expected_context_key != last_context_key {
         return Ok(());
     }
@@ -2583,17 +2740,13 @@ async fn invoke_workflow_bundle_models(
     let mut pending_order_execution_consumed = false;
 
     let mut stage2a_output: Option<crate::workflow::schema::Stage2AOutput> = None;
-    let mut stage2b_output: Option<crate::workflow::schema::Stage2BOutput> = None;
-    let mut stage2c_output: Option<crate::workflow::schema::Stage2COutput> = None;
     let mut selected_stage2a_model_name: Option<String> = None;
-    let mut selected_stage2b_model_name: Option<String> = None;
-    let mut selected_stage2c_model_name: Option<String> = None;
+    let mut selected_stage2b_model_names: HashMap<String, String> = HashMap::new();
+    let mut selected_stage2c_model_names: HashMap<String, String> = HashMap::new();
     if path_runtime_state.hard_invalidation && workflow_state.approved_tactical_plan.is_some() {
         clear_approved_tactical_plan(&mut workflow_state);
-        workflow_state.approved_position_management_plan = None;
-        workflow_state.approved_position_management_plan_updated_at = None;
-        workflow_state.approved_pending_order_management_plan = None;
-        workflow_state.approved_pending_order_management_plan_updated_at = None;
+        clear_position_management_plans(&mut workflow_state);
+        clear_pending_order_management_plans(&mut workflow_state);
         crate::workflow::persistence::save_workflow_state(&state_dir, &workflow_state)?;
         append_workflow_journal_event(
             "workflow_tactical_plan_cleared",
@@ -2638,32 +2791,53 @@ async fn invoke_workflow_bundle_models(
             }),
         );
 
-        if let Some(_stage2_guard) = try_acquire_workflow_stage(&symbol, WorkflowStageKind::Stage2) {
+        if let Some(_stage2_guard) = try_acquire_workflow_stage(&symbol, WorkflowStageKind::Stage2)
+        {
             if config.llm.request_enabled {
                 let path_side = stage1_output
                     .current_path
                     .as_ref()
                     .map(|path| path.side.clone())
                     .unwrap_or_default();
-                let active_position_count = active_position_count_for_side(&trading_state, &path_side);
+                let active_position_count =
+                    active_position_count_for_side(&trading_state, &path_side);
                 let live_entry_order_count =
                     live_entry_order_count_for_side(&trading_state, &path_side);
-                let should_run_stage2b = active_position_count > 0;
-                let should_run_stage2c = active_position_count == 0 && live_entry_order_count > 0;
-                let should_run_stage2a = active_position_count == 0
-                    && live_entry_order_count == 0
-                    && stage1_quality_allows_new_entry(
+                let quality_allows_new_entry = stage1_quality_allows_new_entry(
+                    &stage1_output,
+                    &config
+                        .llm
+                        .workflow
+                        .stage1
+                        .min_overall_quality_for_new_entry_dispatch,
+                );
+                let dispatch_flags = workflow_stage2_dispatch_flags(
+                    active_position_count,
+                    live_entry_order_count,
+                    quality_allows_new_entry,
+                    &config.llm.workflow.limits,
+                );
+                let stage2b_contexts =
+                    crate::workflow::stage2::stage2b_active_positions_for_current_path(
                         &stage1_output,
-                        &config
-                            .llm
-                            .workflow
-                            .stage1
-                            .min_overall_quality_for_new_entry_dispatch,
-                    )
-                    && active_position_count
-                        < config.llm.workflow.limits.max_live_positions_per_direction
-                    && live_entry_order_count
-                        < config.llm.workflow.limits.max_live_entry_orders_per_direction;
+                        &trading_state,
+                        &entry_snapshots,
+                    );
+                let stage2c_contexts =
+                    crate::workflow::stage2::stage2c_active_orders_for_current_path(
+                        &stage1_output,
+                        &trading_state,
+                        &entry_snapshots,
+                    );
+                let should_run_stage2a = dispatch_flags.should_run_stage2a;
+                let should_run_stage2b =
+                    dispatch_flags.should_run_stage2b && !stage2b_contexts.is_empty();
+                let should_run_stage2c =
+                    dispatch_flags.should_run_stage2c && !stage2c_contexts.is_empty();
+                let stage2c_exposure_state = stage2c_exposure_state_for_counts(
+                    active_position_count,
+                    live_entry_order_count,
+                );
 
                 if should_run_stage2a {
                     let prompt_input = crate::workflow::stage2::build_stage2a_prompt_input(
@@ -2804,175 +2978,222 @@ async fn invoke_workflow_bundle_models(
                 }
 
                 if should_run_stage2b {
-                    let prompt_input = crate::workflow::stage2::build_stage2b_prompt_input(
-                        indicator_summary.clone(),
-                        stage1_output.clone(),
-                        candidate_event.clone(),
-                        path_runtime_state.clone(),
-                        workflow_state.approved_position_management_plan.clone(),
-                        &trading_state,
-                        &entry_snapshots,
-                    );
-                    let prompt_value = serde_json::to_value(&prompt_input)
-                        .context("serialize workflow stage2b prompt input")?;
-                    if config.llm.workflow.persist_prompt_inputs {
-                        let _ = persist_workflow_prompt_input_to_disk(
-                            &bundle.raw,
-                            "workflow_stage2b",
-                            &prompt_value,
-                            retention_minutes,
-                        )
-                        .await?;
-                    }
-                    for out in crate::llm::workflow_provider::invoke_stage2b_models(
-                        &http_client,
-                        &loopback_http_client,
-                        &config,
-                        &prompt_value,
-                        &symbol,
-                    )
-                    .await
-                    {
-                        let payload = json!({
-                            "trigger": &*trigger,
-                            "stage": "stage2b",
-                            "model_name": out.model_name,
-                            "provider": out.provider,
-                            "model_id": out.model,
-                            "latency_ms": out.latency_ms,
-                            "raw_response_text": out.raw_response_text,
-                            "parsed_value": out.parsed_value,
-                            "error": out.error,
-                        });
-                        append_workflow_journal_event(
-                            "workflow_stage2b_response",
-                            &symbol,
-                            bundle.raw.ts_bucket,
-                            payload.clone(),
+                    let mut next_position_plans = BTreeMap::new();
+                    for active_position in &stage2b_contexts {
+                        let prompt_input = crate::workflow::stage2::build_stage2b_prompt_input(
+                            indicator_summary.clone(),
+                            stage1_output.clone(),
+                            candidate_event.clone(),
+                            path_runtime_state.clone(),
+                            active_position.clone(),
+                            position_management_plan_for_context(
+                                workflow_state
+                                    .approved_position_management_plans
+                                    .get(&active_position.context_key)
+                                    .cloned(),
+                                &path_runtime_state.path_id,
+                                &active_position.context_key,
+                            ),
+                            &trading_state,
                         );
-                        if stage2b_output.is_some() {
-                            continue;
+                        let prompt_value = serde_json::to_value(&prompt_input)
+                            .context("serialize workflow stage2b prompt input")?;
+                        if config.llm.workflow.persist_prompt_inputs {
+                            let _ = persist_workflow_prompt_input_to_disk(
+                                &bundle.raw,
+                                "workflow_stage2b",
+                                &prompt_value,
+                                retention_minutes,
+                            )
+                            .await?;
                         }
-                        let Some(value) = payload.get("parsed_value").cloned() else {
-                            continue;
-                        };
-                        match crate::workflow::parser::parse_stage2b_output(value, &stage1_output) {
-                            Ok(parsed) => {
-                                selected_stage2b_model_name = Some(out.model_name.clone());
-                                stage2b_output = Some(parsed);
+                        let mut stage2b_output_for_context: Option<
+                            crate::workflow::schema::Stage2BOutput,
+                        > = None;
+                        for out in crate::llm::workflow_provider::invoke_stage2b_models(
+                            &http_client,
+                            &loopback_http_client,
+                            &config,
+                            &prompt_value,
+                            &symbol,
+                        )
+                        .await
+                        {
+                            let payload = json!({
+                                "trigger": &*trigger,
+                                "stage": "stage2b",
+                                "context_key": active_position.context_key,
+                                "model_name": out.model_name,
+                                "provider": out.provider,
+                                "model_id": out.model,
+                                "latency_ms": out.latency_ms,
+                                "raw_response_text": out.raw_response_text,
+                                "parsed_value": out.parsed_value,
+                                "error": out.error,
+                            });
+                            append_workflow_journal_event(
+                                "workflow_stage2b_response",
+                                &symbol,
+                                bundle.raw.ts_bucket,
+                                payload.clone(),
+                            );
+                            if stage2b_output_for_context.is_some() {
+                                continue;
                             }
-                            Err(err) => {
-                                append_workflow_journal_event(
-                                    "workflow_stage2b_parse_error",
-                                    &symbol,
-                                    bundle.raw.ts_bucket,
-                                    json!({
-                                        "trigger": &*trigger,
-                                        "error": format!("{err:#}"),
-                                    }),
-                                );
+                            let Some(value) = payload.get("parsed_value").cloned() else {
+                                continue;
+                            };
+                            match crate::workflow::parser::parse_stage2b_output(
+                                value,
+                                &stage1_output,
+                                &active_position.context_key,
+                            ) {
+                                Ok(parsed) => {
+                                    selected_stage2b_model_names.insert(
+                                        active_position.context_key.clone(),
+                                        out.model_name.clone(),
+                                    );
+                                    stage2b_output_for_context = Some(parsed);
+                                }
+                                Err(err) => {
+                                    append_workflow_journal_event(
+                                        "workflow_stage2b_parse_error",
+                                        &symbol,
+                                        bundle.raw.ts_bucket,
+                                        json!({
+                                            "trigger": &*trigger,
+                                            "context_key": active_position.context_key,
+                                            "error": format!("{err:#}"),
+                                        }),
+                                    );
+                                }
                             }
+                        }
+                        if let Some(parsed) = stage2b_output_for_context {
+                            next_position_plans.insert(
+                                active_position.context_key.clone(),
+                                parsed.position_management_plan,
+                            );
                         }
                     }
-                    if let Some(parsed) = stage2b_output.as_ref() {
-                        workflow_state.approved_position_management_plan =
-                            Some(parsed.position_management_plan.clone());
-                        workflow_state.approved_position_management_plan_updated_at =
-                            Some(Utc::now());
-                        crate::workflow::persistence::save_workflow_state(
-                            &state_dir,
-                            &workflow_state,
-                        )?;
-                    }
+                    replace_position_management_plans(&mut workflow_state, next_position_plans);
+                    crate::workflow::persistence::save_workflow_state(&state_dir, &workflow_state)?;
                 } else {
-                    workflow_state.approved_position_management_plan = None;
-                    workflow_state.approved_position_management_plan_updated_at = None;
+                    clear_position_management_plans(&mut workflow_state);
                 }
 
                 if should_run_stage2c {
-                    let prompt_input = crate::workflow::stage2::build_stage2c_prompt_input(
-                        indicator_summary.clone(),
-                        stage1_output.clone(),
-                        candidate_event,
-                        path_runtime_state.clone(),
-                        workflow_state.approved_pending_order_management_plan.clone(),
-                        &trading_state,
-                        &entry_snapshots,
-                    );
-                    let prompt_value = serde_json::to_value(&prompt_input)
-                        .context("serialize workflow stage2c prompt input")?;
-                    if config.llm.workflow.persist_prompt_inputs {
-                        let _ = persist_workflow_prompt_input_to_disk(
-                            &bundle.raw,
-                            "workflow_stage2c",
-                            &prompt_value,
-                            retention_minutes,
-                        )
-                        .await?;
-                    }
-                    for out in crate::llm::workflow_provider::invoke_stage2c_models(
-                        &http_client,
-                        &loopback_http_client,
-                        &config,
-                        &prompt_value,
-                        &symbol,
-                    )
-                    .await
-                    {
-                        let payload = json!({
-                            "trigger": &*trigger,
-                            "stage": "stage2c",
-                            "model_name": out.model_name,
-                            "provider": out.provider,
-                            "model_id": out.model,
-                            "latency_ms": out.latency_ms,
-                            "raw_response_text": out.raw_response_text,
-                            "parsed_value": out.parsed_value,
-                            "error": out.error,
-                        });
-                        append_workflow_journal_event(
-                            "workflow_stage2c_response",
-                            &symbol,
-                            bundle.raw.ts_bucket,
-                            payload.clone(),
+                    let mut next_pending_order_plans = BTreeMap::new();
+                    let expected_stage2c_exposure_state = stage2c_exposure_state
+                        .expect("Stage2C exposure state must exist when Stage2C is enabled");
+                    for active_order in &stage2c_contexts {
+                        let prompt_input = crate::workflow::stage2::build_stage2c_prompt_input(
+                            indicator_summary.clone(),
+                            stage1_output.clone(),
+                            candidate_event.clone(),
+                            path_runtime_state.clone(),
+                            expected_stage2c_exposure_state,
+                            active_order.clone(),
+                            pending_order_management_plan_for_context(
+                                workflow_state
+                                    .approved_pending_order_management_plans
+                                    .get(&active_order.context_key)
+                                    .cloned(),
+                                &path_runtime_state.path_id,
+                                &active_order.context_key,
+                            ),
+                            &trading_state,
                         );
-                        if stage2c_output.is_some() {
-                            continue;
+                        let prompt_value = serde_json::to_value(&prompt_input)
+                            .context("serialize workflow stage2c prompt input")?;
+                        if config.llm.workflow.persist_prompt_inputs {
+                            let _ = persist_workflow_prompt_input_to_disk(
+                                &bundle.raw,
+                                "workflow_stage2c",
+                                &prompt_value,
+                                retention_minutes,
+                            )
+                            .await?;
                         }
-                        let Some(value) = payload.get("parsed_value").cloned() else {
-                            continue;
-                        };
-                        match crate::workflow::parser::parse_stage2c_output(value, &stage1_output) {
-                            Ok(parsed) => {
-                                selected_stage2c_model_name = Some(out.model_name.clone());
-                                stage2c_output = Some(parsed);
+                        let mut stage2c_output_for_context: Option<
+                            crate::workflow::schema::Stage2COutput,
+                        > = None;
+                        for out in crate::llm::workflow_provider::invoke_stage2c_models(
+                            &http_client,
+                            &loopback_http_client,
+                            &config,
+                            &prompt_value,
+                            &symbol,
+                        )
+                        .await
+                        {
+                            let payload = json!({
+                                "trigger": &*trigger,
+                                "stage": "stage2c",
+                                "context_key": active_order.context_key,
+                                "order_id": active_order.order_id,
+                                "model_name": out.model_name,
+                                "provider": out.provider,
+                                "model_id": out.model,
+                                "latency_ms": out.latency_ms,
+                                "raw_response_text": out.raw_response_text,
+                                "parsed_value": out.parsed_value,
+                                "error": out.error,
+                            });
+                            append_workflow_journal_event(
+                                "workflow_stage2c_response",
+                                &symbol,
+                                bundle.raw.ts_bucket,
+                                payload.clone(),
+                            );
+                            if stage2c_output_for_context.is_some() {
+                                continue;
                             }
-                            Err(err) => {
-                                append_workflow_journal_event(
-                                    "workflow_stage2c_parse_error",
-                                    &symbol,
-                                    bundle.raw.ts_bucket,
-                                    json!({
-                                        "trigger": &*trigger,
-                                        "error": format!("{err:#}"),
-                                    }),
-                                );
+                            let Some(value) = payload.get("parsed_value").cloned() else {
+                                continue;
+                            };
+                            match crate::workflow::parser::parse_stage2c_output(
+                                value,
+                                &stage1_output,
+                                expected_stage2c_exposure_state,
+                                &active_order.context_key,
+                            ) {
+                                Ok(parsed) => {
+                                    selected_stage2c_model_names.insert(
+                                        active_order.context_key.clone(),
+                                        out.model_name.clone(),
+                                    );
+                                    stage2c_output_for_context = Some(parsed);
+                                }
+                                Err(err) => {
+                                    append_workflow_journal_event(
+                                        "workflow_stage2c_parse_error",
+                                        &symbol,
+                                        bundle.raw.ts_bucket,
+                                        json!({
+                                            "trigger": &*trigger,
+                                            "context_key": active_order.context_key,
+                                            "order_id": active_order.order_id,
+                                            "error": format!("{err:#}"),
+                                        }),
+                                    );
+                                }
                             }
+                        }
+                        if let Some(parsed) = stage2c_output_for_context {
+                            next_pending_order_plans.insert(
+                                active_order.context_key.clone(),
+                                parsed.pending_order_management_plan,
+                            );
                         }
                     }
-                    if let Some(parsed) = stage2c_output.as_ref() {
-                        workflow_state.approved_pending_order_management_plan =
-                            Some(parsed.pending_order_management_plan.clone());
-                        workflow_state.approved_pending_order_management_plan_updated_at =
-                            Some(Utc::now());
-                        crate::workflow::persistence::save_workflow_state(
-                            &state_dir,
-                            &workflow_state,
-                        )?;
-                    }
-                } else if live_entry_order_count == 0 {
-                    workflow_state.approved_pending_order_management_plan = None;
-                    workflow_state.approved_pending_order_management_plan_updated_at = None;
+                    replace_pending_order_management_plans(
+                        &mut workflow_state,
+                        next_pending_order_plans,
+                    );
+                    crate::workflow::persistence::save_workflow_state(&state_dir, &workflow_state)?;
+                } else {
+                    clear_pending_order_management_plans(&mut workflow_state);
                 }
                 crate::workflow::persistence::save_workflow_state(&state_dir, &workflow_state)?;
             } else {
@@ -3016,18 +3237,448 @@ async fn invoke_workflow_bundle_models(
 
     if config.llm.execution.enabled && !execution_blocked_due_to_stale {
         if let Some(current_path) = stage1_output.current_path.as_ref() {
-            let watch_price = watcher_reference_price(&input.indicators, path_runtime_state.latest_price);
+            let watch_price =
+                watcher_reference_price(&input.indicators, path_runtime_state.latest_price);
             let watch_facts = build_watcher_price_facts(&input.indicators, watch_price);
 
-            if let Some(plan) = workflow_state.approved_position_management_plan.clone() {
+            let position_plan_context_keys = workflow_state
+                .approved_position_management_plans
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>();
+            for plan_context_key in position_plan_context_keys {
+                if execution_signal_intent.is_some() || management_signal_action.is_some() {
+                    break;
+                }
+                let Some(plan) = workflow_state
+                    .approved_position_management_plans
+                    .get(&plan_context_key)
+                    .cloned()
+                else {
+                    continue;
+                };
                 if plan.path_id != current_path.id {
-                    workflow_state.approved_position_management_plan = None;
-                    workflow_state.approved_position_management_plan_updated_at = None;
-                } else if let Some(action_index) = first_triggered_position_management_action_index(
+                    remove_position_management_plan(&mut workflow_state, &plan_context_key);
+                    continue;
+                }
+                let Some(action_index) = first_triggered_position_management_action_index(
                     &plan,
                     &watch_facts,
                     &config.llm.workflow.watcher,
-                ) {
+                ) else {
+                    continue;
+                };
+                let action = plan.actions[action_index].clone();
+                let snapshot = snapshot_for_management_context(
+                    &symbol,
+                    current_path,
+                    &workflow_state,
+                    &entry_snapshots,
+                    &action.context_key,
+                    &action.path_id,
+                );
+                match action.action_type.as_str() {
+                    "add" => {
+                        let fallback_plan =
+                            matching_tactical_entry_plan(&workflow_state, &action.path_id);
+                        match (
+                            entry_plan_from_snapshot_template(&snapshot, fallback_plan),
+                            find_active_position_for_side(&trading_state, &snapshot.side),
+                        ) {
+                            (Ok(entry_template), Some(active_position)) => {
+                                let bracket_template =
+                                    crate::workflow::schema::PostFillBracketTemplate {
+                                        take_profit_1: snapshot.take_profit_1,
+                                        take_profit_2: snapshot.take_profit_2,
+                                        stop_loss: snapshot.stop_loss,
+                                    };
+                                let mut intent = execution_intent_from_entry_plan(
+                                    &symbol,
+                                    &action.path_id,
+                                    &entry_template,
+                                    current_path,
+                                    Some(&bracket_template),
+                                    watch_price,
+                                    config.llm.workflow.watcher.entry_ttl_minutes,
+                                    action
+                                        .add_ratio
+                                        .map(|ratio| active_position.position_amt.abs() * ratio),
+                                );
+                                intent.reason = Some(action.reason.clone());
+                                match adapt_execution_intent(&intent) {
+                                    Ok(adapted_intent) => {
+                                        match execute_workflow_execution_intent(
+                                            &http_client,
+                                            &config.api.binance,
+                                            &config.llm.execution,
+                                            &symbol,
+                                            &adapted_intent,
+                                        )
+                                        .await
+                                        {
+                                            Ok(report) => {
+                                                append_workflow_journal_event(
+                                                    "workflow_stage2b_add_execution_report",
+                                                    &symbol,
+                                                    bundle.raw.ts_bucket,
+                                                    json!({
+                                                        "trigger": &*trigger,
+                                                        "action": &action,
+                                                        "report": {
+                                                            "decision": report.decision,
+                                                            "quantity": report.quantity,
+                                                            "leverage": report.leverage,
+                                                            "position_side": report.position_side,
+                                                            "maker_entry_price": report.maker_entry_price,
+                                                            "take_profit": report.actual_take_profit,
+                                                            "stop_loss": report.actual_stop_loss,
+                                                            "risk_reward_ratio": report.actual_risk_reward_ratio,
+                                                            "dry_run": report.dry_run,
+                                                        },
+                                                    }),
+                                                );
+                                                if !report.dry_run {
+                                                    let mut next_snapshot = snapshot.clone();
+                                                    next_snapshot.updated_at = Utc::now();
+                                                    crate::workflow::persistence::save_entry_snapshot(
+                                                            &state_dir,
+                                                            &next_snapshot,
+                                                        )?;
+                                                    entry_snapshots.insert(
+                                                        next_snapshot.context_key.clone(),
+                                                        next_snapshot,
+                                                    );
+                                                    workflow_state.last_filled_context_key =
+                                                        Some(snapshot.context_key.clone());
+                                                    if let Some(next_plan) =
+                                                        remove_position_management_action(
+                                                            &plan,
+                                                            action_index,
+                                                        )
+                                                    {
+                                                        upsert_position_management_plan(
+                                                            &mut workflow_state,
+                                                            &plan_context_key,
+                                                            next_plan,
+                                                        );
+                                                    } else {
+                                                        remove_position_management_plan(
+                                                            &mut workflow_state,
+                                                            &plan_context_key,
+                                                        );
+                                                    }
+                                                }
+                                                execution_signal_intent = Some(intent);
+                                                execution_signal_report = Some(report);
+                                                execution_signal_model_name =
+                                                    selected_stage2b_model_names
+                                                        .get(&action.context_key)
+                                                        .cloned()
+                                                        .or_else(|| {
+                                                            Some(
+                                                                "workflow_stage2b_watcher"
+                                                                    .to_string(),
+                                                            )
+                                                        });
+                                            }
+                                            Err(err) => {
+                                                append_workflow_journal_event(
+                                                    "workflow_stage2b_add_execution_error",
+                                                    &symbol,
+                                                    bundle.raw.ts_bucket,
+                                                    json!({
+                                                        "trigger": &*trigger,
+                                                        "action": &action,
+                                                        "error": format!("{err:#}"),
+                                                    }),
+                                                );
+                                            }
+                                        }
+                                    }
+                                    Err(err) => {
+                                        append_workflow_journal_event(
+                                            "workflow_stage2b_add_execution_error",
+                                            &symbol,
+                                            bundle.raw.ts_bucket,
+                                            json!({
+                                                "trigger": &*trigger,
+                                                "action": &action,
+                                                "error": format!("{err:#}"),
+                                                "phase": "intent_adapter",
+                                            }),
+                                        );
+                                    }
+                                }
+                            }
+                            (Err(err), _) => {
+                                append_workflow_journal_event(
+                                    "workflow_stage2b_add_execution_error",
+                                    &symbol,
+                                    bundle.raw.ts_bucket,
+                                    json!({
+                                        "trigger": &*trigger,
+                                        "action": &action,
+                                        "error": format!("{err:#}"),
+                                        "phase": "entry_template",
+                                    }),
+                                );
+                            }
+                            (_, None) => {
+                                append_workflow_journal_event(
+                                    "workflow_stage2b_add_execution_error",
+                                    &symbol,
+                                    bundle.raw.ts_bucket,
+                                    json!({
+                                        "trigger": &*trigger,
+                                        "action": &action,
+                                        "error": "no active position available for add execution",
+                                    }),
+                                );
+                            }
+                        }
+                    }
+                    "reduce" | "exit_full" | "move_stop" | "update_take_profit" => {
+                        match management_action_from_position_management_action(&action).and_then(
+                            |management_action| {
+                                let adapted =
+                                    adapt_management_action(&management_action, &snapshot)?;
+                                Ok((management_action, adapted))
+                            },
+                        ) {
+                            Ok((management_action, adapted_action)) => {
+                                match execute_workflow_management_action(
+                                    &http_client,
+                                    &config.api.binance,
+                                    &config.llm.execution,
+                                    &symbol,
+                                    &snapshot,
+                                    &adapted_action,
+                                )
+                                .await
+                                {
+                                    Ok(report) => {
+                                        append_workflow_journal_event(
+                                            "workflow_stage2b_management_execution_report",
+                                            &symbol,
+                                            bundle.raw.ts_bucket,
+                                            json!({
+                                                "trigger": &*trigger,
+                                                "action": &action,
+                                                "report": {
+                                                    "action": report.action,
+                                                    "dry_run": report.dry_run,
+                                                    "position_count": report.position_count,
+                                                    "open_order_count": report.open_order_count,
+                                                    "canceled_open_orders": report.canceled_open_orders,
+                                                    "reduce_order_ids": report.reduce_order_ids,
+                                                    "close_order_ids": report.close_order_ids,
+                                                    "modify_take_profit_order_ids": report.modify_take_profit_order_ids,
+                                                    "modify_stop_loss_order_ids": report.modify_stop_loss_order_ids,
+                                                    "realized_pnl_usdt": report.realized_pnl_usdt,
+                                                },
+                                            }),
+                                        );
+                                        if !report.dry_run {
+                                            match action.action_type.as_str() {
+                                                "exit_full" => {
+                                                    entry_snapshots.remove(&snapshot.context_key);
+                                                    crate::workflow::persistence::delete_entry_snapshot(
+                                                            &state_dir,
+                                                            &symbol,
+                                                            &snapshot.context_key,
+                                                        )?;
+                                                    clear_approved_tactical_plan(
+                                                        &mut workflow_state,
+                                                    );
+                                                    remove_position_management_plan(
+                                                        &mut workflow_state,
+                                                        &plan_context_key,
+                                                    );
+                                                }
+                                                "move_stop" => {
+                                                    let next_snapshot = patch_entry_snapshot_levels(
+                                                        &snapshot,
+                                                        action.new_stop_loss,
+                                                        None,
+                                                        None,
+                                                    );
+                                                    crate::workflow::persistence::save_entry_snapshot(
+                                                            &state_dir,
+                                                            &next_snapshot,
+                                                        )?;
+                                                    entry_snapshots.insert(
+                                                        next_snapshot.context_key.clone(),
+                                                        next_snapshot,
+                                                    );
+                                                    if let Some(next_plan) =
+                                                        remove_position_management_action(
+                                                            &plan,
+                                                            action_index,
+                                                        )
+                                                    {
+                                                        upsert_position_management_plan(
+                                                            &mut workflow_state,
+                                                            &plan_context_key,
+                                                            next_plan,
+                                                        );
+                                                    } else {
+                                                        remove_position_management_plan(
+                                                            &mut workflow_state,
+                                                            &plan_context_key,
+                                                        );
+                                                    }
+                                                }
+                                                "update_take_profit" => {
+                                                    let next_snapshot = patch_entry_snapshot_levels(
+                                                        &snapshot,
+                                                        None,
+                                                        action.take_profit_1,
+                                                        action.take_profit_2,
+                                                    );
+                                                    crate::workflow::persistence::save_entry_snapshot(
+                                                            &state_dir,
+                                                            &next_snapshot,
+                                                        )?;
+                                                    entry_snapshots.insert(
+                                                        next_snapshot.context_key.clone(),
+                                                        next_snapshot,
+                                                    );
+                                                    if let Some(next_plan) =
+                                                        remove_position_management_action(
+                                                            &plan,
+                                                            action_index,
+                                                        )
+                                                    {
+                                                        upsert_position_management_plan(
+                                                            &mut workflow_state,
+                                                            &plan_context_key,
+                                                            next_plan,
+                                                        );
+                                                    } else {
+                                                        remove_position_management_plan(
+                                                            &mut workflow_state,
+                                                            &plan_context_key,
+                                                        );
+                                                    }
+                                                }
+                                                _ => {
+                                                    let mut next_snapshot = snapshot.clone();
+                                                    next_snapshot.updated_at = Utc::now();
+                                                    crate::workflow::persistence::save_entry_snapshot(
+                                                            &state_dir,
+                                                            &next_snapshot,
+                                                        )?;
+                                                    entry_snapshots.insert(
+                                                        next_snapshot.context_key.clone(),
+                                                        next_snapshot,
+                                                    );
+                                                    if let Some(next_plan) =
+                                                        remove_position_management_action(
+                                                            &plan,
+                                                            action_index,
+                                                        )
+                                                    {
+                                                        upsert_position_management_plan(
+                                                            &mut workflow_state,
+                                                            &plan_context_key,
+                                                            next_plan,
+                                                        );
+                                                    } else {
+                                                        remove_position_management_plan(
+                                                            &mut workflow_state,
+                                                            &plan_context_key,
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        management_signal_action = Some(management_action);
+                                        management_signal_report = Some(report);
+                                        management_signal_model_name = selected_stage2b_model_names
+                                            .get(&action.context_key)
+                                            .cloned()
+                                            .or_else(|| {
+                                                Some("workflow_stage2b_watcher".to_string())
+                                            });
+                                    }
+                                    Err(err) => {
+                                        append_workflow_journal_event(
+                                            "workflow_stage2b_management_execution_error",
+                                            &symbol,
+                                            bundle.raw.ts_bucket,
+                                            json!({
+                                                "trigger": &*trigger,
+                                                "action": &action,
+                                                "error": format!("{err:#}"),
+                                            }),
+                                        );
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                append_workflow_journal_event(
+                                    "workflow_stage2b_management_execution_error",
+                                    &symbol,
+                                    bundle.raw.ts_bucket,
+                                    json!({
+                                        "trigger": &*trigger,
+                                        "action": &action,
+                                        "error": format!("{err:#}"),
+                                        "phase": "adapter",
+                                    }),
+                                );
+                            }
+                        }
+                    }
+                    other => {
+                        append_workflow_journal_event(
+                            "workflow_stage2b_management_execution_error",
+                            &symbol,
+                            bundle.raw.ts_bucket,
+                            json!({
+                                "trigger": &*trigger,
+                                "action": &action,
+                                "error": format!("unsupported stage2b watcher action {}", other),
+                            }),
+                        );
+                    }
+                }
+            }
+
+            if execution_signal_intent.is_none() && management_signal_action.is_none() {
+                let pending_plan_context_keys = workflow_state
+                    .approved_pending_order_management_plans
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                for plan_context_key in pending_plan_context_keys {
+                    if execution_signal_intent.is_some()
+                        || management_signal_action.is_some()
+                        || pending_order_execution_consumed
+                    {
+                        break;
+                    }
+                    let Some(plan) = workflow_state
+                        .approved_pending_order_management_plans
+                        .get(&plan_context_key)
+                        .cloned()
+                    else {
+                        continue;
+                    };
+                    if plan.path_id != current_path.id {
+                        remove_pending_order_management_plan(
+                            &mut workflow_state,
+                            &plan_context_key,
+                        );
+                        continue;
+                    }
+                    let Some(action_index) = first_triggered_pending_order_action_index(
+                        &plan,
+                        &watch_facts,
+                        &config.llm.workflow.watcher,
+                    ) else {
+                        continue;
+                    };
                     let action = plan.actions[action_index].clone();
                     let snapshot = snapshot_for_management_context(
                         &symbol,
@@ -3037,105 +3688,236 @@ async fn invoke_workflow_bundle_models(
                         &action.context_key,
                         &action.path_id,
                     );
+                    let has_live_position =
+                        has_active_position_for_side(&trading_state, &snapshot.side);
                     match action.action_type.as_str() {
-                        "add" => {
-                            let fallback_plan =
-                                matching_tactical_entry_plan(&workflow_state, &action.path_id);
-                            match (
-                                entry_plan_from_snapshot_template(&snapshot, fallback_plan),
-                                find_active_position_for_side(&trading_state, &snapshot.side),
-                            ) {
-                                (Ok(entry_template), Some(active_position)) => {
-                                    let bracket_template =
-                                        crate::workflow::schema::PostFillBracketTemplate {
-                                            take_profit_1: snapshot.take_profit_1,
-                                            take_profit_2: snapshot.take_profit_2,
-                                            stop_loss: snapshot.stop_loss,
-                                        };
-                                    let mut intent = execution_intent_from_entry_plan(
+                        "cancel_pending_order" => {
+                            match cancel_workflow_pending_entry_orders(
+                                &http_client,
+                                &config.api.binance,
+                                &config.llm.execution,
+                                &symbol,
+                                &snapshot.side,
+                            )
+                            .await
+                            {
+                                Ok(canceled_order_ids) => {
+                                    pending_order_execution_consumed = true;
+                                    append_workflow_journal_event(
+                                        "workflow_stage2c_pending_order_execution_report",
                                         &symbol,
-                                        &action.path_id,
-                                        &entry_template,
-                                        current_path,
-                                        Some(&bracket_template),
-                                        watch_price,
-                                        config.llm.workflow.watcher.entry_ttl_minutes,
-                                        action
-                                            .add_ratio
-                                            .map(|ratio| active_position.position_amt.abs() * ratio),
+                                        bundle.raw.ts_bucket,
+                                        json!({
+                                            "trigger": &*trigger,
+                                            "action": &action,
+                                            "canceled_order_ids": canceled_order_ids,
+                                            "dry_run": config.llm.execution.dry_run,
+                                        }),
                                     );
-                                    intent.reason = Some(action.reason.clone());
+                                    if !config.llm.execution.dry_run {
+                                        if !has_live_position {
+                                            entry_snapshots.remove(&snapshot.context_key);
+                                            crate::workflow::persistence::delete_entry_snapshot(
+                                                &state_dir,
+                                                &symbol,
+                                                &snapshot.context_key,
+                                            )?;
+                                            if workflow_state.last_filled_context_key.as_deref()
+                                                == Some(snapshot.context_key.as_str())
+                                            {
+                                                workflow_state.last_filled_context_key = None;
+                                            }
+                                        }
+                                        if workflow_state
+                                            .approved_tactical_plan
+                                            .as_ref()
+                                            .is_some_and(|item| item.path_id == action.path_id)
+                                        {
+                                            clear_approved_tactical_plan(&mut workflow_state);
+                                        }
+                                        workflow_state.pending_entry_bracket_template_override =
+                                            None;
+                                        if let Some(next_plan) =
+                                            remove_pending_order_management_action(
+                                                &plan,
+                                                action_index,
+                                            )
+                                        {
+                                            upsert_pending_order_management_plan(
+                                                &mut workflow_state,
+                                                &plan_context_key,
+                                                next_plan,
+                                            );
+                                        } else {
+                                            remove_pending_order_management_plan(
+                                                &mut workflow_state,
+                                                &plan_context_key,
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(err) => {
+                                    append_workflow_journal_event(
+                                        "workflow_stage2c_pending_order_execution_error",
+                                        &symbol,
+                                        bundle.raw.ts_bucket,
+                                        json!({
+                                            "trigger": &*trigger,
+                                            "action": &action,
+                                            "error": format!("{err:#}"),
+                                        }),
+                                    );
+                                }
+                            }
+                        }
+                        "replace_entry" => {
+                            match build_stage2c_replace_execution_intent(
+                                &symbol,
+                                current_path,
+                                &workflow_state,
+                                &snapshot,
+                                &action,
+                                watch_price,
+                                config.llm.workflow.watcher.entry_ttl_minutes,
+                            ) {
+                                Ok((next_tactical_plan, bracket_template, intent)) => {
                                     match adapt_execution_intent(&intent) {
                                         Ok(adapted_intent) => {
-                                            match execute_workflow_execution_intent(
+                                            match cancel_workflow_pending_entry_orders(
                                                 &http_client,
                                                 &config.api.binance,
                                                 &config.llm.execution,
                                                 &symbol,
-                                                &adapted_intent,
+                                                &snapshot.side,
                                             )
                                             .await
                                             {
-                                                Ok(report) => {
+                                                Ok(canceled_order_ids) => {
+                                                    pending_order_execution_consumed = true;
                                                     append_workflow_journal_event(
-                                                        "workflow_stage2b_add_execution_report",
+                                                        "workflow_stage2c_pending_order_execution_report",
                                                         &symbol,
                                                         bundle.raw.ts_bucket,
                                                         json!({
                                                             "trigger": &*trigger,
                                                             "action": &action,
-                                                            "report": {
-                                                                "decision": report.decision,
-                                                                "quantity": report.quantity,
-                                                                "leverage": report.leverage,
-                                                                "position_side": report.position_side,
-                                                                "maker_entry_price": report.maker_entry_price,
-                                                                "take_profit": report.actual_take_profit,
-                                                                "stop_loss": report.actual_stop_loss,
-                                                                "risk_reward_ratio": report.actual_risk_reward_ratio,
-                                                                "dry_run": report.dry_run,
-                                                            },
+                                                            "canceled_order_ids": canceled_order_ids,
+                                                            "dry_run": config.llm.execution.dry_run,
                                                         }),
                                                     );
-                                                    if !report.dry_run {
-                                                        let mut next_snapshot = snapshot.clone();
-                                                        next_snapshot.updated_at = Utc::now();
-                                                        crate::workflow::persistence::save_entry_snapshot(
-                                                            &state_dir,
-                                                            &next_snapshot,
-                                                        )?;
-                                                        entry_snapshots.insert(
-                                                            next_snapshot.context_key.clone(),
-                                                            next_snapshot,
-                                                        );
-                                                        workflow_state.last_filled_context_key =
-                                                            Some(snapshot.context_key.clone());
-                                                        workflow_state.approved_position_management_plan =
-                                                            remove_position_management_action(
-                                                                &plan,
-                                                                action_index,
+                                                    match execute_workflow_execution_intent(
+                                                        &http_client,
+                                                        &config.api.binance,
+                                                        &config.llm.execution,
+                                                        &symbol,
+                                                        &adapted_intent,
+                                                    )
+                                                    .await
+                                                    {
+                                                        Ok(report) => {
+                                                            append_workflow_journal_event(
+                                                                "workflow_stage2c_replace_execution_report",
+                                                                &symbol,
+                                                                bundle.raw.ts_bucket,
+                                                                json!({
+                                                                    "trigger": &*trigger,
+                                                                    "action": &action,
+                                                                    "report": {
+                                                                        "decision": report.decision,
+                                                                        "quantity": report.quantity,
+                                                                        "leverage": report.leverage,
+                                                                        "position_side": report.position_side,
+                                                                        "maker_entry_price": report.maker_entry_price,
+                                                                        "take_profit": report.actual_take_profit,
+                                                                        "stop_loss": report.actual_stop_loss,
+                                                                        "risk_reward_ratio": report.actual_risk_reward_ratio,
+                                                                        "dry_run": report.dry_run,
+                                                                    },
+                                                                }),
                                                             );
-                                                        workflow_state.approved_position_management_plan_updated_at =
-                                                            workflow_state
-                                                                .approved_position_management_plan
-                                                                .as_ref()
-                                                                .map(|_| Utc::now());
+                                                            if !report.dry_run {
+                                                                workflow_state
+                                                                    .approved_tactical_plan =
+                                                                    Some(next_tactical_plan);
+                                                                workflow_state
+                                                                    .approved_tactical_plan_updated_at =
+                                                                    Some(Utc::now());
+                                                                workflow_state
+                                                                    .pending_entry_bracket_template_override =
+                                                                    Some(bracket_template);
+                                                                let next_snapshot =
+                                                                    crate::workflow::management::snapshot_from_execution_intent(
+                                                                        &symbol,
+                                                                        &intent,
+                                                                        current_path,
+                                                                        Utc::now(),
+                                                                    );
+                                                                crate::workflow::persistence::save_entry_snapshot(
+                                                                    &state_dir,
+                                                                    &next_snapshot,
+                                                                )?;
+                                                                entry_snapshots.insert(
+                                                                    next_snapshot
+                                                                        .context_key
+                                                                        .clone(),
+                                                                    next_snapshot,
+                                                                );
+                                                                workflow_state
+                                                                    .last_filled_context_key = Some(
+                                                                    intent
+                                                                        .entry_snapshot
+                                                                        .context_key
+                                                                        .clone(),
+                                                                );
+                                                                if let Some(next_plan) =
+                                                                    remove_pending_order_management_action(
+                                                                        &plan,
+                                                                        action_index,
+                                                                    )
+                                                                {
+                                                                    upsert_pending_order_management_plan(
+                                                                        &mut workflow_state,
+                                                                        &plan_context_key,
+                                                                        next_plan,
+                                                                    );
+                                                                } else {
+                                                                    remove_pending_order_management_plan(
+                                                                        &mut workflow_state,
+                                                                        &plan_context_key,
+                                                                    );
+                                                                }
+                                                            }
+                                                            execution_signal_intent = Some(intent);
+                                                            execution_signal_report = Some(report);
+                                                            execution_signal_model_name =
+                                                                selected_stage2c_model_names
+                                                                    .get(&action.context_key)
+                                                                    .cloned()
+                                                                    .or_else(|| {
+                                                                        Some(
+                                                                            "workflow_stage2c_watcher"
+                                                                                .to_string(),
+                                                                        )
+                                                                    });
+                                                        }
+                                                        Err(err) => {
+                                                            append_workflow_journal_event(
+                                                                "workflow_stage2c_pending_order_execution_error",
+                                                                &symbol,
+                                                                bundle.raw.ts_bucket,
+                                                                json!({
+                                                                    "trigger": &*trigger,
+                                                                    "action": &action,
+                                                                    "error": format!("{err:#}"),
+                                                                    "phase": "replace_execution",
+                                                                }),
+                                                            );
+                                                        }
                                                     }
-                                                    execution_signal_intent = Some(intent);
-                                                    execution_signal_report = Some(report);
-                                                    execution_signal_model_name =
-                                                        selected_stage2b_model_name
-                                                            .clone()
-                                                            .or_else(|| {
-                                                                Some(
-                                                                    "workflow_stage2b_watcher"
-                                                                        .to_string(),
-                                                                )
-                                                            });
                                                 }
                                                 Err(err) => {
                                                     append_workflow_journal_event(
-                                                        "workflow_stage2b_add_execution_error",
+                                                        "workflow_stage2c_pending_order_execution_error",
                                                         &symbol,
                                                         bundle.raw.ts_bucket,
                                                         json!({
@@ -3149,7 +3931,7 @@ async fn invoke_workflow_bundle_models(
                                         }
                                         Err(err) => {
                                             append_workflow_journal_event(
-                                                "workflow_stage2b_add_execution_error",
+                                                "workflow_stage2c_pending_order_execution_error",
                                                 &symbol,
                                                 bundle.raw.ts_bucket,
                                                 json!({
@@ -3162,551 +3944,81 @@ async fn invoke_workflow_bundle_models(
                                         }
                                     }
                                 }
-                                (Err(err), _) => {
+                                Err(err) => {
                                     append_workflow_journal_event(
-                                        "workflow_stage2b_add_execution_error",
+                                        "workflow_stage2c_pending_order_execution_error",
                                         &symbol,
                                         bundle.raw.ts_bucket,
                                         json!({
                                             "trigger": &*trigger,
                                             "action": &action,
                                             "error": format!("{err:#}"),
-                                            "phase": "entry_template",
-                                        }),
-                                    );
-                                }
-                                (_, None) => {
-                                    append_workflow_journal_event(
-                                        "workflow_stage2b_add_execution_error",
-                                        &symbol,
-                                        bundle.raw.ts_bucket,
-                                        json!({
-                                            "trigger": &*trigger,
-                                            "action": &action,
-                                            "error": "no active position available for add execution",
+                                            "phase": "replace_template",
                                         }),
                                     );
                                 }
                             }
                         }
-                        "reduce" | "exit_full" | "move_stop" | "update_take_profit" => {
-                            match management_action_from_position_management_action(&action)
-                                .and_then(|management_action| {
-                                    let adapted =
-                                        adapt_management_action(&management_action, &snapshot)?;
-                                    Ok((management_action, adapted))
-                                }) {
-                                Ok((management_action, adapted_action)) => {
-                                    match execute_workflow_management_action(
-                                        &http_client,
-                                        &config.api.binance,
-                                        &config.llm.execution,
-                                        &symbol,
-                                        &snapshot,
-                                        &adapted_action,
-                                    )
-                                    .await
-                                    {
-                                        Ok(report) => {
-                                            append_workflow_journal_event(
-                                                "workflow_stage2b_management_execution_report",
-                                                &symbol,
-                                                bundle.raw.ts_bucket,
-                                                json!({
-                                                    "trigger": &*trigger,
-                                                    "action": &action,
-                                                    "report": {
-                                                        "action": report.action,
-                                                        "dry_run": report.dry_run,
-                                                        "position_count": report.position_count,
-                                                        "open_order_count": report.open_order_count,
-                                                        "canceled_open_orders": report.canceled_open_orders,
-                                                        "reduce_order_ids": report.reduce_order_ids,
-                                                        "close_order_ids": report.close_order_ids,
-                                                        "modify_take_profit_order_ids": report.modify_take_profit_order_ids,
-                                                        "modify_stop_loss_order_ids": report.modify_stop_loss_order_ids,
-                                                        "realized_pnl_usdt": report.realized_pnl_usdt,
-                                                    },
-                                                }),
-                                            );
-                                            if !report.dry_run {
-                                                match action.action_type.as_str() {
-                                                    "exit_full" => {
-                                                        entry_snapshots.remove(&snapshot.context_key);
-                                                        crate::workflow::persistence::delete_entry_snapshot(
-                                                            &state_dir,
-                                                            &symbol,
-                                                            &snapshot.context_key,
-                                                        )?;
-                                                        clear_approved_tactical_plan(
-                                                            &mut workflow_state,
-                                                        );
-                                                        workflow_state.approved_position_management_plan =
-                                                            None;
-                                                        workflow_state
-                                                            .approved_position_management_plan_updated_at =
-                                                            None;
-                                                    }
-                                                    "move_stop" => {
-                                                        let next_snapshot = patch_entry_snapshot_levels(
-                                                            &snapshot,
-                                                            action.new_stop_loss,
-                                                            None,
-                                                            None,
-                                                        );
-                                                        crate::workflow::persistence::save_entry_snapshot(
-                                                            &state_dir,
-                                                            &next_snapshot,
-                                                        )?;
-                                                        entry_snapshots.insert(
-                                                            next_snapshot.context_key.clone(),
-                                                            next_snapshot,
-                                                        );
-                                                        workflow_state.approved_position_management_plan =
-                                                            remove_position_management_action(
-                                                                &plan,
-                                                                action_index,
-                                                            );
-                                                        workflow_state
-                                                            .approved_position_management_plan_updated_at =
-                                                            workflow_state
-                                                                .approved_position_management_plan
-                                                                .as_ref()
-                                                                .map(|_| Utc::now());
-                                                    }
-                                                    "update_take_profit" => {
-                                                        let next_snapshot = patch_entry_snapshot_levels(
-                                                            &snapshot,
-                                                            None,
-                                                            action.take_profit_1,
-                                                            action.take_profit_2,
-                                                        );
-                                                        crate::workflow::persistence::save_entry_snapshot(
-                                                            &state_dir,
-                                                            &next_snapshot,
-                                                        )?;
-                                                        entry_snapshots.insert(
-                                                            next_snapshot.context_key.clone(),
-                                                            next_snapshot,
-                                                        );
-                                                        workflow_state.approved_position_management_plan =
-                                                            remove_position_management_action(
-                                                                &plan,
-                                                                action_index,
-                                                            );
-                                                        workflow_state
-                                                            .approved_position_management_plan_updated_at =
-                                                            workflow_state
-                                                                .approved_position_management_plan
-                                                                .as_ref()
-                                                                .map(|_| Utc::now());
-                                                    }
-                                                    _ => {
-                                                        let mut next_snapshot = snapshot.clone();
-                                                        next_snapshot.updated_at = Utc::now();
-                                                        crate::workflow::persistence::save_entry_snapshot(
-                                                            &state_dir,
-                                                            &next_snapshot,
-                                                        )?;
-                                                        entry_snapshots.insert(
-                                                            next_snapshot.context_key.clone(),
-                                                            next_snapshot,
-                                                        );
-                                                        workflow_state.approved_position_management_plan =
-                                                            remove_position_management_action(
-                                                                &plan,
-                                                                action_index,
-                                                            );
-                                                        workflow_state
-                                                            .approved_position_management_plan_updated_at =
-                                                            workflow_state
-                                                                .approved_position_management_plan
-                                                                .as_ref()
-                                                                .map(|_| Utc::now());
-                                                    }
-                                                }
-                                            }
-                                            management_signal_action = Some(management_action);
-                                            management_signal_report = Some(report);
-                                            management_signal_model_name =
-                                                selected_stage2b_model_name.clone().or_else(|| {
-                                                    Some("workflow_stage2b_watcher".to_string())
-                                                });
-                                        }
-                                        Err(err) => {
-                                            append_workflow_journal_event(
-                                                "workflow_stage2b_management_execution_error",
-                                                &symbol,
-                                                bundle.raw.ts_bucket,
-                                                json!({
-                                                    "trigger": &*trigger,
-                                                    "action": &action,
-                                                    "error": format!("{err:#}"),
-                                                }),
-                                            );
-                                        }
+                        "update_post_fill_bracket_template" => {
+                            pending_order_execution_consumed = true;
+                            append_workflow_journal_event(
+                                "workflow_stage2c_pending_order_execution_report",
+                                &symbol,
+                                bundle.raw.ts_bucket,
+                                json!({
+                                    "trigger": &*trigger,
+                                    "action": &action,
+                                    "dry_run": config.llm.execution.dry_run,
+                                }),
+                            );
+                            if !config.llm.execution.dry_run {
+                                if let Some(template) = action.post_fill_bracket_template.clone() {
+                                    workflow_state.pending_entry_bracket_template_override =
+                                        Some(template.clone());
+                                    if !has_live_position {
+                                        let next_snapshot = patch_entry_snapshot_levels(
+                                            &snapshot,
+                                            Some(template.stop_loss),
+                                            Some(template.take_profit_1),
+                                            Some(template.take_profit_2),
+                                        );
+                                        crate::workflow::persistence::save_entry_snapshot(
+                                            &state_dir,
+                                            &next_snapshot,
+                                        )?;
+                                        entry_snapshots.insert(
+                                            next_snapshot.context_key.clone(),
+                                            next_snapshot,
+                                        );
                                     }
                                 }
-                                Err(err) => {
-                                    append_workflow_journal_event(
-                                        "workflow_stage2b_management_execution_error",
-                                        &symbol,
-                                        bundle.raw.ts_bucket,
-                                        json!({
-                                            "trigger": &*trigger,
-                                            "action": &action,
-                                            "error": format!("{err:#}"),
-                                            "phase": "adapter",
-                                        }),
+                                if let Some(next_plan) =
+                                    remove_pending_order_management_action(&plan, action_index)
+                                {
+                                    upsert_pending_order_management_plan(
+                                        &mut workflow_state,
+                                        &plan_context_key,
+                                        next_plan,
+                                    );
+                                } else {
+                                    remove_pending_order_management_plan(
+                                        &mut workflow_state,
+                                        &plan_context_key,
                                     );
                                 }
                             }
                         }
                         other => {
                             append_workflow_journal_event(
-                                "workflow_stage2b_management_execution_error",
+                                "workflow_stage2c_pending_order_execution_error",
                                 &symbol,
                                 bundle.raw.ts_bucket,
                                 json!({
                                     "trigger": &*trigger,
                                     "action": &action,
-                                    "error": format!("unsupported stage2b watcher action {}", other),
+                                    "error": format!("unsupported stage2c watcher action {}", other),
                                 }),
                             );
-                        }
-                    }
-                }
-            }
-
-            if execution_signal_intent.is_none() && management_signal_action.is_none() {
-                if let Some(plan) = workflow_state.approved_pending_order_management_plan.clone() {
-                    if plan.path_id != current_path.id {
-                        workflow_state.approved_pending_order_management_plan = None;
-                        workflow_state.approved_pending_order_management_plan_updated_at = None;
-                    } else if let Some(action_index) = first_triggered_pending_order_action_index(
-                        &plan,
-                        &watch_facts,
-                        &config.llm.workflow.watcher,
-                    ) {
-                        let action = plan.actions[action_index].clone();
-                        let snapshot = snapshot_for_management_context(
-                            &symbol,
-                            current_path,
-                            &workflow_state,
-                            &entry_snapshots,
-                            &action.context_key,
-                            &action.path_id,
-                        );
-                        let has_live_position = has_active_position_for_side(&trading_state, &snapshot.side);
-                        match action.action_type.as_str() {
-                            "cancel_pending_order" => {
-                                match cancel_workflow_pending_entry_orders(
-                                    &http_client,
-                                    &config.api.binance,
-                                    &config.llm.execution,
-                                    &symbol,
-                                    &snapshot.side,
-                                )
-                                .await
-                                {
-                                    Ok(canceled_order_ids) => {
-                                        pending_order_execution_consumed = true;
-                                        append_workflow_journal_event(
-                                            "workflow_stage2c_pending_order_execution_report",
-                                            &symbol,
-                                            bundle.raw.ts_bucket,
-                                            json!({
-                                                "trigger": &*trigger,
-                                                "action": &action,
-                                                "canceled_order_ids": canceled_order_ids,
-                                                "dry_run": config.llm.execution.dry_run,
-                                            }),
-                                        );
-                                        if !config.llm.execution.dry_run {
-                                            if !has_live_position {
-                                                entry_snapshots.remove(&snapshot.context_key);
-                                                crate::workflow::persistence::delete_entry_snapshot(
-                                                    &state_dir,
-                                                    &symbol,
-                                                    &snapshot.context_key,
-                                                )?;
-                                                if workflow_state.last_filled_context_key.as_deref()
-                                                    == Some(snapshot.context_key.as_str())
-                                                {
-                                                    workflow_state.last_filled_context_key = None;
-                                                }
-                                            }
-                                            if workflow_state
-                                                .approved_tactical_plan
-                                                .as_ref()
-                                                .is_some_and(|item| item.path_id == action.path_id)
-                                            {
-                                                clear_approved_tactical_plan(&mut workflow_state);
-                                            }
-                                            workflow_state.pending_entry_bracket_template_override =
-                                                None;
-                                            workflow_state.approved_pending_order_management_plan =
-                                                remove_pending_order_management_action(
-                                                    &plan,
-                                                    action_index,
-                                                );
-                                            workflow_state
-                                                .approved_pending_order_management_plan_updated_at =
-                                                workflow_state
-                                                    .approved_pending_order_management_plan
-                                                    .as_ref()
-                                                    .map(|_| Utc::now());
-                                        }
-                                    }
-                                    Err(err) => {
-                                        append_workflow_journal_event(
-                                            "workflow_stage2c_pending_order_execution_error",
-                                            &symbol,
-                                            bundle.raw.ts_bucket,
-                                            json!({
-                                                "trigger": &*trigger,
-                                                "action": &action,
-                                                "error": format!("{err:#}"),
-                                            }),
-                                        );
-                                    }
-                                }
-                            }
-                            "replace_entry" => {
-                                match build_stage2c_replace_execution_intent(
-                                    &symbol,
-                                    current_path,
-                                    &workflow_state,
-                                    &snapshot,
-                                    &action,
-                                    watch_price,
-                                    config.llm.workflow.watcher.entry_ttl_minutes,
-                                ) {
-                                    Ok((next_tactical_plan, bracket_template, intent)) => {
-                                        match adapt_execution_intent(&intent) {
-                                            Ok(adapted_intent) => {
-                                                match cancel_workflow_pending_entry_orders(
-                                                    &http_client,
-                                                    &config.api.binance,
-                                                    &config.llm.execution,
-                                                    &symbol,
-                                                    &snapshot.side,
-                                                )
-                                                .await
-                                                {
-                                                    Ok(canceled_order_ids) => {
-                                                        pending_order_execution_consumed = true;
-                                                        append_workflow_journal_event(
-                                                            "workflow_stage2c_pending_order_execution_report",
-                                                            &symbol,
-                                                            bundle.raw.ts_bucket,
-                                                            json!({
-                                                                "trigger": &*trigger,
-                                                                "action": &action,
-                                                                "canceled_order_ids": canceled_order_ids,
-                                                                "dry_run": config.llm.execution.dry_run,
-                                                            }),
-                                                        );
-                                                        match execute_workflow_execution_intent(
-                                                            &http_client,
-                                                            &config.api.binance,
-                                                            &config.llm.execution,
-                                                            &symbol,
-                                                            &adapted_intent,
-                                                        )
-                                                        .await
-                                                        {
-                                                            Ok(report) => {
-                                                                append_workflow_journal_event(
-                                                                    "workflow_stage2c_replace_execution_report",
-                                                                    &symbol,
-                                                                    bundle.raw.ts_bucket,
-                                                                    json!({
-                                                                        "trigger": &*trigger,
-                                                                        "action": &action,
-                                                                        "report": {
-                                                                            "decision": report.decision,
-                                                                            "quantity": report.quantity,
-                                                                            "leverage": report.leverage,
-                                                                            "position_side": report.position_side,
-                                                                            "maker_entry_price": report.maker_entry_price,
-                                                                            "take_profit": report.actual_take_profit,
-                                                                            "stop_loss": report.actual_stop_loss,
-                                                                            "risk_reward_ratio": report.actual_risk_reward_ratio,
-                                                                            "dry_run": report.dry_run,
-                                                                        },
-                                                                    }),
-                                                                );
-                                                                if !report.dry_run {
-                                                                    workflow_state.approved_tactical_plan =
-                                                                        Some(next_tactical_plan);
-                                                                    workflow_state
-                                                                        .approved_tactical_plan_updated_at =
-                                                                        Some(Utc::now());
-                                                                    workflow_state
-                                                                        .pending_entry_bracket_template_override =
-                                                                        Some(bracket_template);
-                                                                    let next_snapshot =
-                                                                        crate::workflow::management::snapshot_from_execution_intent(
-                                                                            &symbol,
-                                                                            &intent,
-                                                                            current_path,
-                                                                            Utc::now(),
-                                                                        );
-                                                                    crate::workflow::persistence::save_entry_snapshot(
-                                                                        &state_dir,
-                                                                        &next_snapshot,
-                                                                    )?;
-                                                                    entry_snapshots.insert(
-                                                                        next_snapshot.context_key.clone(),
-                                                                        next_snapshot,
-                                                                    );
-                                                                    workflow_state.last_filled_context_key =
-                                                                        Some(
-                                                                            intent
-                                                                                .entry_snapshot
-                                                                                .context_key
-                                                                                .clone(),
-                                                                        );
-                                                                    workflow_state
-                                                                        .approved_pending_order_management_plan =
-                                                                        remove_pending_order_management_action(
-                                                                            &plan,
-                                                                            action_index,
-                                                                        );
-                                                                    workflow_state
-                                                                        .approved_pending_order_management_plan_updated_at =
-                                                                        workflow_state
-                                                                            .approved_pending_order_management_plan
-                                                                            .as_ref()
-                                                                            .map(|_| Utc::now());
-                                                                }
-                                                                execution_signal_intent = Some(intent);
-                                                                execution_signal_report = Some(report);
-                                                                execution_signal_model_name =
-                                                                    selected_stage2c_model_name
-                                                                        .clone()
-                                                                        .or_else(|| {
-                                                                            Some(
-                                                                                "workflow_stage2c_watcher"
-                                                                                    .to_string(),
-                                                                            )
-                                                                        });
-                                                            }
-                                                            Err(err) => {
-                                                                append_workflow_journal_event(
-                                                                    "workflow_stage2c_pending_order_execution_error",
-                                                                    &symbol,
-                                                                    bundle.raw.ts_bucket,
-                                                                    json!({
-                                                                        "trigger": &*trigger,
-                                                                        "action": &action,
-                                                                        "error": format!("{err:#}"),
-                                                                        "phase": "replace_execution",
-                                                                    }),
-                                                                );
-                                                            }
-                                                        }
-                                                    }
-                                                    Err(err) => {
-                                                        append_workflow_journal_event(
-                                                            "workflow_stage2c_pending_order_execution_error",
-                                                            &symbol,
-                                                            bundle.raw.ts_bucket,
-                                                            json!({
-                                                                "trigger": &*trigger,
-                                                                "action": &action,
-                                                                "error": format!("{err:#}"),
-                                                            }),
-                                                        );
-                                                    }
-                                                }
-                                            }
-                                            Err(err) => {
-                                                append_workflow_journal_event(
-                                                    "workflow_stage2c_pending_order_execution_error",
-                                                    &symbol,
-                                                    bundle.raw.ts_bucket,
-                                                    json!({
-                                                        "trigger": &*trigger,
-                                                        "action": &action,
-                                                        "error": format!("{err:#}"),
-                                                        "phase": "intent_adapter",
-                                                    }),
-                                                );
-                                            }
-                                        }
-                                    }
-                                    Err(err) => {
-                                        append_workflow_journal_event(
-                                            "workflow_stage2c_pending_order_execution_error",
-                                            &symbol,
-                                            bundle.raw.ts_bucket,
-                                            json!({
-                                                "trigger": &*trigger,
-                                                "action": &action,
-                                                "error": format!("{err:#}"),
-                                                "phase": "replace_template",
-                                            }),
-                                        );
-                                    }
-                                }
-                            }
-                            "update_post_fill_bracket_template" => {
-                                pending_order_execution_consumed = true;
-                                append_workflow_journal_event(
-                                    "workflow_stage2c_pending_order_execution_report",
-                                    &symbol,
-                                    bundle.raw.ts_bucket,
-                                    json!({
-                                        "trigger": &*trigger,
-                                        "action": &action,
-                                        "dry_run": config.llm.execution.dry_run,
-                                    }),
-                                );
-                                if !config.llm.execution.dry_run {
-                                    if let Some(template) = action.post_fill_bracket_template.clone()
-                                    {
-                                        workflow_state.pending_entry_bracket_template_override =
-                                            Some(template.clone());
-                                        if !has_live_position {
-                                            let next_snapshot = patch_entry_snapshot_levels(
-                                                &snapshot,
-                                                Some(template.stop_loss),
-                                                Some(template.take_profit_1),
-                                                Some(template.take_profit_2),
-                                            );
-                                            crate::workflow::persistence::save_entry_snapshot(
-                                                &state_dir,
-                                                &next_snapshot,
-                                            )?;
-                                            entry_snapshots.insert(
-                                                next_snapshot.context_key.clone(),
-                                                next_snapshot,
-                                            );
-                                        }
-                                    }
-                                    workflow_state.approved_pending_order_management_plan =
-                                        remove_pending_order_management_action(&plan, action_index);
-                                    workflow_state.approved_pending_order_management_plan_updated_at =
-                                        workflow_state
-                                            .approved_pending_order_management_plan
-                                            .as_ref()
-                                            .map(|_| Utc::now());
-                                }
-                            }
-                            other => {
-                                append_workflow_journal_event(
-                                    "workflow_stage2c_pending_order_execution_error",
-                                    &symbol,
-                                    bundle.raw.ts_bucket,
-                                    json!({
-                                        "trigger": &*trigger,
-                                        "action": &action,
-                                        "error": format!("unsupported stage2c watcher action {}", other),
-                                    }),
-                                );
-                            }
                         }
                     }
                 }
@@ -3750,16 +4062,17 @@ async fn invoke_workflow_bundle_models(
                 &input.indicators,
                 &config.llm.workflow.watcher,
             ) {
-                let current_path = stage1_output
-                    .current_path
-                    .as_ref()
-                    .ok_or_else(|| anyhow!("workflow stage1 current_path missing during entry execution"))?;
+                let current_path = stage1_output.current_path.as_ref().ok_or_else(|| {
+                    anyhow!("workflow stage1 current_path missing during entry execution")
+                })?;
                 let intent = execution_intent_from_entry_plan(
                     &symbol,
                     &tactical_plan.path_id,
                     entry_plan.plan,
                     current_path,
-                    workflow_state.pending_entry_bracket_template_override.as_ref(),
+                    workflow_state
+                        .pending_entry_bracket_template_override
+                        .as_ref(),
                     entry_plan.trigger_price,
                     config.llm.workflow.watcher.entry_ttl_minutes,
                     None,
@@ -4179,8 +4492,7 @@ fn live_entry_order_count_for_side(trading_state: &TradingStateSnapshot, side: &
         .open_orders
         .iter()
         .filter(|order| {
-            entry_order_side(order)
-                .is_some_and(|value| value.eq_ignore_ascii_case(side))
+            entry_order_side(order).is_some_and(|value| value.eq_ignore_ascii_case(side))
         })
         .count()
 }
@@ -4190,8 +4502,7 @@ fn active_position_count_for_side(trading_state: &TradingStateSnapshot, side: &s
         .active_positions
         .iter()
         .filter(|position| {
-            active_position_side(position)
-                .is_some_and(|value| value.eq_ignore_ascii_case(side))
+            active_position_side(position).is_some_and(|value| value.eq_ignore_ascii_case(side))
         })
         .count()
 }
@@ -4215,6 +4526,44 @@ fn stage1_quality_allows_new_entry(
         .as_deref()
         .unwrap_or("low");
     quality_rank(current) >= quality_rank(min_quality)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WorkflowStage2DispatchFlags {
+    should_run_stage2a: bool,
+    should_run_stage2b: bool,
+    should_run_stage2c: bool,
+}
+
+fn stage2c_exposure_state_for_counts(
+    active_position_count: usize,
+    live_entry_order_count: usize,
+) -> Option<&'static str> {
+    if live_entry_order_count == 0 {
+        None
+    } else if active_position_count > 0 {
+        Some("in_position_with_live_entry_orders")
+    } else {
+        Some("flat_with_live_entry_orders")
+    }
+}
+
+fn workflow_stage2_dispatch_flags(
+    active_position_count: usize,
+    live_entry_order_count: usize,
+    quality_allows_new_entry: bool,
+    limits: &crate::app::config::WorkflowLimitsConfig,
+) -> WorkflowStage2DispatchFlags {
+    let direction_limit_reached = active_position_count >= limits.max_live_positions_per_direction
+        || live_entry_order_count >= limits.max_live_entry_orders_per_direction;
+    WorkflowStage2DispatchFlags {
+        should_run_stage2a: active_position_count == 0
+            && live_entry_order_count == 0
+            && quality_allows_new_entry
+            && !direction_limit_reached,
+        should_run_stage2b: active_position_count > 0,
+        should_run_stage2c: live_entry_order_count > 0,
+    }
 }
 
 fn find_active_position_for_side<'a>(
@@ -4605,14 +4954,13 @@ mod tests {
     use crate::workflow::schema::{
         CurrentPath, EntryPlan, EntrySnapshot, PendingOrderManagementAction,
         PendingOrderManagementPlan, PositionManagementAction, PositionManagementPlan, PriceZone,
-        ReevaluationTrigger, Stage1Meta, Stage1Output, TacticalEntryPlan,
-        WatcherTriggerCondition,
+        ReevaluationTrigger, Stage1Meta, Stage1Output, TacticalEntryPlan, WatcherTriggerCondition,
     };
     use crate::workflow::state::WorkflowState;
     use chrono::Duration as ChronoDuration;
     use flate2::{write::GzEncoder, Compression};
-    use std::fs;
     use std::collections::HashMap;
+    use std::fs;
 
     fn sample_price_zone(low: f64, high: f64, timeframe: &str) -> PriceZone {
         PriceZone {
@@ -4699,6 +5047,35 @@ mod tests {
                 entry_note: "entry".to_string(),
             },
         }
+    }
+
+    #[test]
+    fn workflow_stage2_dispatch_flags_block_stage2a_when_same_side_exposure_exists() {
+        let limits = crate::app::config::WorkflowLimitsConfig::default();
+
+        let pending_only = workflow_stage2_dispatch_flags(0, 1, true, &limits);
+        assert!(!pending_only.should_run_stage2a);
+        assert!(!pending_only.should_run_stage2b);
+        assert!(pending_only.should_run_stage2c);
+
+        let position_only = workflow_stage2_dispatch_flags(1, 0, true, &limits);
+        assert!(!position_only.should_run_stage2a);
+        assert!(position_only.should_run_stage2b);
+        assert!(!position_only.should_run_stage2c);
+    }
+
+    #[test]
+    fn workflow_stage2_dispatch_flags_run_stage2b_and_stage2c_for_coexisting_state() {
+        let limits = crate::app::config::WorkflowLimitsConfig::default();
+        let dispatch = workflow_stage2_dispatch_flags(1, 1, true, &limits);
+
+        assert!(!dispatch.should_run_stage2a);
+        assert!(dispatch.should_run_stage2b);
+        assert!(dispatch.should_run_stage2c);
+        assert_eq!(
+            stage2c_exposure_state_for_counts(1, 1),
+            Some("in_position_with_live_entry_orders")
+        );
     }
 
     fn sample_flat_trading_state() -> TradingStateSnapshot {
@@ -4801,7 +5178,9 @@ mod tests {
                         note: String::new(),
                     }),
                     replacement_entry_zone: Some(sample_price_zone(102.0, 103.0, "15m")),
-                    replacement_entry_invalidation_level: Some(sample_price_zone(99.0, 99.0, "15m")),
+                    replacement_entry_invalidation_level: Some(sample_price_zone(
+                        99.0, 99.0, "15m",
+                    )),
                     replacement_stop_loss: Some(98.5),
                     reuse_current_entry_template: Some(true),
                     post_fill_bracket_template: None,
@@ -5241,7 +5620,12 @@ mod tests {
 
         let runtime = tokio::runtime::Runtime::new().expect("create tokio runtime");
         runtime
-            .block_on(persist_bundle_to_disk(&bundle, &compressed, Some("gzip"), 10))
+            .block_on(persist_bundle_to_disk(
+                &bundle,
+                &compressed,
+                Some("gzip"),
+                10,
+            ))
             .expect("persist gzip bundle");
 
         let persisted = fs::read_to_string(&path).expect("read persisted bundle");

@@ -1632,7 +1632,8 @@ pub async fn cancel_workflow_pending_entry_orders(
     snapshot_side: &str,
 ) -> Result<Vec<i64>> {
     let state = fetch_symbol_trading_state(http_client, api_config, exec_config, symbol).await?;
-    let target_position_side = workflow_target_position_side(snapshot_side, exec_config.hedge_mode)?;
+    let target_position_side =
+        workflow_target_position_side(snapshot_side, exec_config.hedge_mode)?;
     let has_active_positions = !matching_active_positions_for_workflow_context(
         &state.active_positions,
         snapshot_side,
@@ -1654,8 +1655,14 @@ pub async fn cancel_workflow_pending_entry_orders(
     if exec_config.dry_run || cancel_candidates.is_empty() {
         return Ok(canceled_ids);
     }
-    cancel_tracked_exit_orders(http_client, api_config, exec_config, symbol, &cancel_candidates)
-        .await?;
+    cancel_tracked_exit_orders(
+        http_client,
+        api_config,
+        exec_config,
+        symbol,
+        &cancel_candidates,
+    )
+    .await?;
     Ok(canceled_ids)
 }
 

@@ -345,13 +345,13 @@
   "candidate_event": {}, # 当前触发 Stage2B 的候选事件
   "path_runtime_state": {}, # 当前 path 的运行时状态
   "exposure_state": "in_position", # Stage2B 只在已持仓时运行
-  "active_positions": [], # 当前活动仓位
+  "active_positions": [], # 当前请求只允许携带 1 笔活动仓位；每笔仓位单独请求
   "latest_15m_trigger_facts": {}, # 15m 战术事实
   "state_guardrail_snapshot": {}, # 状态护栏
   "driver_guardrail_snapshot": {}, # 驱动护栏
   "options_guardrail_snapshot": {}, # 期权护栏
   "stage1_output": {}, # Stage1 strategic path；failure_level 与 reevaluation_trigger 只读
-  "previous_management_plan": {}, # 上一轮管理计划
+  "previous_management_plan": {}, # 与这笔持仓 context_key 对应的上一轮管理计划
   "account": {} # 账户上下文
 }
 ```
@@ -407,28 +407,28 @@
 
 ### 6.5 Stage2C 输入合同
 
-`Stage2C` 是独立请求分支。它只在 `flat_with_live_entry_orders` 状态下被调起。
+`Stage2C` 是独立请求分支。只要存在活动入场挂单，它就会被调起；如果同方向持仓也同时存在，则它作为次级管理分支与 `Stage2B` 同一轮运行。
 
 ```text
 {
   "task": "基于当前 strategic path 与 15m 战术输入管理未成交挂单，以最大化收益为目标",
   "candidate_event": {}, # 当前触发 Stage2C 的候选事件
   "path_runtime_state": {}, # 当前 path 的运行时状态
-  "exposure_state": "flat_with_live_entry_orders", # Stage2C 只在已挂单未持仓时运行
-  "active_orders": [], # 当前活动挂单
+  "exposure_state": "flat_with_live_entry_orders | in_position_with_live_entry_orders", # 只要存在活动入场挂单就运行；若同方向持仓也存在，则取后者
+  "active_orders": [], # 当前请求只允许携带 1 笔活动挂单；每笔挂单单独请求
   "latest_15m_trigger_facts": {}, # 15m 战术事实
   "state_guardrail_snapshot": {}, # 状态护栏
   "driver_guardrail_snapshot": {}, # 驱动护栏
   "options_guardrail_snapshot": {}, # 期权护栏
   "stage1_output": {}, # Stage1 strategic path；failure_level 与 reevaluation_trigger 只读
-  "previous_pending_order_management_plan": {}, # 上一轮挂单管理计划
+  "previous_pending_order_management_plan": {}, # 与这笔挂单 context_key 对应的上一轮挂单管理计划
   "account": {} # 账户上下文
 }
 ```
 
 ### 6.6 Stage2C 输出合同
 
-`Stage2C` 只负责挂单管理。它的目标函数不是找新的 path，而是在已有未成交挂单前提下最大化收益。
+`Stage2C` 只负责挂单管理。它的目标函数不是找新的 path，而是在已有未成交挂单前提下最大化收益；这里允许“已有同方向持仓 + 活动挂单”共存场景作为新的次级管理分支运行。
 这里的 `post_fill_bracket_template` 指“挂单成交后的 bracket 模板”，不是交易所上已存在的真实退出单。
 本版进一步明确：`Stage2C` 也不做“瞬发执行”，而是输出 watcher 未来要监听的条件化挂单管理计划。
 
@@ -437,7 +437,7 @@
   "stage2c_decision": "MANAGE_PENDING_ORDERS", # Stage2C 决策；不承担 Stage1 重评职责
   "pending_order_management_plan": {
     "path_id": "path_current", # 必须匹配 Stage1 current_path.id
-    "exposure_state": "flat_with_live_entry_orders", # 当前风险暴露状态
+    "exposure_state": "flat_with_live_entry_orders | in_position_with_live_entry_orders", # 当前挂单风险暴露状态
     "path_live_assessment": "live | degraded | invalidated", # 当前 path 对既有挂单是否仍成立
     "path_assessment_reason": "string | null", # path 评估说明；用于解释为何保留/修改/撤销挂单
     "actions": [
@@ -496,6 +496,7 @@
 flat_no_orders -> Stage2A
 flat_with_live_entry_orders -> Stage2C
 in_position -> Stage2B
+in_position_with_live_entry_orders -> Stage2B + Stage2C
 ```
 
 对应含义：
@@ -503,24 +504,27 @@ in_position -> Stage2B
 - `flat_no_orders`：没有持仓，也没有活动挂单，只需要审核 path 并找 entry。
 - `flat_with_live_entry_orders`：已有未成交挂单、但尚未持仓，进入挂单管理态。
 - `in_position`：已有持仓，进入持仓管理态。
+- `in_position_with_live_entry_orders`：已有持仓且仍有同方向活动入场挂单；进入“Stage2B 主、Stage2C 次”的共存管理态。
 
 优先级约束：
 
 - 持仓第一：`in_position`
 - 挂单第二：`flat_with_live_entry_orders`
 - 入场第三：`flat_no_orders`
-- `15m` 调度可以并发，但同一 symbol 的最终执行合并必须按上述优先级落地。加一个明确的规则，同一时间内，同方向只能最多有1笔持仓/挂单，不得超过这个上限，达到上限后不再请求stage2a来开仓。持仓数量和挂单数量上限，写到config.yaml里。也就是说同方向当我有1笔挂单/持仓时，就不再请求stage2a。
+- `15m` 调度可以并发，但同一 symbol 的最终执行合并必须按上述优先级落地。
+- 同一时间内，同方向最多只能有 `1` 笔持仓和 `1` 笔活动入场挂单；这两个上限由 `config.yaml` 中的 `llm.workflow.limits.max_live_positions_per_direction` 与 `llm.workflow.limits.max_live_entry_orders_per_direction` 明确配置。目前的stage2b，stage2c不支持挂多单，或多个仓位同时管理，所以每个挂单，每个持仓时单独管理的，单独请求.不要在一个请求里，去把多笔挂单交给模型去管理，每笔挂单一个独立请求！
+- 只要同方向已经存在 `1` 笔持仓或 `1` 笔活动入场挂单，就不再请求 `Stage2A` 去开新仓。
 
 - 如果同一 symbol 同时存在持仓和活动挂单，则以 `Stage2B` 为主，`Stage2C` 为次级管理分支，`Stage2A` 不生效。
-- 这里的“`Stage2C` 为次级管理分支”特指：watcher 仍可继续消费已经存在的 `approved_pending_order_management_plan`。该共存场景下不再新发起 `Stage2C` LLM 请求；新的模型请求入口仍然只允许 `Stage2C` 在 `flat_with_live_entry_orders` 下独立运行。
+- 这里的“`Stage2C` 为次级管理分支”是指：在共存场景下，系统仍然会新发起 `Stage2C` LLM 请求来生成新的挂单管理计划，同时 watcher 继续按优先级消费 `Stage2B / Stage2C` 的条件化计划。
 
 本版的实施含义是：
 
 - `Stage1` 继续定义 strategic path。
 - `Stage2A` 继续审核 path，并给 tactical entry。
 - `Stage2B` 独立请求，专门生成“条件化持仓管理计划”。
-- `Stage2C` 独立请求，专门生成“条件化挂单管理计划”，且只在 `flat_with_live_entry_orders` 下作为新的 LLM 请求分支运行。
-- 若 symbol 已进入 `in_position`，但还残留同方向活动挂单，则新的管理请求由 `Stage2B` 负责；此前已经批准的 `Stage2C.pending_order_management_plan` 仍可继续由 watcher 作为次级挂单管理分支执行。
+- `Stage2C` 独立请求，专门生成“条件化挂单管理计划”；只要存在活动入场挂单，它就会作为新的 LLM 请求分支运行。
+- 若 symbol 已进入 `in_position`，但还残留同方向活动挂单，则 `Stage2B` 负责主持仓管理，`Stage2C` 负责次级挂单管理；两者都可以在同一轮 `15m` review 中生成新的 watcher 计划。
 - `Stage2A / Stage2B / Stage2C` 都只负责给 watcher 提供计划，不直接触发瞬时执行。
 - watcher 根据 `Stage2A / Stage2B / Stage2C` 的条件计划执行，不重新思考 path。
 
@@ -698,7 +702,8 @@ Your work is always two-step:
   - If the path is still alive, return conditional pending-order actions such as keep_order, replace_entry, or update_post_fill_bracket_template.
 
 Your job:
-- Read the active orders, path runtime state, latest_15m_trigger_facts, guardrails, previous_pending_order_management_plan, and stage1_output.
+- Read the exposure_state, active orders, path runtime state, latest_15m_trigger_facts, guardrails, previous_pending_order_management_plan, and stage1_output.
+- If a same-side position is already live, treat this as a pending-order secondary management branch rather than a fresh entry-design task.
 - Decide whether the current pending orders are still supported by the strategic path.
 - If the path is invalidated, output pending-order management actions that cancel or remove stale exposure.
 - If the path is live or degraded-but-valid, output a pending_order_management_plan that maximizes收益 while remaining inside the strategic path envelope.
@@ -752,25 +757,26 @@ You are a top-tier 4h-1d order flow trader reviewing active pending orders. Firs
 23. `Stage2C` 的 path 失活处理必须体现为当前挂单的 cancel / remove stale exposure 动作，而不是重评请求。
 24. `Stage2C` 的 `post_fill_bracket_template` 必须表示“挂单成交后的 bracket 模板”，而不是交易所上的真实退出单。
 25. `Stage2B` 必须只在 `in_position` 下被调起。
-26. `Stage2C` 必须只在 `flat_with_live_entry_orders` 下被调起。
+26. `Stage2C` 只要存在活动入场挂单就必须被调起，其 `exposure_state` 必须为 `flat_with_live_entry_orders | in_position_with_live_entry_orders` 之一。
 27. `Stage2A` 必须只在 `flat_no_orders` 下被调起。
 28. 同一 symbol 的调度优先级必须为：持仓第一、挂单第二、入场第三。
-29. 如果同一 symbol 同时存在持仓与活动挂单，`Stage2B` 必须优先于 `Stage2C`，且 `Stage2A` 不得生效；该场景下不再新发起 `Stage2C` LLM 请求，但若已经存在 `approved_pending_order_management_plan`，watcher 仍可继续将其作为次级挂单管理分支执行。
-30. `Stage2B / Stage2C` 不得在收到模型结果后立即执行动作；它们输出的是 watcher 要消费的条件化计划。
-31. `Stage2B` 的 `add / reduce / exit_full / move_stop / update_take_profit` 默认都应带 `watcher_trigger_condition`；只有 `hold` 可以为 `null`。
-32. `Stage2B.add` 不再输出完整 `add_plan`；改为输出 `add_ratio`，并要求 `reuse_current_entry_template=true`。
-33. `Stage2B.add` 的语义必须是“沿用当前仓位已有 entry/bracket 模板做管理层加仓”，而不是重新做一轮 `Stage2A` 战术设计。
-34. `Stage2B.move_stop / Stage2B.update_take_profit` 不得重给完整 bracket 计划；它们必须只输出改动字段，并要求 `reuse_current_bracket_template=true`。
-35. `Stage2B.move_stop / Stage2B.update_take_profit` 的语义必须是“沿用当前仓位已有 bracket 模板做 patch-style 更新”。
-36. `Stage2C.replace_entry` 不再输出完整 `replacement_entry_plan`；改为只输出 `replacement_entry_zone / replacement_entry_invalidation_level / replacement_stop_loss`，并要求 `reuse_current_entry_template=true`。
-37. `Stage2C.replace_entry` 的语义必须是“沿用当前挂单已有 entry 模板做管理层替换”，而不是重新做一轮 `Stage2A` 战术设计。
-38. `Stage2C` 的 `cancel_pending_order / replace_entry / update_post_fill_bracket_template` 默认都应带 `watcher_trigger_condition`；只有 `keep_order` 可以为 `null`。
-39. `watcher_trigger_condition.trigger_type` 必须收敛为 `price_above_on_close | price_below_on_close`，而“站稳”的 bar 确认规则由 watcher 配置负责。
-40. watcher 继续只消费 `Stage2A / Stage2B / Stage2C` 的条件计划，不回写 `Stage1` 合同。
-41. `Stage1` 提示词中的输出约束必须收敛为语义规则版；字段枚举、必填、空值约束优先由 JSON schema / parser 负责。
-42. 文档必须补齐 `Stage2A / Stage2B / Stage2C` 的完整提示词。
-43. `Stage2B` 提示词必须明确以最大化收益为目标，并采用“两步工作流”：先审核持仓 path 是否存活，再输出条件化 close/de-risk 或 condition-based position management。
-44. `Stage2C` 提示词必须明确以最大化收益为目标，并采用“两步工作流”：先审核挂单 path 是否存活，再输出条件化 cancel/remove stale exposure 或 condition-based pending-order management。
-45. `workflow.stage1.min_overall_quality_for_new_entry_dispatch` 必须可在 `config.yaml` 配置。
-46. 质量过滤只作用于新的入场分发；若已存在持仓或活动挂单，`Stage2B / Stage2C` 不得因质量过滤而停止运行。
-47. `Stage2A` 的 active prompt 资产必须是 [workflow_stage2a/base.txt](/data/systems/llm/src/llm/prompt/workflow_stage2a/base.txt)；旧的 [workflow_stage2/base.txt](/data/systems/llm/src/llm/prompt/workflow_stage2/base.txt) 若仍保留，只能作为迁移历史参考，不得继续作为 active prompt 入口或实现依据。
+29. 如果同一 symbol 同时存在持仓与活动挂单，`Stage2B` 必须优先于 `Stage2C`，且 `Stage2A` 不得生效；该场景下必须继续新发起 `Stage2C` LLM 请求，并由 watcher 按“Stage2B 主、Stage2C 次”的优先级消费计划。
+30. 同一时间内，同方向最多只能有 `1` 笔持仓与 `1` 笔活动入场挂单；达到任一同方向上限后，系统不得再请求 `Stage2A` 开新仓。
+31. `Stage2B / Stage2C` 不得在收到模型结果后立即执行动作；它们输出的是 watcher 要消费的条件化计划。
+32. `Stage2B` 的 `add / reduce / exit_full / move_stop / update_take_profit` 默认都应带 `watcher_trigger_condition`；只有 `hold` 可以为 `null`。
+33. `Stage2B.add` 不再输出完整 `add_plan`；改为输出 `add_ratio`，并要求 `reuse_current_entry_template=true`。
+34. `Stage2B.add` 的语义必须是“沿用当前仓位已有 entry/bracket 模板做管理层加仓”，而不是重新做一轮 `Stage2A` 战术设计。
+35. `Stage2B.move_stop / Stage2B.update_take_profit` 不得重给完整 bracket 计划；它们必须只输出改动字段，并要求 `reuse_current_bracket_template=true`。
+36. `Stage2B.move_stop / Stage2B.update_take_profit` 的语义必须是“沿用当前仓位已有 bracket 模板做 patch-style 更新”。
+37. `Stage2C.replace_entry` 不再输出完整 `replacement_entry_plan`；改为只输出 `replacement_entry_zone / replacement_entry_invalidation_level / replacement_stop_loss`，并要求 `reuse_current_entry_template=true`。
+38. `Stage2C.replace_entry` 的语义必须是“沿用当前挂单已有 entry 模板做管理层替换”，而不是重新做一轮 `Stage2A` 战术设计。
+39. `Stage2C` 的 `cancel_pending_order / replace_entry / update_post_fill_bracket_template` 默认都应带 `watcher_trigger_condition`；只有 `keep_order` 可以为 `null`。
+40. `watcher_trigger_condition.trigger_type` 必须收敛为 `price_above_on_close | price_below_on_close`，而“站稳”的 bar 确认规则由 watcher 配置负责。
+41. watcher 继续只消费 `Stage2A / Stage2B / Stage2C` 的条件计划，不回写 `Stage1` 合同。
+42. `Stage1` 提示词中的输出约束必须收敛为语义规则版；字段枚举、必填、空值约束优先由 JSON schema / parser 负责。
+43. 文档必须补齐 `Stage2A / Stage2B / Stage2C` 的完整提示词。
+44. `Stage2B` 提示词必须明确以最大化收益为目标，并采用“两步工作流”：先审核持仓 path 是否存活，再输出条件化 close/de-risk 或 condition-based position management。
+45. `Stage2C` 提示词必须明确以最大化收益为目标，并采用“两步工作流”：先审核挂单 path 是否存活，再输出条件化 cancel/remove stale exposure 或 condition-based pending-order management。
+46. `workflow.stage1.min_overall_quality_for_new_entry_dispatch` 必须可在 `config.yaml` 配置。
+47. 质量过滤只作用于新的入场分发；若已存在持仓或活动挂单，`Stage2B / Stage2C` 不得因质量过滤而停止运行。
+48. `Stage2A` 的 active prompt 资产必须是 [workflow_stage2a/base.txt](/data/systems/llm/src/llm/prompt/workflow_stage2a/base.txt)；旧的 [workflow_stage2/base.txt](/data/systems/llm/src/llm/prompt/workflow_stage2/base.txt) 若仍保留，只能作为迁移历史参考，不得继续作为 active prompt 入口或实现依据。

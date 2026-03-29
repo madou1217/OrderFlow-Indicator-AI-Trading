@@ -1,9 +1,9 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 use crate::workflow::schema::{
-    PendingOrderManagementPlan, PositionManagementPlan, PostFillBracketTemplate,
-    TacticalEntryPlan,
+    PendingOrderManagementPlan, PositionManagementPlan, PostFillBracketTemplate, TacticalEntryPlan,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -19,13 +19,13 @@ pub struct WorkflowState {
     #[serde(default)]
     pub approved_tactical_plan_updated_at: Option<DateTime<Utc>>,
     #[serde(default)]
-    pub approved_position_management_plan: Option<PositionManagementPlan>,
+    pub approved_position_management_plans: BTreeMap<String, PositionManagementPlan>,
     #[serde(default)]
-    pub approved_position_management_plan_updated_at: Option<DateTime<Utc>>,
+    pub approved_position_management_plans_updated_at: BTreeMap<String, DateTime<Utc>>,
     #[serde(default)]
-    pub approved_pending_order_management_plan: Option<PendingOrderManagementPlan>,
+    pub approved_pending_order_management_plans: BTreeMap<String, PendingOrderManagementPlan>,
     #[serde(default)]
-    pub approved_pending_order_management_plan_updated_at: Option<DateTime<Utc>>,
+    pub approved_pending_order_management_plans_updated_at: BTreeMap<String, DateTime<Utc>>,
     #[serde(default)]
     pub pending_entry_bracket_template_override: Option<PostFillBracketTemplate>,
     #[serde(default)]

@@ -644,7 +644,9 @@ fn build_options_guardrail_snapshot(
         return None;
     }
     let envelope = zone_envelope(stage1_output)?;
-    let windows = tactical_guardrail.get("windows").and_then(Value::as_object)?;
+    let windows = tactical_guardrail
+        .get("windows")
+        .and_then(Value::as_object)?;
     let mut overlapping_windows = Map::new();
     for ready_window in ready_windows {
         let Some(window) = ready_window.as_str() else {
@@ -781,6 +783,56 @@ fn workflow_pending_order_for_open_order(
     })
 }
 
+pub fn stage2b_active_positions_for_current_path(
+    stage1_output: &Stage1Output,
+    trading_state: &TradingStateSnapshot,
+    entry_snapshots: &HashMap<String, EntrySnapshot>,
+) -> Vec<WorkflowPosition> {
+    let Some(current_path) = stage1_output.current_path.as_ref() else {
+        return Vec::new();
+    };
+    trading_state
+        .active_positions
+        .iter()
+        .flat_map(|position| {
+            workflow_positions_for_active_position(&trading_state.symbol, position, entry_snapshots)
+        })
+        .filter(|position| position.direction.eq_ignore_ascii_case(&current_path.side))
+        .filter(|position| {
+            position
+                .entry_snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.path_id == current_path.id)
+                .unwrap_or(true)
+        })
+        .collect()
+}
+
+pub fn stage2c_active_orders_for_current_path(
+    stage1_output: &Stage1Output,
+    trading_state: &TradingStateSnapshot,
+    entry_snapshots: &HashMap<String, EntrySnapshot>,
+) -> Vec<WorkflowPendingOrder> {
+    let Some(current_path) = stage1_output.current_path.as_ref() else {
+        return Vec::new();
+    };
+    trading_state
+        .open_orders
+        .iter()
+        .filter_map(|order| {
+            workflow_pending_order_for_open_order(&trading_state.symbol, order, entry_snapshots)
+        })
+        .filter(|order| order.side.eq_ignore_ascii_case(&current_path.side))
+        .filter(|order| {
+            order
+                .entry_snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.path_id == current_path.id)
+                .unwrap_or(true)
+        })
+        .collect()
+}
+
 fn build_account_context(trading_state: &TradingStateSnapshot) -> WorkflowAccountContext {
     WorkflowAccountContext {
         total_wallet_balance: trading_state.total_wallet_balance,
@@ -819,23 +871,16 @@ pub fn build_stage2b_prompt_input(
     stage1_output: Stage1Output,
     candidate_event: CandidateEvent,
     path_runtime_state: PathRuntimeState,
+    active_position: WorkflowPosition,
     previous_management_plan: Option<crate::workflow::schema::PositionManagementPlan>,
     trading_state: &TradingStateSnapshot,
-    entry_snapshots: &HashMap<String, EntrySnapshot>,
 ) -> Stage2BPromptInput {
-    let active_positions = trading_state
-        .active_positions
-        .iter()
-        .flat_map(|position| {
-            workflow_positions_for_active_position(&trading_state.symbol, position, entry_snapshots)
-        })
-        .collect::<Vec<_>>();
     Stage2BPromptInput {
         task: "基于当前 strategic path 与 15m 战术输入管理持仓，以最大化收益为目标".to_string(),
         candidate_event,
         path_runtime_state,
         exposure_state: "in_position".to_string(),
-        active_positions,
+        active_positions: vec![active_position],
         latest_15m_trigger_facts: build_latest_15m_trigger_facts(&summary),
         state_guardrail_snapshot: build_state_guardrail_snapshot(&summary),
         driver_guardrail_snapshot: build_driver_guardrail_snapshot(&summary),
@@ -851,23 +896,18 @@ pub fn build_stage2c_prompt_input(
     stage1_output: Stage1Output,
     candidate_event: CandidateEvent,
     path_runtime_state: PathRuntimeState,
+    exposure_state: &str,
+    active_order: WorkflowPendingOrder,
     previous_pending_order_management_plan: Option<PendingOrderManagementPlan>,
     trading_state: &TradingStateSnapshot,
-    entry_snapshots: &HashMap<String, EntrySnapshot>,
 ) -> Stage2CPromptInput {
-    let active_orders = trading_state
-        .open_orders
-        .iter()
-        .filter_map(|order| {
-            workflow_pending_order_for_open_order(&trading_state.symbol, order, entry_snapshots)
-        })
-        .collect::<Vec<_>>();
     Stage2CPromptInput {
-        task: "基于当前 strategic path 与 15m 战术输入管理未成交挂单，以最大化收益为目标".to_string(),
+        task: "基于当前 strategic path 与 15m 战术输入管理未成交挂单，以最大化收益为目标"
+            .to_string(),
         candidate_event,
         path_runtime_state,
-        exposure_state: "flat_with_live_entry_orders".to_string(),
-        active_orders,
+        exposure_state: exposure_state.to_string(),
+        active_orders: vec![active_order],
         latest_15m_trigger_facts: build_latest_15m_trigger_facts(&summary),
         state_guardrail_snapshot: build_state_guardrail_snapshot(&summary),
         driver_guardrail_snapshot: build_driver_guardrail_snapshot(&summary),
@@ -875,5 +915,212 @@ pub fn build_stage2c_prompt_input(
         stage1_output,
         previous_pending_order_management_plan,
         account: build_account_context(trading_state),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        stage2b_active_positions_for_current_path, stage2c_active_orders_for_current_path,
+    };
+    use crate::execution::binance::{
+        ActivePositionSnapshot, OpenOrderSnapshot, TradingStateSnapshot,
+    };
+    use crate::workflow::schema::{
+        CurrentPath, EntrySnapshot, MapSummary, OpportunityAssessment, PriceZone,
+        ReevaluationTrigger, Stage1Meta, Stage1Output,
+    };
+    use chrono::Utc;
+    use std::collections::HashMap;
+
+    fn sample_stage1_output() -> Stage1Output {
+        Stage1Output {
+            meta: Stage1Meta {
+                stage1_ts: Utc::now(),
+            },
+            monitoring_status: "active".to_string(),
+            no_trade_reason: None,
+            refresh_hints: Vec::new(),
+            map_summary: MapSummary {
+                location_3d: serde_json::json!({}),
+                location_1d: serde_json::json!({}),
+                location_4h: serde_json::json!({}),
+                price_location_class: "value_edge".to_string(),
+                key_levels: serde_json::json!({}),
+            },
+            opportunity_assessment: OpportunityAssessment {
+                overall_quality: Some("high".to_string()),
+                ..OpportunityAssessment::default()
+            },
+            current_script: Some("value_return".to_string()),
+            driver_attribution: None,
+            current_path: Some(CurrentPath {
+                id: "path_a".to_string(),
+                side: "LONG".to_string(),
+                thesis: "bounce".to_string(),
+                risk_grade: "countertrend_repair".to_string(),
+                activation_anchor_id: None,
+                activation_level: price_zone(1998.0, 2002.0),
+                first_path_target_anchor_id: None,
+                first_path_target: price_zone(2020.0, 2025.0),
+                next_path_target_anchor_id: None,
+                next_path_target: price_zone(2030.0, 2035.0),
+                failure_anchor_id: None,
+                failure_level: price_zone(1989.0, 1992.0),
+                failure_switch: Some("continuation".to_string()),
+                setup_type: "B_reversal".to_string(),
+                reevaluation_trigger: ReevaluationTrigger::default(),
+                tracked_zones: Vec::new(),
+            }),
+        }
+    }
+
+    fn price_zone(low: f64, high: f64) -> PriceZone {
+        PriceZone {
+            low,
+            high,
+            timeframe: Some("15m".to_string()),
+            label: None,
+            reason: None,
+        }
+    }
+
+    fn sample_trading_state() -> TradingStateSnapshot {
+        TradingStateSnapshot {
+            symbol: "ETHUSDT".to_string(),
+            has_active_context: true,
+            has_active_positions: true,
+            has_open_orders: true,
+            active_positions: vec![
+                ActivePositionSnapshot {
+                    position_side: "LONG".to_string(),
+                    position_amt: 1.0,
+                    entry_price: 2000.0,
+                    mark_price: 2005.0,
+                    unrealized_pnl: 5.0,
+                    leverage: 5,
+                },
+                ActivePositionSnapshot {
+                    position_side: "SHORT".to_string(),
+                    position_amt: -0.5,
+                    entry_price: 2100.0,
+                    mark_price: 2090.0,
+                    unrealized_pnl: 5.0,
+                    leverage: 4,
+                },
+            ],
+            open_orders: vec![
+                OpenOrderSnapshot {
+                    order_id: 11,
+                    side: "BUY".to_string(),
+                    position_side: "LONG".to_string(),
+                    order_type: "LIMIT".to_string(),
+                    status: "NEW".to_string(),
+                    orig_qty: 1.0,
+                    executed_qty: 0.0,
+                    price: 1999.0,
+                    stop_price: 0.0,
+                    close_position: false,
+                    reduce_only: false,
+                    is_algo_order: false,
+                },
+                OpenOrderSnapshot {
+                    order_id: 22,
+                    side: "SELL".to_string(),
+                    position_side: "SHORT".to_string(),
+                    order_type: "LIMIT".to_string(),
+                    status: "NEW".to_string(),
+                    orig_qty: 0.5,
+                    executed_qty: 0.0,
+                    price: 2101.0,
+                    stop_price: 0.0,
+                    close_position: false,
+                    reduce_only: false,
+                    is_algo_order: false,
+                },
+            ],
+            total_wallet_balance: 1000.0,
+            available_balance: 500.0,
+        }
+    }
+
+    fn sample_entry_snapshots() -> HashMap<String, EntrySnapshot> {
+        HashMap::from([
+            (
+                "ETHUSDT:LONG:path_a".to_string(),
+                EntrySnapshot {
+                    symbol: "ETHUSDT".to_string(),
+                    context_key: "ETHUSDT:LONG:path_a".to_string(),
+                    path_id: "path_a".to_string(),
+                    side: "LONG".to_string(),
+                    entry_profile: Some("reclaim_then_hold".to_string()),
+                    intent_mode: Some("immediate".to_string()),
+                    entry_activation_level: Some(price_zone(1998.0, 2002.0)),
+                    entry_zone: Some(price_zone(1999.0, 2001.0)),
+                    entry_invalidation_level: Some(price_zone(1989.0, 1992.0)),
+                    max_drift_pct: Some(0.2),
+                    stop_loss: 1989.0,
+                    take_profit_1: 2020.0,
+                    take_profit_2: 2030.0,
+                    allowed_stop_loss_levels: vec![1989.0],
+                    allowed_take_profit_levels: vec![2020.0, 2030.0],
+                    tp1_realized: false,
+                    applied_driver_deterioration_signals: Vec::new(),
+                    created_at: Utc::now(),
+                    updated_at: Utc::now(),
+                },
+            ),
+            (
+                "ETHUSDT:SHORT:path_b".to_string(),
+                EntrySnapshot {
+                    symbol: "ETHUSDT".to_string(),
+                    context_key: "ETHUSDT:SHORT:path_b".to_string(),
+                    path_id: "path_b".to_string(),
+                    side: "SHORT".to_string(),
+                    entry_profile: Some("reject_then_go".to_string()),
+                    intent_mode: Some("maker_limit".to_string()),
+                    entry_activation_level: Some(price_zone(2102.0, 2104.0)),
+                    entry_zone: Some(price_zone(2101.0, 2103.0)),
+                    entry_invalidation_level: Some(price_zone(2110.0, 2112.0)),
+                    max_drift_pct: Some(0.2),
+                    stop_loss: 2111.0,
+                    take_profit_1: 2080.0,
+                    take_profit_2: 2060.0,
+                    allowed_stop_loss_levels: vec![2111.0],
+                    allowed_take_profit_levels: vec![2080.0, 2060.0],
+                    tp1_realized: false,
+                    applied_driver_deterioration_signals: Vec::new(),
+                    created_at: Utc::now(),
+                    updated_at: Utc::now(),
+                },
+            ),
+        ])
+    }
+
+    #[test]
+    fn stage2b_context_selection_keeps_only_current_path_position() {
+        let contexts = stage2b_active_positions_for_current_path(
+            &sample_stage1_output(),
+            &sample_trading_state(),
+            &sample_entry_snapshots(),
+        );
+
+        assert_eq!(contexts.len(), 1);
+        assert_eq!(contexts[0].context_key, "ETHUSDT:LONG:path_a");
+        assert_eq!(contexts[0].direction, "LONG");
+    }
+
+    #[test]
+    fn stage2c_context_selection_keeps_only_current_path_order() {
+        let contexts = stage2c_active_orders_for_current_path(
+            &sample_stage1_output(),
+            &sample_trading_state(),
+            &sample_entry_snapshots(),
+        );
+
+        assert_eq!(contexts.len(), 1);
+        assert_eq!(contexts[0].context_key, "ETHUSDT:LONG:path_a");
+        assert_eq!(contexts[0].order_id, 11);
+        assert_eq!(contexts[0].side, "LONG");
     }
 }

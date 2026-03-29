@@ -3,7 +3,7 @@ use crate::workflow::schema::{EntrySnapshot, Stage1Output, TrackedZone};
 use crate::workflow::state::WorkflowState;
 use anyhow::{Context, Result};
 use chrono::Utc;
-use serde_json::Value;
+use serde_json::{Map, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
 use tracing::warn;
@@ -21,6 +21,77 @@ fn symbol_prefix(symbol: &str) -> String {
 
 fn sanitize_context_key(context_key: &str) -> String {
     urlencoding::encode(context_key.trim()).into_owned()
+}
+
+fn plan_context_key(value: &Value) -> Option<String> {
+    value
+        .get("actions")
+        .and_then(Value::as_array)
+        .and_then(|actions| actions.first())
+        .and_then(|action| action.get("context_key"))
+        .and_then(Value::as_str)
+        .map(|context_key| context_key.to_string())
+}
+
+fn remove_legacy_workflow_state_fields(object: &mut Map<String, Value>) {
+    for field in [
+        "last_executed_plan_role",
+        "last_stage2_event_fingerprint",
+        "last_stage2_event_at",
+    ] {
+        object.remove(field);
+    }
+}
+
+fn migrate_legacy_stage1_output_fields(value: &mut Value) -> bool {
+    let Some(root) = value.as_object_mut() else {
+        return false;
+    };
+    let mut migrated = false;
+    for field in ["script_rejections", "management_plan"] {
+        migrated |= root.remove(field).is_some();
+    }
+    let Some(map_summary) = root.get_mut("map_summary").and_then(Value::as_object_mut) else {
+        return migrated;
+    };
+
+    if map_summary.contains_key("location_3d") {
+        migrated |= map_summary.remove("regime_3d").is_some();
+        return migrated;
+    }
+
+    let Some(regime_3d) = map_summary.remove("regime_3d") else {
+        return migrated;
+    };
+    map_summary.insert("location_3d".to_string(), regime_3d);
+    true
+}
+
+fn migrate_legacy_plan_fields(
+    object: &mut Map<String, Value>,
+    legacy_plan_field: &str,
+    legacy_updated_at_field: &str,
+    next_plan_field: &str,
+    next_updated_at_field: &str,
+) {
+    let Some(plan_value) = object.remove(legacy_plan_field) else {
+        object.remove(legacy_updated_at_field);
+        return;
+    };
+    let Some(context_key) = plan_context_key(&plan_value) else {
+        object.remove(legacy_updated_at_field);
+        return;
+    };
+
+    let mut plans = Map::new();
+    plans.insert(context_key.clone(), plan_value);
+    object.insert(next_plan_field.to_string(), Value::Object(plans));
+
+    if let Some(updated_at_value) = object.remove(legacy_updated_at_field) {
+        let mut timestamps = Map::new();
+        timestamps.insert(context_key, updated_at_value);
+        object.insert(next_updated_at_field.to_string(), Value::Object(timestamps));
+    }
 }
 
 fn write_json<T: serde::Serialize + ?Sized>(path: &Path, value: &T) -> Result<()> {
@@ -85,8 +156,21 @@ pub fn load_workflow_state(state_dir: &str, symbol: &str) -> Result<Option<Workf
     let mut value: Value = serde_json::from_slice(&data)
         .with_context(|| format!("parse workflow json {}", path.display()))?;
     if let Some(object) = value.as_object_mut() {
-        object.remove("last_stage2_event_fingerprint");
-        object.remove("last_stage2_event_at");
+        remove_legacy_workflow_state_fields(object);
+        migrate_legacy_plan_fields(
+            object,
+            "approved_position_management_plan",
+            "approved_position_management_plan_updated_at",
+            "approved_position_management_plans",
+            "approved_position_management_plans_updated_at",
+        );
+        migrate_legacy_plan_fields(
+            object,
+            "approved_pending_order_management_plan",
+            "approved_pending_order_management_plan_updated_at",
+            "approved_pending_order_management_plans",
+            "approved_pending_order_management_plans_updated_at",
+        );
     }
     serde_json::from_value(value)
         .with_context(|| format!("parse workflow json {}", path.display()))
@@ -104,7 +188,7 @@ pub fn load_stage1_output(state_dir: &str, symbol: &str) -> Result<Option<Stage1
         return Ok(None);
     }
     let data = fs::read(&path).with_context(|| format!("read workflow file {}", path.display()))?;
-    let value: Value = match serde_json::from_slice(&data)
+    let mut value: Value = match serde_json::from_slice(&data)
         .with_context(|| format!("parse workflow json {}", path.display()))
     {
         Ok(value) => value,
@@ -119,8 +203,14 @@ pub fn load_stage1_output(state_dir: &str, symbol: &str) -> Result<Option<Stage1
             return Ok(None);
         }
     };
+    let migrated = migrate_legacy_stage1_output_fields(&mut value);
     match parse_stage1_output(value) {
-        Ok(output) => Ok(Some(output)),
+        Ok(output) => {
+            if migrated {
+                write_json(&path, &output)?;
+            }
+            Ok(Some(output))
+        }
         Err(err) => {
             let quarantined = quarantine_invalid_file(&path, "schema_mismatch")?;
             warn!(
@@ -194,6 +284,7 @@ mod tests {
     use crate::workflow::schema::EntrySnapshot;
     use crate::workflow::state::WorkflowState;
     use chrono::Utc;
+    use serde_json::Value;
     use std::fs;
     use std::path::PathBuf;
     use uuid::Uuid;
@@ -284,6 +375,94 @@ mod tests {
     }
 
     #[test]
+    fn load_workflow_state_migrates_legacy_single_plan_fields() {
+        let state_dir = format!("/tmp/workflow_test_state_legacy_{}", Uuid::new_v4());
+        fs::create_dir_all(&state_dir).expect("create state dir");
+        let path = super::workflow_state_path(&state_dir, "ETHUSDT").expect("state path");
+        let now = Utc::now();
+        let legacy = serde_json::json!({
+            "symbol": "ETHUSDT",
+            "pending_stage1_refresh_reason": null,
+            "last_stage1_ts": null,
+            "approved_tactical_plan": null,
+            "approved_tactical_plan_updated_at": null,
+            "approved_position_management_plan": {
+                "path_id": "path_a",
+                "exposure_state": "in_position",
+                "path_live_assessment": "live",
+                "path_assessment_reason": null,
+                "actions": [{
+                    "action_type": "hold",
+                    "context_key": "ETHUSDT:LONG:path_a",
+                    "path_id": "path_a",
+                    "watcher_trigger_condition": null,
+                    "add_ratio": null,
+                    "reuse_current_entry_template": null,
+                    "reduce_ratio": null,
+                    "new_stop_loss": null,
+                    "reuse_current_bracket_template": null,
+                    "take_profit_1": null,
+                    "take_profit_2": null,
+                    "reason": "hold"
+                }],
+                "management_note": "hold"
+            },
+            "approved_position_management_plan_updated_at": now,
+            "approved_pending_order_management_plan": {
+                "path_id": "path_a",
+                "exposure_state": "flat_with_live_entry_orders",
+                "path_live_assessment": "live",
+                "path_assessment_reason": null,
+                "actions": [{
+                    "action_type": "keep_order",
+                    "context_key": "ETHUSDT:LONG:path_a",
+                    "path_id": "path_a",
+                    "watcher_trigger_condition": null,
+                    "replacement_entry_zone": null,
+                    "replacement_entry_invalidation_level": null,
+                    "replacement_stop_loss": null,
+                    "reuse_current_entry_template": null,
+                    "post_fill_bracket_template": null,
+                    "reason": "keep"
+                }],
+                "management_note": "keep"
+            },
+            "approved_pending_order_management_plan_updated_at": now,
+            "pending_entry_bracket_template_override": null,
+            "active_15m_window_start": null,
+            "filled_stopout_attempts": 0,
+            "last_filled_context_key": null,
+            "last_executed_plan_role": "secondary",
+            "last_stage2_event_fingerprint": "legacy-stage2-fingerprint",
+            "last_stage2_event_at": now
+        });
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&legacy).expect("serialize legacy"),
+        )
+        .expect("write legacy state");
+
+        let loaded = load_workflow_state(&state_dir, "ETHUSDT")
+            .expect("load state")
+            .expect("state exists");
+
+        assert!(loaded
+            .approved_position_management_plans
+            .contains_key("ETHUSDT:LONG:path_a"));
+        assert!(loaded
+            .approved_position_management_plans_updated_at
+            .contains_key("ETHUSDT:LONG:path_a"));
+        assert!(loaded
+            .approved_pending_order_management_plans
+            .contains_key("ETHUSDT:LONG:path_a"));
+        assert!(loaded
+            .approved_pending_order_management_plans_updated_at
+            .contains_key("ETHUSDT:LONG:path_a"));
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
     fn load_stage1_output_quarantines_incompatible_legacy_file() {
         let state_dir = format!("/tmp/workflow_test_stage1_{}", Uuid::new_v4());
         fs::create_dir_all(&state_dir).expect("create state dir");
@@ -322,6 +501,62 @@ mod tests {
             .unwrap_or_default()
             .to_string();
         assert!(backup_name.contains("ETHUSDT.stage1_output.json.invalid."));
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn load_stage1_output_migrates_legacy_regime_3d_and_rewrites_file() {
+        let state_dir = format!("/tmp/workflow_test_stage1_migrate_{}", Uuid::new_v4());
+        fs::create_dir_all(&state_dir).expect("create state dir");
+        let path = stage1_output_path(&state_dir, "ETHUSDT").expect("stage1 path");
+        let legacy = serde_json::json!({
+            "meta": {"stage1_ts": Utc::now()},
+            "monitoring_status": "no_edge",
+            "no_trade_reason": "path_not_actionable",
+            "refresh_hints": [],
+            "map_summary": {
+                "regime_3d": {"summary": "legacy 3d"},
+                "location_1d": {"summary": "legacy 1d"},
+                "location_4h": {"summary": "legacy 4h"},
+                "price_location_class": "value_edge",
+                "key_levels": {}
+            },
+            "opportunity_assessment": {
+                "location_quality": "low",
+                "state_quality": "low",
+                "driver_quality": "low",
+                "geometry_quality": "low",
+                "uniqueness_quality": "low",
+                "overall_quality": "low",
+                "disqualifiers": ["legacy cache"]
+            },
+            "script_rejections": [],
+            "management_plan": {"legacy": true},
+            "current_script": null,
+            "driver_attribution": null,
+            "current_path": null
+        });
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&legacy).expect("serialize legacy"),
+        )
+        .expect("write legacy stage1");
+
+        let loaded = load_stage1_output(&state_dir, "ETHUSDT")
+            .expect("load stage1")
+            .expect("stage1 exists");
+        assert_eq!(loaded.map_summary.location_3d["summary"], "legacy 3d");
+
+        let rewritten: Value =
+            serde_json::from_slice(&fs::read(&path).expect("read rewritten stage1"))
+                .expect("parse rewritten stage1");
+        let map_summary = rewritten
+            .get("map_summary")
+            .and_then(Value::as_object)
+            .expect("map summary");
+        assert!(map_summary.contains_key("location_3d"));
+        assert!(!map_summary.contains_key("regime_3d"));
 
         let _ = fs::remove_dir_all(&state_dir);
     }
