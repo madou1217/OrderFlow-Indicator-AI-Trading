@@ -178,15 +178,20 @@ fn compute_stats_at(
     }
 
     let prefix_at = |values: &[f64], idx: usize| values.get(idx).copied().unwrap_or(0.0);
-    let prefix_count_at =
-        |values: &[usize], idx: usize| values.get(idx).copied().unwrap_or(0usize);
+    let prefix_count_at = |values: &[usize], idx: usize| values.get(idx).copied().unwrap_or(0usize);
     let before_idx = start_idx.checked_sub(1);
-    let sum_w =
-        prefix_at(&points.prefix_weight, end_idx) - before_idx.map(|idx| prefix_at(&points.prefix_weight, idx)).unwrap_or(0.0);
-    let sum_pv =
-        prefix_at(&points.prefix_price_weight, end_idx) - before_idx.map(|idx| prefix_at(&points.prefix_price_weight, idx)).unwrap_or(0.0);
-    let sum_p2v =
-        prefix_at(&points.prefix_price_sq_weight, end_idx) - before_idx.map(|idx| prefix_at(&points.prefix_price_sq_weight, idx)).unwrap_or(0.0);
+    let sum_w = prefix_at(&points.prefix_weight, end_idx)
+        - before_idx
+            .map(|idx| prefix_at(&points.prefix_weight, idx))
+            .unwrap_or(0.0);
+    let sum_pv = prefix_at(&points.prefix_price_weight, end_idx)
+        - before_idx
+            .map(|idx| prefix_at(&points.prefix_price_weight, idx))
+            .unwrap_or(0.0);
+    let sum_p2v = prefix_at(&points.prefix_price_sq_weight, end_idx)
+        - before_idx
+            .map(|idx| prefix_at(&points.prefix_price_sq_weight, idx))
+            .unwrap_or(0.0);
     let sample_count = prefix_count_at(&points.prefix_positive_samples, end_idx)
         - before_idx
             .map(|idx| prefix_count_at(&points.prefix_positive_samples, idx))

@@ -945,7 +945,9 @@ pub async fn invoke_stage2c_models(
 
 #[cfg(test)]
 mod tests {
-    use super::{should_retry_workflow_stage_once, workflow_stage1_schema, workflow_stage2b_schema};
+    use super::{
+        should_retry_workflow_stage_once, workflow_stage1_schema, workflow_stage2b_schema,
+    };
     use crate::app::config::LlmModelConfig;
     use crate::llm::prompt::WorkflowPromptStage;
 

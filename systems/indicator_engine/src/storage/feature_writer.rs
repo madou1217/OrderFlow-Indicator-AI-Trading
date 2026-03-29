@@ -2,6 +2,9 @@ use crate::indicators::context::{zscore, IndicatorContext};
 use crate::indicators::i25_open_interest::build_open_interest_view;
 use crate::indicators::i26_long_short_ratios::build_long_short_ratio_view;
 use crate::indicators::i27_options_surface::build_options_surface_view;
+use crate::indicators::shared::avwap::{
+    avwap_7d_window_slices, avwap_gap_zscore, avwap_lookback_start, avwap_of_slice,
+};
 use crate::indicators::shared::funding::compute_funding_window_metrics;
 use crate::ingest::decoder::MarketKind;
 use crate::runtime::state_store::{MinuteHistory, WhaleStats};
@@ -488,7 +491,11 @@ impl FeatureWriter {
     }
 
     async fn insert_avwap_feature_window(&self, ctx: &IndicatorContext, mins: i64) -> Result<()> {
-        let (fut_avwap, spot_avwap) = cumulative_avwap_7d(ctx, ctx.ts_bucket);
+        let lookback_start = avwap_lookback_start(ctx.ts_bucket);
+        let (fut_window, spot_window) =
+            avwap_7d_window_slices(&ctx.history_futures, &ctx.history_spot, ctx.ts_bucket);
+        let fut_avwap = avwap_of_slice(fut_window);
+        let spot_avwap = avwap_of_slice(spot_window);
         let fut_last = ctx.futures.last_price;
         let fut_mark = ctx.latest_mark.as_ref().and_then(|m| m.mark_price);
 
@@ -496,7 +503,7 @@ impl FeatureWriter {
         let price_minus_spot = fut_last.zip(spot_avwap).map(|(p, a)| p - a);
         let mark_minus_spot = fut_mark.zip(spot_avwap).map(|(p, a)| p - a);
         let avwap_gap = fut_avwap.zip(spot_avwap).map(|(f, s)| f - s);
-        let anchor_ts = Some(ctx.ts_bucket - Duration::days(7));
+        let anchor_ts = Some(lookback_start);
         let bar_interval = interval_text(mins);
 
         sqlx::query(
@@ -556,7 +563,7 @@ impl FeatureWriter {
         .bind(mark_minus_spot)
         .bind(avwap_gap)
         .bind(avwap_gap)
-        .bind(zscore_gap(ctx, avwap_gap))
+        .bind(avwap_gap_zscore(fut_window, spot_window, avwap_gap))
         .bind(json!({ "window_minutes": mins }))
         .execute(&self.pool)
         .await
@@ -1105,39 +1112,6 @@ fn rolling_cvd_7d(history: &[MinuteHistory], ts_bucket: DateTime<Utc>) -> Option
     Some(end_cvd - start_cvd)
 }
 
-fn cumulative_avwap_7d(
-    ctx: &IndicatorContext,
-    ts_bucket: DateTime<Utc>,
-) -> (Option<f64>, Option<f64>) {
-    let start = ts_bucket - Duration::days(7);
-    let fut = ctx
-        .history_futures
-        .iter()
-        .filter(|h| h.ts_bucket > start && h.ts_bucket <= ts_bucket)
-        .collect::<Vec<_>>();
-    let spot = ctx
-        .history_spot
-        .iter()
-        .filter(|h| h.ts_bucket > start && h.ts_bucket <= ts_bucket)
-        .collect::<Vec<_>>();
-    let fut_num = fut.iter().map(|h| h.total_notional).sum::<f64>();
-    let fut_den = fut.iter().map(|h| h.total_qty).sum::<f64>();
-    let spot_num = spot.iter().map(|h| h.total_notional).sum::<f64>();
-    let spot_den = spot.iter().map(|h| h.total_qty).sum::<f64>();
-    (
-        if fut_den > 0.0 {
-            Some(fut_num / fut_den)
-        } else {
-            None
-        },
-        if spot_den > 0.0 {
-            Some(spot_num / spot_den)
-        } else {
-            None
-        },
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::aggregate_window;
@@ -1301,40 +1275,5 @@ fn ols_slope(values: &[f64]) -> Option<f64> {
         None
     } else {
         Some(num / den)
-    }
-}
-
-fn zscore_gap(ctx: &IndicatorContext, current_gap: Option<f64>) -> Option<f64> {
-    let current = current_gap?;
-    let n = ctx.history_futures.len().min(ctx.history_spot.len());
-    if n < 10 {
-        return None;
-    }
-    let mut gaps = Vec::new();
-    for i in 0..n {
-        let f = &ctx.history_futures[n - 1 - i];
-        let s = &ctx.history_spot[n - 1 - i];
-        if f.total_qty <= 0.0 || s.total_qty <= 0.0 {
-            continue;
-        }
-        gaps.push((f.total_notional / f.total_qty) - (s.total_notional / s.total_qty));
-    }
-    if gaps.len() < 10 {
-        return None;
-    }
-    let mean = gaps.iter().sum::<f64>() / gaps.len() as f64;
-    let var = gaps
-        .iter()
-        .map(|v| {
-            let d = *v - mean;
-            d * d
-        })
-        .sum::<f64>()
-        / gaps.len() as f64;
-    let sd = var.sqrt();
-    if sd <= 1e-12 {
-        Some(0.0)
-    } else {
-        Some((current - mean) / sd)
     }
 }

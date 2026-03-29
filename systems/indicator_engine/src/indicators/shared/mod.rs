@@ -1,3 +1,4 @@
+pub mod avwap;
 pub mod confirm_spot;
 pub mod event_ids;
 pub mod event_lifecycle;

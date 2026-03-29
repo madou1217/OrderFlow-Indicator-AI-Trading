@@ -62,8 +62,7 @@ impl Indicator for I16FundingRate {
 fn build_recent_7d_payload(ctx: &IndicatorContext) -> Vec<Value> {
     let end = ctx.ts_bucket + Duration::minutes(1);
     let recent_cutoff = end - Duration::days(7);
-    ctx
-        .funding_changes_recent
+    ctx.funding_changes_recent
         .iter()
         .filter(|c| c.ts_change >= recent_cutoff && c.ts_change < end)
         .map(|c| funding_change_json(c))

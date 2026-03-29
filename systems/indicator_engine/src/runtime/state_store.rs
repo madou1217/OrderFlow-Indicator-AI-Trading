@@ -2668,20 +2668,22 @@ impl StateStore {
             funding_points_in_window: self.funding_points_between(ts_bucket, as_of_ts),
             mark_points_in_window: self.mark_points_between(ts_bucket, as_of_ts),
             funding_changes_recent: Arc::new(self.funding_changes_until(as_of_ts)),
-            funding_recent_7d_payload: Arc::new(self
-                .funding_recent_7d_payload
-                .iter()
-                .filter(|row| row.ts < as_of_ts)
-                .map(|row| row.payload_json.clone())
-                .collect()),
+            funding_recent_7d_payload: Arc::new(
+                self.funding_recent_7d_payload
+                    .iter()
+                    .filter(|row| row.ts < as_of_ts)
+                    .map(|row| row.payload_json.clone())
+                    .collect(),
+            ),
             funding_points_recent: Arc::new(self.funding_points_until(as_of_ts)),
             mark_points_recent: Arc::new(self.mark_points_until(as_of_ts)),
-            liquidation_recent_7d_payload: Arc::new(self
-                .liquidation_recent_7d_payload
-                .iter()
-                .filter(|row| row.ts <= ts_bucket)
-                .map(|row| row.payload_json.clone())
-                .collect()),
+            liquidation_recent_7d_payload: Arc::new(
+                self.liquidation_recent_7d_payload
+                    .iter()
+                    .filter(|row| row.ts <= ts_bucket)
+                    .map(|row| row.payload_json.clone())
+                    .collect(),
+            ),
             divergence_all_events: Arc::new(
                 self.divergence_all_events
                     .iter()

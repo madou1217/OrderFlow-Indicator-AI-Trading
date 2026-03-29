@@ -1,9 +1,12 @@
 use crate::indicators::context::{IndicatorComputation, IndicatorContext, IndicatorSnapshotRow};
 use crate::indicators::indicator_trait::Indicator;
+use crate::indicators::shared::avwap::{
+    avwap_7d_window_slices, avwap_gap_zscore, avwap_lookback_start, avwap_of_slice,
+    AVWAP_LOOKBACK_DAYS,
+};
 use chrono::Duration;
 use serde_json::{json, Value};
 
-const LOOKBACK_DAYS: i64 = 7;
 const WINDOWS: [(&str, i64); 5] = [
     ("15m", 15),
     ("1h", 60),
@@ -20,12 +23,12 @@ impl Indicator for I18Avwap {
     }
 
     fn evaluate(&self, ctx: &IndicatorContext) -> IndicatorComputation {
-        let lookback_start = ctx.ts_bucket - Duration::days(LOOKBACK_DAYS);
-        let fut_window = history_window_slice(&ctx.history_futures, lookback_start, ctx.ts_bucket);
-        let spot_window = history_window_slice(&ctx.history_spot, lookback_start, ctx.ts_bucket);
+        let lookback_start = avwap_lookback_start(ctx.ts_bucket);
+        let (fut_window, spot_window) =
+            avwap_7d_window_slices(&ctx.history_futures, &ctx.history_spot, ctx.ts_bucket);
 
-        let fut_avwap = avwap_of_slice(&fut_window);
-        let spot_avwap = avwap_of_slice(&spot_window);
+        let fut_avwap = avwap_of_slice(fut_window);
+        let spot_avwap = avwap_of_slice(spot_window);
         let fut_last_price = ctx.futures.last_price;
         let minute_end = ctx.ts_bucket + Duration::minutes(1);
         let fut_mark_price = ctx
@@ -36,11 +39,11 @@ impl Indicator for I18Avwap {
         let price_minus_spot_avwap_fut = fut_last_price.zip(spot_avwap).map(|(p, a)| p - a);
         let price_minus_spot_avwap_futmark = fut_mark_price.zip(spot_avwap).map(|(p, a)| p - a);
         let avwap_gap = fut_avwap.zip(spot_avwap).map(|(f, s)| f - s);
-        let z_avwap_gap = zscore_gap(&fut_window, &spot_window, avwap_gap);
+        let z_avwap_gap = avwap_gap_zscore(fut_window, spot_window, avwap_gap);
 
         let series = WINDOWS
             .iter()
-            .map(|(label, mins)| (*label, build_series(&fut_window, &spot_window, *mins)))
+            .map(|(label, mins)| (*label, build_series(fut_window, spot_window, *mins)))
             .collect::<Vec<_>>();
 
         IndicatorComputation {
@@ -72,16 +75,6 @@ impl Indicator for I18Avwap {
             }),
             ..Default::default()
         }
-    }
-}
-
-fn avwap_of_slice(history: &[crate::runtime::state_store::MinuteHistory]) -> Option<f64> {
-    let num = history.iter().map(|h| h.total_notional).sum::<f64>();
-    let den = history.iter().map(|h| h.total_qty).sum::<f64>();
-    if den > 0.0 {
-        Some(num / den)
-    } else {
-        None
     }
 }
 
@@ -127,7 +120,7 @@ fn build_series(
             continue;
         }
 
-        let start_ts = t - Duration::days(LOOKBACK_DAYS);
+        let start_ts = t - Duration::days(AVWAP_LOOKBACK_DAYS);
         let j = lower_bound_ts(&ts, start_ts + Duration::minutes(1));
 
         let fn_prev = if j > 0 { fut_num[j - 1] } else { 0.0 };
@@ -163,57 +156,6 @@ fn build_series(
     out
 }
 
-fn history_window_slice<'a>(
-    history: &'a [crate::runtime::state_store::MinuteHistory],
-    lookback_start: chrono::DateTime<chrono::Utc>,
-    end_ts: chrono::DateTime<chrono::Utc>,
-) -> &'a [crate::runtime::state_store::MinuteHistory] {
-    if history.is_empty() {
-        return &[];
-    }
-    let start_idx = lower_bound_history_ts(history, lookback_start + Duration::minutes(1));
-    let end_exclusive = upper_bound_history_ts(history, end_ts);
-    if start_idx >= end_exclusive {
-        &[]
-    } else {
-        &history[start_idx..end_exclusive]
-    }
-}
-
-fn lower_bound_history_ts(
-    history: &[crate::runtime::state_store::MinuteHistory],
-    target: chrono::DateTime<chrono::Utc>,
-) -> usize {
-    let mut l = 0usize;
-    let mut r = history.len();
-    while l < r {
-        let m = (l + r) / 2;
-        if history[m].ts_bucket < target {
-            l = m + 1;
-        } else {
-            r = m;
-        }
-    }
-    l
-}
-
-fn upper_bound_history_ts(
-    history: &[crate::runtime::state_store::MinuteHistory],
-    target: chrono::DateTime<chrono::Utc>,
-) -> usize {
-    let mut l = 0usize;
-    let mut r = history.len();
-    while l < r {
-        let m = (l + r) / 2;
-        if history[m].ts_bucket <= target {
-            l = m + 1;
-        } else {
-            r = m;
-        }
-    }
-    l
-}
-
 fn lower_bound_ts(
     values: &[chrono::DateTime<chrono::Utc>],
     target: chrono::DateTime<chrono::Utc>,
@@ -229,46 +171,6 @@ fn lower_bound_ts(
         }
     }
     l
-}
-
-fn zscore_gap(
-    fut: &[crate::runtime::state_store::MinuteHistory],
-    spot: &[crate::runtime::state_store::MinuteHistory],
-    current_gap: Option<f64>,
-) -> Option<f64> {
-    let current = current_gap?;
-    let n = fut.len().min(spot.len());
-    if n < 10 {
-        return None;
-    }
-
-    let mut gaps = Vec::new();
-    for i in 0..n {
-        let f = &fut[n - 1 - i];
-        let s = &spot[n - 1 - i];
-        if f.total_qty <= 0.0 || s.total_qty <= 0.0 {
-            continue;
-        }
-        gaps.push((f.total_notional / f.total_qty) - (s.total_notional / s.total_qty));
-    }
-    if gaps.len() < 10 {
-        return None;
-    }
-
-    let mean = gaps.iter().sum::<f64>() / gaps.len() as f64;
-    let var = gaps
-        .iter()
-        .map(|v| {
-            let d = v - mean;
-            d * d
-        })
-        .sum::<f64>()
-        / gaps.len() as f64;
-    let sd = var.sqrt();
-    if sd <= 1e-12 {
-        return Some(0.0);
-    }
-    Some((current - mean) / sd)
 }
 
 fn find_series(series: &[(&str, Vec<Value>)], key: &str) -> Vec<Value> {
