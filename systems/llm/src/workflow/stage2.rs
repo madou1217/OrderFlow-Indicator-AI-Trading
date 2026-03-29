@@ -851,7 +851,8 @@ pub fn build_stage2a_prompt_input(
     trading_state: &TradingStateSnapshot,
 ) -> Stage2APromptInput {
     Stage2APromptInput {
-        task: "审核当前 strategic path，并基于 15m 战术输入设计 tactical entry".to_string(),
+        task: "Review the current strategic path and design the tactical entry from 15m inputs"
+            .to_string(),
         candidate_event,
         path_runtime_state,
         previous_tactical_plan,
@@ -876,7 +877,8 @@ pub fn build_stage2b_prompt_input(
     trading_state: &TradingStateSnapshot,
 ) -> Stage2BPromptInput {
     Stage2BPromptInput {
-        task: "基于当前 strategic path 与 15m 战术输入管理持仓，以最大化收益为目标".to_string(),
+        task: "Manage the active position from the current strategic path and 15m inputs to maximize returns"
+            .to_string(),
         candidate_event,
         path_runtime_state,
         exposure_state: "in_position".to_string(),
@@ -902,7 +904,7 @@ pub fn build_stage2c_prompt_input(
     trading_state: &TradingStateSnapshot,
 ) -> Stage2CPromptInput {
     Stage2CPromptInput {
-        task: "基于当前 strategic path 与 15m 战术输入管理未成交挂单，以最大化收益为目标"
+        task: "Manage the live pending order from the current strategic path and 15m inputs to maximize returns"
             .to_string(),
         candidate_event,
         path_runtime_state,
