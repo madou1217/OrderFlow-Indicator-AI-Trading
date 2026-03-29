@@ -407,7 +407,7 @@ Stage1 只执行内核的第 1、2、3、3.5 步。
   "task": "执行3D/1D/4H地图、主剧本选择、战略path构建、4H/1D驱动归因",
   "strategic_indicator_summary": {},
   "previous_stage1_output": {},
-  "refresh_reason": "scheduled_4h | path_invalidated | no_edge_reentered | regime_shift"
+  "refresh_reason": "scheduled_2h | path_invalidated | no_edge_reentered | regime_shift"
 }
 ```
 

@@ -434,8 +434,6 @@ pub struct LlmConfig {
     pub queue_key: String,
     #[serde(default = "default_llm_purge_queue_on_start")]
     pub purge_queue_on_start: bool,
-    #[serde(default = "default_call_interval_secs")]
-    pub call_interval_secs: u64,
     #[serde(default = "default_request_timeout_secs")]
     pub request_timeout_secs: u64,
     #[serde(default = "default_bundle_settle_ms")]
@@ -450,12 +448,6 @@ pub struct LlmConfig {
     pub temp_cache_retention_hours: Option<u64>,
     #[serde(default, rename = "temp_cache_retention_minutes")]
     pub temp_cache_retention_minutes_legacy: Option<u64>,
-    #[serde(default = "default_call_schedule_minutes")]
-    pub call_schedule_minutes: Vec<u8>,
-    #[serde(default)]
-    pub call_schedule_minutes_by_model: HashMap<String, Vec<u8>>,
-    #[serde(default)]
-    pub min_invoke_interval_secs_by_model: HashMap<String, u64>,
     #[serde(default = "default_print_response")]
     pub print_response: bool,
     #[serde(default = "default_telegram_signal_decisions")]
@@ -481,7 +473,6 @@ impl Default for LlmConfig {
             symbol: default_symbol(),
             queue_key: default_queue_key(),
             purge_queue_on_start: default_llm_purge_queue_on_start(),
-            call_interval_secs: default_call_interval_secs(),
             request_timeout_secs: default_request_timeout_secs(),
             bundle_settle_ms: default_bundle_settle_ms(),
             bundle_stale_secs: default_bundle_stale_secs(),
@@ -489,9 +480,6 @@ impl Default for LlmConfig {
             bundle_execution_stale_secs: default_bundle_execution_stale_secs(),
             temp_cache_retention_hours: Some(default_temp_cache_retention_hours()),
             temp_cache_retention_minutes_legacy: None,
-            call_schedule_minutes: default_call_schedule_minutes(),
-            call_schedule_minutes_by_model: HashMap::new(),
-            min_invoke_interval_secs_by_model: HashMap::new(),
             print_response: default_print_response(),
             telegram_signal_decisions: default_telegram_signal_decisions(),
             x_signal_decisions: default_x_signal_decisions(),
@@ -545,16 +533,14 @@ pub struct WorkflowConfig {
     pub enabled: bool,
     #[serde(default = "default_workflow_stage1_refresh_hours")]
     pub stage1_refresh_hours: Vec<u8>,
-    #[serde(default = "default_workflow_stage2_refresh_minutes")]
-    pub stage2_refresh_minutes: Vec<u8>,
-    #[serde(default)]
-    pub legacy_modes_enabled: bool,
-    #[serde(default)]
-    pub soft_gate_min_pass: WorkflowSoftGateMinPassConfig,
+    #[serde(default = "default_workflow_stage2_review_minutes")]
+    pub stage2_review_minutes: Vec<u8>,
     #[serde(default = "default_workflow_state_dir")]
     pub state_dir: String,
     #[serde(default = "default_workflow_persist_prompt_inputs")]
     pub persist_prompt_inputs: bool,
+    #[serde(default)]
+    pub watcher: WorkflowWatcherConfig,
 }
 
 impl Default for WorkflowConfig {
@@ -562,11 +548,256 @@ impl Default for WorkflowConfig {
         Self {
             enabled: false,
             stage1_refresh_hours: default_workflow_stage1_refresh_hours(),
-            stage2_refresh_minutes: default_workflow_stage2_refresh_minutes(),
-            legacy_modes_enabled: false,
-            soft_gate_min_pass: WorkflowSoftGateMinPassConfig::default(),
+            stage2_review_minutes: default_workflow_stage2_review_minutes(),
             state_dir: default_workflow_state_dir(),
             persist_prompt_inputs: default_workflow_persist_prompt_inputs(),
+            watcher: WorkflowWatcherConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct WorkflowWatcherConfig {
+    #[serde(default = "default_watcher_evaluate_on")]
+    pub evaluate_on: String,
+    #[serde(default = "default_watcher_entry_attempt_window")]
+    pub entry_attempt_window: String,
+    #[serde(default = "default_watcher_max_filled_stopout_attempts")]
+    pub max_filled_stopout_attempts: u8,
+    #[serde(default = "default_watcher_count_unfilled_attempts")]
+    pub count_unfilled_attempts: bool,
+    #[serde(default)]
+    pub price_predicates: WorkflowWatcherPricePredicatesConfig,
+    #[serde(default)]
+    pub entry_profile_rules: WorkflowWatcherEntryProfileRulesConfig,
+    #[serde(default)]
+    pub intent_mode_rules: WorkflowWatcherIntentModeRulesConfig,
+}
+
+impl Default for WorkflowWatcherConfig {
+    fn default() -> Self {
+        Self {
+            evaluate_on: default_watcher_evaluate_on(),
+            entry_attempt_window: default_watcher_entry_attempt_window(),
+            max_filled_stopout_attempts: default_watcher_max_filled_stopout_attempts(),
+            count_unfilled_attempts: default_watcher_count_unfilled_attempts(),
+            price_predicates: WorkflowWatcherPricePredicatesConfig::default(),
+            entry_profile_rules: WorkflowWatcherEntryProfileRulesConfig::default(),
+            intent_mode_rules: WorkflowWatcherIntentModeRulesConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct WorkflowWatcherPricePredicatesConfig {
+    #[serde(default)]
+    pub price_above_on_close: ClosePredicateConfig,
+    #[serde(default)]
+    pub price_below_on_close: ClosePredicateConfig,
+    #[serde(default)]
+    pub entry_reclaim_confirmed: EntryReclaimPredicateConfig,
+    #[serde(default)]
+    pub entry_hold_confirmed: EntryHoldPredicateConfig,
+    #[serde(default)]
+    pub breakout_confirmed: BreakoutPredicateConfig,
+    #[serde(default)]
+    pub pullback_acceptance_confirmed: PullbackAcceptancePredicateConfig,
+    #[serde(default)]
+    pub failed_auction_reentry_confirmed: FailedAuctionReentryPredicateConfig,
+}
+
+impl Default for WorkflowWatcherPricePredicatesConfig {
+    fn default() -> Self {
+        Self {
+            price_above_on_close: ClosePredicateConfig::default(),
+            price_below_on_close: ClosePredicateConfig::default(),
+            entry_reclaim_confirmed: EntryReclaimPredicateConfig::default(),
+            entry_hold_confirmed: EntryHoldPredicateConfig::default(),
+            breakout_confirmed: BreakoutPredicateConfig::default(),
+            pullback_acceptance_confirmed: PullbackAcceptancePredicateConfig::default(),
+            failed_auction_reentry_confirmed: FailedAuctionReentryPredicateConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ClosePredicateConfig {
+    #[serde(default = "default_watcher_confirm_bars")]
+    pub confirm_bars: u8,
+    #[serde(default)]
+    pub min_close_bps: f64,
+}
+
+impl Default for ClosePredicateConfig {
+    fn default() -> Self {
+        Self {
+            confirm_bars: default_watcher_confirm_bars(),
+            min_close_bps: default_watcher_min_close_bps(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct EntryReclaimPredicateConfig {
+    #[serde(default = "default_watcher_confirm_bars")]
+    pub confirm_bars: u8,
+    #[serde(default = "default_true")]
+    pub allow_equal: bool,
+}
+
+impl Default for EntryReclaimPredicateConfig {
+    fn default() -> Self {
+        Self {
+            confirm_bars: default_watcher_confirm_bars(),
+            allow_equal: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct EntryHoldPredicateConfig {
+    #[serde(default = "default_watcher_confirm_bars")]
+    pub hold_bars: u8,
+    #[serde(default = "default_watcher_retest_tolerance_bps")]
+    pub retest_tolerance_bps: f64,
+}
+
+impl Default for EntryHoldPredicateConfig {
+    fn default() -> Self {
+        Self {
+            hold_bars: default_watcher_confirm_bars(),
+            retest_tolerance_bps: default_watcher_retest_tolerance_bps(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct BreakoutPredicateConfig {
+    #[serde(default = "default_watcher_confirm_bars")]
+    pub confirm_bars: u8,
+    #[serde(default)]
+    pub min_break_bps: f64,
+}
+
+impl Default for BreakoutPredicateConfig {
+    fn default() -> Self {
+        Self {
+            confirm_bars: default_watcher_confirm_bars(),
+            min_break_bps: default_watcher_min_break_bps(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PullbackAcceptancePredicateConfig {
+    #[serde(default = "default_watcher_confirm_bars")]
+    pub confirm_bars: u8,
+    #[serde(default = "default_true")]
+    pub require_touch_entry_zone: bool,
+    #[serde(default = "default_watcher_pullback_overshoot_bps")]
+    pub max_overshoot_bps: f64,
+}
+
+impl Default for PullbackAcceptancePredicateConfig {
+    fn default() -> Self {
+        Self {
+            confirm_bars: default_watcher_confirm_bars(),
+            require_touch_entry_zone: true,
+            max_overshoot_bps: default_watcher_pullback_overshoot_bps(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct FailedAuctionReentryPredicateConfig {
+    #[serde(default = "default_true")]
+    pub require_probe_invalidation: bool,
+    #[serde(default = "default_watcher_probe_lookback_bars")]
+    pub probe_lookback_bars: u8,
+    #[serde(default = "default_watcher_confirm_bars")]
+    pub reaccept_confirm_bars: u8,
+}
+
+impl Default for FailedAuctionReentryPredicateConfig {
+    fn default() -> Self {
+        Self {
+            require_probe_invalidation: true,
+            probe_lookback_bars: default_watcher_probe_lookback_bars(),
+            reaccept_confirm_bars: default_watcher_confirm_bars(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct WorkflowWatcherEntryProfileRulesConfig {
+    #[serde(default = "default_reclaim_then_hold_predicates")]
+    pub reclaim_then_hold: PredicateListRuleConfig,
+    #[serde(default = "default_pullback_acceptance_predicates")]
+    pub pullback_acceptance: PredicateListRuleConfig,
+    #[serde(default = "default_failed_auction_reentry_predicates")]
+    pub failed_auction_reentry: PredicateListRuleConfig,
+}
+
+impl Default for WorkflowWatcherEntryProfileRulesConfig {
+    fn default() -> Self {
+        Self {
+            reclaim_then_hold: default_reclaim_then_hold_predicates(),
+            pullback_acceptance: default_pullback_acceptance_predicates(),
+            failed_auction_reentry: default_failed_auction_reentry_predicates(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct WorkflowWatcherIntentModeRulesConfig {
+    #[serde(default = "default_immediate_intent_rule")]
+    pub immediate: IntentModeRuleConfig,
+    #[serde(default = "default_pullback_intent_rule")]
+    pub pullback: IntentModeRuleConfig,
+    #[serde(default = "default_breakout_intent_rule")]
+    pub breakout: IntentModeRuleConfig,
+}
+
+impl Default for WorkflowWatcherIntentModeRulesConfig {
+    fn default() -> Self {
+        Self {
+            immediate: default_immediate_intent_rule(),
+            pullback: default_pullback_intent_rule(),
+            breakout: default_breakout_intent_rule(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PredicateListRuleConfig {
+    #[serde(default)]
+    pub required_predicates: Vec<String>,
+}
+
+impl Default for PredicateListRuleConfig {
+    fn default() -> Self {
+        Self {
+            required_predicates: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct IntentModeRuleConfig {
+    #[serde(default)]
+    pub required_predicates: Vec<String>,
+    #[serde(default)]
+    pub require_price_inside_entry_zone: bool,
+    #[serde(default)]
+    pub disallow_breakout_chase: bool,
+}
+
+impl Default for IntentModeRuleConfig {
+    fn default() -> Self {
+        Self {
+            required_predicates: Vec::new(),
+            require_price_inside_entry_zone: false,
+            disallow_breakout_chase: false,
         }
     }
 }
@@ -593,26 +824,6 @@ impl Default for LlmCompatibilityExecutionPolicyConfig {
             entry_sl_remap: ExecutionEntrySlRemapConfig::default(),
             min_distance_v: default_execution_min_distance_v(),
             min_rr: default_execution_min_rr(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct WorkflowSoftGateMinPassConfig {
-    #[serde(default = "default_workflow_soft_gate_a_continuation")]
-    pub a_continuation: u8,
-    #[serde(default = "default_workflow_soft_gate_b_reversal")]
-    pub b_reversal: u8,
-    #[serde(default = "default_workflow_soft_gate_c_value_return")]
-    pub c_value_return: u8,
-}
-
-impl Default for WorkflowSoftGateMinPassConfig {
-    fn default() -> Self {
-        Self {
-            a_continuation: default_workflow_soft_gate_a_continuation(),
-            b_reversal: default_workflow_soft_gate_b_reversal(),
-            c_value_return: default_workflow_soft_gate_c_value_return(),
         }
     }
 }
@@ -691,10 +902,6 @@ fn default_llm_request_enabled() -> bool {
     true
 }
 
-fn default_call_interval_secs() -> u64 {
-    900
-}
-
 fn default_request_timeout_secs() -> u64 {
     1200
 }
@@ -716,10 +923,10 @@ fn default_bundle_execution_stale_secs() -> u64 {
 }
 
 fn default_workflow_stage1_refresh_hours() -> Vec<u8> {
-    vec![0, 4, 8, 12, 16, 20]
+    vec![0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22]
 }
 
-fn default_workflow_stage2_refresh_minutes() -> Vec<u8> {
+fn default_workflow_stage2_review_minutes() -> Vec<u8> {
     vec![0, 15, 30, 45]
 }
 
@@ -731,16 +938,93 @@ fn default_workflow_persist_prompt_inputs() -> bool {
     true
 }
 
-fn default_workflow_soft_gate_a_continuation() -> u8 {
+fn default_watcher_evaluate_on() -> String {
+    "1m_close".to_string()
+}
+
+fn default_watcher_entry_attempt_window() -> String {
+    "same_15m_window".to_string()
+}
+
+fn default_watcher_max_filled_stopout_attempts() -> u8 {
+    2
+}
+
+fn default_watcher_count_unfilled_attempts() -> bool {
+    false
+}
+
+fn default_watcher_confirm_bars() -> u8 {
     3
 }
 
-fn default_workflow_soft_gate_b_reversal() -> u8 {
-    2
+fn default_watcher_min_close_bps() -> f64 {
+    3.0
 }
 
-fn default_workflow_soft_gate_c_value_return() -> u8 {
-    2
+fn default_watcher_retest_tolerance_bps() -> f64 {
+    5.0
+}
+
+fn default_watcher_min_break_bps() -> f64 {
+    8.0
+}
+
+fn default_watcher_pullback_overshoot_bps() -> f64 {
+    5.0
+}
+
+fn default_watcher_probe_lookback_bars() -> u8 {
+    3
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_reclaim_then_hold_predicates() -> PredicateListRuleConfig {
+    PredicateListRuleConfig {
+        required_predicates: vec![
+            "entry_reclaim_confirmed".to_string(),
+            "entry_hold_confirmed".to_string(),
+        ],
+    }
+}
+
+fn default_pullback_acceptance_predicates() -> PredicateListRuleConfig {
+    PredicateListRuleConfig {
+        required_predicates: vec!["pullback_acceptance_confirmed".to_string()],
+    }
+}
+
+fn default_failed_auction_reentry_predicates() -> PredicateListRuleConfig {
+    PredicateListRuleConfig {
+        required_predicates: vec!["failed_auction_reentry_confirmed".to_string()],
+    }
+}
+
+fn default_immediate_intent_rule() -> IntentModeRuleConfig {
+    IntentModeRuleConfig {
+        required_predicates: Vec::new(),
+        require_price_inside_entry_zone: true,
+        disallow_breakout_chase: false,
+    }
+}
+
+fn default_pullback_intent_rule() -> IntentModeRuleConfig {
+    IntentModeRuleConfig {
+        required_predicates: Vec::new(),
+        require_price_inside_entry_zone: true,
+        disallow_breakout_chase: true,
+    }
+}
+
+fn default_breakout_intent_rule() -> IntentModeRuleConfig {
+    IntentModeRuleConfig {
+        required_predicates: vec!["breakout_confirmed".to_string()],
+        require_price_inside_entry_zone: false,
+        disallow_breakout_chase: false,
+    }
 }
 
 fn default_temp_cache_retention_hours() -> u64 {
@@ -751,8 +1035,24 @@ fn default_temp_cache_retention_minutes() -> u64 {
     default_temp_cache_retention_hours() * 60
 }
 
-fn default_call_schedule_minutes() -> Vec<u8> {
-    vec![0, 15, 30, 45]
+fn validate_schedule_hours(hours: &[u8], field_name: &str) -> Result<()> {
+    if hours.is_empty() {
+        return Err(anyhow!("{} cannot be empty", field_name));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for hour in hours {
+        if *hour > 23 {
+            return Err(anyhow!(
+                "{} contains invalid hour {}; expected 0..=23",
+                field_name,
+                hour
+            ));
+        }
+        if !seen.insert(*hour) {
+            return Err(anyhow!("{} contains duplicate hour {}", field_name, hour));
+        }
+    }
+    Ok(())
 }
 
 fn validate_schedule_minutes(minutes: &[u8], field_name: &str) -> Result<()> {
@@ -779,39 +1079,129 @@ fn validate_schedule_minutes(minutes: &[u8], field_name: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_schedule_hours(hours: &[u8], field_name: &str) -> Result<()> {
-    if hours.is_empty() {
-        return Err(anyhow!("{} cannot be empty", field_name));
-    }
-    let mut seen = std::collections::HashSet::new();
-    for hour in hours {
-        if *hour > 23 {
+fn validate_required_predicates(predicates: &[String], field_name: &str) -> Result<()> {
+    const ALLOWED: &[&str] = &[
+        "price_above_on_close",
+        "price_below_on_close",
+        "entry_reclaim_confirmed",
+        "entry_hold_confirmed",
+        "breakout_confirmed",
+        "pullback_acceptance_confirmed",
+        "failed_auction_reentry_confirmed",
+    ];
+    for predicate in predicates {
+        if !ALLOWED.iter().any(|allowed| predicate == allowed) {
             return Err(anyhow!(
-                "{} contains invalid hour {}; expected 0..=23",
+                "{} contains unsupported predicate {}",
                 field_name,
-                hour
+                predicate
             ));
-        }
-        if !seen.insert(*hour) {
-            return Err(anyhow!("{} contains duplicate hour {}", field_name, hour));
         }
     }
     Ok(())
 }
 
-fn validate_workflow_soft_gate_min_pass(cfg: &WorkflowSoftGateMinPassConfig) -> Result<()> {
-    for (name, value) in [
-        ("a_continuation", cfg.a_continuation),
-        ("b_reversal", cfg.b_reversal),
-        ("c_value_return", cfg.c_value_return),
-    ] {
-        if value > 4 {
-            return Err(anyhow!(
-                "llm.workflow.soft_gate_min_pass.{} must be between 0 and 4",
-                name
-            ));
-        }
+fn validate_workflow_watcher_config(cfg: &WorkflowWatcherConfig) -> Result<()> {
+    if cfg.evaluate_on.trim() != "1m_close" {
+        return Err(anyhow!("llm.workflow.watcher.evaluate_on must be 1m_close"));
     }
+    if cfg.entry_attempt_window.trim() != "same_15m_window" {
+        return Err(anyhow!(
+            "llm.workflow.watcher.entry_attempt_window must be same_15m_window"
+        ));
+    }
+    if cfg.max_filled_stopout_attempts == 0 {
+        return Err(anyhow!(
+            "llm.workflow.watcher.max_filled_stopout_attempts must be > 0"
+        ));
+    }
+    if cfg.count_unfilled_attempts {
+        return Err(anyhow!(
+            "llm.workflow.watcher.count_unfilled_attempts=true is not supported yet"
+        ));
+    }
+    if cfg.price_predicates.price_above_on_close.confirm_bars == 0
+        || cfg.price_predicates.price_below_on_close.confirm_bars == 0
+        || cfg.price_predicates.entry_reclaim_confirmed.confirm_bars == 0
+        || cfg.price_predicates.entry_hold_confirmed.hold_bars == 0
+        || cfg.price_predicates.breakout_confirmed.confirm_bars == 0
+        || cfg
+            .price_predicates
+            .pullback_acceptance_confirmed
+            .confirm_bars
+            == 0
+        || cfg
+            .price_predicates
+            .failed_auction_reentry_confirmed
+            .reaccept_confirm_bars
+            == 0
+    {
+        return Err(anyhow!(
+            "llm.workflow.watcher predicate confirm bars must be > 0"
+        ));
+    }
+    if cfg.price_predicates.price_above_on_close.min_close_bps < 0.0
+        || cfg.price_predicates.price_below_on_close.min_close_bps < 0.0
+    {
+        return Err(anyhow!(
+            "llm.workflow.watcher price_above_on_close/price_below_on_close min_close_bps must be >= 0"
+        ));
+    }
+    if cfg.price_predicates.breakout_confirmed.min_break_bps <= 0.0 {
+        return Err(anyhow!(
+            "llm.workflow.watcher.breakout_confirmed.min_break_bps must be > 0"
+        ));
+    }
+    if cfg
+        .price_predicates
+        .entry_hold_confirmed
+        .retest_tolerance_bps
+        < 0.0
+    {
+        return Err(anyhow!(
+            "llm.workflow.watcher.entry_hold_confirmed.retest_tolerance_bps must be >= 0"
+        ));
+    }
+    if cfg
+        .price_predicates
+        .pullback_acceptance_confirmed
+        .max_overshoot_bps
+        < 0.0
+    {
+        return Err(anyhow!(
+            "llm.workflow.watcher.pullback_acceptance_confirmed.max_overshoot_bps must be >= 0"
+        ));
+    }
+    validate_required_predicates(
+        &cfg.entry_profile_rules
+            .reclaim_then_hold
+            .required_predicates,
+        "llm.workflow.watcher.entry_profile_rules.reclaim_then_hold.required_predicates",
+    )?;
+    validate_required_predicates(
+        &cfg.entry_profile_rules
+            .pullback_acceptance
+            .required_predicates,
+        "llm.workflow.watcher.entry_profile_rules.pullback_acceptance.required_predicates",
+    )?;
+    validate_required_predicates(
+        &cfg.entry_profile_rules
+            .failed_auction_reentry
+            .required_predicates,
+        "llm.workflow.watcher.entry_profile_rules.failed_auction_reentry.required_predicates",
+    )?;
+    validate_required_predicates(
+        &cfg.intent_mode_rules.immediate.required_predicates,
+        "llm.workflow.watcher.intent_mode_rules.immediate.required_predicates",
+    )?;
+    validate_required_predicates(
+        &cfg.intent_mode_rules.pullback.required_predicates,
+        "llm.workflow.watcher.intent_mode_rules.pullback.required_predicates",
+    )?;
+    validate_required_predicates(
+        &cfg.intent_mode_rules.breakout.required_predicates,
+        "llm.workflow.watcher.intent_mode_rules.breakout.required_predicates",
+    )?;
     Ok(())
 }
 
@@ -925,7 +1315,10 @@ fn default_binance_futures_rest_api_url() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{validate_temp_cache_retention_config, LlmConfig, LlmModelConfig};
+    use super::{
+        validate_temp_cache_retention_config, validate_workflow_watcher_config, LlmConfig,
+        LlmModelConfig, WorkflowWatcherConfig,
+    };
 
     #[test]
     fn default_llm_request_enabled_is_true() {
@@ -977,6 +1370,74 @@ mod tests {
         assert!((policy.min_distance_v - 0.0).abs() < f64::EPSILON);
         assert!((policy.min_rr - 0.0).abs() < f64::EPSILON);
         assert!((execution.max_margin_usdt - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn default_workflow_watcher_config_is_stricter_and_valid() {
+        let watcher = WorkflowWatcherConfig::default();
+        assert_eq!(watcher.evaluate_on, "1m_close");
+        assert_eq!(watcher.entry_attempt_window, "same_15m_window");
+        assert_eq!(watcher.max_filled_stopout_attempts, 2);
+        assert!(!watcher.count_unfilled_attempts);
+        assert_eq!(
+            watcher.price_predicates.price_above_on_close.confirm_bars,
+            3
+        );
+        assert!(
+            (watcher.price_predicates.price_above_on_close.min_close_bps - 3.0).abs()
+                < f64::EPSILON
+        );
+        assert_eq!(watcher.price_predicates.breakout_confirmed.confirm_bars, 3);
+        assert!(
+            (watcher.price_predicates.breakout_confirmed.min_break_bps - 8.0).abs() < f64::EPSILON
+        );
+        assert_eq!(watcher.price_predicates.entry_hold_confirmed.hold_bars, 3);
+        assert!(
+            (watcher
+                .price_predicates
+                .entry_hold_confirmed
+                .retest_tolerance_bps
+                - 5.0)
+                .abs()
+                < f64::EPSILON
+        );
+        assert_eq!(
+            watcher
+                .price_predicates
+                .pullback_acceptance_confirmed
+                .confirm_bars,
+            3
+        );
+        assert!(
+            (watcher
+                .price_predicates
+                .pullback_acceptance_confirmed
+                .max_overshoot_bps
+                - 5.0)
+                .abs()
+                < f64::EPSILON
+        );
+        assert_eq!(
+            watcher
+                .entry_profile_rules
+                .reclaim_then_hold
+                .required_predicates,
+            vec![
+                "entry_reclaim_confirmed".to_string(),
+                "entry_hold_confirmed".to_string()
+            ]
+        );
+        validate_workflow_watcher_config(&watcher).expect("watcher config valid");
+    }
+
+    #[test]
+    fn workflow_watcher_rejects_non_positive_breakout_bps() {
+        let mut watcher = WorkflowWatcherConfig::default();
+        watcher.price_predicates.breakout_confirmed.min_break_bps = 0.0;
+        let err = validate_workflow_watcher_config(&watcher).expect_err("expected validation err");
+        assert!(err
+            .to_string()
+            .contains("breakout_confirmed.min_break_bps must be > 0"));
     }
 
     #[test]
@@ -1241,9 +1702,6 @@ fn validate_config(cfg: &RootConfig) -> Result<()> {
         ));
     }
 
-    if cfg.llm.call_interval_secs == 0 {
-        return Err(anyhow!("llm.call_interval_secs must be > 0"));
-    }
     if cfg.llm.symbol.trim().is_empty() {
         return Err(anyhow!("llm.symbol is empty"));
     }
@@ -1254,62 +1712,18 @@ fn validate_config(cfg: &RootConfig) -> Result<()> {
         return Err(anyhow!("llm.bundle_settle_ms must be > 0"));
     }
     validate_temp_cache_retention_config(&cfg.llm)?;
-    validate_schedule_minutes(&cfg.llm.call_schedule_minutes, "llm.call_schedule_minutes")?;
     validate_schedule_hours(
         &cfg.llm.workflow.stage1_refresh_hours,
         "llm.workflow.stage1_refresh_hours",
     )?;
     validate_schedule_minutes(
-        &cfg.llm.workflow.stage2_refresh_minutes,
-        "llm.workflow.stage2_refresh_minutes",
+        &cfg.llm.workflow.stage2_review_minutes,
+        "llm.workflow.stage2_review_minutes",
     )?;
-    validate_workflow_soft_gate_min_pass(&cfg.llm.workflow.soft_gate_min_pass)?;
-    if cfg.llm.workflow.legacy_modes_enabled {
-        return Err(anyhow!(
-            "llm.workflow.legacy_modes_enabled must remain false; legacy workflow code has been removed"
-        ));
-    }
     if cfg.llm.workflow.state_dir.trim().is_empty() {
         return Err(anyhow!("llm.workflow.state_dir is empty"));
     }
-    for (provider, minutes) in &cfg.llm.call_schedule_minutes_by_model {
-        let key = provider.trim().to_ascii_lowercase();
-        if key != "claude"
-            && key != "qwen"
-            && key != "custom_llm"
-            && key != "gemini"
-            && key != "grok"
-        {
-            return Err(anyhow!(
-                "llm.call_schedule_minutes_by_model key must be one of [claude, qwen, custom_llm, gemini, grok], got {}",
-                provider
-            ));
-        }
-        validate_schedule_minutes(
-            minutes,
-            &format!("llm.call_schedule_minutes_by_model.{}", key),
-        )?;
-    }
-    for (provider, secs) in &cfg.llm.min_invoke_interval_secs_by_model {
-        let key = provider.trim().to_ascii_lowercase();
-        if key != "claude"
-            && key != "qwen"
-            && key != "custom_llm"
-            && key != "gemini"
-            && key != "grok"
-        {
-            return Err(anyhow!(
-                "llm.min_invoke_interval_secs_by_model key must be one of [claude, qwen, custom_llm, gemini, grok], got {}",
-                provider
-            ));
-        }
-        if *secs == 0 {
-            return Err(anyhow!(
-                "llm.min_invoke_interval_secs_by_model.{} must be > 0",
-                key
-            ));
-        }
-    }
+    validate_workflow_watcher_config(&cfg.llm.workflow.watcher)?;
     validate_telegram_signal_decisions(&cfg.llm.telegram_signal_decisions)?;
     validate_x_signal_decisions(&cfg.llm.x_signal_decisions)?;
     if !cfg.mq.queues.contains_key(&cfg.llm.queue_key) {

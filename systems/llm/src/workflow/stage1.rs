@@ -1,13 +1,13 @@
-use crate::workflow::schema::{IndicatorSummary, Stage1Output, Stage1PromptInput};
+use crate::workflow::schema::{Stage1Output, Stage1PromptInput, StrategicIndicatorSummary};
 
 pub fn build_stage1_prompt_input(
-    indicator_summary: IndicatorSummary,
+    strategic_indicator_summary: StrategicIndicatorSummary,
     previous_stage1_output: Option<Stage1Output>,
     refresh_reason: String,
 ) -> Stage1PromptInput {
     Stage1PromptInput {
-        task: "Build the Stage1 map, choose exactly one script and path only when the map is active, and return null current_script/current_path when the result is no_edge.".to_string(),
-        indicator_summary,
+        task: "Execute the 3D/1D/4H map, choose exactly one current script, and build exactly one strategic path when the market has a valid edge.".to_string(),
+        strategic_indicator_summary,
         previous_stage1_output,
         refresh_reason,
     }

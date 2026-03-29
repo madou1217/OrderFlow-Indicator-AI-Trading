@@ -75,17 +75,23 @@ pub struct AuctionContext {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
-pub struct IndicatorSummary {
+pub struct StrategicSummaryMeta {
     pub symbol: String,
     pub ts_bucket: DateTime<Utc>,
     pub source_routing_key: String,
     pub indicator_count: usize,
     #[serde(default)]
     pub missing_indicator_codes: Vec<String>,
-    pub position_context: Value,
-    pub state_context: Value,
-    pub driver_context: Value,
-    pub trigger_context: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct StrategicIndicatorSummary {
+    pub meta: StrategicSummaryMeta,
+    pub position_layer: Value,
+    pub state_layer: Value,
+    pub driver_layer: Value,
+    pub trigger_layer: Value,
     pub auction_context: AuctionContext,
     pub aux_context: Value,
 }
@@ -99,35 +105,94 @@ pub struct Stage1Meta {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(deny_unknown_fields)]
 pub struct MapSummary {
-    #[serde(default)]
-    pub market_tradeable: bool,
-    #[serde(default)]
-    pub location_bias: Option<String>,
-    #[serde(default)]
-    pub state_summary: Option<String>,
-    #[serde(default)]
-    pub driver_summary: Option<String>,
-    #[serde(default)]
-    pub notes: Vec<String>,
+    pub regime_3d: Value,
+    pub location_1d: Value,
+    pub location_4h: Value,
+    pub price_location_class: String,
+    pub key_levels: Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(deny_unknown_fields)]
 pub struct DriverAttribution {
-    pub driver_bias: String,
+    pub flow_driver: String,
+    pub spot_confirming: bool,
+    pub driver_note: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct OpportunityAssessment {
     #[serde(default)]
-    pub primary_driver: Option<String>,
+    pub location_quality: Option<String>,
     #[serde(default)]
-    pub supporting_evidence: Vec<String>,
+    pub state_quality: Option<String>,
     #[serde(default)]
-    pub conflicting_evidence: Vec<String>,
+    pub driver_quality: Option<String>,
+    #[serde(default)]
+    pub geometry_quality: Option<String>,
+    #[serde(default)]
+    pub uniqueness_quality: Option<String>,
+    #[serde(default)]
+    pub overall_quality: Option<String>,
+    #[serde(default)]
+    pub disqualifiers: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct ScriptRejection {
+    pub script: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct ZoneReevaluationTrigger {
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub zone_id: Option<String>,
+    #[serde(default)]
+    pub timeframe: Option<String>,
+    #[serde(default)]
+    pub min_confirmed_bars: Option<u64>,
+    #[serde(default)]
+    pub summary: String,
+    #[serde(default)]
+    pub evidence: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct DriverReevaluationTrigger {
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub expected_flow_driver: Option<String>,
+    #[serde(default)]
+    pub invalidate_when_drivers: Vec<String>,
+    #[serde(default)]
+    pub require_spot_confirmation: Option<bool>,
+    #[serde(default)]
+    pub driver_signal: Option<String>,
+    #[serde(default)]
+    pub min_confirmed_windows: Option<u64>,
+    #[serde(default)]
+    pub summary: String,
+    #[serde(default)]
+    pub evidence: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(deny_unknown_fields)]
 pub struct ReevaluationTrigger {
     #[serde(default)]
-    pub signals: Vec<String>,
+    pub extreme_location: ZoneReevaluationTrigger,
+    #[serde(default)]
+    pub reverse_confirmation: ZoneReevaluationTrigger,
+    #[serde(default)]
+    pub driver_change: DriverReevaluationTrigger,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -167,11 +232,21 @@ pub struct CurrentPath {
     pub id: String,
     pub side: String,
     pub thesis: String,
+    pub risk_grade: String,
+    #[serde(default)]
+    pub activation_anchor_id: Option<String>,
     pub activation_level: PriceZone,
+    #[serde(default)]
+    pub first_path_target_anchor_id: Option<String>,
     pub first_path_target: PriceZone,
+    #[serde(default)]
+    pub next_path_target_anchor_id: Option<String>,
     pub next_path_target: PriceZone,
+    #[serde(default)]
+    pub failure_anchor_id: Option<String>,
     pub failure_level: PriceZone,
-    pub failure_switch: String,
+    #[serde(default)]
+    pub failure_switch: Option<String>,
     pub setup_type: String,
     pub reevaluation_trigger: ReevaluationTrigger,
     pub management_plan: ManagementPlan,
@@ -188,73 +263,17 @@ pub struct Stage1Output {
     pub no_trade_reason: Option<String>,
     #[serde(default)]
     pub refresh_hints: Vec<String>,
+    pub map_summary: MapSummary,
     #[serde(default)]
-    pub map_summary: Option<MapSummary>,
+    pub opportunity_assessment: OpportunityAssessment,
+    #[serde(default)]
+    pub script_rejections: Vec<ScriptRejection>,
     #[serde(default)]
     pub current_script: Option<String>,
     #[serde(default)]
     pub driver_attribution: Option<DriverAttribution>,
     #[serde(default)]
     pub current_path: Option<CurrentPath>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-#[serde(deny_unknown_fields)]
-pub struct HardGateEvaluation {
-    #[serde(default)]
-    pub location_valid: bool,
-    #[serde(default)]
-    pub trigger_confirmed: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-#[serde(deny_unknown_fields)]
-pub struct SoftGateEvaluation {
-    #[serde(default)]
-    pub state_clear: bool,
-    #[serde(default)]
-    pub driver_clear: bool,
-    #[serde(default)]
-    pub orderflow_real: bool,
-    #[serde(default)]
-    pub invalidation_clear: bool,
-    #[serde(default)]
-    pub passed_count: u8,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-#[serde(deny_unknown_fields)]
-pub struct WorkflowRuntimeContract {
-    pub monitoring_status: String,
-    #[serde(default)]
-    pub no_edge_reentered: bool,
-    #[serde(default)]
-    pub failure_level_breached: bool,
-    #[serde(default)]
-    pub reevaluation_trigger_hit: bool,
-    #[serde(default)]
-    pub activation_level_active: bool,
-    #[serde(default)]
-    pub setup_confirmed: bool,
-    pub hard_gate: HardGateEvaluation,
-    pub soft_gate: SoftGateEvaluation,
-    #[serde(default)]
-    pub soft_gate_min_required: u8,
-    #[serde(default)]
-    pub allow_execute: bool,
-    #[serde(default)]
-    pub request_refresh_reason: Option<String>,
-    #[serde(default)]
-    pub request_trigger_source: Option<String>,
-    #[serde(default)]
-    pub recommended_context_key: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct RequestStage1Reevaluation {
-    pub refresh_reason: String,
-    pub trigger_source: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -304,23 +323,6 @@ pub struct ManagementAction {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
-pub struct Stage2Decision {
-    pub decision: String,
-    pub reason: String,
-    #[serde(default)]
-    pub request_stage1_reevaluation: Option<RequestStage1Reevaluation>,
-    #[serde(default)]
-    pub execution_intent: Option<ExecutionIntent>,
-    #[serde(default)]
-    pub management_actions: Vec<ManagementAction>,
-    #[serde(default)]
-    pub hard_gate: Option<HardGateEvaluation>,
-    #[serde(default)]
-    pub soft_gate: Option<SoftGateEvaluation>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
 pub struct EntrySnapshot {
     pub symbol: String,
     pub context_key: String,
@@ -333,6 +335,10 @@ pub struct EntrySnapshot {
     pub allowed_stop_loss_levels: Vec<f64>,
     #[serde(default)]
     pub allowed_take_profit_levels: Vec<f64>,
+    #[serde(default)]
+    pub tp1_realized: bool,
+    #[serde(default)]
+    pub applied_driver_deterioration_signals: Vec<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -341,7 +347,7 @@ pub struct EntrySnapshot {
 #[serde(deny_unknown_fields)]
 pub struct Stage1PromptInput {
     pub task: String,
-    pub indicator_summary: IndicatorSummary,
+    pub strategic_indicator_summary: StrategicIndicatorSummary,
     #[serde(default)]
     pub previous_stage1_output: Option<Stage1Output>,
     pub refresh_reason: String,
@@ -375,13 +381,117 @@ pub struct WorkflowAccountContext {
     pub has_open_orders: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct CandidateEvent {
+    pub event_type: String,
+    pub event_ts: DateTime<Utc>,
+    pub latest_price: f64,
+    pub reason: String,
+    #[serde(default)]
+    pub details: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct PathAuditFlags {
+    pub extreme_location: bool,
+    pub reverse_confirmation: bool,
+    pub driver_change: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct PathRuntimeState {
+    pub path_id: String,
+    pub monitoring_status: String,
+    pub latest_price: f64,
+    #[serde(default)]
+    pub hard_invalidation: bool,
+    #[serde(default)]
+    pub failure_level_breached: bool,
+    #[serde(default)]
+    pub path_alive: bool,
+    #[serde(default)]
+    pub activation_level_touched: bool,
+    #[serde(default)]
+    pub opposing_pressure_detected: bool,
+    pub audit_flags: PathAuditFlags,
+    #[serde(default)]
+    pub active_entry_context_keys: Vec<String>,
+    #[serde(default)]
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct TacticalEntrySnapshot {
+    pub context_key: String,
+    pub path_id: String,
+    pub plan_role: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct EntryPlan {
+    pub side: String,
+    pub entry_profile: String,
+    pub intent_mode: String,
+    pub entry_activation_level: PriceZone,
+    pub entry_zone: PriceZone,
+    pub entry_invalidation_level: PriceZone,
+    pub stop_loss: f64,
+    pub take_profit_1: f64,
+    pub take_profit_2: f64,
+    pub ttl_minutes: u64,
+    pub max_drift_pct: f64,
+    pub entry_snapshot: TacticalEntrySnapshot,
+    #[serde(default)]
+    pub entry_note: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct AttemptPolicy {
+    pub max_filled_stopout_attempts: u8,
+    pub count_unfilled_attempts: bool,
+    pub time_window: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct TacticalEntryPlan {
+    pub path_id: String,
+    pub primary_entry_plan: EntryPlan,
+    pub secondary_entry_plan: EntryPlan,
+    pub attempt_policy: AttemptPolicy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Stage2Output {
+    pub stage2_decision: String,
+    #[serde(default)]
+    pub tactical_entry_plan: Option<TacticalEntryPlan>,
+    #[serde(default)]
+    pub reevaluation_reason: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Stage2PromptInput {
     pub task: String,
-    pub indicator_summary: IndicatorSummary,
+    pub candidate_event: CandidateEvent,
+    pub path_runtime_state: PathRuntimeState,
+    #[serde(default)]
+    pub previous_tactical_plan: Option<TacticalEntryPlan>,
+    pub tactical_position_slice: Value,
+    pub latest_15m_trigger_facts: Value,
+    pub state_guardrail_snapshot: Value,
+    pub driver_guardrail_snapshot: Value,
+    #[serde(default)]
+    pub options_guardrail_snapshot: Option<Value>,
     pub stage1_output: Stage1Output,
-    pub runtime_contract: WorkflowRuntimeContract,
     #[serde(default)]
     pub active_positions: Vec<WorkflowPosition>,
     pub account: WorkflowAccountContext,
@@ -390,8 +500,8 @@ pub struct Stage2PromptInput {
 #[cfg(test)]
 mod tests {
     use super::{
-        EntrySnapshotRef, ExecutionIntent, HardGateEvaluation, ManagementAction, PriceZone,
-        SoftGateEvaluation, Stage2Decision,
+        AttemptPolicy, EntryPlan, EntrySnapshotRef, ExecutionIntent, PriceZone, Stage2Output,
+        TacticalEntryPlan, TacticalEntrySnapshot,
     };
     use serde_json::json;
 
@@ -418,58 +528,126 @@ mod tests {
     }
 
     #[test]
-    fn stage2_decision_roundtrip_preserves_contract_fields() {
-        let decision = Stage2Decision {
-            decision: "EXECUTE".to_string(),
-            reason: "confirmed".to_string(),
-            request_stage1_reevaluation: None,
-            execution_intent: Some(ExecutionIntent {
-                side: "LONG".to_string(),
-                intent_mode: "immediate".to_string(),
-                entry_zone: PriceZone {
-                    low: 100.0,
-                    high: 101.0,
-                    timeframe: Some("15m".to_string()),
-                    label: Some("entry".to_string()),
-                    reason: None,
-                },
-                trigger_price: Some(100.5),
-                stop_loss: 99.0,
-                take_profit_1: 103.0,
-                take_profit_2: 105.0,
-                ttl_minutes: 15,
-                max_drift_pct: 0.2,
+    fn stage2_output_roundtrip_preserves_new_contract() {
+        let output = Stage2Output {
+            stage2_decision: "PATH_CONFIRMED".to_string(),
+            tactical_entry_plan: Some(TacticalEntryPlan {
                 path_id: "path_a".to_string(),
-                entry_snapshot: EntrySnapshotRef {
-                    context_key: "ETHUSDT:LONG".to_string(),
-                    path_id: "path_a".to_string(),
+                primary_entry_plan: EntryPlan {
+                    side: "LONG".to_string(),
+                    entry_profile: "reclaim_then_hold".to_string(),
+                    intent_mode: "immediate".to_string(),
+                    entry_activation_level: PriceZone {
+                        low: 100.0,
+                        high: 101.0,
+                        timeframe: Some("15m".to_string()),
+                        label: Some("activation".to_string()),
+                        reason: None,
+                    },
+                    entry_zone: PriceZone {
+                        low: 100.0,
+                        high: 101.0,
+                        timeframe: Some("15m".to_string()),
+                        label: Some("entry".to_string()),
+                        reason: None,
+                    },
+                    entry_invalidation_level: PriceZone {
+                        low: 98.5,
+                        high: 99.0,
+                        timeframe: Some("15m".to_string()),
+                        label: Some("invalid".to_string()),
+                        reason: None,
+                    },
+                    stop_loss: 98.8,
+                    take_profit_1: 103.0,
+                    take_profit_2: 105.0,
+                    ttl_minutes: 15,
+                    max_drift_pct: 0.2,
+                    entry_snapshot: TacticalEntrySnapshot {
+                        context_key: "ETHUSDT:LONG:path_a:primary".to_string(),
+                        path_id: "path_a".to_string(),
+                        plan_role: "primary".to_string(),
+                    },
+                    entry_note: "follow-through".to_string(),
                 },
-                reason: Some("go".to_string()),
+                secondary_entry_plan: EntryPlan {
+                    side: "LONG".to_string(),
+                    entry_profile: "failed_auction_reentry".to_string(),
+                    intent_mode: "pullback".to_string(),
+                    entry_activation_level: PriceZone {
+                        low: 99.5,
+                        high: 100.0,
+                        timeframe: Some("15m".to_string()),
+                        label: Some("activation".to_string()),
+                        reason: None,
+                    },
+                    entry_zone: PriceZone {
+                        low: 99.5,
+                        high: 100.2,
+                        timeframe: Some("15m".to_string()),
+                        label: Some("entry".to_string()),
+                        reason: None,
+                    },
+                    entry_invalidation_level: PriceZone {
+                        low: 98.3,
+                        high: 98.7,
+                        timeframe: Some("15m".to_string()),
+                        label: Some("invalid".to_string()),
+                        reason: None,
+                    },
+                    stop_loss: 98.5,
+                    take_profit_1: 103.0,
+                    take_profit_2: 105.0,
+                    ttl_minutes: 15,
+                    max_drift_pct: 0.25,
+                    entry_snapshot: TacticalEntrySnapshot {
+                        context_key: "ETHUSDT:LONG:path_a:secondary".to_string(),
+                        path_id: "path_a".to_string(),
+                        plan_role: "secondary".to_string(),
+                    },
+                    entry_note: "deeper retry".to_string(),
+                },
+                attempt_policy: AttemptPolicy {
+                    max_filled_stopout_attempts: 2,
+                    count_unfilled_attempts: false,
+                    time_window: "same_15m_window".to_string(),
+                },
             }),
-            management_actions: vec![ManagementAction {
-                action_type: "MOVE_STOP".to_string(),
-                context_key: "ETHUSDT:LONG".to_string(),
-                path_id: "path_prev".to_string(),
-                reduce_ratio: None,
-                new_stop_loss: Some(100.0),
-                take_profit_1: None,
-                take_profit_2: None,
-                reason: Some("trail".to_string()),
-            }],
-            hard_gate: Some(HardGateEvaluation {
-                location_valid: true,
-                trigger_confirmed: true,
-            }),
-            soft_gate: Some(SoftGateEvaluation {
-                state_clear: true,
-                driver_clear: true,
-                orderflow_real: true,
-                invalidation_clear: true,
-                passed_count: 4,
-            }),
+            reevaluation_reason: None,
         };
-        let value = serde_json::to_value(&decision).expect("serialize");
-        let decoded: Stage2Decision = serde_json::from_value(value).expect("decode");
-        assert_eq!(decoded, decision);
+
+        let value = serde_json::to_value(&output).expect("serialize");
+        let decoded: Stage2Output = serde_json::from_value(value).expect("decode");
+        assert_eq!(decoded, output);
+    }
+
+    #[test]
+    fn execution_intent_roundtrip_keeps_internal_execution_contract() {
+        let intent = ExecutionIntent {
+            side: "LONG".to_string(),
+            intent_mode: "immediate".to_string(),
+            entry_zone: PriceZone {
+                low: 100.0,
+                high: 101.0,
+                timeframe: None,
+                label: None,
+                reason: None,
+            },
+            trigger_price: Some(100.5),
+            stop_loss: 99.0,
+            take_profit_1: 103.0,
+            take_profit_2: 105.0,
+            ttl_minutes: 15,
+            max_drift_pct: 0.2,
+            path_id: "path_a".to_string(),
+            entry_snapshot: EntrySnapshotRef {
+                context_key: "ETHUSDT:LONG:path_a:primary".to_string(),
+                path_id: "path_a".to_string(),
+            },
+            reason: Some("execute".to_string()),
+        };
+        let value = serde_json::to_value(&intent).expect("serialize");
+        let decoded: ExecutionIntent = serde_json::from_value(value).expect("decode");
+        assert_eq!(decoded, intent);
     }
 }

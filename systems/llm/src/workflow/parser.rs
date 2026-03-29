@@ -1,39 +1,65 @@
 use crate::workflow::schema::{
-    ManagementAction, Stage1Output, Stage2Decision, WorkflowRuntimeContract,
+    CurrentPath, EntryPlan, PathRuntimeState, Stage1Output, Stage2Output,
 };
 use anyhow::{anyhow, Result};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::HashSet;
 
-const ALLOWED_SETUP_TYPES: &[&str] = &["A_continuation", "B_reversal", "C_value_return"];
-const ALLOWED_REEVALUATION_SIGNALS: &[&str] =
-    &["extreme_location", "reverse_confirmation", "driver_change"];
-const ALLOWED_INTENT_MODES: &[&str] = &["immediate", "pullback", "breakout"];
-const ALLOWED_MANAGEMENT_ACTIONS: &[&str] = &[
-    "HOLD",
-    "REDUCE_POSITION",
-    "FLATTEN_POSITION",
-    "MOVE_STOP",
-    "UPDATE_TAKE_PROFIT",
+const ALLOWED_CURRENT_SCRIPTS: &[&str] = &["continuation", "crowded_reversal", "value_return"];
+const ALLOWED_NO_EDGE_REASONS: &[&str] = &[
+    "conflict_no_edge",
+    "script_not_unique",
+    "path_not_actionable",
 ];
-const ALLOWED_STOP_MIGRATION_AFTER_TARGETS: &[&str] = &["take_profit_1", "take_profit_2"];
-const ALLOWED_STOP_MIGRATION_BASES: &[&str] =
-    &["activation_level", "first_path_target", "next_path_target"];
-const ALLOWED_DRIVER_DETERIORATION_SIGNALS: &[&str] = &[
+const ALLOWED_PRICE_LOCATION_CLASSES: &[&str] = &[
+    "inside_value_middle",
+    "value_edge",
+    "outside_value_extended",
+];
+const ALLOWED_RISK_GRADES: &[&str] = &[
+    "aligned_trend",
+    "countertrend_repair",
+    "high_conflict_repair",
+];
+const ALLOWED_SETUP_TYPES: &[&str] = &["A_continuation", "B_reversal", "C_value_return"];
+const ALLOWED_ENTRY_PROFILES: &[&str] = &[
+    "reclaim_then_hold",
+    "pullback_acceptance",
+    "failed_auction_reentry",
+];
+const ALLOWED_INTENT_MODES: &[&str] = &["immediate", "pullback", "breakout"];
+const ALLOWED_FLOW_DRIVERS: &[&str] = &["spot_led", "futures_led", "mixed"];
+const ALLOWED_OPPORTUNITY_QUALITIES: &[&str] = &["high", "medium", "low"];
+const ALLOWED_ZONE_TRIGGER_KINDS: &[&str] = &[
+    "accepted_into_zone",
+    "accepted_beyond_zone",
+    "rejected_from_zone",
+    "reaccepted_through_zone",
+];
+const ALLOWED_TRIGGER_TIMEFRAMES: &[&str] = &["15m", "4h", "1d"];
+const ALLOWED_DRIVER_TRIGGER_KINDS: &[&str] = &[
+    "driver_flip",
+    "spot_confirmation_lost",
+    "oi_support_lost",
+    "state_regime_conflict",
+];
+const ALLOWED_DRIVER_SIGNALS: &[&str] = &[
     "spot_confirmation_lost",
     "oi_support_lost",
     "fake_order_risk_rising",
     "driver_flip_confirmed",
 ];
 
-fn approx_in_zone(level: f64, low: f64, high: f64) -> bool {
-    level >= low && level <= high
+pub fn parse_json_from_text(text: &str) -> Result<Value> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("empty JSON text"));
+    }
+    serde_json::from_str(trimmed).map_err(|err| anyhow!("parse JSON from model text failed: {err}"))
 }
 
-fn approx_in_levels(level: f64, levels: &[f64]) -> bool {
-    levels
-        .iter()
-        .any(|candidate| (*candidate - level).abs() < f64::EPSILON)
+fn approx_in_zone(level: f64, low: f64, high: f64) -> bool {
+    level >= low && level <= high
 }
 
 fn is_machine_identifier(value: &str) -> bool {
@@ -44,1374 +70,1221 @@ fn is_machine_identifier(value: &str) -> bool {
             .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
 }
 
-fn stop_basis_zone<'a>(
-    current_path: &'a crate::workflow::schema::CurrentPath,
-    basis: &str,
-) -> Option<&'a crate::workflow::schema::PriceZone> {
-    match basis {
-        "activation_level" => Some(&current_path.activation_level),
-        "first_path_target" => Some(&current_path.first_path_target),
-        "next_path_target" => Some(&current_path.next_path_target),
-        _ => None,
+fn validate_management_plan(path: &CurrentPath) -> Result<()> {
+    if path.management_plan.take_profit_1_basis != "first_path_target" {
+        return Err(anyhow!("take_profit_1_basis must be first_path_target"));
     }
-}
-
-fn validate_stop_migration_rule(
-    current_path: &crate::workflow::schema::CurrentPath,
-    rule: &crate::workflow::schema::StopMigrationRule,
-) -> Result<()> {
-    if !ALLOWED_STOP_MIGRATION_AFTER_TARGETS.contains(&rule.after_target.as_str()) {
+    if path.management_plan.take_profit_2_basis != "next_path_target" {
+        return Err(anyhow!("take_profit_2_basis must be next_path_target"));
+    }
+    if !approx_in_zone(
+        path.management_plan.take_profit_1_level,
+        path.first_path_target.low,
+        path.first_path_target.high,
+    ) {
         return Err(anyhow!(
-            "unsupported stop_migration_rules.after_target {}",
-            rule.after_target
+            "take_profit_1_level must align with first_path_target"
         ));
     }
-    if !ALLOWED_STOP_MIGRATION_BASES.contains(&rule.new_stop_basis.as_str()) {
+    if !approx_in_zone(
+        path.management_plan.take_profit_2_level,
+        path.next_path_target.low,
+        path.next_path_target.high,
+    ) {
         return Err(anyhow!(
-            "unsupported stop_migration_rules.new_stop_basis {}",
-            rule.new_stop_basis
+            "take_profit_2_level must align with next_path_target"
         ));
     }
-    let zone = stop_basis_zone(current_path, &rule.new_stop_basis)
-        .ok_or_else(|| anyhow!("unsupported stop migration basis"))?;
-    if !approx_in_zone(rule.new_stop_level, zone.low, zone.high) {
-        return Err(anyhow!(
-            "stop_migration_rules.new_stop_level must align with {}",
-            rule.new_stop_basis
-        ));
-    }
-    Ok(())
-}
-
-fn validate_driver_deterioration_rule(
-    rule: &crate::workflow::schema::DriverDeteriorationRule,
-    require_reduce_ratio: bool,
-    field_name: &str,
-) -> Result<()> {
-    if !ALLOWED_DRIVER_DETERIORATION_SIGNALS.contains(&rule.driver_signal.as_str()) {
-        return Err(anyhow!(
-            "{}.driver_signal must be one of [spot_confirmation_lost, oi_support_lost, fake_order_risk_rising, driver_flip_confirmed]",
-            field_name
-        ));
-    }
-    if require_reduce_ratio {
-        let ratio = rule
-            .reduce_ratio
-            .ok_or_else(|| anyhow!("{}.reduce_ratio is required", field_name))?;
-        if !(0.0 < ratio && ratio <= 1.0) {
+    for rule in &path.management_plan.stop_migration_rules {
+        if !matches!(
+            rule.after_target.as_str(),
+            "take_profit_1" | "take_profit_2"
+        ) {
             return Err(anyhow!(
-                "{}.reduce_ratio must be between 0 and 1",
-                field_name
+                "stop_migration_rules.after_target must be take_profit_1 or take_profit_2"
             ));
         }
-    } else if rule.reduce_ratio.is_some() {
-        return Err(anyhow!("{} must not include reduce_ratio", field_name));
-    }
-    Ok(())
-}
-
-fn validate_runtime_context_key(
-    symbol: &str,
-    context_key: &str,
-    expected_side: Option<&str>,
-) -> Result<()> {
-    let mut parts = context_key.split(':');
-    let symbol_part = parts
-        .next()
-        .ok_or_else(|| anyhow!("context_key must include symbol prefix"))?;
-    let side_part = parts
-        .next()
-        .ok_or_else(|| anyhow!("context_key must include side suffix"))?;
-    let suffixes = parts.collect::<Vec<_>>();
-    if suffixes.iter().any(|suffix| suffix.trim().is_empty()) {
-        return Err(anyhow!(
-            "context_key opaque suffix must be non-empty when present"
-        ));
-    }
-    if !symbol_part.eq_ignore_ascii_case(symbol) {
-        return Err(anyhow!(
-            "context_key symbol {} does not match workflow symbol {}",
-            symbol_part,
-            symbol
-        ));
-    }
-    if !matches!(side_part, "LONG" | "SHORT" | "BOTH") {
-        return Err(anyhow!(
-            "context_key side {} must be LONG, SHORT, or BOTH",
-            side_part
-        ));
-    }
-    if let Some(expected_side) = expected_side {
-        if !side_part.eq_ignore_ascii_case(expected_side) && !side_part.eq_ignore_ascii_case("BOTH")
-        {
+        if !matches!(
+            rule.new_stop_basis.as_str(),
+            "activation_level" | "first_path_target" | "next_path_target"
+        ) {
             return Err(anyhow!(
-                "context_key side {} must match expected side {} or BOTH",
-                side_part,
-                expected_side
+                "stop_migration_rules.new_stop_basis must be activation_level, first_path_target, or next_path_target"
+            ));
+        }
+    }
+    for rule in &path.management_plan.reduce_on_driver_deterioration {
+        let Some(reduce_ratio) = rule.reduce_ratio else {
+            return Err(anyhow!(
+                "reduce_on_driver_deterioration requires reduce_ratio"
+            ));
+        };
+        if !(0.0 < reduce_ratio && reduce_ratio <= 1.0) {
+            return Err(anyhow!(
+                "reduce_on_driver_deterioration.reduce_ratio must be between 0 and 1"
+            ));
+        }
+    }
+    for rule in &path.management_plan.exit_full_on_driver_deterioration {
+        if rule.reduce_ratio.is_some() {
+            return Err(anyhow!(
+                "exit_full_on_driver_deterioration.reduce_ratio must be null"
             ));
         }
     }
     Ok(())
 }
 
-fn runtime_requires_reevaluation(runtime_contract: &WorkflowRuntimeContract) -> bool {
-    runtime_contract.no_edge_reentered
-        || runtime_contract.failure_level_breached
-        || runtime_contract.reevaluation_trigger_hit
+fn same_zone(level: f64, other: f64) -> bool {
+    (level - other).abs() <= f64::EPSILON
+}
+
+fn infer_anchor_id(
+    path: &CurrentPath,
+    role: &str,
+    zone: &crate::workflow::schema::PriceZone,
+) -> Option<String> {
+    path.tracked_zones
+        .iter()
+        .find(|tracked| {
+            tracked.role == role
+                && same_zone(tracked.low, zone.low)
+                && same_zone(tracked.high, zone.high)
+        })
+        .map(|tracked| tracked.zone_id.clone())
+}
+
+fn validate_anchor_id(
+    path: &CurrentPath,
+    anchor_id: &Option<String>,
+    expected_role: &str,
+    field: &str,
+) -> Result<()> {
+    let Some(anchor_id) = anchor_id.as_deref() else {
+        return Ok(());
+    };
+    if anchor_id.trim().is_empty() {
+        return Err(anyhow!("{field} must be non-empty when provided"));
+    }
+    let zone = path
+        .tracked_zones
+        .iter()
+        .find(|tracked| tracked.zone_id == anchor_id)
+        .ok_or_else(|| anyhow!("{field} must match one of current_path.tracked_zones[].zone_id"))?;
+    if zone.role != expected_role {
+        return Err(anyhow!(
+            "{field} must point to a tracked zone with role={expected_role}"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_quality(name: &str, value: Option<&str>) -> Result<()> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    if !ALLOWED_OPPORTUNITY_QUALITIES.contains(&value) {
+        return Err(anyhow!(
+            "{name} must be one of [high, medium, low] when provided"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_opportunity_assessment(output: &Stage1Output) -> Result<()> {
+    let assessment = &output.opportunity_assessment;
+    validate_quality(
+        "opportunity_assessment.location_quality",
+        assessment.location_quality.as_deref(),
+    )?;
+    validate_quality(
+        "opportunity_assessment.state_quality",
+        assessment.state_quality.as_deref(),
+    )?;
+    validate_quality(
+        "opportunity_assessment.driver_quality",
+        assessment.driver_quality.as_deref(),
+    )?;
+    validate_quality(
+        "opportunity_assessment.geometry_quality",
+        assessment.geometry_quality.as_deref(),
+    )?;
+    validate_quality(
+        "opportunity_assessment.uniqueness_quality",
+        assessment.uniqueness_quality.as_deref(),
+    )?;
+    validate_quality(
+        "opportunity_assessment.overall_quality",
+        assessment.overall_quality.as_deref(),
+    )?;
+    if matches!(output.monitoring_status.as_str(), "active")
+        && assessment.overall_quality.as_deref().is_some()
+        && assessment.overall_quality.as_deref() != Some("high")
+    {
+        return Err(anyhow!(
+            "active stage1 output requires opportunity_assessment.overall_quality=high"
+        ));
+    }
+    if matches!(output.monitoring_status.as_str(), "active")
+        && assessment.overall_quality.as_deref() == Some("high")
+        && !assessment.disqualifiers.is_empty()
+    {
+        return Err(anyhow!(
+            "active stage1 output with overall_quality=high must not carry disqualifiers"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_script_rejections(output: &Stage1Output) -> Result<()> {
+    if output.script_rejections.is_empty() {
+        return Ok(());
+    }
+    let mut seen = HashSet::new();
+    for rejection in &output.script_rejections {
+        if !ALLOWED_CURRENT_SCRIPTS.contains(&rejection.script.as_str()) {
+            return Err(anyhow!(
+                "script_rejections[].script must be one of [continuation, crowded_reversal, value_return]"
+            ));
+        }
+        if rejection.reason.trim().is_empty() {
+            return Err(anyhow!("script_rejections[].reason must be non-empty"));
+        }
+        if !seen.insert(rejection.script.as_str()) {
+            return Err(anyhow!("script_rejections[].script must be unique"));
+        }
+    }
+
+    if let Some(current_script) = output.current_script.as_deref() {
+        let expected = ALLOWED_CURRENT_SCRIPTS
+            .iter()
+            .copied()
+            .filter(|script| *script != current_script)
+            .collect::<HashSet<_>>();
+        let actual = output
+            .script_rejections
+            .iter()
+            .map(|item| item.script.as_str())
+            .collect::<HashSet<_>>();
+        if actual != expected {
+            return Err(anyhow!(
+                "active stage1 output must reject exactly the two non-selected scripts"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_zone_reevaluation_trigger(
+    field: &str,
+    trigger: &crate::workflow::schema::ZoneReevaluationTrigger,
+    path: &CurrentPath,
+) -> Result<()> {
+    let has_structured_contract = trigger.kind.is_some()
+        || trigger.zone_id.is_some()
+        || trigger.timeframe.is_some()
+        || trigger.min_confirmed_bars.is_some();
+    if !has_structured_contract {
+        return Ok(());
+    }
+
+    let kind = trigger.kind.as_deref().ok_or_else(|| {
+        anyhow!("{field}.kind is required when using structured reevaluation_trigger")
+    })?;
+    if !ALLOWED_ZONE_TRIGGER_KINDS.contains(&kind) {
+        return Err(anyhow!(
+            "{field}.kind must be one of [accepted_into_zone, accepted_beyond_zone, rejected_from_zone, reaccepted_through_zone]"
+        ));
+    }
+    let zone_id = trigger.zone_id.as_deref().ok_or_else(|| {
+        anyhow!("{field}.zone_id is required when using structured reevaluation_trigger")
+    })?;
+    if zone_id.trim().is_empty() {
+        return Err(anyhow!("{field}.zone_id must be non-empty"));
+    }
+    if !path
+        .tracked_zones
+        .iter()
+        .any(|tracked| tracked.zone_id == zone_id)
+    {
+        return Err(anyhow!(
+            "{field}.zone_id must match one of current_path.tracked_zones[].zone_id"
+        ));
+    }
+    let timeframe = trigger.timeframe.as_deref().ok_or_else(|| {
+        anyhow!("{field}.timeframe is required when using structured reevaluation_trigger")
+    })?;
+    if !ALLOWED_TRIGGER_TIMEFRAMES.contains(&timeframe) {
+        return Err(anyhow!("{field}.timeframe must be one of [15m, 4h, 1d]"));
+    }
+    let min_confirmed_bars = trigger.min_confirmed_bars.ok_or_else(|| {
+        anyhow!("{field}.min_confirmed_bars is required when using structured reevaluation_trigger")
+    })?;
+    if min_confirmed_bars == 0 {
+        return Err(anyhow!("{field}.min_confirmed_bars must be >= 1"));
+    }
+    if trigger.summary.trim().is_empty() {
+        return Err(anyhow!("{field}.summary must be non-empty"));
+    }
+    if trigger.evidence.is_empty() {
+        return Err(anyhow!("{field}.evidence must be non-empty"));
+    }
+    Ok(())
+}
+
+fn validate_driver_reevaluation_trigger(
+    trigger: &crate::workflow::schema::DriverReevaluationTrigger,
+    driver_attribution: Option<&crate::workflow::schema::DriverAttribution>,
+) -> Result<()> {
+    let has_structured_contract = trigger.kind.is_some()
+        || trigger.expected_flow_driver.is_some()
+        || !trigger.invalidate_when_drivers.is_empty()
+        || trigger.require_spot_confirmation.is_some()
+        || trigger.driver_signal.is_some()
+        || trigger.min_confirmed_windows.is_some();
+    if !has_structured_contract {
+        return Ok(());
+    }
+
+    let kind = trigger.kind.as_deref().ok_or_else(|| {
+        anyhow!(
+            "reevaluation_trigger.driver_change.kind is required when using structured reevaluation_trigger"
+        )
+    })?;
+    if !ALLOWED_DRIVER_TRIGGER_KINDS.contains(&kind) {
+        return Err(anyhow!(
+            "reevaluation_trigger.driver_change.kind must be one of [driver_flip, spot_confirmation_lost, oi_support_lost, state_regime_conflict]"
+        ));
+    }
+    let expected_flow_driver = trigger.expected_flow_driver.as_deref().ok_or_else(|| {
+        anyhow!(
+            "reevaluation_trigger.driver_change.expected_flow_driver is required when using structured reevaluation_trigger"
+        )
+    })?;
+    if !ALLOWED_FLOW_DRIVERS.contains(&expected_flow_driver) {
+        return Err(anyhow!(
+            "reevaluation_trigger.driver_change.expected_flow_driver must be one of [spot_led, futures_led, mixed]"
+        ));
+    }
+    if let Some(driver) = driver_attribution {
+        if driver.flow_driver != expected_flow_driver {
+            return Err(anyhow!(
+                "reevaluation_trigger.driver_change.expected_flow_driver must match driver_attribution.flow_driver"
+            ));
+        }
+    }
+    if trigger.invalidate_when_drivers.is_empty() {
+        return Err(anyhow!(
+            "reevaluation_trigger.driver_change.invalidate_when_drivers must be non-empty"
+        ));
+    }
+    let mut seen = HashSet::new();
+    for driver in &trigger.invalidate_when_drivers {
+        if !ALLOWED_FLOW_DRIVERS.contains(&driver.as_str()) {
+            return Err(anyhow!(
+                "reevaluation_trigger.driver_change.invalidate_when_drivers must only contain [spot_led, futures_led, mixed]"
+            ));
+        }
+        if !seen.insert(driver.as_str()) {
+            return Err(anyhow!(
+                "reevaluation_trigger.driver_change.invalidate_when_drivers must be unique"
+            ));
+        }
+    }
+    if trigger
+        .invalidate_when_drivers
+        .iter()
+        .any(|item| item == expected_flow_driver)
+    {
+        return Err(anyhow!(
+            "reevaluation_trigger.driver_change.invalidate_when_drivers must exclude expected_flow_driver"
+        ));
+    }
+    if let Some(driver_signal) = trigger.driver_signal.as_deref() {
+        if !ALLOWED_DRIVER_SIGNALS.contains(&driver_signal) {
+            return Err(anyhow!(
+                "reevaluation_trigger.driver_change.driver_signal must be one of [spot_confirmation_lost, oi_support_lost, fake_order_risk_rising, driver_flip_confirmed]"
+            ));
+        }
+    }
+    let min_confirmed_windows = trigger.min_confirmed_windows.ok_or_else(|| {
+        anyhow!(
+            "reevaluation_trigger.driver_change.min_confirmed_windows is required when using structured reevaluation_trigger"
+        )
+    })?;
+    if min_confirmed_windows == 0 {
+        return Err(anyhow!(
+            "reevaluation_trigger.driver_change.min_confirmed_windows must be >= 1"
+        ));
+    }
+    if trigger.summary.trim().is_empty() {
+        return Err(anyhow!(
+            "reevaluation_trigger.driver_change.summary must be non-empty"
+        ));
+    }
+    if trigger.evidence.is_empty() {
+        return Err(anyhow!(
+            "reevaluation_trigger.driver_change.evidence must be non-empty"
+        ));
+    }
+    Ok(())
 }
 
 pub fn parse_stage1_output(value: Value) -> Result<Stage1Output> {
     let mut output: Stage1Output = serde_json::from_value(value)?;
-    if output.monitoring_status.trim().is_empty() {
-        return Err(anyhow!("monitoring_status must be non-empty"));
+    if !matches!(output.monitoring_status.as_str(), "active" | "no_edge") {
+        return Err(anyhow!("monitoring_status must be active or no_edge"));
     }
-    if output.monitoring_status == "active" {
-        let current_script = output
-            .current_script
-            .as_ref()
-            .ok_or_else(|| anyhow!("active stage1 output requires current_script"))?;
-        if current_script.trim().is_empty() {
-            return Err(anyhow!("current_script must be non-empty"));
-        }
-        let current_path = output
-            .current_path
-            .as_ref()
-            .ok_or_else(|| anyhow!("active stage1 output requires current_path"))?;
-        if current_path.id.trim().is_empty() {
-            return Err(anyhow!("current_path.id must be non-empty"));
-        }
-        if current_path.id == current_path.failure_switch {
-            return Err(anyhow!(
-                "failure_switch must be a script name, not current path id"
-            ));
-        }
-        if current_path.thesis.trim().is_empty() {
-            return Err(anyhow!("current_path.thesis must be non-empty"));
-        }
-        if !matches!(current_path.side.as_str(), "LONG" | "SHORT") {
-            return Err(anyhow!("current_path.side must be LONG or SHORT"));
-        }
-        if !ALLOWED_SETUP_TYPES.contains(&current_path.setup_type.as_str()) {
-            return Err(anyhow!(
-                "unsupported setup_type {}",
-                current_path.setup_type
-            ));
-        }
-        if current_path.failure_switch.trim().is_empty() {
-            return Err(anyhow!("failure_switch must be non-empty"));
-        }
-        if !is_machine_identifier(&current_path.failure_switch) {
-            return Err(anyhow!(
-                "failure_switch must be an English machine-style script identifier"
-            ));
-        }
-        if current_path.tracked_zones.is_empty() {
-            return Err(anyhow!("tracked_zones must be non-empty"));
-        }
-        if current_path.management_plan.take_profit_1_basis != "first_path_target" {
-            return Err(anyhow!("take_profit_1_basis must be first_path_target"));
-        }
-        if current_path.management_plan.take_profit_2_basis != "next_path_target" {
-            return Err(anyhow!("take_profit_2_basis must be next_path_target"));
-        }
-        if !approx_in_zone(
-            current_path.management_plan.take_profit_1_level,
-            current_path.first_path_target.low,
-            current_path.first_path_target.high,
-        ) {
-            return Err(anyhow!(
-                "take_profit_1_level must align with first_path_target"
-            ));
-        }
-        if !approx_in_zone(
-            current_path.management_plan.take_profit_2_level,
-            current_path.next_path_target.low,
-            current_path.next_path_target.high,
-        ) {
-            return Err(anyhow!(
-                "take_profit_2_level must align with next_path_target"
-            ));
-        }
-        for signal in &current_path.reevaluation_trigger.signals {
-            if !ALLOWED_REEVALUATION_SIGNALS.contains(&signal.as_str()) {
-                return Err(anyhow!("unsupported reevaluation signal {}", signal));
+    if !ALLOWED_PRICE_LOCATION_CLASSES.contains(&output.map_summary.price_location_class.as_str()) {
+        return Err(anyhow!(
+            "map_summary.price_location_class must be one of [inside_value_middle, value_edge, outside_value_extended]"
+        ));
+    }
+    validate_opportunity_assessment(&output)?;
+    validate_script_rejections(&output)?;
+
+    match output.monitoring_status.as_str() {
+        "active" => {
+            let driver_attribution = output.driver_attribution.clone();
+            let script = output
+                .current_script
+                .as_ref()
+                .ok_or_else(|| anyhow!("active stage1 output requires current_script"))?;
+            if !ALLOWED_CURRENT_SCRIPTS.contains(&script.as_str()) {
+                return Err(anyhow!(
+                    "current_script must be one of [continuation, crowded_reversal, value_return]"
+                ));
             }
+            let path = output
+                .current_path
+                .as_mut()
+                .ok_or_else(|| anyhow!("active stage1 output requires current_path"))?;
+            if path.id.trim().is_empty() {
+                return Err(anyhow!("current_path.id must be non-empty"));
+            }
+            if path.thesis.trim().is_empty() {
+                return Err(anyhow!("current_path.thesis must be non-empty"));
+            }
+            if !matches!(path.side.as_str(), "LONG" | "SHORT") {
+                return Err(anyhow!("current_path.side must be LONG or SHORT"));
+            }
+            if !ALLOWED_RISK_GRADES.contains(&path.risk_grade.as_str()) {
+                return Err(anyhow!(
+                    "risk_grade must be one of [aligned_trend, countertrend_repair, high_conflict_repair]"
+                ));
+            }
+            if !ALLOWED_SETUP_TYPES.contains(&path.setup_type.as_str()) {
+                return Err(anyhow!(
+                    "setup_type must be one of [A_continuation, B_reversal, C_value_return]"
+                ));
+            }
+            if let Some(failure_switch) = path.failure_switch.as_ref() {
+                if !ALLOWED_CURRENT_SCRIPTS.contains(&failure_switch.as_str())
+                    && !is_machine_identifier(failure_switch)
+                {
+                    return Err(anyhow!(
+                        "failure_switch must be a script name or a machine-style reevaluation identifier"
+                    ));
+                }
+            }
+            if path.activation_anchor_id.is_none() {
+                path.activation_anchor_id =
+                    infer_anchor_id(path, "activation", &path.activation_level);
+            }
+            if path.first_path_target_anchor_id.is_none() {
+                path.first_path_target_anchor_id =
+                    infer_anchor_id(path, "target", &path.first_path_target);
+            }
+            if path.next_path_target_anchor_id.is_none() {
+                path.next_path_target_anchor_id =
+                    infer_anchor_id(path, "target", &path.next_path_target);
+            }
+            if path.failure_anchor_id.is_none() {
+                path.failure_anchor_id = infer_anchor_id(path, "failure", &path.failure_level);
+            }
+            validate_anchor_id(
+                path,
+                &path.activation_anchor_id,
+                "activation",
+                "current_path.activation_anchor_id",
+            )?;
+            validate_anchor_id(
+                path,
+                &path.first_path_target_anchor_id,
+                "target",
+                "current_path.first_path_target_anchor_id",
+            )?;
+            validate_anchor_id(
+                path,
+                &path.next_path_target_anchor_id,
+                "target",
+                "current_path.next_path_target_anchor_id",
+            )?;
+            validate_anchor_id(
+                path,
+                &path.failure_anchor_id,
+                "failure",
+                "current_path.failure_anchor_id",
+            )?;
+            validate_zone_reevaluation_trigger(
+                "reevaluation_trigger.extreme_location",
+                &path.reevaluation_trigger.extreme_location,
+                path,
+            )?;
+            validate_zone_reevaluation_trigger(
+                "reevaluation_trigger.reverse_confirmation",
+                &path.reevaluation_trigger.reverse_confirmation,
+                path,
+            )?;
+            validate_driver_reevaluation_trigger(
+                &path.reevaluation_trigger.driver_change,
+                driver_attribution.as_ref(),
+            )?;
+            validate_management_plan(path)?;
         }
-        for rule in &current_path.management_plan.stop_migration_rules {
-            validate_stop_migration_rule(current_path, rule)?;
-        }
-        for signal in &current_path.management_plan.reduce_on_driver_deterioration {
-            validate_driver_deterioration_rule(signal, true, "reduce_on_driver_deterioration")?;
-        }
-        for signal in &current_path
-            .management_plan
-            .exit_full_on_driver_deterioration
-        {
-            validate_driver_deterioration_rule(signal, false, "exit_full_on_driver_deterioration")?;
-        }
-    } else if output.monitoring_status == "no_edge" {
-        if output.current_script.is_some() || output.current_path.is_some() {
+        "no_edge" => {
+            if let Some(reason) = output.no_trade_reason.as_ref() {
+                if !ALLOWED_NO_EDGE_REASONS.contains(&reason.as_str()) {
+                    return Err(anyhow!(
+                        "no_trade_reason must be one of [conflict_no_edge, script_not_unique, path_not_actionable]"
+                    ));
+                }
+            }
             output.current_script = None;
             output.current_path = None;
         }
+        _ => unreachable!(),
     }
+
     Ok(output)
 }
 
-pub fn parse_stage2_decision(
-    value: Value,
-    symbol: &str,
-    stage1_output: &Stage1Output,
-    runtime_contract: &WorkflowRuntimeContract,
-    has_positions: bool,
-    entry_snapshots: &HashMap<String, crate::workflow::schema::EntrySnapshot>,
-) -> Result<Stage2Decision> {
-    let decision: Stage2Decision = serde_json::from_value(value)?;
-    match decision.decision.as_str() {
-        "WAIT" | "EXECUTE" | "REQUEST_STAGE1_REEVALUATION" => {}
-        other => return Err(anyhow!("unsupported stage2 decision {}", other)),
+fn validate_entry_plan(
+    entry_plan: &EntryPlan,
+    current_path: &CurrentPath,
+    plan_role: &str,
+) -> Result<()> {
+    if !matches!(entry_plan.side.as_str(), "LONG" | "SHORT") {
+        return Err(anyhow!("{}.side must be LONG or SHORT", plan_role));
     }
-    if decision.reason.trim().is_empty() {
-        return Err(anyhow!("stage2 reason must be non-empty"));
-    }
-    let hard_gate = decision
-        .hard_gate
-        .as_ref()
-        .ok_or_else(|| anyhow!("stage2 output requires hard_gate"))?;
-    let soft_gate = decision
-        .soft_gate
-        .as_ref()
-        .ok_or_else(|| anyhow!("stage2 output requires soft_gate"))?;
-    if hard_gate != &runtime_contract.hard_gate {
+    if entry_plan.side != current_path.side {
         return Err(anyhow!(
-            "stage2 hard_gate must match code-side runtime contract"
+            "{}.side must match Stage1 current_path.side",
+            plan_role
         ));
     }
-    if soft_gate != &runtime_contract.soft_gate {
+    if !ALLOWED_ENTRY_PROFILES.contains(&entry_plan.entry_profile.as_str()) {
         return Err(anyhow!(
-            "stage2 soft_gate must match code-side runtime contract"
+            "{}.entry_profile must be one of [reclaim_then_hold, pullback_acceptance, failed_auction_reentry]",
+            plan_role
         ));
     }
-    if runtime_contract.monitoring_status == "no_edge" {
-        if decision.execution_intent.is_some() {
-            return Err(anyhow!(
-                "no_edge stage2 output cannot include execution_intent"
-            ));
-        }
-        if runtime_contract.no_edge_reentered {
-            let request = decision
-                .request_stage1_reevaluation
-                .as_ref()
-                .ok_or_else(|| anyhow!("no_edge_reentered requires reevaluation request"))?;
-            if decision.decision != "REQUEST_STAGE1_REEVALUATION" {
-                return Err(anyhow!(
-                    "no_edge_reentered must request Stage1 reevaluation"
-                ));
-            }
-            if request.refresh_reason != "no_edge_reentered" {
-                return Err(anyhow!(
-                    "no_edge_reentered must use refresh_reason=no_edge_reentered"
-                ));
-            }
-            if request.trigger_source != "refresh_hint" {
-                return Err(anyhow!(
-                    "no_edge_reentered must use trigger_source=refresh_hint"
-                ));
-            }
-        } else if decision.decision != "WAIT" || decision.request_stage1_reevaluation.is_some() {
-            return Err(anyhow!(
-                "no_edge without reentry must remain WAIT without reevaluation request"
-            ));
-        }
+    if !ALLOWED_INTENT_MODES.contains(&entry_plan.intent_mode.as_str()) {
+        return Err(anyhow!(
+            "{}.intent_mode must be one of [immediate, pullback, breakout]",
+            plan_role
+        ));
     }
-    if runtime_contract.monitoring_status == "active"
-        && runtime_requires_reevaluation(runtime_contract)
-        && decision.decision != "REQUEST_STAGE1_REEVALUATION"
+    if entry_plan.entry_snapshot.path_id != current_path.id {
+        return Err(anyhow!(
+            "{}.entry_snapshot.path_id must match current_path.id",
+            plan_role
+        ));
+    }
+    if entry_plan.entry_snapshot.context_key.trim().is_empty() {
+        return Err(anyhow!(
+            "{}.entry_snapshot.context_key must be non-empty",
+            plan_role
+        ));
+    }
+    if entry_plan.ttl_minutes == 0 {
+        return Err(anyhow!("{}.ttl_minutes must be > 0", plan_role));
+    }
+    if entry_plan.max_drift_pct < 0.0 {
+        return Err(anyhow!("{}.max_drift_pct must be >= 0", plan_role));
+    }
+    if (entry_plan.take_profit_1 - current_path.management_plan.take_profit_1_level).abs()
+        > f64::EPSILON
     {
         return Err(anyhow!(
-            "runtime invalidation requires REQUEST_STAGE1_REEVALUATION"
+            "{}.take_profit_1 must inherit Stage1 current_path take_profit_1_level",
+            plan_role
         ));
     }
-    if decision.decision == "REQUEST_STAGE1_REEVALUATION" {
-        if !runtime_requires_reevaluation(runtime_contract) {
-            return Err(anyhow!(
-                "Stage2 cannot request reevaluation without code-side trigger"
-            ));
-        }
-        let request = decision
-            .request_stage1_reevaluation
-            .as_ref()
-            .ok_or_else(|| anyhow!("reevaluation decision requires request payload"))?;
-        if !matches!(
-            request.refresh_reason.as_str(),
-            "thesis_invalidated" | "no_edge_reentered"
-        ) {
-            return Err(anyhow!("invalid refresh_reason {}", request.refresh_reason));
-        }
-        if decision.execution_intent.is_some() {
-            return Err(anyhow!(
-                "REQUEST_STAGE1_REEVALUATION cannot include execution_intent"
-            ));
-        }
+    if (entry_plan.take_profit_2 - current_path.management_plan.take_profit_2_level).abs()
+        > f64::EPSILON
+    {
+        return Err(anyhow!(
+            "{}.take_profit_2 must inherit Stage1 current_path take_profit_2_level",
+            plan_role
+        ));
     }
-    if decision.decision == "WAIT" && decision.execution_intent.is_some() {
-        return Err(anyhow!("WAIT cannot include execution_intent"));
-    }
-    if decision.decision == "EXECUTE" {
-        if !runtime_contract.allow_execute {
-            return Err(anyhow!(
-                "EXECUTE is not allowed by code-side runtime contract"
-            ));
-        }
-        let intent = decision
-            .execution_intent
-            .as_ref()
-            .ok_or_else(|| anyhow!("EXECUTE requires execution_intent"))?;
-        let current_path = stage1_output
-            .current_path
-            .as_ref()
-            .ok_or_else(|| anyhow!("active stage1 path missing"))?;
-        if intent.path_id != current_path.id {
-            return Err(anyhow!(
-                "execution_intent.path_id must match current_path.id"
-            ));
-        }
-        if intent.side != current_path.side {
-            return Err(anyhow!(
-                "execution_intent.side must match current_path.side"
-            ));
-        }
-        if !ALLOWED_INTENT_MODES.contains(&intent.intent_mode.as_str()) {
-            return Err(anyhow!(
-                "unsupported execution intent_mode {}",
-                intent.intent_mode
-            ));
-        }
-        if intent.entry_snapshot.context_key.trim().is_empty() {
-            return Err(anyhow!(
-                "execution_intent.entry_snapshot.context_key must be non-empty"
-            ));
-        }
-        if let Some(snapshot) = entry_snapshots.get(&intent.entry_snapshot.context_key) {
-            if snapshot.path_id != intent.path_id {
-                return Err(anyhow!(
-                    "execution_intent.context_key already exists with a different path_id"
-                ));
-            }
-        }
-        validate_runtime_context_key(
-            symbol,
-            &intent.entry_snapshot.context_key,
-            Some(&intent.side),
-        )?;
-        if intent.entry_snapshot.path_id != intent.path_id {
-            return Err(anyhow!(
-                "entry_snapshot.path_id must match execution path id"
-            ));
-        }
-        if !approx_in_zone(
-            intent.stop_loss,
-            current_path.failure_level.low,
-            current_path.failure_level.high,
-        ) {
-            return Err(anyhow!("execution stop_loss must align with failure_level"));
-        }
-        if !approx_in_zone(
-            intent.take_profit_1,
-            current_path.first_path_target.low,
-            current_path.first_path_target.high,
-        ) {
-            return Err(anyhow!("execution tp1 must align with first_path_target"));
-        }
-        if !approx_in_zone(
-            intent.take_profit_2,
-            current_path.next_path_target.low,
-            current_path.next_path_target.high,
-        ) {
-            return Err(anyhow!("execution tp2 must align with next_path_target"));
-        }
-        if !(hard_gate.location_valid && hard_gate.trigger_confirmed) {
-            return Err(anyhow!("EXECUTE requires hard_gate to fully pass"));
-        }
-        if soft_gate.passed_count < runtime_contract.soft_gate_min_required {
-            return Err(anyhow!(
-                "EXECUTE requires soft_gate.passed_count to meet runtime threshold"
-            ));
-        }
-    }
-    if !has_positions && !decision.management_actions.is_empty() {
-        return Err(anyhow!("management_actions require active positions"));
-    }
-    for action in &decision.management_actions {
-        validate_management_action(symbol, action, entry_snapshots)?;
-    }
-    Ok(decision)
-}
 
-fn validate_management_action(
-    symbol: &str,
-    action: &ManagementAction,
-    entry_snapshots: &HashMap<String, crate::workflow::schema::EntrySnapshot>,
-) -> Result<()> {
-    if !ALLOWED_MANAGEMENT_ACTIONS.contains(&action.action_type.as_str()) {
-        return Err(anyhow!(
-            "unsupported management action {}",
-            action.action_type
-        ));
-    }
-    if action.context_key.trim().is_empty() {
-        return Err(anyhow!("management action context_key must be non-empty"));
-    }
-    let snapshot = entry_snapshots
-        .get(&action.context_key)
-        .ok_or_else(|| anyhow!("missing entry snapshot for {}", action.context_key))?;
-    validate_runtime_context_key(symbol, &action.context_key, Some(&snapshot.side))?;
-    if snapshot.path_id != action.path_id {
-        return Err(anyhow!(
-            "management action path_id must match persisted entry snapshot path_id"
-        ));
-    }
-    match action.action_type.as_str() {
-        "HOLD" => {
-            if action.reduce_ratio.is_some()
-                || action.new_stop_loss.is_some()
-                || action.take_profit_1.is_some()
-                || action.take_profit_2.is_some()
+    match current_path.side.as_str() {
+        "LONG" => {
+            if entry_plan.stop_loss < current_path.failure_level.low - f64::EPSILON {
+                return Err(anyhow!(
+                    "{}.stop_loss must not widen beyond Stage1.failure_level.low",
+                    plan_role
+                ));
+            }
+            if entry_plan.entry_invalidation_level.low
+                < current_path.failure_level.low - f64::EPSILON
             {
-                return Err(anyhow!("HOLD cannot include update fields"));
-            }
-        }
-        "REDUCE_POSITION" => {
-            let ratio = action
-                .reduce_ratio
-                .ok_or_else(|| anyhow!("REDUCE_POSITION requires reduce_ratio"))?;
-            if !(0.0 < ratio && ratio <= 1.0) {
-                return Err(anyhow!("reduce_ratio must be between 0 and 1"));
-            }
-        }
-        "FLATTEN_POSITION" => {}
-        "MOVE_STOP" => {
-            let new_stop_loss = action
-                .new_stop_loss
-                .ok_or_else(|| anyhow!("MOVE_STOP requires new_stop_loss"))?;
-            if !approx_in_levels(new_stop_loss, &snapshot.allowed_stop_loss_levels) {
-                return Err(anyhow!("MOVE_STOP requires new_stop_loss"));
-            }
-        }
-        "UPDATE_TAKE_PROFIT" => {
-            if action.take_profit_1.is_none() && action.take_profit_2.is_none() {
                 return Err(anyhow!(
-                    "UPDATE_TAKE_PROFIT requires take_profit_1 or take_profit_2"
+                    "{}.entry_invalidation_level must stay inside the Stage1 path envelope",
+                    plan_role
                 ));
             }
-            if action.take_profit_1.is_some() && action.take_profit_2.is_some() {
+        }
+        "SHORT" => {
+            if entry_plan.stop_loss > current_path.failure_level.high + f64::EPSILON {
                 return Err(anyhow!(
-                    "UPDATE_TAKE_PROFIT cannot include both take_profit_1 and take_profit_2"
+                    "{}.stop_loss must not widen beyond Stage1.failure_level.high",
+                    plan_role
                 ));
             }
-            if let Some(level) = action.take_profit_1 {
-                if !approx_in_levels(level, &snapshot.allowed_take_profit_levels) {
-                    return Err(anyhow!(
-                        "take_profit_1 must come from persisted management plan/path levels"
-                    ));
-                }
-            }
-            if let Some(level) = action.take_profit_2 {
-                if !approx_in_levels(level, &snapshot.allowed_take_profit_levels) {
-                    return Err(anyhow!(
-                        "take_profit_2 must come from persisted management plan/path levels"
-                    ));
-                }
+            if entry_plan.entry_invalidation_level.high
+                > current_path.failure_level.high + f64::EPSILON
+            {
+                return Err(anyhow!(
+                    "{}.entry_invalidation_level must stay inside the Stage1 path envelope",
+                    plan_role
+                ));
             }
         }
         _ => unreachable!(),
     }
+
     Ok(())
 }
 
-pub fn parse_json_from_text(raw: &str) -> Option<Value> {
-    let trimmed = raw.trim();
-    if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
-        return Some(v);
+pub fn parse_stage2_output(
+    value: Value,
+    stage1_output: &Stage1Output,
+    path_runtime_state: &PathRuntimeState,
+) -> Result<Stage2Output> {
+    let output: Stage2Output = serde_json::from_value(value)?;
+    if !matches!(
+        output.stage2_decision.as_str(),
+        "PATH_CONFIRMED" | "REQUEST_STAGE1_REEVALUATION"
+    ) {
+        return Err(anyhow!(
+            "stage2_decision must be PATH_CONFIRMED or REQUEST_STAGE1_REEVALUATION"
+        ));
     }
-    let start = trimmed.find('{')?;
-    let end = trimmed.rfind('}')?;
-    if end <= start {
-        return None;
+
+    let soft_invalidation_triplet = path_runtime_state.audit_flags.extreme_location
+        && path_runtime_state.audit_flags.reverse_confirmation
+        && path_runtime_state.audit_flags.driver_change;
+
+    if output.stage2_decision == "REQUEST_STAGE1_REEVALUATION" {
+        if output
+            .reevaluation_reason
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .is_empty()
+        {
+            return Err(anyhow!(
+                "REQUEST_STAGE1_REEVALUATION requires reevaluation_reason"
+            ));
+        }
+        if output.tactical_entry_plan.is_some() {
+            return Err(anyhow!(
+                "REQUEST_STAGE1_REEVALUATION must not include tactical_entry_plan"
+            ));
+        }
+        if !(path_runtime_state.hard_invalidation || soft_invalidation_triplet) {
+            return Err(anyhow!(
+                "REQUEST_STAGE1_REEVALUATION requires hard invalidation or the full soft-invalidation triplet"
+            ));
+        }
+        return Ok(output);
     }
-    serde_json::from_str::<Value>(&trimmed[start..=end]).ok()
+
+    if path_runtime_state.hard_invalidation || soft_invalidation_triplet {
+        return Err(anyhow!(
+            "path invalidation requires REQUEST_STAGE1_REEVALUATION"
+        ));
+    }
+    if output.reevaluation_reason.is_some() {
+        return Err(anyhow!(
+            "PATH_CONFIRMED must not include reevaluation_reason"
+        ));
+    }
+
+    let current_path = stage1_output
+        .current_path
+        .as_ref()
+        .ok_or_else(|| anyhow!("PATH_CONFIRMED requires Stage1 current_path"))?;
+    let tactical_plan = output
+        .tactical_entry_plan
+        .as_ref()
+        .ok_or_else(|| anyhow!("PATH_CONFIRMED requires tactical_entry_plan"))?;
+    if tactical_plan.path_id != current_path.id {
+        return Err(anyhow!(
+            "tactical_entry_plan.path_id must match Stage1 current_path.id"
+        ));
+    }
+    validate_entry_plan(
+        &tactical_plan.primary_entry_plan,
+        current_path,
+        "primary_entry_plan",
+    )?;
+    validate_entry_plan(
+        &tactical_plan.secondary_entry_plan,
+        current_path,
+        "secondary_entry_plan",
+    )?;
+    if tactical_plan.primary_entry_plan.entry_snapshot.context_key
+        == tactical_plan
+            .secondary_entry_plan
+            .entry_snapshot
+            .context_key
+    {
+        return Err(anyhow!(
+            "primary_entry_plan and secondary_entry_plan must use distinct context_key values"
+        ));
+    }
+    if tactical_plan.attempt_policy.max_filled_stopout_attempts != 2 {
+        return Err(anyhow!(
+            "attempt_policy.max_filled_stopout_attempts must be 2"
+        ));
+    }
+    if tactical_plan.attempt_policy.count_unfilled_attempts {
+        return Err(anyhow!(
+            "attempt_policy.count_unfilled_attempts must remain false"
+        ));
+    }
+    if tactical_plan.attempt_policy.time_window != "same_15m_window" {
+        return Err(anyhow!(
+            "attempt_policy.time_window must be same_15m_window"
+        ));
+    }
+
+    Ok(output)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_stage1_output, parse_stage2_decision};
+    use super::{parse_stage1_output, parse_stage2_output};
     use crate::workflow::schema::{
-        EntrySnapshot, HardGateEvaluation, PriceZone, SoftGateEvaluation, Stage1Meta, Stage1Output,
-        WorkflowRuntimeContract,
+        AttemptPolicy, CurrentPath, DriverAttribution, DriverReevaluationTrigger, EntryPlan,
+        ManagementPlan, MapSummary, OpportunityAssessment, PathAuditFlags, PathRuntimeState,
+        PriceZone, ReevaluationTrigger, ScriptRejection, Stage1Meta, Stage1Output, Stage2Output,
+        StopMigrationRule, TacticalEntryPlan, TacticalEntrySnapshot, ZoneReevaluationTrigger,
     };
     use chrono::Utc;
-    use serde_json::json;
-    use std::collections::HashMap;
+    use serde_json::{json, Value};
 
-    fn runtime_contract(
-        stage1_output: &Stage1Output,
-        hard_gate: HardGateEvaluation,
-        soft_gate: SoftGateEvaluation,
-    ) -> WorkflowRuntimeContract {
-        WorkflowRuntimeContract {
-            monitoring_status: stage1_output.monitoring_status.clone(),
-            no_edge_reentered: false,
-            failure_level_breached: false,
-            reevaluation_trigger_hit: false,
-            activation_level_active: hard_gate.location_valid,
-            setup_confirmed: hard_gate.trigger_confirmed,
-            hard_gate: hard_gate.clone(),
-            soft_gate: soft_gate.clone(),
-            soft_gate_min_required: 3,
-            allow_execute: stage1_output.monitoring_status == "active"
-                && hard_gate.location_valid
-                && hard_gate.trigger_confirmed
-                && soft_gate.passed_count >= 3,
-            request_refresh_reason: None,
-            request_trigger_source: None,
-            recommended_context_key: None,
-        }
-    }
-
-    #[test]
-    fn stage1_parser_requires_path_id() {
-        let value = json!({
-            "meta": { "stage1_ts": Utc::now() },
-            "monitoring_status": "active",
-            "current_script": "reclaim reversal",
-            "driver_attribution": { "driver_bias": "spot_led" },
-            "current_path": {
-                "id": "",
-                "side": "LONG",
-                "thesis": "x",
-                "activation_level": {"low": 1.0, "high": 1.0},
-                "first_path_target": {"low": 2.0, "high": 2.0},
-                "next_path_target": {"low": 3.0, "high": 3.0},
-                "failure_level": {"low": 0.5, "high": 0.5},
-                "failure_switch": "alt",
-                "setup_type": "B_reversal",
-                "reevaluation_trigger": { "signals": ["driver_change"] },
-                "management_plan": {
-                    "take_profit_1_basis": "first_path_target",
-                    "take_profit_2_basis": "next_path_target",
-                    "take_profit_1_level": 2.0,
-                    "take_profit_2_level": 3.0,
-                    "stop_migration_rules": [],
-                    "reduce_on_driver_deterioration": [],
-                    "exit_full_on_driver_deterioration": []
-                },
-                "tracked_zones": [{
-                    "zone_id": "z1",
-                    "timeframe": "4h",
-                    "role": "activation",
-                    "low": 1.0,
-                    "high": 1.0
-                }]
-            }
-        });
-        assert!(parse_stage1_output(value).is_err());
-    }
-
-    #[test]
-    fn stage2_parser_validates_management_context_path_binding() {
-        let stage1_output = Stage1Output {
-            meta: Stage1Meta {
-                stage1_ts: Utc::now(),
-            },
-            monitoring_status: "active".to_string(),
-            no_trade_reason: None,
-            refresh_hints: Vec::new(),
-            map_summary: None,
-            current_script: Some("script".to_string()),
-            driver_attribution: None,
-            current_path: Some(crate::workflow::schema::CurrentPath {
-                id: "path_new".to_string(),
-                side: "LONG".to_string(),
-                thesis: "thesis".to_string(),
-                activation_level: PriceZone {
-                    low: 1.0,
-                    high: 1.0,
-                    timeframe: None,
-                    label: None,
-                    reason: None,
-                },
-                first_path_target: PriceZone {
-                    low: 2.0,
-                    high: 2.0,
-                    timeframe: None,
-                    label: None,
-                    reason: None,
-                },
-                next_path_target: PriceZone {
-                    low: 3.0,
-                    high: 3.0,
-                    timeframe: None,
-                    label: None,
-                    reason: None,
-                },
-                failure_level: PriceZone {
-                    low: 0.5,
-                    high: 0.5,
-                    timeframe: None,
-                    label: None,
-                    reason: None,
-                },
-                failure_switch: "alt".to_string(),
-                setup_type: "A_continuation".to_string(),
-                reevaluation_trigger: crate::workflow::schema::ReevaluationTrigger {
-                    signals: vec!["driver_change".to_string()],
-                },
-                management_plan: crate::workflow::schema::ManagementPlan {
-                    take_profit_1_basis: "first_path_target".to_string(),
-                    take_profit_2_basis: "next_path_target".to_string(),
-                    take_profit_1_level: 2.0,
-                    take_profit_2_level: 3.0,
-                    stop_migration_rules: vec![],
-                    reduce_on_driver_deterioration: vec![],
-                    exit_full_on_driver_deterioration: vec![],
-                },
-                tracked_zones: vec![crate::workflow::schema::TrackedZone {
-                    zone_id: "z1".to_string(),
-                    timeframe: "4h".to_string(),
-                    role: "activation".to_string(),
-                    low: 1.0,
-                    high: 1.0,
-                    reason: None,
-                }],
-            }),
-        };
-        let mut snapshots = HashMap::new();
-        snapshots.insert(
-            "ETHUSDT:LONG".to_string(),
-            EntrySnapshot {
-                symbol: "ETHUSDT".to_string(),
-                context_key: "ETHUSDT:LONG".to_string(),
-                path_id: "path_old".to_string(),
-                side: "LONG".to_string(),
-                stop_loss: 1.0,
-                take_profit_1: 2.0,
-                take_profit_2: 3.0,
-                allowed_stop_loss_levels: vec![1.0, 1.1],
-                allowed_take_profit_levels: vec![2.0, 3.0],
-                created_at: Utc::now(),
-                updated_at: Utc::now(),
-            },
-        );
-        let value = json!({
-            "decision": "WAIT",
-            "reason": "hold",
-            "request_stage1_reevaluation": null,
-            "execution_intent": null,
-            "management_actions": [{
-                "type": "MOVE_STOP",
-                "context_key": "ETHUSDT:LONG",
-                "path_id": "path_new",
-                "new_stop_loss": 1.1
-            }],
-            "hard_gate": {
-                "location_valid": true,
-                "trigger_confirmed": true
-            },
-            "soft_gate": {
-                "state_clear": true,
-                "driver_clear": true,
-                "orderflow_real": true,
-                "invalidation_clear": true,
-                "passed_count": 4
-            }
-        });
-        let runtime_contract = runtime_contract(
-            &stage1_output,
-            HardGateEvaluation {
-                location_valid: true,
-                trigger_confirmed: true,
-            },
-            SoftGateEvaluation {
-                state_clear: true,
-                driver_clear: true,
-                orderflow_real: true,
-                invalidation_clear: true,
-                passed_count: 4,
-            },
-        );
-        assert!(parse_stage2_decision(
-            value,
-            "ETHUSDT",
-            &stage1_output,
-            &runtime_contract,
-            true,
-            &snapshots,
-        )
-        .is_err());
-    }
-
-    #[test]
-    fn stage2_parser_rejects_wait_with_execution_payload() {
-        let stage1_output = Stage1Output {
-            meta: Stage1Meta {
-                stage1_ts: Utc::now(),
-            },
-            monitoring_status: "active".to_string(),
-            no_trade_reason: None,
-            refresh_hints: Vec::new(),
-            map_summary: None,
-            current_script: Some("script".to_string()),
-            driver_attribution: None,
-            current_path: Some(crate::workflow::schema::CurrentPath {
-                id: "path_new".to_string(),
-                side: "LONG".to_string(),
-                thesis: "thesis".to_string(),
-                activation_level: PriceZone {
-                    low: 1.0,
-                    high: 1.0,
-                    timeframe: None,
-                    label: None,
-                    reason: None,
-                },
-                first_path_target: PriceZone {
-                    low: 2.0,
-                    high: 2.0,
-                    timeframe: None,
-                    label: None,
-                    reason: None,
-                },
-                next_path_target: PriceZone {
-                    low: 3.0,
-                    high: 3.0,
-                    timeframe: None,
-                    label: None,
-                    reason: None,
-                },
-                failure_level: PriceZone {
-                    low: 0.5,
-                    high: 0.5,
-                    timeframe: None,
-                    label: None,
-                    reason: None,
-                },
-                failure_switch: "alt".to_string(),
-                setup_type: "A_continuation".to_string(),
-                reevaluation_trigger: crate::workflow::schema::ReevaluationTrigger {
-                    signals: vec!["driver_change".to_string()],
-                },
-                management_plan: crate::workflow::schema::ManagementPlan {
-                    take_profit_1_basis: "first_path_target".to_string(),
-                    take_profit_2_basis: "next_path_target".to_string(),
-                    take_profit_1_level: 2.0,
-                    take_profit_2_level: 3.0,
-                    stop_migration_rules: vec![],
-                    reduce_on_driver_deterioration: vec![],
-                    exit_full_on_driver_deterioration: vec![],
-                },
-                tracked_zones: vec![crate::workflow::schema::TrackedZone {
-                    zone_id: "z1".to_string(),
-                    timeframe: "4h".to_string(),
-                    role: "activation".to_string(),
-                    low: 1.0,
-                    high: 1.0,
-                    reason: None,
-                }],
-            }),
-        };
-        let value = json!({
-            "decision": "WAIT",
-            "reason": "wait",
-            "request_stage1_reevaluation": null,
-            "execution_intent": {
-                "side": "LONG",
-                "intent_mode": "immediate",
-                "entry_zone": {"low": 1.0, "high": 1.0},
-                "stop_loss": 0.5,
-                "take_profit_1": 2.0,
-                "take_profit_2": 3.0,
-                "ttl_minutes": 15,
-                "max_drift_pct": 0.1,
-                "path_id": "path_new",
-                "entry_snapshot": {
-                    "context_key": "ETHUSDT:LONG",
-                    "path_id": "path_new"
-                }
-            },
-            "management_actions": [],
-            "hard_gate": {
-                "location_valid": true,
-                "trigger_confirmed": true
-            },
-            "soft_gate": {
-                "state_clear": true,
-                "driver_clear": true,
-                "orderflow_real": true,
-                "invalidation_clear": true,
-                "passed_count": 4
-            }
-        });
-        assert!(parse_stage2_decision(
-            value,
-            "ETHUSDT",
-            &stage1_output,
-            &runtime_contract(
-                &stage1_output,
-                HardGateEvaluation {
-                    location_valid: true,
-                    trigger_confirmed: true,
-                },
-                SoftGateEvaluation {
-                    state_clear: true,
-                    driver_clear: true,
-                    orderflow_real: true,
-                    invalidation_clear: true,
-                    passed_count: 4,
-                },
-            ),
-            false,
-            &HashMap::new(),
-        )
-        .is_err());
-    }
-
-    #[test]
-    fn stage2_parser_rejects_dual_take_profit_update() {
-        let stage1_output = Stage1Output {
-            meta: Stage1Meta {
-                stage1_ts: Utc::now(),
-            },
-            monitoring_status: "active".to_string(),
-            no_trade_reason: None,
-            refresh_hints: Vec::new(),
-            map_summary: None,
-            current_script: Some("script".to_string()),
-            driver_attribution: None,
-            current_path: Some(crate::workflow::schema::CurrentPath {
-                id: "path_new".to_string(),
-                side: "LONG".to_string(),
-                thesis: "thesis".to_string(),
-                activation_level: PriceZone {
-                    low: 1.0,
-                    high: 1.0,
-                    timeframe: None,
-                    label: None,
-                    reason: None,
-                },
-                first_path_target: PriceZone {
-                    low: 2.0,
-                    high: 2.0,
-                    timeframe: None,
-                    label: None,
-                    reason: None,
-                },
-                next_path_target: PriceZone {
-                    low: 3.0,
-                    high: 3.0,
-                    timeframe: None,
-                    label: None,
-                    reason: None,
-                },
-                failure_level: PriceZone {
-                    low: 0.5,
-                    high: 0.5,
-                    timeframe: None,
-                    label: None,
-                    reason: None,
-                },
-                failure_switch: "alt".to_string(),
-                setup_type: "A_continuation".to_string(),
-                reevaluation_trigger: crate::workflow::schema::ReevaluationTrigger {
-                    signals: vec!["driver_change".to_string()],
-                },
-                management_plan: crate::workflow::schema::ManagementPlan {
-                    take_profit_1_basis: "first_path_target".to_string(),
-                    take_profit_2_basis: "next_path_target".to_string(),
-                    take_profit_1_level: 2.0,
-                    take_profit_2_level: 3.0,
-                    stop_migration_rules: vec![],
-                    reduce_on_driver_deterioration: vec![],
-                    exit_full_on_driver_deterioration: vec![],
-                },
-                tracked_zones: vec![crate::workflow::schema::TrackedZone {
-                    zone_id: "z1".to_string(),
-                    timeframe: "4h".to_string(),
-                    role: "activation".to_string(),
-                    low: 1.0,
-                    high: 1.0,
-                    reason: None,
-                }],
-            }),
-        };
-        let mut snapshots = HashMap::new();
-        snapshots.insert(
-            "ETHUSDT:LONG".to_string(),
-            EntrySnapshot {
-                symbol: "ETHUSDT".to_string(),
-                context_key: "ETHUSDT:LONG".to_string(),
-                path_id: "path_new".to_string(),
-                side: "LONG".to_string(),
-                stop_loss: 1.0,
-                take_profit_1: 2.0,
-                take_profit_2: 3.0,
-                allowed_stop_loss_levels: vec![1.0, 1.1],
-                allowed_take_profit_levels: vec![2.0, 3.0],
-                created_at: Utc::now(),
-                updated_at: Utc::now(),
-            },
-        );
-        let value = json!({
-            "decision": "WAIT",
-            "reason": "manage",
-            "request_stage1_reevaluation": null,
-            "execution_intent": null,
-            "management_actions": [{
-                "type": "UPDATE_TAKE_PROFIT",
-                "context_key": "ETHUSDT:LONG",
-                "path_id": "path_new",
-                "take_profit_1": 2.1,
-                "take_profit_2": 3.1
-            }],
-            "hard_gate": {
-                "location_valid": true,
-                "trigger_confirmed": true
-            },
-            "soft_gate": {
-                "state_clear": true,
-                "driver_clear": true,
-                "orderflow_real": true,
-                "invalidation_clear": true,
-                "passed_count": 4
-            }
-        });
-        let runtime_contract = runtime_contract(
-            &stage1_output,
-            HardGateEvaluation {
-                location_valid: true,
-                trigger_confirmed: true,
-            },
-            SoftGateEvaluation {
-                state_clear: true,
-                driver_clear: true,
-                orderflow_real: true,
-                invalidation_clear: true,
-                passed_count: 4,
-            },
-        );
-        assert!(parse_stage2_decision(
-            value,
-            "ETHUSDT",
-            &stage1_output,
-            &runtime_contract,
-            true,
-            &snapshots,
-        )
-        .is_err());
-    }
-
-    #[test]
-    fn stage2_parser_rejects_management_price_outside_persisted_contract() {
-        let stage1_output = Stage1Output {
-            meta: Stage1Meta {
-                stage1_ts: Utc::now(),
-            },
-            monitoring_status: "active".to_string(),
-            no_trade_reason: None,
-            refresh_hints: Vec::new(),
-            map_summary: None,
-            current_script: Some("script".to_string()),
-            driver_attribution: None,
-            current_path: Some(crate::workflow::schema::CurrentPath {
-                id: "path_new".to_string(),
-                side: "LONG".to_string(),
-                thesis: "thesis".to_string(),
-                activation_level: PriceZone {
-                    low: 1.0,
-                    high: 1.0,
-                    timeframe: None,
-                    label: None,
-                    reason: None,
-                },
-                first_path_target: PriceZone {
-                    low: 2.0,
-                    high: 2.0,
-                    timeframe: None,
-                    label: None,
-                    reason: None,
-                },
-                next_path_target: PriceZone {
-                    low: 3.0,
-                    high: 3.0,
-                    timeframe: None,
-                    label: None,
-                    reason: None,
-                },
-                failure_level: PriceZone {
-                    low: 0.5,
-                    high: 0.5,
-                    timeframe: None,
-                    label: None,
-                    reason: None,
-                },
-                failure_switch: "alt".to_string(),
-                setup_type: "A_continuation".to_string(),
-                reevaluation_trigger: crate::workflow::schema::ReevaluationTrigger {
-                    signals: vec!["driver_change".to_string()],
-                },
-                management_plan: crate::workflow::schema::ManagementPlan {
-                    take_profit_1_basis: "first_path_target".to_string(),
-                    take_profit_2_basis: "next_path_target".to_string(),
-                    take_profit_1_level: 2.0,
-                    take_profit_2_level: 3.0,
-                    stop_migration_rules: vec![],
-                    reduce_on_driver_deterioration: vec![],
-                    exit_full_on_driver_deterioration: vec![],
-                },
-                tracked_zones: vec![crate::workflow::schema::TrackedZone {
-                    zone_id: "z1".to_string(),
-                    timeframe: "4h".to_string(),
-                    role: "activation".to_string(),
-                    low: 1.0,
-                    high: 1.0,
-                    reason: None,
-                }],
-            }),
-        };
-        let mut snapshots = HashMap::new();
-        snapshots.insert(
-            "ETHUSDT:LONG".to_string(),
-            EntrySnapshot {
-                symbol: "ETHUSDT".to_string(),
-                context_key: "ETHUSDT:LONG".to_string(),
-                path_id: "path_new".to_string(),
-                side: "LONG".to_string(),
-                stop_loss: 1.0,
-                take_profit_1: 2.0,
-                take_profit_2: 3.0,
-                allowed_stop_loss_levels: vec![1.0, 1.1],
-                allowed_take_profit_levels: vec![2.0, 3.0],
-                created_at: Utc::now(),
-                updated_at: Utc::now(),
-            },
-        );
-        let value = json!({
-            "decision": "WAIT",
-            "reason": "manage",
-            "request_stage1_reevaluation": null,
-            "execution_intent": null,
-            "management_actions": [{
-                "type": "MOVE_STOP",
-                "context_key": "ETHUSDT:LONG",
-                "path_id": "path_new",
-                "new_stop_loss": 9.9
-            }],
-            "hard_gate": {
-                "location_valid": true,
-                "trigger_confirmed": true
-            },
-            "soft_gate": {
-                "state_clear": true,
-                "driver_clear": true,
-                "orderflow_real": true,
-                "invalidation_clear": true,
-                "passed_count": 4
-            }
-        });
-        let runtime_contract = runtime_contract(
-            &stage1_output,
-            HardGateEvaluation {
-                location_valid: true,
-                trigger_confirmed: true,
-            },
-            SoftGateEvaluation {
-                state_clear: true,
-                driver_clear: true,
-                orderflow_real: true,
-                invalidation_clear: true,
-                passed_count: 4,
-            },
-        );
-        assert!(parse_stage2_decision(
-            value,
-            "ETHUSDT",
-            &stage1_output,
-            &runtime_contract,
-            true,
-            &snapshots,
-        )
-        .is_err());
-    }
-
-    #[test]
-    fn stage2_parser_allows_wait_with_management_actions_when_positions_exist() {
-        let stage1_output = Stage1Output {
+    fn sample_stage1_output() -> Stage1Output {
+        Stage1Output {
             meta: Stage1Meta {
                 stage1_ts: Utc::now(),
             },
             monitoring_status: "active".to_string(),
             no_trade_reason: None,
             refresh_hints: vec![],
-            map_summary: None,
-            current_script: Some("continuation".to_string()),
-            driver_attribution: None,
-            current_path: Some(crate::workflow::schema::CurrentPath {
+            map_summary: MapSummary {
+                regime_3d: json!({}),
+                location_1d: json!({}),
+                location_4h: json!({}),
+                price_location_class: "value_edge".to_string(),
+                key_levels: json!({}),
+            },
+            opportunity_assessment: OpportunityAssessment {
+                location_quality: Some("high".to_string()),
+                state_quality: Some("high".to_string()),
+                driver_quality: Some("high".to_string()),
+                geometry_quality: Some("high".to_string()),
+                uniqueness_quality: Some("high".to_string()),
+                overall_quality: Some("high".to_string()),
+                disqualifiers: vec![],
+            },
+            script_rejections: vec![
+                ScriptRejection {
+                    script: "continuation".to_string(),
+                    reason: "wrong regime".to_string(),
+                },
+                ScriptRejection {
+                    script: "crowded_reversal".to_string(),
+                    reason: "no reversal trigger".to_string(),
+                },
+            ],
+            current_script: Some("value_return".to_string()),
+            driver_attribution: Some(DriverAttribution {
+                flow_driver: "mixed".to_string(),
+                spot_confirming: true,
+                driver_note: "note".to_string(),
+            }),
+            current_path: Some(CurrentPath {
                 id: "path_a".to_string(),
                 side: "LONG".to_string(),
-                thesis: "thesis".to_string(),
+                thesis: "bounce".to_string(),
+                risk_grade: "countertrend_repair".to_string(),
+                activation_anchor_id: Some("z_act".to_string()),
                 activation_level: PriceZone {
-                    low: 1.0,
-                    high: 1.1,
+                    low: 100.0,
+                    high: 101.0,
                     timeframe: None,
                     label: None,
                     reason: None,
                 },
+                first_path_target_anchor_id: Some("z_tp1".to_string()),
                 first_path_target: PriceZone {
-                    low: 2.0,
-                    high: 2.1,
+                    low: 103.0,
+                    high: 104.0,
                     timeframe: None,
                     label: None,
                     reason: None,
                 },
+                next_path_target_anchor_id: Some("z_tp2".to_string()),
                 next_path_target: PriceZone {
-                    low: 3.0,
-                    high: 3.1,
+                    low: 106.0,
+                    high: 107.0,
                     timeframe: None,
                     label: None,
                     reason: None,
                 },
+                failure_anchor_id: Some("z_fail".to_string()),
                 failure_level: PriceZone {
-                    low: 0.8,
-                    high: 0.9,
+                    low: 98.0,
+                    high: 99.0,
                     timeframe: None,
                     label: None,
                     reason: None,
                 },
-                failure_switch: "reversal".to_string(),
-                setup_type: "A_continuation".to_string(),
-                reevaluation_trigger: crate::workflow::schema::ReevaluationTrigger {
-                    signals: vec!["driver_change".to_string()],
+                failure_switch: Some("continuation".to_string()),
+                setup_type: "C_value_return".to_string(),
+                reevaluation_trigger: ReevaluationTrigger {
+                    extreme_location: ZoneReevaluationTrigger {
+                        kind: Some("accepted_into_zone".to_string()),
+                        zone_id: Some("z_tp2".to_string()),
+                        timeframe: Some("15m".to_string()),
+                        min_confirmed_bars: Some(1),
+                        summary: "accepted into target extension".to_string(),
+                        evidence: vec!["price accepted into tp2".to_string()],
+                    },
+                    reverse_confirmation: ZoneReevaluationTrigger {
+                        kind: Some("accepted_beyond_zone".to_string()),
+                        zone_id: Some("z_fail".to_string()),
+                        timeframe: Some("15m".to_string()),
+                        min_confirmed_bars: Some(1),
+                        summary: "accepted through failure".to_string(),
+                        evidence: vec!["failure shelf lost".to_string()],
+                    },
+                    driver_change: DriverReevaluationTrigger {
+                        kind: Some("driver_flip".to_string()),
+                        expected_flow_driver: Some("mixed".to_string()),
+                        invalidate_when_drivers: vec![
+                            "spot_led".to_string(),
+                            "futures_led".to_string(),
+                        ],
+                        require_spot_confirmation: Some(false),
+                        driver_signal: Some("driver_flip_confirmed".to_string()),
+                        min_confirmed_windows: Some(1),
+                        summary: "driver flips away from mixed".to_string(),
+                        evidence: vec!["driver attribution changed".to_string()],
+                    },
                 },
-                management_plan: crate::workflow::schema::ManagementPlan {
+                management_plan: ManagementPlan {
                     take_profit_1_basis: "first_path_target".to_string(),
                     take_profit_2_basis: "next_path_target".to_string(),
-                    take_profit_1_level: 2.0,
-                    take_profit_2_level: 3.0,
-                    stop_migration_rules: vec![],
+                    take_profit_1_level: 103.5,
+                    take_profit_2_level: 106.5,
+                    stop_migration_rules: vec![StopMigrationRule {
+                        after_target: "take_profit_1".to_string(),
+                        new_stop_basis: "activation_level".to_string(),
+                        new_stop_level: 101.0,
+                    }],
                     reduce_on_driver_deterioration: vec![],
                     exit_full_on_driver_deterioration: vec![],
                 },
-                tracked_zones: vec![crate::workflow::schema::TrackedZone {
-                    zone_id: "z1".to_string(),
-                    timeframe: "15m".to_string(),
-                    role: "activation".to_string(),
-                    low: 1.0,
-                    high: 1.1,
-                    reason: None,
-                }],
+                tracked_zones: vec![
+                    crate::workflow::schema::TrackedZone {
+                        zone_id: "z_act".to_string(),
+                        timeframe: "4h".to_string(),
+                        role: "activation".to_string(),
+                        low: 100.0,
+                        high: 101.0,
+                        reason: None,
+                    },
+                    crate::workflow::schema::TrackedZone {
+                        zone_id: "z_tp1".to_string(),
+                        timeframe: "4h".to_string(),
+                        role: "target".to_string(),
+                        low: 103.0,
+                        high: 104.0,
+                        reason: None,
+                    },
+                    crate::workflow::schema::TrackedZone {
+                        zone_id: "z_tp2".to_string(),
+                        timeframe: "4h".to_string(),
+                        role: "target".to_string(),
+                        low: 106.0,
+                        high: 107.0,
+                        reason: None,
+                    },
+                    crate::workflow::schema::TrackedZone {
+                        zone_id: "z_fail".to_string(),
+                        timeframe: "4h".to_string(),
+                        role: "failure".to_string(),
+                        low: 98.0,
+                        high: 99.0,
+                        reason: None,
+                    },
+                ],
             }),
-        };
-        let mut snapshots = HashMap::new();
-        snapshots.insert(
-            "ETHUSDT:LONG".to_string(),
-            EntrySnapshot {
-                symbol: "ETHUSDT".to_string(),
-                context_key: "ETHUSDT:LONG".to_string(),
-                path_id: "path_a".to_string(),
-                side: "LONG".to_string(),
-                stop_loss: 0.9,
-                take_profit_1: 2.0,
-                take_profit_2: 3.0,
-                allowed_stop_loss_levels: vec![0.9],
-                allowed_take_profit_levels: vec![2.0, 3.0],
-                created_at: Utc::now(),
-                updated_at: Utc::now(),
-            },
-        );
-        let value = json!({
-            "decision": "WAIT",
-            "reason": "manage only",
-            "request_stage1_reevaluation": null,
-            "execution_intent": null,
-            "management_actions": [{
-                "type": "HOLD",
-                "context_key": "ETHUSDT:LONG",
-                "path_id": "path_a"
-            }],
-            "hard_gate": {
-                "location_valid": false,
-                "trigger_confirmed": false
-            },
-            "soft_gate": {
-                "state_clear": true,
-                "driver_clear": true,
-                "orderflow_real": true,
-                "invalidation_clear": true,
-                "passed_count": 4
-            }
-        });
-
-        let parsed = parse_stage2_decision(
-            value,
-            "ETHUSDT",
-            &stage1_output,
-            &runtime_contract(
-                &stage1_output,
-                HardGateEvaluation {
-                    location_valid: false,
-                    trigger_confirmed: false,
-                },
-                SoftGateEvaluation {
-                    state_clear: true,
-                    driver_clear: true,
-                    orderflow_real: true,
-                    invalidation_clear: true,
-                    passed_count: 4,
-                },
-            ),
-            true,
-            &snapshots,
-        )
-        .expect("parse");
-        assert_eq!(parsed.decision, "WAIT");
-        assert_eq!(parsed.management_actions.len(), 1);
+        }
     }
 
     #[test]
-    fn stage1_parser_rejects_natural_language_failure_switch() {
+    fn stage1_parser_cleans_no_edge_path_fields() {
         let value = json!({
-            "meta": { "stage1_ts": Utc::now() },
-            "monitoring_status": "active",
-            "no_trade_reason": null,
-            "refresh_hints": [],
-            "map_summary": null,
-            "current_script": "value_return_long",
-            "driver_attribution": null,
-            "current_path": {
-                "id": "path_a",
-                "side": "LONG",
-                "thesis": "English thesis",
-                "activation_level": {"low": 100.0, "high": 101.0, "timeframe": null, "label": null, "reason": null},
-                "first_path_target": {"low": 103.0, "high": 103.0, "timeframe": null, "label": null, "reason": null},
-                "next_path_target": {"low": 105.0, "high": 105.0, "timeframe": null, "label": null, "reason": null},
-                "failure_level": {"low": 99.0, "high": 99.0, "timeframe": null, "label": null, "reason": null},
-                "failure_switch": "若失效则转空重评",
-                "setup_type": "C_value_return",
-                "reevaluation_trigger": { "signals": ["driver_change"] },
-                "management_plan": {
-                    "take_profit_1_basis": "first_path_target",
-                    "take_profit_2_basis": "next_path_target",
-                    "take_profit_1_level": 103.0,
-                    "take_profit_2_level": 105.0,
-                    "stop_migration_rules": [],
-                    "reduce_on_driver_deterioration": [],
-                    "exit_full_on_driver_deterioration": []
-                },
-                "tracked_zones": [{
-                    "zone_id": "z1",
-                    "timeframe": "4h",
-                    "role": "activation",
-                    "low": 100.0,
-                    "high": 101.0,
-                    "reason": null
-                }]
-            }
-        });
-        assert!(parse_stage1_output(value).is_err());
-    }
-
-    #[test]
-    fn stage1_parser_rejects_freeform_management_plan_contract_fields() {
-        let value = json!({
-            "meta": { "stage1_ts": Utc::now() },
-            "monitoring_status": "active",
-            "no_trade_reason": null,
-            "refresh_hints": [],
-            "map_summary": null,
-            "current_script": "value_return_long",
-            "driver_attribution": null,
-            "current_path": {
-                "id": "path_a",
-                "side": "LONG",
-                "thesis": "English thesis",
-                "activation_level": {"low": 100.0, "high": 101.0, "timeframe": null, "label": null, "reason": null},
-                "first_path_target": {"low": 103.0, "high": 103.0, "timeframe": null, "label": null, "reason": null},
-                "next_path_target": {"low": 105.0, "high": 105.0, "timeframe": null, "label": null, "reason": null},
-                "failure_level": {"low": 99.0, "high": 99.0, "timeframe": null, "label": null, "reason": null},
-                "failure_switch": "reevaluate_short",
-                "setup_type": "C_value_return",
-                "reevaluation_trigger": { "signals": ["driver_change"] },
-                "management_plan": {
-                    "take_profit_1_basis": "first_path_target",
-                    "take_profit_2_basis": "next_path_target",
-                    "take_profit_1_level": 103.0,
-                    "take_profit_2_level": 105.0,
-                    "stop_migration_rules": [{
-                        "after_target": "TP1",
-                        "new_stop_basis": "4h_tpo_poc",
-                        "new_stop_level": 100.5
-                    }],
-                    "reduce_on_driver_deterioration": [{
-                        "driver_signal": "若15m期货CVD转负则减仓",
-                        "reduce_ratio": 0.5
-                    }],
-                    "exit_full_on_driver_deterioration": []
-                },
-                "tracked_zones": [{
-                    "zone_id": "z1",
-                    "timeframe": "4h",
-                    "role": "activation",
-                    "low": 100.0,
-                    "high": 101.0,
-                    "reason": null
-                }]
-            }
-        });
-        assert!(parse_stage1_output(value).is_err());
-    }
-
-    #[test]
-    fn stage1_parser_normalizes_no_edge_output_with_extra_path_fields() {
-        let value = json!({
-            "meta": { "stage1_ts": Utc::now() },
+            "meta": {"stage1_ts": Utc::now()},
             "monitoring_status": "no_edge",
-            "no_trade_reason": "balanced inside value",
+            "no_trade_reason": "conflict_no_edge",
             "refresh_hints": [],
-            "map_summary": null,
-            "current_script": "should_be_dropped",
+            "map_summary": {
+                "regime_3d": {},
+                "location_1d": {},
+                "location_4h": {},
+                "price_location_class": "inside_value_middle",
+                "key_levels": {}
+            },
+            "current_script": "value_return",
             "driver_attribution": null,
             "current_path": {
-                "id": "path_a",
+                "id": "x",
                 "side": "LONG",
-                "thesis": "English thesis",
-                "activation_level": {"low": 100.0, "high": 101.0, "timeframe": null, "label": null, "reason": null},
-                "first_path_target": {"low": 103.0, "high": 103.0, "timeframe": null, "label": null, "reason": null},
-                "next_path_target": {"low": 105.0, "high": 105.0, "timeframe": null, "label": null, "reason": null},
-                "failure_level": {"low": 99.0, "high": 99.0, "timeframe": null, "label": null, "reason": null},
-                "failure_switch": "reevaluate_short",
+                "thesis": "bounce",
+                "risk_grade": "countertrend_repair",
+                "activation_level": {"low": 100.0, "high": 101.0},
+                "first_path_target": {"low": 103.0, "high": 104.0},
+                "next_path_target": {"low": 106.0, "high": 107.0},
+                "failure_level": {"low": 98.0, "high": 99.0},
+                "failure_switch": "continuation",
                 "setup_type": "C_value_return",
-                "reevaluation_trigger": { "signals": ["driver_change"] },
+                "reevaluation_trigger": {
+                    "extreme_location": {},
+                    "reverse_confirmation": {},
+                    "driver_change": {}
+                },
                 "management_plan": {
                     "take_profit_1_basis": "first_path_target",
                     "take_profit_2_basis": "next_path_target",
-                    "take_profit_1_level": 103.0,
-                    "take_profit_2_level": 105.0,
+                    "take_profit_1_level": 103.5,
+                    "take_profit_2_level": 106.5,
                     "stop_migration_rules": [],
                     "reduce_on_driver_deterioration": [],
                     "exit_full_on_driver_deterioration": []
                 },
-                "tracked_zones": [{
-                    "zone_id": "z1",
-                    "timeframe": "4h",
-                    "role": "activation",
-                    "low": 100.0,
-                    "high": 101.0,
-                    "reason": null
-                }]
+                "tracked_zones": []
             }
         });
-
         let parsed = parse_stage1_output(value).expect("parse");
-        assert_eq!(parsed.monitoring_status, "no_edge");
         assert!(parsed.current_script.is_none());
         assert!(parsed.current_path.is_none());
+    }
+
+    #[test]
+    fn stage1_parser_accepts_structured_quality_contract() {
+        let value = serde_json::to_value(sample_stage1_output()).expect("serialize");
+        let parsed = parse_stage1_output(value).expect("parse");
+        assert_eq!(
+            parsed.opportunity_assessment.overall_quality.as_deref(),
+            Some("high")
+        );
+        let path = parsed.current_path.expect("path");
+        assert_eq!(path.activation_anchor_id.as_deref(), Some("z_act"));
+        assert_eq!(
+            path.reevaluation_trigger
+                .driver_change
+                .expected_flow_driver
+                .as_deref(),
+            Some("mixed")
+        );
+    }
+
+    #[test]
+    fn stage1_parser_backfills_missing_anchor_ids_from_tracked_zones() {
+        let mut value = serde_json::to_value(sample_stage1_output()).expect("serialize");
+        let path = value
+            .get_mut("current_path")
+            .and_then(Value::as_object_mut)
+            .expect("current_path object");
+        path.remove("activation_anchor_id");
+        path.remove("first_path_target_anchor_id");
+        path.remove("next_path_target_anchor_id");
+        path.remove("failure_anchor_id");
+
+        let parsed = parse_stage1_output(value).expect("parse");
+        let path = parsed.current_path.expect("path");
+        assert_eq!(path.activation_anchor_id.as_deref(), Some("z_act"));
+        assert_eq!(path.first_path_target_anchor_id.as_deref(), Some("z_tp1"));
+        assert_eq!(path.next_path_target_anchor_id.as_deref(), Some("z_tp2"));
+        assert_eq!(path.failure_anchor_id.as_deref(), Some("z_fail"));
+    }
+
+    #[test]
+    fn stage2_parser_accepts_path_confirmed_with_tactical_plan() {
+        let stage1 = sample_stage1_output();
+        let runtime_state = PathRuntimeState {
+            path_id: "path_a".to_string(),
+            monitoring_status: "active".to_string(),
+            latest_price: 100.5,
+            hard_invalidation: false,
+            failure_level_breached: false,
+            path_alive: true,
+            activation_level_touched: true,
+            opposing_pressure_detected: false,
+            audit_flags: PathAuditFlags::default(),
+            active_entry_context_keys: vec![],
+            notes: vec![],
+        };
+        let output = Stage2Output {
+            stage2_decision: "PATH_CONFIRMED".to_string(),
+            tactical_entry_plan: Some(TacticalEntryPlan {
+                path_id: "path_a".to_string(),
+                primary_entry_plan: EntryPlan {
+                    side: "LONG".to_string(),
+                    entry_profile: "reclaim_then_hold".to_string(),
+                    intent_mode: "immediate".to_string(),
+                    entry_activation_level: PriceZone {
+                        low: 100.0,
+                        high: 101.0,
+                        timeframe: None,
+                        label: None,
+                        reason: None,
+                    },
+                    entry_zone: PriceZone {
+                        low: 100.0,
+                        high: 101.0,
+                        timeframe: None,
+                        label: None,
+                        reason: None,
+                    },
+                    entry_invalidation_level: PriceZone {
+                        low: 98.5,
+                        high: 99.0,
+                        timeframe: None,
+                        label: None,
+                        reason: None,
+                    },
+                    stop_loss: 98.6,
+                    take_profit_1: 103.5,
+                    take_profit_2: 106.5,
+                    ttl_minutes: 15,
+                    max_drift_pct: 0.2,
+                    entry_snapshot: TacticalEntrySnapshot {
+                        context_key: "ETHUSDT:LONG:path_a:primary".to_string(),
+                        path_id: "path_a".to_string(),
+                        plan_role: "primary".to_string(),
+                    },
+                    entry_note: "note".to_string(),
+                },
+                secondary_entry_plan: EntryPlan {
+                    side: "LONG".to_string(),
+                    entry_profile: "failed_auction_reentry".to_string(),
+                    intent_mode: "pullback".to_string(),
+                    entry_activation_level: PriceZone {
+                        low: 99.7,
+                        high: 100.2,
+                        timeframe: None,
+                        label: None,
+                        reason: None,
+                    },
+                    entry_zone: PriceZone {
+                        low: 99.7,
+                        high: 100.5,
+                        timeframe: None,
+                        label: None,
+                        reason: None,
+                    },
+                    entry_invalidation_level: PriceZone {
+                        low: 98.2,
+                        high: 98.9,
+                        timeframe: None,
+                        label: None,
+                        reason: None,
+                    },
+                    stop_loss: 98.3,
+                    take_profit_1: 103.5,
+                    take_profit_2: 106.5,
+                    ttl_minutes: 15,
+                    max_drift_pct: 0.25,
+                    entry_snapshot: TacticalEntrySnapshot {
+                        context_key: "ETHUSDT:LONG:path_a:secondary".to_string(),
+                        path_id: "path_a".to_string(),
+                        plan_role: "secondary".to_string(),
+                    },
+                    entry_note: "note".to_string(),
+                },
+                attempt_policy: AttemptPolicy {
+                    max_filled_stopout_attempts: 2,
+                    count_unfilled_attempts: false,
+                    time_window: "same_15m_window".to_string(),
+                },
+            }),
+            reevaluation_reason: None,
+        };
+        let value = serde_json::to_value(output).expect("serialize");
+        let parsed = parse_stage2_output(value, &stage1, &runtime_state).expect("parse");
+        assert_eq!(parsed.stage2_decision, "PATH_CONFIRMED");
+    }
+
+    #[test]
+    fn stage2_parser_rejects_path_confirmed_when_audit_triplet_is_hit() {
+        let stage1 = sample_stage1_output();
+        let runtime_state = PathRuntimeState {
+            path_id: "path_a".to_string(),
+            monitoring_status: "active".to_string(),
+            latest_price: 100.5,
+            hard_invalidation: false,
+            failure_level_breached: false,
+            path_alive: false,
+            activation_level_touched: true,
+            opposing_pressure_detected: true,
+            audit_flags: PathAuditFlags {
+                extreme_location: true,
+                reverse_confirmation: true,
+                driver_change: true,
+            },
+            active_entry_context_keys: vec![],
+            notes: vec![],
+        };
+        let value = json!({
+            "stage2_decision": "PATH_CONFIRMED",
+            "tactical_entry_plan": null,
+            "reevaluation_reason": null
+        });
+        assert!(parse_stage2_output(value, &stage1, &runtime_state).is_err());
+    }
+
+    #[test]
+    fn stage2_parser_rejects_reevaluation_without_hard_or_soft_invalidation() {
+        let stage1 = sample_stage1_output();
+        let runtime_state = PathRuntimeState {
+            path_id: "path_a".to_string(),
+            monitoring_status: "active".to_string(),
+            latest_price: 100.5,
+            hard_invalidation: false,
+            failure_level_breached: false,
+            path_alive: true,
+            activation_level_touched: false,
+            opposing_pressure_detected: true,
+            audit_flags: PathAuditFlags {
+                extreme_location: false,
+                reverse_confirmation: true,
+                driver_change: true,
+            },
+            active_entry_context_keys: vec![],
+            notes: vec![],
+        };
+        let value = json!({
+            "stage2_decision": "REQUEST_STAGE1_REEVALUATION",
+            "tactical_entry_plan": null,
+            "reevaluation_reason": "opposing_pressure"
+        });
+        assert!(parse_stage2_output(value, &stage1, &runtime_state).is_err());
+    }
+
+    #[test]
+    fn stage2_parser_accepts_reevaluation_when_soft_invalidation_triplet_is_hit() {
+        let stage1 = sample_stage1_output();
+        let runtime_state = PathRuntimeState {
+            path_id: "path_a".to_string(),
+            monitoring_status: "active".to_string(),
+            latest_price: 100.5,
+            hard_invalidation: false,
+            failure_level_breached: false,
+            path_alive: false,
+            activation_level_touched: false,
+            opposing_pressure_detected: true,
+            audit_flags: PathAuditFlags {
+                extreme_location: true,
+                reverse_confirmation: true,
+                driver_change: true,
+            },
+            active_entry_context_keys: vec![],
+            notes: vec![],
+        };
+        let value = json!({
+            "stage2_decision": "REQUEST_STAGE1_REEVALUATION",
+            "tactical_entry_plan": null,
+            "reevaluation_reason": "soft_invalidation_triplet"
+        });
+        let parsed = parse_stage2_output(value, &stage1, &runtime_state).expect("parse");
+        assert_eq!(parsed.stage2_decision, "REQUEST_STAGE1_REEVALUATION");
+    }
+
+    #[test]
+    fn stage2_parser_rejects_path_confirmed_with_reevaluation_reason() {
+        let stage1 = sample_stage1_output();
+        let runtime_state = PathRuntimeState {
+            path_id: "path_a".to_string(),
+            monitoring_status: "active".to_string(),
+            latest_price: 100.5,
+            hard_invalidation: false,
+            failure_level_breached: false,
+            path_alive: true,
+            activation_level_touched: true,
+            opposing_pressure_detected: false,
+            audit_flags: PathAuditFlags::default(),
+            active_entry_context_keys: vec![],
+            notes: vec![],
+        };
+        let output = json!({
+            "stage2_decision": "PATH_CONFIRMED",
+            "tactical_entry_plan": {
+                "path_id": "path_a",
+                "primary_entry_plan": {
+                    "side": "LONG",
+                    "entry_profile": "reclaim_then_hold",
+                    "intent_mode": "immediate",
+                    "entry_activation_level": {"low": 100.0, "high": 101.0},
+                    "entry_zone": {"low": 100.0, "high": 101.0},
+                    "entry_invalidation_level": {"low": 98.5, "high": 99.0},
+                    "stop_loss": 98.6,
+                    "take_profit_1": 103.5,
+                    "take_profit_2": 106.5,
+                    "ttl_minutes": 15,
+                    "max_drift_pct": 0.2,
+                    "entry_snapshot": {
+                        "context_key": "ETHUSDT:LONG:path_a:primary",
+                        "path_id": "path_a",
+                        "plan_role": "primary"
+                    },
+                    "entry_note": "note"
+                },
+                "secondary_entry_plan": {
+                    "side": "LONG",
+                    "entry_profile": "failed_auction_reentry",
+                    "intent_mode": "pullback",
+                    "entry_activation_level": {"low": 99.7, "high": 100.2},
+                    "entry_zone": {"low": 99.7, "high": 100.5},
+                    "entry_invalidation_level": {"low": 98.2, "high": 98.9},
+                    "stop_loss": 98.3,
+                    "take_profit_1": 103.5,
+                    "take_profit_2": 106.5,
+                    "ttl_minutes": 15,
+                    "max_drift_pct": 0.25,
+                    "entry_snapshot": {
+                        "context_key": "ETHUSDT:LONG:path_a:secondary",
+                        "path_id": "path_a",
+                        "plan_role": "secondary"
+                    },
+                    "entry_note": "note"
+                },
+                "attempt_policy": {
+                    "max_filled_stopout_attempts": 2,
+                    "count_unfilled_attempts": false,
+                    "time_window": "same_15m_window"
+                }
+            },
+            "reevaluation_reason": "should_be_null"
+        });
+        assert!(parse_stage2_output(output, &stage1, &runtime_state).is_err());
     }
 }
