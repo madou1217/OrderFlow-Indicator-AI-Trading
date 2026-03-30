@@ -20,6 +20,8 @@ pub struct AppContext {
     pub db_pool: PgPool,
     pub mq_consume_channel: Channel,
     pub consume_queue_name: String,
+    pub mq_fast_consume_channel: Channel,
+    pub fast_consume_queue_name: String,
     pub http_client: Client,
     pub loopback_http_client: Client,
     pub producer_instance_id: String,
@@ -83,12 +85,22 @@ pub async fn bootstrap() -> Result<AppContext> {
         .create_channel()
         .await
         .context("create topology channel")?;
-    declare_topology_for_llm(&topology_channel, &config.mq, &config.llm.queue_key).await?;
+    let fast_consume_queue_name = declare_topology_for_llm(
+        &topology_channel,
+        &config.mq,
+        &config.llm.queue_key,
+        &config.llm.symbol,
+    )
+    .await?;
 
     let mq_consume_channel = mq_connection
         .create_channel()
         .await
         .context("create mq consume channel")?;
+    let mq_fast_consume_channel = mq_connection
+        .create_channel()
+        .await
+        .context("create mq fast consume channel")?;
 
     let rest_proxy_url = config.network.effective_rest_proxy_url();
     let mut http_builder = Client::builder()
@@ -148,6 +160,8 @@ pub async fn bootstrap() -> Result<AppContext> {
         db_pool,
         mq_consume_channel,
         consume_queue_name,
+        mq_fast_consume_channel,
+        fast_consume_queue_name,
         http_client,
         loopback_http_client,
         producer_instance_id,
@@ -216,7 +230,12 @@ async fn ensure_kline_bar_covering_index(pool: &PgPool) -> Result<()> {
     Ok(())
 }
 
-async fn declare_topology_for_llm(channel: &Channel, mq: &MqConfig, queue_key: &str) -> Result<()> {
+async fn declare_topology_for_llm(
+    channel: &Channel,
+    mq: &MqConfig,
+    queue_key: &str,
+    symbol: &str,
+) -> Result<String> {
     for exchange in [
         &mq.exchanges.md_live,
         &mq.exchanges.md_replay,
@@ -245,7 +264,9 @@ async fn declare_topology_for_llm(channel: &Channel, mq: &MqConfig, queue_key: &
         .get(queue_key)
         .ok_or_else(|| anyhow!("llm queue key={} not found", queue_key))?;
     declare_and_bind_queue(channel, queue_cfg).await?;
-    Ok(())
+    let fast_queue_cfg = watcher_fast_queue_config(mq, queue_cfg, symbol);
+    declare_and_bind_queue(channel, &fast_queue_cfg).await?;
+    Ok(fast_queue_cfg.name)
 }
 
 async fn declare_and_bind_queue(channel: &Channel, queue_cfg: &MqQueueConfig) -> Result<()> {
@@ -322,6 +343,34 @@ fn exchange_kind(kind: &str) -> ExchangeKind {
         "direct" => ExchangeKind::Direct,
         "topic" => ExchangeKind::Topic,
         _ => ExchangeKind::Topic,
+    }
+}
+
+fn watcher_fast_queue_config(
+    mq: &MqConfig,
+    base_queue_cfg: &MqQueueConfig,
+    symbol: &str,
+) -> MqQueueConfig {
+    let symbol_lower = symbol.trim().to_ascii_lowercase();
+    MqQueueConfig {
+        name: format!("{}.watcher_fast.{}", base_queue_cfg.name, symbol_lower),
+        bind: vec![
+            crate::app::config::MqBinding {
+                exchange: mq.exchanges.md_live.name.clone(),
+                routing_key: format!("md.futures.mark_price.{}", symbol_lower),
+            },
+            crate::app::config::MqBinding {
+                exchange: mq.exchanges.md_live.name.clone(),
+                routing_key: format!("md.agg.futures.trade.1s.{}", symbol_lower),
+            },
+            crate::app::config::MqBinding {
+                exchange: mq.exchanges.md_live.name.clone(),
+                routing_key: format!("md.futures.kline.1m.{}", symbol_lower),
+            },
+        ],
+        message_ttl_ms: Some(60_000),
+        max_length: Some(4_096),
+        max_length_bytes: None,
     }
 }
 

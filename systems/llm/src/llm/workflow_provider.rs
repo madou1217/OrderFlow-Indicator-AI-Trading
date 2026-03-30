@@ -429,18 +429,17 @@ fn workflow_stage2a_schema() -> Value {
     })
 }
 
-fn watcher_trigger_condition_schema() -> Value {
+fn price_trigger_condition_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["trigger_type", "trigger_level", "note"],
+        "required": ["trigger_type", "trigger_price"],
         "properties": {
             "trigger_type": {
                 "type": "string",
-                "enum": ["price_above_on_close", "price_below_on_close"]
+                "enum": ["price_above", "price_below"]
             },
-            "trigger_level": {"type": "number"},
-            "note": {"type": "string"}
+            "trigger_price": {"type": "number"}
         }
     })
 }
@@ -453,7 +452,8 @@ fn position_management_action_schema() -> Value {
             "action_type",
             "context_key",
             "path_id",
-            "watcher_trigger_condition",
+            "trigger_condition",
+            "execution_price",
             "add_ratio",
             "reuse_current_entry_template",
             "reduce_ratio",
@@ -466,11 +466,12 @@ fn position_management_action_schema() -> Value {
         "properties": {
             "action_type": {
                 "type": "string",
-                "enum": ["hold", "add", "reduce", "exit_full", "move_stop", "update_take_profit"]
+                "enum": ["add", "reduce", "exit_full", "move_stop", "update_take_profit"]
             },
             "context_key": {"type": "string"},
             "path_id": {"type": "string"},
-            "watcher_trigger_condition": nullable(watcher_trigger_condition_schema()),
+            "trigger_condition": nullable(price_trigger_condition_schema()),
+            "execution_price": {"type": ["number", "null"]},
             "add_ratio": {"type": ["number", "null"]},
             "reuse_current_entry_template": {"type": ["boolean", "null"]},
             "reduce_ratio": {"type": ["number", "null"]},
@@ -539,7 +540,8 @@ fn pending_order_management_action_schema() -> Value {
             "action_type",
             "context_key",
             "path_id",
-            "watcher_trigger_condition",
+            "trigger_condition",
+            "execution_price",
             "replacement_entry_zone",
             "replacement_entry_invalidation_level",
             "replacement_stop_loss",
@@ -550,11 +552,12 @@ fn pending_order_management_action_schema() -> Value {
         "properties": {
             "action_type": {
                 "type": "string",
-                "enum": ["keep_order", "cancel_pending_order", "replace_entry", "update_post_fill_bracket_template"]
+                "enum": ["cancel_pending_order", "replace_entry", "update_post_fill_bracket_template"]
             },
             "context_key": {"type": "string"},
             "path_id": {"type": "string"},
-            "watcher_trigger_condition": nullable(watcher_trigger_condition_schema()),
+            "trigger_condition": nullable(price_trigger_condition_schema()),
+            "execution_price": {"type": ["number", "null"]},
             "replacement_entry_zone": nullable(price_zone_schema(&["15m", "15m-4h"])),
             "replacement_entry_invalidation_level": nullable(price_zone_schema(&["15m", "15m-4h"])),
             "replacement_stop_loss": {"type": ["number", "null"]},
@@ -1039,8 +1042,17 @@ mod tests {
             .iter()
             .filter_map(|value| value.as_str())
             .collect::<Vec<_>>();
-        assert!(required.contains(&"watcher_trigger_condition"));
+        assert!(required.contains(&"trigger_condition"));
+        assert!(required.contains(&"execution_price"));
         assert!(required.contains(&"reuse_current_bracket_template"));
+        let action_enum = action["properties"]["action_type"]["enum"]
+            .as_array()
+            .expect("action enum");
+        let variants = action_enum
+            .iter()
+            .filter_map(|value| value.as_str())
+            .collect::<Vec<_>>();
+        assert!(!variants.contains(&"hold"));
     }
 
     #[test]
@@ -1057,6 +1069,25 @@ mod tests {
     fn stage2c_schema_closes_all_object_nodes_and_supports_coexisting_exposure() {
         let schema = workflow_stage2c_schema();
         assert_closed_object_schemas(&schema);
+        let action = schema["properties"]["pending_order_management_plan"]["properties"]["actions"]
+            ["items"]
+            .clone();
+        let required = action["required"]
+            .as_array()
+            .expect("required array")
+            .iter()
+            .filter_map(|value| value.as_str())
+            .collect::<Vec<_>>();
+        assert!(required.contains(&"trigger_condition"));
+        assert!(required.contains(&"execution_price"));
+        let action_enum = action["properties"]["action_type"]["enum"]
+            .as_array()
+            .expect("action enum");
+        let variants = action_enum
+            .iter()
+            .filter_map(|value| value.as_str())
+            .collect::<Vec<_>>();
+        assert!(!variants.contains(&"keep_order"));
         let enum_values = schema["properties"]["pending_order_management_plan"]["properties"]
             ["exposure_state"]["enum"]
             .as_array()

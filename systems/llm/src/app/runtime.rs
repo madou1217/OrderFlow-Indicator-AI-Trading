@@ -3,8 +3,9 @@ use crate::app::config::RootConfig;
 use crate::app::telegram::{TelegramOperator, TradeSignalNotification};
 use crate::app::x::XOperator;
 use crate::execution::binance::{
-    cancel_workflow_pending_entry_orders, execute_workflow_execution_intent,
-    execute_workflow_management_action, fetch_symbol_trading_state, ActivePositionSnapshot,
+    cancel_workflow_pending_entry_orders, ensure_account_trading_ws_started,
+    execute_workflow_execution_intent, execute_workflow_management_action,
+    fetch_symbol_trading_state, fetch_symbol_trading_state_for_fast_path, ActivePositionSnapshot,
     ExecutionReport, ManagementExecutionReport, OpenOrderSnapshot,
     TradeExecutionBlockedByCurrentPriceBeyondStopLoss, TradingStateSnapshot,
 };
@@ -160,12 +161,68 @@ struct MinuteBundleEnvelope {
     indicators: Value,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct FastMarketEnvelope {
+    msg_type: String,
+    routing_key: String,
+    market: String,
+    symbol: String,
+    #[serde(default)]
+    source_kind: Option<String>,
+    #[serde(default)]
+    backfill_in_progress: Option<bool>,
+    event_ts: DateTime<Utc>,
+    #[serde(default)]
+    published_at: Option<DateTime<Utc>>,
+    data: Value,
+}
+
 #[derive(Debug, Clone)]
 struct LatestBundle {
     raw: MinuteBundleEnvelope,
     indicators: Value,
     missing_indicator_codes: Vec<String>,
     received_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FastPriceSource {
+    MarkPrice,
+    Trade1s,
+    Kline1m,
+}
+
+impl FastPriceSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::MarkPrice => "mark_price",
+            Self::Trade1s => "trade_1s",
+            Self::Kline1m => "kline_1m",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct FastPriceEvent {
+    symbol: String,
+    event_ts: DateTime<Utc>,
+    price: f64,
+    source: FastPriceSource,
+    routing_key: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct FastWatcherPlanState {
+    plan_version: String,
+    context_key: String,
+    last_event_ts: Option<DateTime<Utc>>,
+    activation_seen_at: Option<DateTime<Utc>>,
+    advanced_beyond_entry_after_activation: bool,
+    breakout_started_at: Option<DateTime<Utc>>,
+    breakout_extreme_price: Option<f64>,
+    invalidation_probe_seen_at: Option<DateTime<Utc>>,
+    recovery_started_at: Option<DateTime<Utc>>,
+    fired: bool,
 }
 
 fn update_pending_invoke_bundle(
@@ -217,10 +274,31 @@ fn decode_minute_bundle_envelope(
     serde_json::from_slice(decoded.as_ref()).context("parse minute bundle as json")
 }
 
+fn decode_fast_market_envelope(
+    raw: &[u8],
+    content_encoding: Option<&str>,
+) -> Result<FastMarketEnvelope> {
+    let decoded = decode_minute_bundle_body(raw, content_encoding)?;
+    serde_json::from_slice(decoded.as_ref()).context("parse fast market event as json")
+}
+
+fn value_as_f64(value: &Value) -> Option<f64> {
+    value
+        .as_f64()
+        .or_else(|| value.as_i64().map(|item| item as f64))
+        .or_else(|| value.as_u64().map(|item| item as f64))
+        .or_else(|| value.as_str().and_then(|item| item.parse::<f64>().ok()))
+}
+
 pub async fn run(ctx: AppContext) -> Result<()> {
     ensure_temp_indicator_dir().await?;
     ensure_temp_model_input_dir().await?;
     ensure_llm_journal_dir().await?;
+    ensure_account_trading_ws_started(
+        &ctx.http_client,
+        &ctx.config.api.binance,
+        &ctx.config.llm.execution,
+    );
 
     if ctx.config.llm.purge_queue_on_start {
         let purged = ctx
@@ -240,10 +318,30 @@ pub async fn run(ctx: AppContext) -> Result<()> {
         );
     }
 
+    let fast_purged = ctx
+        .mq_fast_consume_channel
+        .queue_purge(&ctx.fast_consume_queue_name, QueuePurgeOptions::default())
+        .await
+        .with_context(|| {
+            format!(
+                "purge llm fast consume queue {}",
+                ctx.fast_consume_queue_name
+            )
+        })?;
+    debug!(
+        queue = %ctx.fast_consume_queue_name,
+        purged = fast_purged,
+        "llm fast watcher startup queue purge completed"
+    );
+
     ctx.mq_consume_channel
         .basic_qos(500, BasicQosOptions::default())
         .await
         .context("set llm queue qos")?;
+    ctx.mq_fast_consume_channel
+        .basic_qos(1_000, BasicQosOptions::default())
+        .await
+        .context("set llm fast queue qos")?;
 
     let consumer_tag = format!(
         "llm_{}_{}",
@@ -260,9 +358,25 @@ pub async fn run(ctx: AppContext) -> Result<()> {
         )
         .await
         .with_context(|| format!("consume queue {}", ctx.consume_queue_name))?;
+    let fast_consumer_tag = format!(
+        "llm_fast_{}_{}",
+        ctx.fast_consume_queue_name.replace('.', "_"),
+        &ctx.producer_instance_id
+    );
+    let mut fast_consumer = ctx
+        .mq_fast_consume_channel
+        .basic_consume(
+            &ctx.fast_consume_queue_name,
+            &fast_consumer_tag,
+            BasicConsumeOptions::default(),
+            FieldTable::default(),
+        )
+        .await
+        .with_context(|| format!("consume queue {}", ctx.fast_consume_queue_name))?;
 
     let mut pending_invoke_bundle: Option<LatestBundle> = None;
     let mut last_invoked_ts_bucket: Option<DateTime<Utc>> = None;
+    let mut fast_watcher_state: Option<FastWatcherPlanState> = None;
     let disabled_deadline = Instant::now() + Duration::from_secs(365 * 24 * 60 * 60);
     let mut settle_timer: Pin<Box<Sleep>> = Box::pin(sleep_until(disabled_deadline));
 
@@ -419,6 +533,50 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                     }
                     Err(err) => {
                         error!(error = %err, "llm consumer stream error");
+                    }
+                }
+            }
+            maybe_delivery = fast_consumer.next() => {
+                let Some(delivery_result) = maybe_delivery else {
+                    warn!("llm fast mq consumer stream ended");
+                    break;
+                };
+                match delivery_result {
+                    Ok(delivery) => {
+                        let content_encoding = delivery
+                            .properties
+                            .content_encoding()
+                            .as_ref()
+                            .map(|value| value.as_str().to_string());
+                        match decode_fast_market_envelope(&delivery.data, content_encoding.as_deref()) {
+                            Ok(envelope) => {
+                                if let Some(event) =
+                                    extract_fast_price_event(&envelope, &ctx.config.llm.symbol)
+                                {
+                                    if let Err(err) =
+                                        handle_fast_market_event(&ctx, &mut fast_watcher_state, event)
+                                            .await
+                                    {
+                                        warn!(error = %err, "llm fast watcher event handling failed");
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                warn!(
+                                    error = %err,
+                                    payload_len = delivery.data.len(),
+                                    content_encoding = content_encoding.as_deref().unwrap_or("identity"),
+                                    "llm decode fast market event failed"
+                                );
+                            }
+                        }
+
+                        if let Err(err) = delivery.ack(BasicAckOptions::default()).await {
+                            warn!(error = %err, "llm fast ack failed");
+                        }
+                    }
+                    Err(err) => {
+                        error!(error = %err, "llm fast consumer stream error");
                     }
                 }
             }
@@ -999,12 +1157,25 @@ fn prepend_backfilled_kline_bars(
 }
 
 fn extract_kline_history_bars(indicators: &Value, market: &str, interval_code: &str) -> Vec<Value> {
-    indicators
-        .pointer(&format!(
-            "/kline_history/payload/intervals/{interval_code}/markets/{market}/bars"
-        ))
+    let market_pointer =
+        format!("/kline_history/payload/intervals/{interval_code}/markets/{market}");
+    let Some(market_node) = indicators.pointer(&market_pointer) else {
+        return Vec::new();
+    };
+
+    let bars = market_node
+        .get("bars")
         .and_then(Value::as_array)
         .cloned()
+        .unwrap_or_default();
+    if !bars.is_empty() {
+        return bars;
+    }
+
+    market_node
+        .get("latest_bar")
+        .cloned()
+        .map(|bar| vec![bar])
         .unwrap_or_default()
 }
 
@@ -1422,6 +1593,251 @@ fn workflow_entry_context_key(symbol: &str, side: &str, path_id: &str) -> String
     )
 }
 
+fn extract_fast_price_event(
+    envelope: &FastMarketEnvelope,
+    target_symbol: &str,
+) -> Option<FastPriceEvent> {
+    if !envelope.symbol.eq_ignore_ascii_case(target_symbol) {
+        return None;
+    }
+    if envelope.backfill_in_progress.unwrap_or(false) {
+        return None;
+    }
+    let (price, source) = match envelope.msg_type.as_str() {
+        "md.mark_price" => (
+            value_as_f64(envelope.data.get("mark_price")?)?,
+            FastPriceSource::MarkPrice,
+        ),
+        "md.agg.trade.1s" => (
+            value_as_f64(envelope.data.get("last_price")?)?,
+            FastPriceSource::Trade1s,
+        ),
+        "md.kline" => (
+            value_as_f64(envelope.data.get("close_price")?)?,
+            FastPriceSource::Kline1m,
+        ),
+        _ => return None,
+    };
+    if !price.is_finite() || price <= 0.0 {
+        return None;
+    }
+    Some(FastPriceEvent {
+        symbol: envelope.symbol.to_ascii_uppercase(),
+        event_ts: envelope.event_ts,
+        price,
+        source,
+        routing_key: envelope.routing_key.clone(),
+    })
+}
+
+fn fast_plan_version(
+    tactical_plan: &crate::workflow::schema::TacticalEntryPlan,
+    updated_at: Option<DateTime<Utc>>,
+) -> String {
+    let updated_at_ms = updated_at
+        .map(|ts| ts.timestamp_millis())
+        .unwrap_or_default();
+    format!("{}:{updated_at_ms}", tactical_plan.path_id)
+}
+
+fn sync_fast_watcher_plan_state(
+    fast_state: &mut Option<FastWatcherPlanState>,
+    plan_version: &str,
+    context_key: &str,
+) {
+    let should_reset = fast_state
+        .as_ref()
+        .map(|state| state.plan_version != plan_version || state.context_key != context_key)
+        .unwrap_or(true);
+    if should_reset {
+        *fast_state = Some(FastWatcherPlanState {
+            plan_version: plan_version.to_string(),
+            context_key: context_key.to_string(),
+            ..FastWatcherPlanState::default()
+        });
+    }
+}
+
+fn favorable_beyond_zone(
+    side: &str,
+    price: f64,
+    zone: &crate::workflow::schema::PriceZone,
+) -> bool {
+    match side {
+        "LONG" => price > zone.high,
+        "SHORT" => price < zone.low,
+        _ => false,
+    }
+}
+
+fn inside_or_beyond_activation(plan: &crate::workflow::schema::EntryPlan, price: f64) -> bool {
+    plan.entry_activation_level.contains(price)
+        || favorable_beyond_zone(&plan.side, price, &plan.entry_activation_level)
+}
+
+fn breakout_crossed(plan: &crate::workflow::schema::EntryPlan, price: f64) -> bool {
+    favorable_beyond_zone(&plan.side, price, &plan.entry_zone)
+}
+
+fn breakout_excursion_bps(plan: &crate::workflow::schema::EntryPlan, extreme_price: f64) -> f64 {
+    match plan.side.as_str() {
+        "LONG" if plan.entry_zone.high > 0.0 => {
+            ((extreme_price / plan.entry_zone.high) - 1.0) * 10_000.0
+        }
+        "SHORT" if extreme_price > 0.0 => ((plan.entry_zone.low / extreme_price) - 1.0) * 10_000.0,
+        _ => 0.0,
+    }
+}
+
+fn fast_confirm_duration_ms(confirm_bars: u8) -> i64 {
+    confirm_bars.saturating_sub(1) as i64 * 1_000
+}
+
+fn fast_watcher_entry_ready(
+    state: &mut FastWatcherPlanState,
+    plan: &crate::workflow::schema::EntryPlan,
+    event: &FastPriceEvent,
+    watcher_cfg: &crate::app::config::WorkflowWatcherConfig,
+) -> bool {
+    if state.fired {
+        return false;
+    }
+    if state
+        .last_event_ts
+        .map(|last_ts| event.event_ts < last_ts)
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    state.last_event_ts = Some(event.event_ts);
+
+    if plan.entry_profile == "failed_auction_reentry" {
+        if plan.entry_invalidation_level.contains(event.price) {
+            state.invalidation_probe_seen_at = Some(event.event_ts);
+            state.recovery_started_at = None;
+        }
+        let probe_window_ms = watcher_cfg
+            .price_predicates
+            .failed_auction_reentry_confirmed
+            .probe_lookback_bars as i64
+            * 1_000;
+        let probe_recent = state
+            .invalidation_probe_seen_at
+            .map(|ts| {
+                event.event_ts.signed_duration_since(ts).num_milliseconds() <= probe_window_ms
+            })
+            .unwrap_or(false);
+        if !probe_recent {
+            state.invalidation_probe_seen_at = None;
+            state.recovery_started_at = None;
+            return false;
+        }
+        let recovered =
+            plan.entry_zone.contains(event.price) || inside_or_beyond_activation(plan, event.price);
+        if !recovered {
+            state.recovery_started_at = None;
+            return false;
+        }
+        let recovery_started_at = *state.recovery_started_at.get_or_insert(event.event_ts);
+        let recovery_ms = fast_confirm_duration_ms(
+            watcher_cfg
+                .price_predicates
+                .failed_auction_reentry_confirmed
+                .reaccept_confirm_bars,
+        );
+        return event
+            .event_ts
+            .signed_duration_since(recovery_started_at)
+            .num_milliseconds()
+            >= recovery_ms;
+    }
+
+    match plan.intent_mode.as_str() {
+        "immediate" => plan.entry_zone.contains(event.price),
+        "pullback" => {
+            if inside_or_beyond_activation(plan, event.price) {
+                state.activation_seen_at.get_or_insert(event.event_ts);
+            }
+            if state.activation_seen_at.is_some() && breakout_crossed(plan, event.price) {
+                state.advanced_beyond_entry_after_activation = true;
+            }
+            state.activation_seen_at.is_some()
+                && state.advanced_beyond_entry_after_activation
+                && plan.entry_zone.contains(event.price)
+        }
+        "breakout" => {
+            if !breakout_crossed(plan, event.price) {
+                state.breakout_started_at = None;
+                state.breakout_extreme_price = None;
+                return false;
+            }
+            let breakout_started_at = *state.breakout_started_at.get_or_insert(event.event_ts);
+            state.breakout_extreme_price =
+                Some(match (plan.side.as_str(), state.breakout_extreme_price) {
+                    ("LONG", Some(previous)) => previous.max(event.price),
+                    ("SHORT", Some(previous)) => previous.min(event.price),
+                    _ => event.price,
+                });
+            let dwell_ms = fast_confirm_duration_ms(
+                watcher_cfg.price_predicates.breakout_confirmed.confirm_bars,
+            );
+            let dwell_ready = event
+                .event_ts
+                .signed_duration_since(breakout_started_at)
+                .num_milliseconds()
+                >= dwell_ms;
+            let excursion_ready = state
+                .breakout_extreme_price
+                .map(|price| breakout_excursion_bps(plan, price))
+                .unwrap_or_default()
+                >= watcher_cfg
+                    .price_predicates
+                    .breakout_confirmed
+                    .min_break_bps;
+            dwell_ready || excursion_ready
+        }
+        _ => false,
+    }
+}
+
+fn select_fast_entry_plan<'a>(
+    symbol: &str,
+    tactical_plan: &'a crate::workflow::schema::TacticalEntryPlan,
+    workflow_state: &crate::workflow::state::WorkflowState,
+    trading_state: &TradingStateSnapshot,
+    entry_snapshots: &HashMap<String, crate::workflow::schema::EntrySnapshot>,
+    trigger_price: f64,
+    entry_ready: bool,
+    hard_invalidation_hit: bool,
+    max_filled_stopout_attempts: u8,
+) -> Option<SelectedEntryPlan<'a>> {
+    if !entry_ready {
+        return None;
+    }
+    if hard_invalidation_hit {
+        return None;
+    }
+    let side = tactical_plan.entry_plan.side.as_str();
+    if has_active_position_for_side(trading_state, side) {
+        return None;
+    }
+    if live_entry_order_count_for_side(trading_state, side) > 0 {
+        return None;
+    }
+    if workflow_state.filled_stopout_attempts >= max_filled_stopout_attempts {
+        return None;
+    }
+    let candidate = &tactical_plan.entry_plan;
+    let context_key = workflow_entry_context_key(symbol, &candidate.side, &tactical_plan.path_id);
+    if entry_snapshots.contains_key(&context_key) {
+        return None;
+    }
+    Some(SelectedEntryPlan {
+        plan: candidate,
+        trigger_price,
+    })
+}
+
 fn execution_intent_from_entry_plan(
     symbol: &str,
     path_id: &str,
@@ -1719,6 +2135,7 @@ fn has_pending_position_management_actions(
 ) -> bool {
     plan.actions
         .iter()
+        // Treat legacy placeholder holds as inert so old persisted plans stay harmless.
         .any(|action| action.action_type != "hold")
 }
 
@@ -1727,6 +2144,7 @@ fn has_pending_order_management_actions(
 ) -> bool {
     plan.actions
         .iter()
+        // Treat legacy placeholder keep_order actions as inert.
         .any(|action| action.action_type != "keep_order")
 }
 
@@ -1740,8 +2158,8 @@ fn position_management_plan_for_context(
         return None;
     }
     plan.actions
-        .retain(|action| action.context_key == context_key);
-    if plan.actions.is_empty() {
+        .retain(|action| action.context_key == context_key && action.action_type != "hold");
+    if !has_pending_position_management_actions(&plan) {
         None
     } else {
         Some(plan)
@@ -1758,8 +2176,8 @@ fn pending_order_management_plan_for_context(
         return None;
     }
     plan.actions
-        .retain(|action| action.context_key == context_key);
-    if plan.actions.is_empty() {
+        .retain(|action| action.context_key == context_key && action.action_type != "keep_order");
+    if !has_pending_order_management_actions(&plan) {
         None
     } else {
         Some(plan)
@@ -1789,7 +2207,10 @@ fn replace_position_management_plans(
     plans: BTreeMap<String, crate::workflow::schema::PositionManagementPlan>,
 ) {
     let now = Utc::now();
-    workflow_state.approved_position_management_plans = plans;
+    workflow_state.approved_position_management_plans = plans
+        .into_iter()
+        .filter(|(_, plan)| has_pending_position_management_actions(plan))
+        .collect();
     workflow_state.approved_position_management_plans_updated_at = workflow_state
         .approved_position_management_plans
         .keys()
@@ -1803,7 +2224,10 @@ fn replace_pending_order_management_plans(
     plans: BTreeMap<String, crate::workflow::schema::PendingOrderManagementPlan>,
 ) {
     let now = Utc::now();
-    workflow_state.approved_pending_order_management_plans = plans;
+    workflow_state.approved_pending_order_management_plans = plans
+        .into_iter()
+        .filter(|(_, plan)| has_pending_order_management_actions(plan))
+        .collect();
     workflow_state.approved_pending_order_management_plans_updated_at = workflow_state
         .approved_pending_order_management_plans
         .keys()
@@ -1895,28 +2319,26 @@ fn remove_pending_order_management_action(
 fn first_triggered_position_management_action_index(
     plan: &crate::workflow::schema::PositionManagementPlan,
     facts: &WatcherPriceFacts,
-    watcher_cfg: &crate::app::config::WorkflowWatcherConfig,
 ) -> Option<usize> {
     plan.actions.iter().position(|action| {
         action.action_type != "hold"
             && action
-                .watcher_trigger_condition
+                .trigger_condition
                 .as_ref()
-                .is_some_and(|trigger| watcher_trigger_condition_met(trigger, facts, watcher_cfg))
+                .is_some_and(|trigger| price_trigger_condition_met(trigger, facts.current_price))
     })
 }
 
 fn first_triggered_pending_order_action_index(
     plan: &crate::workflow::schema::PendingOrderManagementPlan,
     facts: &WatcherPriceFacts,
-    watcher_cfg: &crate::app::config::WorkflowWatcherConfig,
 ) -> Option<usize> {
     plan.actions.iter().position(|action| {
         action.action_type != "keep_order"
             && action
-                .watcher_trigger_condition
+                .trigger_condition
                 .as_ref()
-                .is_some_and(|trigger| watcher_trigger_condition_met(trigger, facts, watcher_cfg))
+                .is_some_and(|trigger| price_trigger_condition_met(trigger, facts.current_price))
     })
 }
 
@@ -1934,6 +2356,7 @@ fn management_action_from_position_management_action(
         action_type: action_type.to_string(),
         context_key: action.context_key.clone(),
         path_id: action.path_id.clone(),
+        execution_price: action.execution_price,
         reduce_ratio: action.reduce_ratio,
         new_stop_loss: action.new_stop_loss,
         take_profit_1: action.take_profit_1,
@@ -1981,6 +2404,254 @@ fn select_entry_plan<'a>(
         plan: candidate,
         trigger_price: watch_price,
     })
+}
+
+async fn handle_fast_market_event(
+    ctx: &AppContext,
+    fast_state: &mut Option<FastWatcherPlanState>,
+    event: FastPriceEvent,
+) -> Result<()> {
+    let symbol = event.symbol.to_ascii_uppercase();
+    let state_dir = ctx.config.llm.workflow.state_dir.clone();
+    let mut workflow_state =
+        crate::workflow::persistence::load_workflow_state(&state_dir, &symbol)?
+            .unwrap_or_else(|| default_workflow_state(&symbol));
+    workflow_state.symbol = symbol.clone();
+
+    let Some(stage1_output) =
+        crate::workflow::persistence::load_stage1_output(&state_dir, &symbol)?
+    else {
+        *fast_state = None;
+        return Ok(());
+    };
+    if stage1_output.monitoring_status != "active" {
+        *fast_state = None;
+        return Ok(());
+    }
+    let Some(current_path) = stage1_output.current_path.as_ref() else {
+        *fast_state = None;
+        return Ok(());
+    };
+    if workflow_state.pending_stage1_refresh_reason.is_some() {
+        *fast_state = None;
+        return Ok(());
+    }
+    let Some(tactical_plan) = workflow_state.approved_tactical_plan.as_ref() else {
+        *fast_state = None;
+        return Ok(());
+    };
+    if tactical_plan.path_id != current_path.id {
+        *fast_state = None;
+        return Ok(());
+    }
+    if ctx.config.llm.workflow.watcher.entry_attempt_window == "same_15m_window"
+        && workflow_state
+            .active_15m_window_start
+            .is_some_and(|start| start != floor_to_15m_window_start(event.event_ts))
+    {
+        *fast_state = None;
+        return Ok(());
+    }
+
+    let context_key = workflow_entry_context_key(
+        &symbol,
+        &tactical_plan.entry_plan.side,
+        &tactical_plan.path_id,
+    );
+    let plan_version = fast_plan_version(
+        tactical_plan,
+        workflow_state.approved_tactical_plan_updated_at,
+    );
+    sync_fast_watcher_plan_state(fast_state, &plan_version, &context_key);
+
+    let hard_invalidation_hit =
+        crate::workflow::stage2::failure_level_breached(&stage1_output, event.price)?;
+    if hard_invalidation_hit {
+        *fast_state = None;
+        return Ok(());
+    }
+
+    let fast_plan_state = fast_state
+        .as_mut()
+        .ok_or_else(|| anyhow!("fast watcher state unavailable"))?;
+
+    let mut entry_snapshots =
+        crate::workflow::persistence::load_entry_snapshots_for_symbol(&state_dir, &symbol)?
+            .into_iter()
+            .map(|snapshot| (snapshot.context_key.clone(), snapshot))
+            .collect::<HashMap<_, _>>();
+    if entry_snapshots.contains_key(&context_key) {
+        fast_plan_state.fired = true;
+        return Ok(());
+    }
+
+    let entry_ready = fast_watcher_entry_ready(
+        fast_plan_state,
+        &tactical_plan.entry_plan,
+        &event,
+        &ctx.config.llm.workflow.watcher,
+    );
+    if !entry_ready {
+        return Ok(());
+    }
+
+    let trading_state = fetch_symbol_trading_state_for_fast_path(
+        &ctx.http_client,
+        &ctx.config.api.binance,
+        &ctx.config.llm.execution,
+        &symbol,
+    )
+    .await?;
+    let Some(selected_entry_plan) = select_fast_entry_plan(
+        &symbol,
+        tactical_plan,
+        &workflow_state,
+        &trading_state,
+        &entry_snapshots,
+        event.price,
+        entry_ready,
+        hard_invalidation_hit,
+        ctx.config.llm.workflow.watcher.max_filled_stopout_attempts,
+    ) else {
+        return Ok(());
+    };
+
+    let intent = execution_intent_from_entry_plan(
+        &symbol,
+        &tactical_plan.path_id,
+        selected_entry_plan.plan,
+        current_path,
+        workflow_state
+            .pending_entry_bracket_template_override
+            .as_ref(),
+        selected_entry_plan.trigger_price,
+        ctx.config.llm.workflow.watcher.entry_ttl_minutes,
+        None,
+    );
+
+    match adapt_execution_intent(&intent) {
+        Ok(adapted_intent) => match execute_workflow_execution_intent(
+            &ctx.http_client,
+            &ctx.config.api.binance,
+            &ctx.config.llm.execution,
+            &symbol,
+            &adapted_intent,
+        )
+        .await
+        {
+            Ok(report) => {
+                append_workflow_journal_event(
+                    "workflow_execution_report",
+                    &symbol,
+                    event.event_ts,
+                    json!({
+                        "trigger": "watcher_fast_consumer",
+                        "path_id": intent.path_id,
+                        "context_key": intent.entry_snapshot.context_key,
+                        "price_source": event.source.as_str(),
+                        "routing_key": event.routing_key,
+                        "trigger_price": event.price,
+                        "report": {
+                            "decision": report.decision,
+                            "quantity": report.quantity,
+                            "leverage": report.leverage,
+                            "position_side": report.position_side,
+                            "maker_entry_price": report.maker_entry_price,
+                            "take_profit": report.actual_take_profit,
+                            "stop_loss": report.actual_stop_loss,
+                            "risk_reward_ratio": report.actual_risk_reward_ratio,
+                            "dry_run": report.dry_run,
+                        }
+                    }),
+                );
+                fast_plan_state.fired = true;
+                if !report.dry_run {
+                    let snapshot = crate::workflow::management::snapshot_from_execution_intent(
+                        &symbol,
+                        &intent,
+                        current_path,
+                        Utc::now(),
+                    );
+                    crate::workflow::persistence::save_entry_snapshot(&state_dir, &snapshot)?;
+                    entry_snapshots.insert(snapshot.context_key.clone(), snapshot);
+                    workflow_state.last_filled_context_key =
+                        Some(intent.entry_snapshot.context_key.clone());
+                    crate::workflow::persistence::save_workflow_state(&state_dir, &workflow_state)?;
+                }
+
+                let signal = build_execution_trade_signal(
+                    event.event_ts,
+                    "watcher_fast_consumer",
+                    &symbol,
+                    "workflow_watcher_fast",
+                    &trading_state,
+                    &intent,
+                    Some(&report),
+                    intent.reason.as_deref(),
+                );
+                let telegram_operator = TelegramOperator::from_config(&ctx.config.api.telegram);
+                let x_operator = XOperator::from_config(&ctx.config.api.x);
+                send_trade_signal_notifications(
+                    telegram_operator.as_ref(),
+                    x_operator.as_ref(),
+                    &ctx.config.llm.telegram_signal_decisions,
+                    &ctx.config.llm.x_signal_decisions,
+                    &ctx.http_client,
+                    &signal,
+                )
+                .await;
+            }
+            Err(err) => {
+                let blocked = err
+                    .downcast_ref::<TradeExecutionBlockedByCurrentPriceBeyondStopLoss>()
+                    .map(|item| {
+                        json!({
+                            "decision": item.decision.as_str(),
+                            "current_reference_price": item.current_reference_price,
+                            "current_price_source": item.current_price_source,
+                            "entry_price": item.entry_price,
+                            "stop_loss": item.stop_loss,
+                            "best_bid_price": item.best_bid_price,
+                            "best_ask_price": item.best_ask_price,
+                        })
+                    });
+                append_workflow_journal_event(
+                    "workflow_execution_error",
+                    &symbol,
+                    event.event_ts,
+                    json!({
+                        "trigger": "watcher_fast_consumer",
+                        "path_id": intent.path_id,
+                        "context_key": intent.entry_snapshot.context_key,
+                        "price_source": event.source.as_str(),
+                        "routing_key": event.routing_key,
+                        "trigger_price": event.price,
+                        "error": format!("{err:#}"),
+                        "blocked": blocked,
+                    }),
+                );
+            }
+        },
+        Err(err) => {
+            append_workflow_journal_event(
+                "workflow_execution_error",
+                &symbol,
+                event.event_ts,
+                json!({
+                    "trigger": "watcher_fast_consumer",
+                    "path_id": intent.path_id,
+                    "context_key": intent.entry_snapshot.context_key,
+                    "price_source": event.source.as_str(),
+                    "routing_key": event.routing_key,
+                    "trigger_price": event.price,
+                    "error": format!("{err:#}"),
+                    "phase": "intent_adapter",
+                }),
+            );
+        }
+    }
+
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -2249,22 +2920,13 @@ fn evaluate_watcher_predicate(
     }
 }
 
-fn watcher_trigger_condition_met(
-    trigger: &crate::workflow::schema::WatcherTriggerCondition,
-    facts: &WatcherPriceFacts,
-    watcher_cfg: &crate::app::config::WorkflowWatcherConfig,
+fn price_trigger_condition_met(
+    trigger: &crate::workflow::schema::PriceTriggerCondition,
+    current_price: f64,
 ) -> bool {
     match trigger.trigger_type.as_str() {
-        "price_above_on_close" => price_above_on_close(
-            facts,
-            trigger.trigger_level,
-            &watcher_cfg.price_predicates.price_above_on_close,
-        ),
-        "price_below_on_close" => price_below_on_close(
-            facts,
-            trigger.trigger_level,
-            &watcher_cfg.price_predicates.price_below_on_close,
-        ),
+        "price_above" => current_price >= trigger.trigger_price,
+        "price_below" => current_price <= trigger.trigger_price,
         _ => false,
     }
 }
@@ -3410,11 +4072,9 @@ async fn invoke_workflow_bundle_models(
                     remove_position_management_plan(&mut workflow_state, &plan_context_key);
                     continue;
                 }
-                let Some(action_index) = first_triggered_position_management_action_index(
-                    &plan,
-                    &watch_facts,
-                    &config.llm.workflow.watcher,
-                ) else {
+                let Some(action_index) =
+                    first_triggered_position_management_action_index(&plan, &watch_facts)
+                else {
                     continue;
                 };
                 let action = plan.actions[action_index].clone();
@@ -3821,11 +4481,9 @@ async fn invoke_workflow_bundle_models(
                         );
                         continue;
                     }
-                    let Some(action_index) = first_triggered_pending_order_action_index(
-                        &plan,
-                        &watch_facts,
-                        &config.llm.workflow.watcher,
-                    ) else {
+                    let Some(action_index) =
+                        first_triggered_pending_order_action_index(&plan, &watch_facts)
+                    else {
                         continue;
                     };
                     let action = plan.actions[action_index].clone();
@@ -5100,8 +5758,9 @@ mod tests {
     use super::*;
     use crate::workflow::schema::{
         CurrentPath, EntryPlan, EntrySnapshot, PendingOrderManagementAction,
-        PendingOrderManagementPlan, PositionManagementAction, PositionManagementPlan, PriceZone,
-        ReevaluationTrigger, Stage1Meta, Stage1Output, TacticalEntryPlan, WatcherTriggerCondition,
+        PendingOrderManagementPlan, PositionManagementAction, PositionManagementPlan,
+        PriceTriggerCondition, PriceZone, ReevaluationTrigger, Stage1Meta, Stage1Output,
+        TacticalEntryPlan,
     };
     use crate::workflow::state::WorkflowState;
     use chrono::Duration as ChronoDuration;
@@ -5117,6 +5776,83 @@ mod tests {
             label: None,
             reason: None,
         }
+    }
+
+    fn sample_fast_entry_plan(intent_mode: &str, entry_profile: &str) -> EntryPlan {
+        EntryPlan {
+            side: "LONG".to_string(),
+            entry_profile: entry_profile.to_string(),
+            intent_mode: intent_mode.to_string(),
+            entry_activation_level: sample_price_zone(100.0, 101.2, "15m"),
+            entry_zone: sample_price_zone(100.0, 101.0, "15m"),
+            entry_invalidation_level: sample_price_zone(98.5, 99.0, "15m"),
+            stop_loss: 98.4,
+            max_drift_pct: 0.2,
+            entry_note: String::new(),
+        }
+    }
+
+    fn sample_fast_price_event(ts: &str, price: f64) -> FastPriceEvent {
+        FastPriceEvent {
+            symbol: "ETHUSDT".to_string(),
+            event_ts: DateTime::parse_from_rfc3339(ts)
+                .expect("fast ts")
+                .with_timezone(&Utc),
+            price,
+            source: FastPriceSource::MarkPrice,
+            routing_key: "md.futures.mark_price.ethusdt".to_string(),
+        }
+    }
+
+    fn sample_fast_watcher_config() -> crate::app::config::WorkflowWatcherConfig {
+        let mut watcher_cfg = crate::app::config::WorkflowWatcherConfig::default();
+        watcher_cfg
+            .price_predicates
+            .price_above_on_close
+            .confirm_bars = 2;
+        watcher_cfg
+            .price_predicates
+            .price_above_on_close
+            .min_close_bps = 1.0;
+        watcher_cfg
+            .price_predicates
+            .price_below_on_close
+            .confirm_bars = 2;
+        watcher_cfg
+            .price_predicates
+            .price_below_on_close
+            .min_close_bps = 1.0;
+        watcher_cfg
+            .price_predicates
+            .entry_reclaim_confirmed
+            .confirm_bars = 2;
+        watcher_cfg.price_predicates.entry_hold_confirmed.hold_bars = 2;
+        watcher_cfg
+            .price_predicates
+            .entry_hold_confirmed
+            .retest_tolerance_bps = 10.0;
+        watcher_cfg.price_predicates.breakout_confirmed.confirm_bars = 2;
+        watcher_cfg
+            .price_predicates
+            .breakout_confirmed
+            .min_break_bps = 3.0;
+        watcher_cfg
+            .price_predicates
+            .pullback_acceptance_confirmed
+            .confirm_bars = 2;
+        watcher_cfg
+            .price_predicates
+            .pullback_acceptance_confirmed
+            .max_overshoot_bps = 10.0;
+        watcher_cfg
+            .price_predicates
+            .failed_auction_reentry_confirmed
+            .probe_lookback_bars = 2;
+        watcher_cfg
+            .price_predicates
+            .failed_auction_reentry_confirmed
+            .reaccept_confirm_bars = 2;
+        watcher_cfg
     }
 
     fn sample_stage1_output() -> Stage1Output {
@@ -5272,98 +6008,65 @@ mod tests {
     }
 
     #[test]
-    fn remove_position_management_action_drops_hold_only_tail() {
+    fn remove_position_management_action_drops_empty_tail() {
         let plan = PositionManagementPlan {
             path_id: "path_a".to_string(),
             exposure_state: "in_position".to_string(),
             path_live_assessment: "live".to_string(),
             path_assessment_reason: None,
-            actions: vec![
-                PositionManagementAction {
-                    action_type: "add".to_string(),
-                    context_key: "ETHUSDT:LONG:path_a".to_string(),
-                    path_id: "path_a".to_string(),
-                    watcher_trigger_condition: Some(WatcherTriggerCondition {
-                        trigger_type: "price_above_on_close".to_string(),
-                        trigger_level: 101.0,
-                        note: String::new(),
-                    }),
-                    add_ratio: Some(0.25),
-                    reuse_current_entry_template: Some(true),
-                    reduce_ratio: None,
-                    new_stop_loss: None,
-                    reuse_current_bracket_template: None,
-                    take_profit_1: None,
-                    take_profit_2: None,
-                    reason: "add".to_string(),
-                },
-                PositionManagementAction {
-                    action_type: "hold".to_string(),
-                    context_key: "ETHUSDT:LONG:path_a".to_string(),
-                    path_id: "path_a".to_string(),
-                    watcher_trigger_condition: None,
-                    add_ratio: None,
-                    reuse_current_entry_template: None,
-                    reduce_ratio: None,
-                    new_stop_loss: None,
-                    reuse_current_bracket_template: None,
-                    take_profit_1: None,
-                    take_profit_2: None,
-                    reason: "hold".to_string(),
-                },
-            ],
+            actions: vec![PositionManagementAction {
+                action_type: "add".to_string(),
+                context_key: "ETHUSDT:LONG:path_a".to_string(),
+                path_id: "path_a".to_string(),
+                trigger_condition: Some(PriceTriggerCondition {
+                    trigger_type: "price_above".to_string(),
+                    trigger_price: 101.0,
+                }),
+                execution_price: None,
+                add_ratio: Some(0.25),
+                reuse_current_entry_template: Some(true),
+                reduce_ratio: None,
+                new_stop_loss: None,
+                reuse_current_bracket_template: None,
+                take_profit_1: None,
+                take_profit_2: None,
+                reason: "add".to_string(),
+            }],
             management_note: "note".to_string(),
         };
         assert!(remove_position_management_action(&plan, 0).is_none());
     }
 
     #[test]
-    fn remove_pending_order_management_action_drops_keep_only_tail() {
+    fn remove_pending_order_management_action_drops_empty_tail() {
         let plan = PendingOrderManagementPlan {
             path_id: "path_a".to_string(),
             exposure_state: "flat_with_live_entry_orders".to_string(),
             path_live_assessment: "live".to_string(),
             path_assessment_reason: None,
-            actions: vec![
-                PendingOrderManagementAction {
-                    action_type: "replace_entry".to_string(),
-                    context_key: "ETHUSDT:LONG:path_a".to_string(),
-                    path_id: "path_a".to_string(),
-                    watcher_trigger_condition: Some(WatcherTriggerCondition {
-                        trigger_type: "price_above_on_close".to_string(),
-                        trigger_level: 101.0,
-                        note: String::new(),
-                    }),
-                    replacement_entry_zone: Some(sample_price_zone(102.0, 103.0, "15m")),
-                    replacement_entry_invalidation_level: Some(sample_price_zone(
-                        99.0, 99.0, "15m",
-                    )),
-                    replacement_stop_loss: Some(98.5),
-                    reuse_current_entry_template: Some(true),
-                    post_fill_bracket_template: None,
-                    reason: "replace".to_string(),
-                },
-                PendingOrderManagementAction {
-                    action_type: "keep_order".to_string(),
-                    context_key: "ETHUSDT:LONG:path_a".to_string(),
-                    path_id: "path_a".to_string(),
-                    watcher_trigger_condition: None,
-                    replacement_entry_zone: None,
-                    replacement_entry_invalidation_level: None,
-                    replacement_stop_loss: None,
-                    reuse_current_entry_template: None,
-                    post_fill_bracket_template: None,
-                    reason: "keep".to_string(),
-                },
-            ],
+            actions: vec![PendingOrderManagementAction {
+                action_type: "replace_entry".to_string(),
+                context_key: "ETHUSDT:LONG:path_a".to_string(),
+                path_id: "path_a".to_string(),
+                trigger_condition: Some(PriceTriggerCondition {
+                    trigger_type: "price_above".to_string(),
+                    trigger_price: 101.0,
+                }),
+                execution_price: None,
+                replacement_entry_zone: Some(sample_price_zone(102.0, 103.0, "15m")),
+                replacement_entry_invalidation_level: Some(sample_price_zone(99.0, 99.0, "15m")),
+                replacement_stop_loss: Some(98.5),
+                reuse_current_entry_template: Some(true),
+                post_fill_bracket_template: None,
+                reason: "replace".to_string(),
+            }],
             management_note: "note".to_string(),
         };
         assert!(remove_pending_order_management_action(&plan, 0).is_none());
     }
 
     #[test]
-    fn first_triggered_position_management_action_matches_price_close_rule() {
-        let watcher_cfg = crate::app::config::WorkflowWatcherConfig::default();
+    fn first_triggered_position_management_action_matches_immediate_price_rule() {
         let facts = WatcherPriceFacts {
             current_price: 102.0,
             recent_bars: vec![
@@ -5389,52 +6092,35 @@ mod tests {
             exposure_state: "in_position".to_string(),
             path_live_assessment: "live".to_string(),
             path_assessment_reason: None,
-            actions: vec![
-                PositionManagementAction {
-                    action_type: "hold".to_string(),
-                    context_key: "ETHUSDT:LONG:path_a".to_string(),
-                    path_id: "path_a".to_string(),
-                    watcher_trigger_condition: None,
-                    add_ratio: None,
-                    reuse_current_entry_template: None,
-                    reduce_ratio: None,
-                    new_stop_loss: None,
-                    reuse_current_bracket_template: None,
-                    take_profit_1: None,
-                    take_profit_2: None,
-                    reason: "hold".to_string(),
-                },
-                PositionManagementAction {
-                    action_type: "move_stop".to_string(),
-                    context_key: "ETHUSDT:LONG:path_a".to_string(),
-                    path_id: "path_a".to_string(),
-                    watcher_trigger_condition: Some(WatcherTriggerCondition {
-                        trigger_type: "price_above_on_close".to_string(),
-                        trigger_level: 101.0,
-                        note: String::new(),
-                    }),
-                    add_ratio: None,
-                    reuse_current_entry_template: None,
-                    reduce_ratio: None,
-                    new_stop_loss: Some(100.5),
-                    reuse_current_bracket_template: Some(true),
-                    take_profit_1: None,
-                    take_profit_2: None,
-                    reason: "tighten".to_string(),
-                },
-            ],
+            actions: vec![PositionManagementAction {
+                action_type: "move_stop".to_string(),
+                context_key: "ETHUSDT:LONG:path_a".to_string(),
+                path_id: "path_a".to_string(),
+                trigger_condition: Some(PriceTriggerCondition {
+                    trigger_type: "price_above".to_string(),
+                    trigger_price: 101.0,
+                }),
+                execution_price: None,
+                add_ratio: None,
+                reuse_current_entry_template: None,
+                reduce_ratio: None,
+                new_stop_loss: Some(100.5),
+                reuse_current_bracket_template: Some(true),
+                take_profit_1: None,
+                take_profit_2: None,
+                reason: "tighten".to_string(),
+            }],
             management_note: "note".to_string(),
         };
 
         assert_eq!(
-            first_triggered_position_management_action_index(&plan, &facts, &watcher_cfg),
-            Some(1)
+            first_triggered_position_management_action_index(&plan, &facts),
+            Some(0)
         );
     }
 
     #[test]
-    fn first_triggered_pending_order_action_matches_price_close_rule() {
-        let watcher_cfg = crate::app::config::WorkflowWatcherConfig::default();
+    fn first_triggered_pending_order_action_matches_immediate_price_rule() {
         let facts = WatcherPriceFacts {
             current_price: 99.0,
             recent_bars: vec![
@@ -5460,42 +6146,28 @@ mod tests {
             exposure_state: "flat_with_live_entry_orders".to_string(),
             path_live_assessment: "degraded".to_string(),
             path_assessment_reason: None,
-            actions: vec![
-                PendingOrderManagementAction {
-                    action_type: "keep_order".to_string(),
-                    context_key: "ETHUSDT:LONG:path_a".to_string(),
-                    path_id: "path_a".to_string(),
-                    watcher_trigger_condition: None,
-                    replacement_entry_zone: None,
-                    replacement_entry_invalidation_level: None,
-                    replacement_stop_loss: None,
-                    reuse_current_entry_template: None,
-                    post_fill_bracket_template: None,
-                    reason: "keep".to_string(),
-                },
-                PendingOrderManagementAction {
-                    action_type: "cancel_pending_order".to_string(),
-                    context_key: "ETHUSDT:LONG:path_a".to_string(),
-                    path_id: "path_a".to_string(),
-                    watcher_trigger_condition: Some(WatcherTriggerCondition {
-                        trigger_type: "price_below_on_close".to_string(),
-                        trigger_level: 100.0,
-                        note: String::new(),
-                    }),
-                    replacement_entry_zone: None,
-                    replacement_entry_invalidation_level: None,
-                    replacement_stop_loss: None,
-                    reuse_current_entry_template: None,
-                    post_fill_bracket_template: None,
-                    reason: "cancel".to_string(),
-                },
-            ],
+            actions: vec![PendingOrderManagementAction {
+                action_type: "cancel_pending_order".to_string(),
+                context_key: "ETHUSDT:LONG:path_a".to_string(),
+                path_id: "path_a".to_string(),
+                trigger_condition: Some(PriceTriggerCondition {
+                    trigger_type: "price_below".to_string(),
+                    trigger_price: 100.0,
+                }),
+                execution_price: None,
+                replacement_entry_zone: None,
+                replacement_entry_invalidation_level: None,
+                replacement_stop_loss: None,
+                reuse_current_entry_template: None,
+                post_fill_bracket_template: None,
+                reason: "cancel".to_string(),
+            }],
             management_note: "note".to_string(),
         };
 
         assert_eq!(
-            first_triggered_pending_order_action_index(&plan, &facts, &watcher_cfg),
-            Some(1)
+            first_triggered_pending_order_action_index(&plan, &facts),
+            Some(0)
         );
     }
 
@@ -5698,11 +6370,11 @@ mod tests {
             action_type: "replace_entry".to_string(),
             context_key: "ETHUSDT:LONG:path_a".to_string(),
             path_id: "path_a".to_string(),
-            watcher_trigger_condition: Some(WatcherTriggerCondition {
-                trigger_type: "price_above_on_close".to_string(),
-                trigger_level: 101.0,
-                note: String::new(),
+            trigger_condition: Some(PriceTriggerCondition {
+                trigger_type: "price_above".to_string(),
+                trigger_price: 101.0,
             }),
+            execution_price: None,
             replacement_entry_zone: Some(sample_price_zone(102.0, 103.0, "15m")),
             replacement_entry_invalidation_level: Some(sample_price_zone(99.5, 100.0, "15m")),
             replacement_stop_loss: Some(99.4),
@@ -5798,6 +6470,112 @@ mod tests {
         );
 
         fs::remove_file(&path).expect("cleanup persisted minute bundle");
+    }
+
+    #[test]
+    fn fast_watcher_immediate_triggers_inside_entry_zone() {
+        let watcher_cfg = sample_fast_watcher_config();
+        let plan = sample_fast_entry_plan("immediate", "pullback_acceptance");
+        let mut state = FastWatcherPlanState::default();
+
+        assert!(!fast_watcher_entry_ready(
+            &mut state,
+            &plan,
+            &sample_fast_price_event("2026-03-30T09:35:00Z", 99.8),
+            &watcher_cfg,
+        ));
+        assert!(fast_watcher_entry_ready(
+            &mut state,
+            &plan,
+            &sample_fast_price_event("2026-03-30T09:35:01Z", 100.4),
+            &watcher_cfg,
+        ));
+    }
+
+    #[test]
+    fn fast_watcher_pullback_requires_activation_then_reentry() {
+        let watcher_cfg = sample_fast_watcher_config();
+        let plan = sample_fast_entry_plan("pullback", "pullback_acceptance");
+        let mut state = FastWatcherPlanState::default();
+
+        assert!(!fast_watcher_entry_ready(
+            &mut state,
+            &plan,
+            &sample_fast_price_event("2026-03-30T09:35:00Z", 100.4),
+            &watcher_cfg,
+        ));
+        assert!(!fast_watcher_entry_ready(
+            &mut state,
+            &plan,
+            &sample_fast_price_event("2026-03-30T09:35:01Z", 101.1),
+            &watcher_cfg,
+        ));
+        assert!(fast_watcher_entry_ready(
+            &mut state,
+            &plan,
+            &sample_fast_price_event("2026-03-30T09:35:02Z", 100.8),
+            &watcher_cfg,
+        ));
+    }
+
+    #[test]
+    fn fast_watcher_breakout_triggers_on_dwell_or_excursion() {
+        let watcher_cfg = sample_fast_watcher_config();
+        let plan = sample_fast_entry_plan("breakout", "reclaim_then_hold");
+
+        let mut dwell_state = FastWatcherPlanState::default();
+        assert!(!fast_watcher_entry_ready(
+            &mut dwell_state,
+            &plan,
+            &sample_fast_price_event("2026-03-30T09:35:00Z", 101.01),
+            &watcher_cfg,
+        ));
+        assert!(fast_watcher_entry_ready(
+            &mut dwell_state,
+            &plan,
+            &sample_fast_price_event("2026-03-30T09:35:01Z", 101.02),
+            &watcher_cfg,
+        ));
+
+        let mut excursion_state = FastWatcherPlanState::default();
+        assert!(fast_watcher_entry_ready(
+            &mut excursion_state,
+            &plan,
+            &sample_fast_price_event("2026-03-30T09:35:00Z", 101.05),
+            &watcher_cfg,
+        ));
+    }
+
+    #[test]
+    fn fast_watcher_failed_auction_reentry_requires_probe_then_recovery() {
+        let watcher_cfg = sample_fast_watcher_config();
+        let plan = sample_fast_entry_plan("pullback", "failed_auction_reentry");
+        let mut state = FastWatcherPlanState::default();
+
+        assert!(!fast_watcher_entry_ready(
+            &mut state,
+            &plan,
+            &sample_fast_price_event("2026-03-30T09:35:00Z", 100.6),
+            &watcher_cfg,
+        ));
+        assert!(!fast_watcher_entry_ready(
+            &mut state,
+            &plan,
+            &sample_fast_price_event("2026-03-30T09:35:01Z", 98.7),
+            &watcher_cfg,
+        ));
+        assert!(!fast_watcher_entry_ready(
+            &mut state,
+            &plan,
+            &sample_fast_price_event("2026-03-30T09:35:02Z", 100.8),
+            &watcher_cfg,
+        ));
+        assert!(fast_watcher_entry_ready(
+            &mut state,
+            &plan,
+            &sample_fast_price_event("2026-03-30T09:35:03Z", 100.9),
+            &watcher_cfg,
+        ));
     }
 
     /*
@@ -6121,6 +6899,40 @@ mod tests {
                 .expect("parse open time")
                 .with_timezone(&Utc)
         );
+    }
+
+    #[test]
+    fn latest_closed_1m_price_falls_back_to_compact_latest_bar() {
+        let indicators = json!({
+            "kline_history": {
+                "payload": {
+                    "intervals": {
+                        "1m": {
+                            "markets": {
+                                "futures": {
+                                    "returned_count": 1024,
+                                    "latest_bar": {
+                                        "open_time": "2026-03-30T09:07:00Z",
+                                        "close_time": "2026-03-30T09:08:00Z",
+                                        "open": 2061.67,
+                                        "high": 2062.30,
+                                        "low": 2061.31,
+                                        "close": 2061.96,
+                                        "is_closed": true
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        assert_eq!(latest_closed_1m_price(&indicators), Some(2061.96));
+
+        let bars = extract_kline_history_bars(&indicators, "futures", "1m");
+        assert_eq!(bars.len(), 1);
+        assert_eq!(bars[0].get("close"), Some(&json!(2061.96)));
     }
 
     #[test]

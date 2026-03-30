@@ -302,6 +302,8 @@ pub struct ManagementAction {
     pub context_key: String,
     pub path_id: String,
     #[serde(default)]
+    pub execution_price: Option<f64>,
+    #[serde(default)]
     pub reduce_ratio: Option<f64>,
     #[serde(default)]
     pub new_stop_loss: Option<f64>,
@@ -438,11 +440,9 @@ pub struct Stage2AOutput {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
-pub struct WatcherTriggerCondition {
+pub struct PriceTriggerCondition {
     pub trigger_type: String,
-    pub trigger_level: f64,
-    #[serde(default)]
-    pub note: String,
+    pub trigger_price: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -452,7 +452,9 @@ pub struct PositionManagementAction {
     pub context_key: String,
     pub path_id: String,
     #[serde(default)]
-    pub watcher_trigger_condition: Option<WatcherTriggerCondition>,
+    pub trigger_condition: Option<PriceTriggerCondition>,
+    #[serde(default)]
+    pub execution_price: Option<f64>,
     #[serde(default)]
     pub add_ratio: Option<f64>,
     #[serde(default)]
@@ -497,7 +499,9 @@ pub struct PendingOrderManagementAction {
     pub context_key: String,
     pub path_id: String,
     #[serde(default)]
-    pub watcher_trigger_condition: Option<WatcherTriggerCondition>,
+    pub trigger_condition: Option<PriceTriggerCondition>,
+    #[serde(default)]
+    pub execution_price: Option<f64>,
     #[serde(default)]
     pub replacement_entry_zone: Option<PriceZone>,
     #[serde(default)]

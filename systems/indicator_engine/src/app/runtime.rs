@@ -6,9 +6,7 @@ use crate::indicators::context::{
 use crate::indicators::i19_kline_history::build_interval_bar_records;
 use crate::indicators::i27_options_surface::OPTIONS_SURFACE_WINDOWS;
 use crate::indicators::shared::incremental::IncrementalIndicatorConfig;
-use crate::ingest::decoder::{
-    build_engine_event, EngineEvent, EngineEventEnvelope, MdData,
-};
+use crate::ingest::decoder::{build_engine_event, EngineEvent, EngineEventEnvelope, MdData};
 use crate::ingest::mq_consumer;
 use crate::ingest::watermark::floor_minute;
 use crate::observability::heartbeat;
@@ -564,9 +562,8 @@ pub async fn run(ctx: AppContext) -> Result<()> {
         runtime_options.divergence_bootstrap_block_len,
         runtime_options.divergence_p_value_threshold,
     );
-    state_store.set_incremental_runtime_options(build_incremental_indicator_config(
-        &runtime_options,
-    ));
+    state_store
+        .set_incremental_runtime_options(build_incremental_indicator_config(&runtime_options));
     let mut tick = interval(Duration::from_secs(1));
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
@@ -654,8 +651,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
     metrics.set_backfill_mode(false);
 
     let state_store = Arc::new(Mutex::new(state_store));
-    let (live_ready_job_tx_raw, live_ready_job_rx) =
-        mpsc::channel(LIVE_READY_JOB_QUEUE_CAPACITY);
+    let (live_ready_job_tx_raw, live_ready_job_rx) = mpsc::channel(LIVE_READY_JOB_QUEUE_CAPACITY);
     let mut live_ready_job_tx = Some(live_ready_job_tx_raw);
     let live_ready_job_pending = Arc::new(AtomicUsize::new(0));
     let (live_prepare_task_tx_raw, live_prepare_task_rx) =
@@ -705,8 +701,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
     let snapshot_fanout_handle =
         tokio::spawn(async move { snapshot_fanout_projector.run_loop().await });
 
-    let (prepare_ingest_tx, mut prepare_ingest_rx) =
-        mpsc::channel(PREPARE_INGEST_QUEUE_CAPACITY);
+    let (prepare_ingest_tx, mut prepare_ingest_rx) = mpsc::channel(PREPARE_INGEST_QUEUE_CAPACITY);
     let trade_ingest_pending = Arc::new(AtomicUsize::new(0));
     let non_trade_ingest_pending = Arc::new(AtomicUsize::new(0));
     let mut trade_ingest_forwarder_handle = Some(tokio::spawn(run_ingest_forwarder(
@@ -3050,10 +3045,7 @@ async fn abort_oi_ratio_patch_task(
     );
 }
 
-fn available_ready_job_slots(
-    queue_capacity: usize,
-    ready_job_pending: &Arc<AtomicUsize>,
-) -> usize {
+fn available_ready_job_slots(queue_capacity: usize, ready_job_pending: &Arc<AtomicUsize>) -> usize {
     queue_capacity.saturating_sub(
         ready_job_pending
             .load(Ordering::Acquire)
@@ -3067,8 +3059,9 @@ fn available_live_pipeline_slots(
     prepare_minute_pending: &Arc<AtomicUsize>,
 ) -> usize {
     queue_capacity.saturating_sub(
-        (ready_job_pending.load(Ordering::Acquire) + prepare_minute_pending.load(Ordering::Acquire))
-            .min(queue_capacity),
+        (ready_job_pending.load(Ordering::Acquire)
+            + prepare_minute_pending.load(Ordering::Acquire))
+        .min(queue_capacity),
     )
 }
 
@@ -3224,11 +3217,13 @@ async fn run_live_prepare_loop(
     while let Some(task) = prepare_task_rx.recv().await {
         let first_minute = task.minutes.first().copied();
         let last_minute = task.minutes.last().copied();
-        let fetched_rows = if let (Some(first_minute), Some(last_minute)) = (first_minute, last_minute)
+        let fetched_rows = if let (Some(first_minute), Some(last_minute)) =
+            (first_minute, last_minute)
         {
             let needs_hydration = {
                 let state_store = state_store.lock().await;
-                state_store.has_unhydrated_futures_orderbook_heatmap_in_range(first_minute, last_minute)
+                state_store
+                    .has_unhydrated_futures_orderbook_heatmap_in_range(first_minute, last_minute)
             };
             if needs_hydration {
                 fetch_futures_orderbook_heatmap_rows_for_range(
@@ -3251,10 +3246,9 @@ async fn run_live_prepare_loop(
             let mut state_store = state_store.lock().await;
             if let (Some(first_minute), Some(last_minute)) = (first_minute, last_minute) {
                 let last_minute_exclusive = last_minute + ChronoDuration::minutes(1);
-                if state_store.has_unhydrated_futures_orderbook_heatmap_in_range(
-                    first_minute,
-                    last_minute,
-                ) {
+                if state_store
+                    .has_unhydrated_futures_orderbook_heatmap_in_range(first_minute, last_minute)
+                {
                     let ingested_rows = ingest_futures_orderbook_heatmap_rows(
                         &mut state_store,
                         fetched_rows,
@@ -3361,12 +3355,11 @@ async fn poll_materialize_handle(
             "{} materialize worker exited unexpectedly",
             worker_kind.label()
         ),
-        Ok(Err(err)) => Err(err).with_context(|| {
-            format!("{} materialize worker failed", worker_kind.label())
-        }),
-        Err(err) => Err(err).with_context(|| {
-            format!("{} materialize worker join failed", worker_kind.label())
-        }),
+        Ok(Err(err)) => {
+            Err(err).with_context(|| format!("{} materialize worker failed", worker_kind.label()))
+        }
+        Err(err) => Err(err)
+            .with_context(|| format!("{} materialize worker join failed", worker_kind.label())),
     }
 }
 
@@ -3483,10 +3476,8 @@ async fn enqueue_live_ready_jobs(
 
     if allow_dirty_enqueue {
         loop {
-            let available_dirty_slots = available_ready_job_slots(
-                DIRTY_READY_JOB_QUEUE_CAPACITY,
-                dirty_ready_job_pending,
-            );
+            let available_dirty_slots =
+                available_ready_job_slots(DIRTY_READY_JOB_QUEUE_CAPACITY, dirty_ready_job_pending);
             if available_dirty_slots == 0
                 || dirty_windows_enqueued >= DIRTY_RECOMPUTE_WINDOW_BUDGET_PER_TICK
             {
@@ -3506,8 +3497,7 @@ async fn enqueue_live_ready_jobs(
                             dirty_from,
                             dirty_to,
                             state_store.has_unhydrated_futures_orderbook_heatmap_in_range(
-                                dirty_from,
-                                dirty_to,
+                                dirty_from, dirty_to,
                             ),
                         )
                     })
@@ -3530,10 +3520,8 @@ async fn enqueue_live_ready_jobs(
             let dirty_batch = {
                 let mut state_store = state_store.lock().await;
                 if needs_hydration
-                    && state_store.has_unhydrated_futures_orderbook_heatmap_in_range(
-                        dirty_from,
-                        dirty_to,
-                    )
+                    && state_store
+                        .has_unhydrated_futures_orderbook_heatmap_in_range(dirty_from, dirty_to)
                 {
                     ingest_futures_orderbook_heatmap_rows(
                         &mut state_store,
@@ -6288,7 +6276,10 @@ mod tests {
 
     #[test]
     fn dirty_enqueue_is_deferred_when_live_queue_has_work() {
-        let ready_through_ts = Utc.with_ymd_and_hms(2026, 3, 24, 7, 10, 0).single().unwrap();
+        let ready_through_ts = Utc
+            .with_ymd_and_hms(2026, 3, 24, 7, 10, 0)
+            .single()
+            .unwrap();
         let next_live_minute = Some(ready_through_ts - ChronoDuration::minutes(1));
 
         assert!(!super::should_enqueue_dirty_ready_jobs(
@@ -6316,7 +6307,10 @@ mod tests {
 
     #[test]
     fn dirty_enqueue_is_allowed_only_when_live_is_fully_idle() {
-        let ready_through_ts = Utc.with_ymd_and_hms(2026, 3, 24, 7, 10, 0).single().unwrap();
+        let ready_through_ts = Utc
+            .with_ymd_and_hms(2026, 3, 24, 7, 10, 0)
+            .single()
+            .unwrap();
         let next_live_minute = Some(ready_through_ts + ChronoDuration::minutes(1));
 
         assert!(super::should_enqueue_dirty_ready_jobs(

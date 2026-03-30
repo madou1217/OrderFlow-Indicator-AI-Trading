@@ -117,7 +117,11 @@ impl IncrementalIndicatorState {
         self.outputs = Arc::new(IncrementalIndicatorOutputs::default());
         self.funding = FundingState::new();
         self.avwap = AvwapState::new();
-        self.rvwap = RvwapState::new(self.config.rvwap_windows.clone(), self.config.rvwap_output_windows.clone(), self.config.rvwap_min_samples);
+        self.rvwap = RvwapState::new(
+            self.config.rvwap_windows.clone(),
+            self.config.rvwap_output_windows.clone(),
+            self.config.rvwap_min_samples,
+        );
         self.high_volume = HighVolumePulseState::new(
             self.config.high_volume_pulse_z_windows.clone(),
             self.config.high_volume_pulse_summary_windows.clone(),
@@ -354,11 +358,7 @@ impl FundingState {
                 .get(&minutes)
                 .cloned()
                 .unwrap_or_else(|| FundingFeatureOutput::default());
-            let changes = feature
-                .changes_json
-                .as_array()
-                .cloned()
-                .unwrap_or_default();
+            let changes = feature.changes_json.as_array().cloned().unwrap_or_default();
             by_window.insert(
                 label.to_string(),
                 json!({
@@ -391,7 +391,12 @@ impl FundingState {
         let start_idx = self
             .funding_points
             .back()
-            .map(|point| lower_bound_funding_point_ts(funding_points_recent, point.ts + Duration::microseconds(1)))
+            .map(|point| {
+                lower_bound_funding_point_ts(
+                    funding_points_recent,
+                    point.ts + Duration::microseconds(1),
+                )
+            })
             .unwrap_or(0);
         for point in &funding_points_recent[start_idx..] {
             self.funding_points.push_back(point.clone());
@@ -402,7 +407,9 @@ impl FundingState {
         let start_idx = self
             .mark_points
             .back()
-            .map(|point| lower_bound_mark_point_ts(mark_points_recent, point.ts + Duration::microseconds(1)))
+            .map(|point| {
+                lower_bound_mark_point_ts(mark_points_recent, point.ts + Duration::microseconds(1))
+            })
             .unwrap_or(0);
         for point in &mark_points_recent[start_idx..] {
             self.mark_points.push_back(point.clone());
@@ -417,7 +424,12 @@ impl FundingState {
         let start_idx = self
             .changes
             .back()
-            .map(|change| lower_bound_funding_change_ts(funding_changes_recent, change.ts_change + Duration::microseconds(1)))
+            .map(|change| {
+                lower_bound_funding_change_ts(
+                    funding_changes_recent,
+                    change.ts_change + Duration::microseconds(1),
+                )
+            })
             .unwrap_or(0);
         let minute_start = ts_bucket;
         let minute_end = ts_bucket + Duration::minutes(1);
@@ -428,7 +440,8 @@ impl FundingState {
             if change.ts_change >= minute_start && change.ts_change < minute_end {
                 appended.push(payload.clone());
             }
-            self.recent_7d_payload.push_back((change.ts_change, payload));
+            self.recent_7d_payload
+                .push_back((change.ts_change, payload));
         }
         appended
     }
@@ -629,7 +642,8 @@ impl AvwapState {
                 {
                     return;
                 }
-                let start_idx = lower_bound_history_ts(history_futures, last_ts + Duration::minutes(1));
+                let start_idx =
+                    lower_bound_history_ts(history_futures, last_ts + Duration::minutes(1));
                 let spot_start_idx =
                     lower_bound_history_ts(history_spot, last_ts + Duration::minutes(1));
                 let fut_tail = &history_futures[start_idx..];
@@ -758,8 +772,7 @@ impl AvwapState {
         let fut_mark_price = latest_mark.and_then(|mark| mark.mark_price);
         let price_minus_avwap_fut = fut_last_price.zip(avwap_fut).map(|(p, a)| p - a);
         let price_minus_spot_avwap_fut = fut_last_price.zip(avwap_spot).map(|(p, a)| p - a);
-        let price_minus_spot_avwap_futmark =
-            fut_mark_price.zip(avwap_spot).map(|(p, a)| p - a);
+        let price_minus_spot_avwap_futmark = fut_mark_price.zip(avwap_spot).map(|(p, a)| p - a);
         let avwap_gap = avwap_fut.zip(avwap_spot).map(|(f, s)| f - s);
         let zavwap_gap = gap_zscore(&self.gap_values, avwap_gap);
         let lookback_start = ts_bucket - Duration::days(AVWAP_LOOKBACK_DAYS);
@@ -769,9 +782,7 @@ impl AvwapState {
             let rows = self
                 .series_json_by_window
                 .get(code)
-                .map(|rows| {
-                    rows.iter().cloned().collect::<Vec<_>>()
-                })
+                .map(|rows| rows.iter().cloned().collect::<Vec<_>>())
                 .unwrap_or_default();
             series_by_window.insert(code.to_string(), Value::Array(rows));
         }
@@ -875,10 +886,7 @@ where
     Some(previous.unwrap_or(0.0) + add - remove)
 }
 
-fn lower_bound_funding_point_ts(
-    values: &[LatestFundingState],
-    target: DateTime<Utc>,
-) -> usize {
+fn lower_bound_funding_point_ts(values: &[LatestFundingState], target: DateTime<Utc>) -> usize {
     let mut l = 0usize;
     let mut r = values.len();
     while l < r {
@@ -937,7 +945,10 @@ fn lower_bound_funding_points_deque(
     l
 }
 
-fn lower_bound_mark_points_deque(values: &VecDeque<LatestMarkState>, target: DateTime<Utc>) -> usize {
+fn lower_bound_mark_points_deque(
+    values: &VecDeque<LatestMarkState>,
+    target: DateTime<Utc>,
+) -> usize {
     let mut l = 0usize;
     let mut r = values.len();
     while l < r {
@@ -966,10 +977,12 @@ fn latest_mark_at_or_before(
     points: &VecDeque<LatestMarkState>,
     end: DateTime<Utc>,
 ) -> Option<(DateTime<Utc>, f64)> {
-    points
-        .iter()
-        .rev()
-        .find_map(|point| (point.ts <= end).then_some(point.mark_price).flatten().map(|value| (point.ts, value)))
+    points.iter().rev().find_map(|point| {
+        (point.ts <= end)
+            .then_some(point.mark_price)
+            .flatten()
+            .map(|value| (point.ts, value))
+    })
 }
 
 fn latest_index_at_or_before(
@@ -1078,11 +1091,7 @@ fn build_funding_outputs(
             funding_points_recent,
             mark_points_recent,
         );
-        let changes = feature
-            .changes_json
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
+        let changes = feature.changes_json.as_array().cloned().unwrap_or_default();
         by_window.insert(
             label.to_string(),
             json!({
@@ -1372,7 +1381,8 @@ impl RvwapState {
                 {
                     return;
                 }
-                let start_idx = lower_bound_history_ts(history_futures, last_ts + Duration::minutes(1));
+                let start_idx =
+                    lower_bound_history_ts(history_futures, last_ts + Duration::minutes(1));
                 for row in &history_futures[start_idx..] {
                     self.append_minute(row);
                 }
@@ -1387,7 +1397,9 @@ impl RvwapState {
         };
         let weight = row.total_qty.max(0.0);
         let prev = self.points.back();
-        let prev_w = prev.map(|point| point.prefix_weight).unwrap_or(self.base_weight);
+        let prev_w = prev
+            .map(|point| point.prefix_weight)
+            .unwrap_or(self.base_weight);
         let prev_pw = prev
             .map(|point| point.prefix_price_weight)
             .unwrap_or(self.base_price_weight);
@@ -1405,7 +1417,11 @@ impl RvwapState {
             prefix_weight: prev_w + if weight > 0.0 { weight } else { 0.0 },
             prefix_price_weight: prev_pw + if weight > 0.0 { price * weight } else { 0.0 },
             prefix_price_sq_weight: prev_p2w
-                + if weight > 0.0 { price * price * weight } else { 0.0 },
+                + if weight > 0.0 {
+                    price * price * weight
+                } else {
+                    0.0
+                },
             prefix_positive_samples: prev_count + usize::from(weight > 0.0),
         };
         self.points.push_back(point);
@@ -1459,7 +1475,9 @@ impl RvwapState {
             if let Some(series) = self.series_by_output_window.get_mut(code) {
                 while series
                     .front()
-                    .map(|series_row| series_row.ts <= anchor - Duration::minutes(HISTORY_LIMIT_MINUTES_I64))
+                    .map(|series_row| {
+                        series_row.ts <= anchor - Duration::minutes(HISTORY_LIMIT_MINUTES_I64)
+                    })
                     .unwrap_or(false)
                 {
                     series.pop_front();
@@ -1480,7 +1498,10 @@ impl RvwapState {
         self.last_ts = Some(row.ts_bucket);
     }
 
-    fn current_stats_by_window(&self, end_idx: usize) -> BTreeMap<String, Option<RvwapStatsOutput>> {
+    fn current_stats_by_window(
+        &self,
+        end_idx: usize,
+    ) -> BTreeMap<String, Option<RvwapStatsOutput>> {
         let mut out = BTreeMap::new();
         for (code, minutes) in &self.rolling_windows {
             out.insert(code.clone(), self.compute_stats_at(end_idx, *minutes));
@@ -1557,9 +1578,7 @@ impl RvwapState {
             let rows = self
                 .series_json_by_output_window
                 .get(code)
-                .map(|rows| {
-                    rows.iter().cloned().collect::<Vec<_>>()
-                })
+                .map(|rows| rows.iter().cloned().collect::<Vec<_>>())
                 .unwrap_or_default();
             series_by_output_window.insert(code.clone(), Value::Array(rows));
         }
@@ -1740,7 +1759,8 @@ impl HighVolumePulseState {
                 {
                     return;
                 }
-                let start_idx = lower_bound_history_ts(history_futures, last_ts + Duration::minutes(1));
+                let start_idx =
+                    lower_bound_history_ts(history_futures, last_ts + Duration::minutes(1));
                 for row in &history_futures[start_idx..] {
                     self.append_minute(row);
                 }
@@ -2119,7 +2139,10 @@ impl TpoState {
         ib_minutes: i64,
         output_windows: Vec<(String, i64)>,
     ) -> Self {
-        let session_preference = session_windows.iter().map(|(code, _)| code.clone()).collect();
+        let session_preference = session_windows
+            .iter()
+            .map(|(code, _)| code.clone())
+            .collect();
         let sessions = session_windows
             .into_iter()
             .map(|(code, minutes)| {
@@ -2163,7 +2186,8 @@ impl TpoState {
                 {
                     return;
                 }
-                let start_idx = lower_bound_history_ts(history_futures, last_ts + Duration::minutes(1));
+                let start_idx =
+                    lower_bound_history_ts(history_futures, last_ts + Duration::minutes(1));
                 for row in &history_futures[start_idx..] {
                     for session in &mut self.sessions {
                         session.append_history_row(row);
@@ -2191,16 +2215,19 @@ impl TpoState {
         );
         out.insert(
             "rows_nb".to_string(),
-            json!(self.sessions.first().map(|session| session.rows_nb).unwrap_or_default()),
+            json!(self
+                .sessions
+                .first()
+                .map(|session| session.rows_nb)
+                .unwrap_or_default()),
         );
         out.insert(
             "value_area_pct".to_string(),
-            json!(
-                self.sessions
-                    .first()
-                    .map(|session| session.value_area_pct)
-                    .unwrap_or_default()
-            ),
+            json!(self
+                .sessions
+                .first()
+                .map(|session| session.value_area_pct)
+                .unwrap_or_default()),
         );
         merge_primary_session_fields(&mut out, &by_session, &self.session_preference);
         out.insert("by_session".to_string(), Value::Object(by_session));
@@ -2313,8 +2340,18 @@ fn build_profile_state_from_endpoints(
 }
 
 fn increment_profile(profile: &mut SessionProfileState, bar: &MinuteRangeBar) {
-    let from_idx = price_to_bin_idx(bar.low, profile.p_min, profile.bin_width, profile.scores.len());
-    let to_idx = price_to_bin_idx(bar.high, profile.p_min, profile.bin_width, profile.scores.len());
+    let from_idx = price_to_bin_idx(
+        bar.low,
+        profile.p_min,
+        profile.bin_width,
+        profile.scores.len(),
+    );
+    let to_idx = price_to_bin_idx(
+        bar.high,
+        profile.p_min,
+        profile.bin_width,
+        profile.scores.len(),
+    );
     for idx in from_idx.min(to_idx)..=from_idx.max(to_idx) {
         profile.scores[idx] += 1;
     }
@@ -2456,7 +2493,10 @@ fn upper_bound_f64(values: &[f64], target: f64) -> usize {
 }
 
 fn min_price_for_bin_idx(profile: &SessionProfileState, idx: usize) -> f64 {
-    if idx == 0 || profile.scores.len() <= 1 || profile.bin_width <= EPS || !profile.bin_width.is_finite()
+    if idx == 0
+        || profile.scores.len() <= 1
+        || profile.bin_width <= EPS
+        || !profile.bin_width.is_finite()
     {
         return f64::NEG_INFINITY;
     }
@@ -2476,7 +2516,12 @@ fn min_price_for_bin_idx(profile: &SessionProfileState, idx: usize) -> f64 {
         hi += span;
     }
 
-    if price_to_bin_idx(theoretical, profile.p_min, profile.bin_width, profile.scores.len()) >= idx
+    if price_to_bin_idx(
+        theoretical,
+        profile.p_min,
+        profile.bin_width,
+        profile.scores.len(),
+    ) >= idx
     {
         hi = theoretical;
     } else {
@@ -2636,17 +2681,24 @@ mod tests {
             latest_funding: latest_funding.clone(),
             funding_changes_in_window: funding_changes
                 .iter()
-                .filter(|change| change.ts_change >= ts_bucket && change.ts_change < ts_bucket + Duration::minutes(1))
+                .filter(|change| {
+                    change.ts_change >= ts_bucket
+                        && change.ts_change < ts_bucket + Duration::minutes(1)
+                })
                 .cloned()
                 .collect(),
             funding_points_in_window: funding_points
                 .iter()
-                .filter(|point| point.ts >= ts_bucket && point.ts < ts_bucket + Duration::minutes(1))
+                .filter(|point| {
+                    point.ts >= ts_bucket && point.ts < ts_bucket + Duration::minutes(1)
+                })
                 .cloned()
                 .collect(),
             mark_points_in_window: mark_points
                 .iter()
-                .filter(|point| point.ts >= ts_bucket && point.ts < ts_bucket + Duration::minutes(1))
+                .filter(|point| {
+                    point.ts >= ts_bucket && point.ts < ts_bucket + Duration::minutes(1)
+                })
                 .cloned()
                 .collect(),
             funding_changes_recent: Arc::new(funding_changes.clone()),
@@ -2685,8 +2737,11 @@ mod tests {
             ),
         };
 
-        let legacy_ctx =
-            IndicatorContext::from_bundle(bundle.clone(), &options, KlineHistorySupplement::default());
+        let legacy_ctx = IndicatorContext::from_bundle(
+            bundle.clone(),
+            &options,
+            KlineHistorySupplement::default(),
+        );
 
         let mut incremental_state = IncrementalIndicatorState::default();
         incremental_state.configure(config_from_options(&options));
@@ -2869,7 +2924,10 @@ mod tests {
                 ("4h".to_string(), 240),
                 ("1d".to_string(), 1440),
             ],
-            high_volume_pulse_summary_windows: vec![("15m".to_string(), 15), ("1h".to_string(), 60)],
+            high_volume_pulse_summary_windows: vec![
+                ("15m".to_string(), 15),
+                ("1h".to_string(), 60),
+            ],
             high_volume_pulse_min_samples: options.high_volume_pulse_min_samples,
         }
     }
@@ -2883,7 +2941,12 @@ mod tests {
             kline_history_bars_1d: 120,
             kline_history_bars_3d: 120,
             kline_history_fill_1d_from_db: true,
-            fvg_windows: vec!["15m".to_string(), "4h".to_string(), "1d".to_string(), "3d".to_string()],
+            fvg_windows: vec![
+                "15m".to_string(),
+                "4h".to_string(),
+                "1d".to_string(),
+                "3d".to_string(),
+            ],
             fvg_fill_from_db: true,
             fvg_db_bars_4h: 256,
             fvg_db_bars_1d: 256,

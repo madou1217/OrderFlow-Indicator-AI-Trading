@@ -9,10 +9,10 @@ use crate::indicators::i12_buying_exhaustion::{
     compute_exhaustion_all_history_from_histories, ExhaustionEventData,
     EXHAUSTION_INCREMENTAL_LOOKBACK_MINUTES,
 };
+use crate::indicators::shared::funding::funding_change_json;
 use crate::indicators::shared::incremental::{
     IncrementalIndicatorConfig, IncrementalIndicatorOutputs, IncrementalIndicatorState,
 };
-use crate::indicators::shared::funding::funding_change_json;
 use crate::indicators::shared::liquidation::build_recent_7d_entry as build_liquidation_recent_7d_entry;
 use crate::ingest::decoder::{
     AggFundingMark1mEvent, AggLiq1mEvent, AggOrderbook1mEvent, AggTrade1mEvent, AggVpinSnapshot,
@@ -1494,20 +1494,13 @@ impl StateStore {
         }
     }
 
-    fn truncate_shared_suffix<T, F>(
-        shared: &mut Arc<Vec<T>>,
-        start: DateTime<Utc>,
-        ts_of: F,
-    ) where
+    fn truncate_shared_suffix<T, F>(shared: &mut Arc<Vec<T>>, start: DateTime<Utc>, ts_of: F)
+    where
         T: Clone,
         F: Fn(&T) -> DateTime<Utc>,
     {
         let vec = Arc::make_mut(shared);
-        while vec
-            .last()
-            .map(|item| ts_of(item) >= start)
-            .unwrap_or(false)
-        {
+        while vec.last().map(|item| ts_of(item) >= start).unwrap_or(false) {
             vec.pop();
         }
     }
@@ -3214,9 +3207,14 @@ impl StateStore {
             .map(|h| h.ts_bucket)
             .or_else(|| self.history_spot.back().map(|h| h.ts_bucket));
         Self::truncate_shared_suffix(&mut self.history_futures_shared, start, |row| row.ts_bucket);
-        Self::truncate_shared_len(&mut self.liquidation_recent_7d_payload_shared, self.history_futures.len());
+        Self::truncate_shared_len(
+            &mut self.liquidation_recent_7d_payload_shared,
+            self.history_futures.len(),
+        );
         Self::truncate_shared_suffix(&mut self.history_spot_shared, start, |row| row.ts_bucket);
-        Self::truncate_shared_suffix(&mut self.funding_changes_recent_shared, start, |row| row.ts_change);
+        Self::truncate_shared_suffix(&mut self.funding_changes_recent_shared, start, |row| {
+            row.ts_change
+        });
         Self::truncate_shared_len(
             &mut self.funding_recent_7d_payload_shared,
             self.funding_changes.len(),

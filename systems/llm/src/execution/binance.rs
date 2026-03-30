@@ -179,6 +179,9 @@ struct AccountWsState {
     total_wallet_balance: Option<f64>,
     available_balance: Option<f64>,
     positions: HashMap<(String, String), ActivePositionSnapshot>,
+    position_snapshot_ready_symbols: HashSet<String>,
+    open_orders: HashMap<(String, i64), OpenOrderSnapshot>,
+    open_order_snapshot_ready_symbols: HashSet<String>,
     flattened_at: HashMap<(String, String), Instant>,
 }
 
@@ -186,6 +189,90 @@ fn account_ws_state() -> Arc<Mutex<AccountWsState>> {
     ACCOUNT_WS_STATE
         .get_or_init(|| Arc::new(Mutex::new(AccountWsState::default())))
         .clone()
+}
+
+pub fn ensure_account_trading_ws_started(
+    http_client: &Client,
+    api_config: &BinanceApiConfig,
+    exec_config: &LlmExecutionConfig,
+) {
+    ensure_account_ws_listener_started(http_client, api_config, exec_config);
+}
+
+fn normalized_account_ws_symbol(symbol: &str) -> String {
+    symbol.trim().to_ascii_uppercase()
+}
+
+fn open_order_status_is_live(status: &str) -> bool {
+    !matches!(
+        status,
+        "FILLED" | "CANCELED" | "EXPIRED" | "EXPIRED_IN_MATCH" | "REJECTED"
+    )
+}
+
+fn infer_account_ws_is_algo_order(order_type: &str) -> bool {
+    matches!(order_type, "STOP" | "STOP_MARKET" | "TRAILING_STOP_MARKET")
+}
+
+fn snapshot_symbol_trading_state_from_ws(symbol: &str) -> Option<TradingStateSnapshot> {
+    let symbol_key = normalized_account_ws_symbol(symbol);
+    let state = account_ws_state();
+    let guard = state.lock().ok()?;
+    let total_wallet_balance = guard.total_wallet_balance?;
+    let available_balance = guard.available_balance.unwrap_or(total_wallet_balance);
+    if !guard.position_snapshot_ready_symbols.contains(&symbol_key)
+        || !guard
+            .open_order_snapshot_ready_symbols
+            .contains(&symbol_key)
+    {
+        return None;
+    }
+
+    let mut active_positions = guard
+        .positions
+        .iter()
+        .filter(|((sym, _), position)| {
+            sym.eq_ignore_ascii_case(&symbol_key) && position.position_amt.abs() > f64::EPSILON
+        })
+        .map(|(_, position)| position.clone())
+        .collect::<Vec<_>>();
+    active_positions.sort_by(|left, right| left.position_side.cmp(&right.position_side));
+
+    let mut open_orders = guard
+        .open_orders
+        .iter()
+        .filter(|((sym, _), order)| {
+            sym.eq_ignore_ascii_case(&symbol_key) && open_order_status_is_live(&order.status)
+        })
+        .map(|(_, order)| order.clone())
+        .collect::<Vec<_>>();
+    open_orders.sort_by_key(|order| order.order_id);
+
+    let has_active_positions = !active_positions.is_empty();
+    let has_open_orders = !open_orders.is_empty();
+    Some(TradingStateSnapshot {
+        symbol: symbol_key,
+        has_active_context: has_active_positions || has_open_orders,
+        has_active_positions,
+        has_open_orders,
+        active_positions,
+        open_orders,
+        total_wallet_balance,
+        available_balance,
+    })
+}
+
+pub async fn fetch_symbol_trading_state_for_fast_path(
+    http_client: &Client,
+    api_config: &BinanceApiConfig,
+    exec_config: &LlmExecutionConfig,
+    symbol: &str,
+) -> Result<TradingStateSnapshot> {
+    ensure_account_ws_listener_started(http_client, api_config, exec_config);
+    if let Some(snapshot) = snapshot_symbol_trading_state_from_ws(symbol) {
+        return Ok(snapshot);
+    }
+    fetch_symbol_trading_state(http_client, api_config, exec_config, symbol).await
 }
 
 fn ws_state_has_recent_flatten_event(
@@ -708,6 +795,7 @@ async fn run_account_ws_listener_loop(
                     }
                 }
                 "ORDER_TRADE_UPDATE" => {
+                    apply_order_trade_update_event(&payload, &state);
                     info!(
                         connection_attempt = connection_attempt,
                         message_index = message_index,
@@ -964,6 +1052,7 @@ fn apply_account_update_event(payload: &Value, state: &Arc<Mutex<AccountWsState>
             if symbol.is_empty() {
                 continue;
             }
+            let symbol = normalized_account_ws_symbol(&symbol);
             let position_side = p
                 .get("ps")
                 .and_then(Value::as_str)
@@ -971,6 +1060,7 @@ fn apply_account_update_event(payload: &Value, state: &Arc<Mutex<AccountWsState>
                 .to_string();
             let position_amt = parse_optional_f64(p, &["pa"]).unwrap_or(0.0);
             let key = (symbol.clone(), position_side.clone());
+            guard.position_snapshot_ready_symbols.insert(symbol.clone());
             let had_live_position = guard
                 .positions
                 .get(&key)
@@ -1010,6 +1100,59 @@ fn apply_account_update_event(payload: &Value, state: &Arc<Mutex<AccountWsState>
     flattened_symbols.into_iter().collect()
 }
 
+fn apply_order_trade_update_event(payload: &Value, state: &Arc<Mutex<AccountWsState>>) {
+    let event_type = payload.get("e").and_then(Value::as_str).unwrap_or_default();
+    if event_type != "ORDER_TRADE_UPDATE" {
+        return;
+    }
+    let Some(order_obj) = payload.get("o") else {
+        return;
+    };
+    let Some(symbol) = parse_optional_str(order_obj, &["s"]) else {
+        return;
+    };
+    let Some(order_id) = parse_optional_id(order_obj, &["i"]) else {
+        return;
+    };
+    let symbol = normalized_account_ws_symbol(&symbol);
+    let status = parse_optional_str(order_obj, &["X"]).unwrap_or_else(|| "NEW".to_string());
+
+    let Ok(mut guard) = state.lock() else {
+        return;
+    };
+    guard
+        .open_order_snapshot_ready_symbols
+        .insert(symbol.clone());
+
+    let key = (symbol, order_id);
+    if !open_order_status_is_live(&status) {
+        guard.open_orders.remove(&key);
+        return;
+    }
+
+    let order_type = parse_optional_str(order_obj, &["o", "ot"]).unwrap_or_else(|| "-".to_string());
+    let existing_is_algo = guard.open_orders.get(&key).map(|order| order.is_algo_order);
+    guard.open_orders.insert(
+        key,
+        OpenOrderSnapshot {
+            order_id,
+            side: parse_optional_str(order_obj, &["S"]).unwrap_or_else(|| "-".to_string()),
+            position_side: parse_optional_str(order_obj, &["ps"])
+                .unwrap_or_else(|| "BOTH".to_string()),
+            order_type: order_type.clone(),
+            status,
+            orig_qty: parse_optional_f64(order_obj, &["q"]).unwrap_or(0.0),
+            executed_qty: parse_optional_f64(order_obj, &["z"]).unwrap_or(0.0),
+            price: parse_optional_f64(order_obj, &["p"]).unwrap_or(0.0),
+            stop_price: parse_optional_f64(order_obj, &["sp"]).unwrap_or(0.0),
+            close_position: parse_optional_bool(order_obj, &["cp"]).unwrap_or(false),
+            reduce_only: parse_optional_bool(order_obj, &["R"]).unwrap_or(false),
+            is_algo_order: existing_is_algo
+                .unwrap_or_else(|| infer_account_ws_is_algo_order(&order_type)),
+        },
+    );
+}
+
 pub async fn fetch_symbol_trading_state(
     http_client: &Client,
     api_config: &BinanceApiConfig,
@@ -1023,6 +1166,7 @@ pub async fn fetch_symbol_trading_state(
     let mut open_algo_orders =
         fetch_open_algo_orders(http_client, api_config, exec_config, symbol).await?;
     open_orders.append(&mut open_algo_orders);
+    sync_account_ws_open_orders_from_rest(symbol, &open_orders);
     if should_reconcile_ws_positions_with_rest(
         active_position_source,
         &active_positions,
@@ -1395,6 +1539,22 @@ pub async fn execute_workflow_management_action(
                 &cancel_candidates,
             )
             .await?;
+            if let Some(execution_price) = action.execution_price {
+                for position in matching_positions {
+                    let close_order_id = place_workflow_exit_for_position(
+                        http_client,
+                        api_config,
+                        exec_config,
+                        symbol,
+                        position,
+                        ExitKind::StopLoss,
+                        execution_price,
+                    )
+                    .await?;
+                    report.close_order_ids.push(close_order_id);
+                }
+                return Ok(report);
+            }
             let symbol_filters = fetch_symbol_filters(http_client, api_config, symbol).await?;
             for position in matching_positions {
                 let close_qty =
@@ -1444,10 +1604,28 @@ pub async fn execute_workflow_management_action(
             let reduce_ratio = action
                 .reduce_ratio
                 .ok_or_else(|| anyhow!("workflow REDUCE_POSITION requires reduce_ratio"))?;
-            let symbol_filters = fetch_symbol_filters(http_client, api_config, symbol).await?;
             if exec_config.dry_run {
                 return Ok(report);
             }
+            if let Some(execution_price) = action.execution_price {
+                for position in &matching_positions {
+                    if let Some(reduce_order_id) = place_workflow_reduce_exit_for_position(
+                        http_client,
+                        api_config,
+                        exec_config,
+                        symbol,
+                        position,
+                        execution_price,
+                        reduce_ratio,
+                    )
+                    .await?
+                    {
+                        report.reduce_order_ids.push(reduce_order_id);
+                    }
+                }
+                return Ok(report);
+            }
+            let symbol_filters = fetch_symbol_filters(http_client, api_config, symbol).await?;
             for position in &matching_positions {
                 let reduce_qty = round_down_to_step(
                     position.position_amt.abs() * reduce_ratio,
@@ -1846,6 +2024,53 @@ async fn place_workflow_exit_for_position(
     .await
 }
 
+async fn place_workflow_reduce_exit_for_position(
+    http_client: &Client,
+    api_config: &BinanceApiConfig,
+    exec_config: &LlmExecutionConfig,
+    symbol: &str,
+    position: &ActivePositionSnapshot,
+    trigger_price: f64,
+    reduce_ratio: f64,
+) -> Result<Option<i64>> {
+    let symbol_filters = fetch_symbol_filters(http_client, api_config, symbol).await?;
+    let position_side = effective_active_position_side(position, exec_config.hedge_mode);
+    let reduce_qty = round_down_to_step(
+        position.position_amt.abs() * reduce_ratio,
+        symbol_filters.step_size,
+    );
+    if reduce_qty < symbol_filters.min_qty {
+        return Ok(None);
+    }
+    let quantity = format_decimal(reduce_qty, symbol_filters.qty_precision);
+    let decision = ExecutionSide::from_position_amt(position.position_amt);
+    let quantized_price = quantize_exit_price(
+        trigger_price,
+        symbol_filters.tick_size,
+        symbol_filters.price_precision,
+        decision,
+        false,
+    );
+    let trigger_price = format_decimal(
+        quantized_price.max(symbol_filters.tick_size),
+        symbol_filters.price_precision,
+    );
+    let exit_side = decision.exit_order_side();
+    place_close_order(
+        http_client,
+        api_config,
+        exec_config,
+        symbol,
+        exit_side,
+        position_side,
+        "STOP_MARKET",
+        &quantity,
+        &trigger_price,
+    )
+    .await
+    .map(Some)
+}
+
 pub(crate) async fn cleanup_orphan_exit_orders_for_symbol(
     http_client: &Client,
     api_config: &BinanceApiConfig,
@@ -1947,15 +2172,13 @@ async fn fetch_account_balance(
 ) -> Result<FuturesAccountBalance> {
     ensure_account_ws_listener_started(http_client, api_config, exec_config);
     if let Ok(guard) = account_ws_state().lock() {
-        if guard.has_account_update {
-            if let (Some(total_wallet_balance), Some(available_balance)) =
-                (guard.total_wallet_balance, guard.available_balance)
-            {
-                return Ok(FuturesAccountBalance {
-                    total_wallet_balance,
-                    available_balance,
-                });
-            }
+        if let (Some(total_wallet_balance), Some(available_balance)) =
+            (guard.total_wallet_balance, guard.available_balance)
+        {
+            return Ok(FuturesAccountBalance {
+                total_wallet_balance,
+                available_balance,
+            });
         }
     }
 
@@ -1992,11 +2215,12 @@ async fn fetch_active_positions_with_source(
     symbol: &str,
 ) -> Result<(Vec<ActivePositionSnapshot>, ActivePositionSource)> {
     ensure_account_ws_listener_started(http_client, api_config, exec_config);
+    let symbol_key = normalized_account_ws_symbol(symbol);
     if let Ok(guard) = account_ws_state().lock() {
-        if guard.has_account_update {
+        if guard.position_snapshot_ready_symbols.contains(&symbol_key) {
             let mut out = Vec::new();
             for ((sym, _side), pos) in &guard.positions {
-                if sym.eq_ignore_ascii_case(symbol) && pos.position_amt.abs() > f64::EPSILON {
+                if sym.eq_ignore_ascii_case(&symbol_key) && pos.position_amt.abs() > f64::EPSILON {
                     out.push(pos.clone());
                 }
             }
@@ -2052,11 +2276,12 @@ fn sync_account_ws_positions_from_rest(symbol: &str, positions: &[ActivePosition
     let Ok(mut guard) = state.lock() else {
         return;
     };
+    let symbol_key = normalized_account_ws_symbol(symbol);
 
     let stale_keys = guard
         .positions
         .keys()
-        .filter(|(sym, _)| sym.eq_ignore_ascii_case(symbol))
+        .filter(|(sym, _)| sym.eq_ignore_ascii_case(&symbol_key))
         .cloned()
         .collect::<Vec<_>>();
     for key in stale_keys {
@@ -2064,10 +2289,36 @@ fn sync_account_ws_positions_from_rest(symbol: &str, positions: &[ActivePosition
     }
 
     for position in positions {
-        let key = (symbol.to_string(), position.position_side.clone());
+        let key = (symbol_key.clone(), position.position_side.clone());
         guard.flattened_at.remove(&key);
         guard.positions.insert(key, position.clone());
     }
+    guard.position_snapshot_ready_symbols.insert(symbol_key);
+}
+
+fn sync_account_ws_open_orders_from_rest(symbol: &str, orders: &[OpenOrderSnapshot]) {
+    let state = account_ws_state();
+    let Ok(mut guard) = state.lock() else {
+        return;
+    };
+    let symbol_key = normalized_account_ws_symbol(symbol);
+
+    let stale_keys = guard
+        .open_orders
+        .keys()
+        .filter(|(sym, _)| sym.eq_ignore_ascii_case(&symbol_key))
+        .cloned()
+        .collect::<Vec<_>>();
+    for key in stale_keys {
+        guard.open_orders.remove(&key);
+    }
+
+    for order in orders {
+        guard
+            .open_orders
+            .insert((symbol_key.clone(), order.order_id), order.clone());
+    }
+    guard.open_order_snapshot_ready_symbols.insert(symbol_key);
 }
 
 fn should_reconcile_ws_positions_with_rest(
@@ -3688,7 +3939,7 @@ mod tests {
     use super::*;
     use crate::workflow::schema::{EntrySnapshotRef, ExecutionIntent, PriceZone};
     use serde_json::json;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::sync::{Arc, Mutex};
 
     fn sample_workflow_execution_intent(
@@ -4036,6 +4287,9 @@ mod tests {
                     leverage: 10,
                 },
             )]),
+            position_snapshot_ready_symbols: HashSet::from(["TESTUSDT".to_string()]),
+            open_orders: HashMap::new(),
+            open_order_snapshot_ready_symbols: HashSet::new(),
             flattened_at: HashMap::new(),
         }));
         let payload = json!({
@@ -4096,6 +4350,9 @@ mod tests {
                     leverage: 10,
                 },
             )]),
+            position_snapshot_ready_symbols: HashSet::from(["TESTUSDT".to_string()]),
+            open_orders: HashMap::new(),
+            open_order_snapshot_ready_symbols: HashSet::new(),
             flattened_at: HashMap::new(),
         }));
         let flatten_payload = json!({
@@ -4127,6 +4384,116 @@ mod tests {
                 .map(|position| position.position_amt),
             Some(0.30)
         );
+    }
+
+    #[test]
+    fn order_trade_update_event_tracks_live_open_orders() {
+        let state = Arc::new(Mutex::new(AccountWsState {
+            total_wallet_balance: Some(100.0),
+            available_balance: Some(90.0),
+            ..AccountWsState::default()
+        }));
+        let open_payload = json!({
+            "e": "ORDER_TRADE_UPDATE",
+            "o": {
+                "s": "TESTUSDT",
+                "i": 12345,
+                "S": "BUY",
+                "ps": "LONG",
+                "o": "LIMIT",
+                "X": "NEW",
+                "q": "0.12",
+                "z": "0.00",
+                "p": "2201.5",
+                "sp": "0",
+                "cp": false,
+                "R": false
+            }
+        });
+        apply_order_trade_update_event(&open_payload, &state);
+
+        let guard = state.lock().expect("lock state");
+        assert!(guard.open_order_snapshot_ready_symbols.contains("TESTUSDT"));
+        let order = guard
+            .open_orders
+            .get(&("TESTUSDT".to_string(), 12345))
+            .expect("tracked open order");
+        assert_eq!(order.side, "BUY");
+        assert_eq!(order.position_side, "LONG");
+        assert_eq!(order.status, "NEW");
+        assert!(!order.is_algo_order);
+        drop(guard);
+
+        let closed_payload = json!({
+            "e": "ORDER_TRADE_UPDATE",
+            "o": {
+                "s": "TESTUSDT",
+                "i": 12345,
+                "X": "FILLED"
+            }
+        });
+        apply_order_trade_update_event(&closed_payload, &state);
+
+        let guard = state.lock().expect("lock state");
+        assert!(guard
+            .open_orders
+            .get(&("TESTUSDT".to_string(), 12345))
+            .is_none());
+    }
+
+    #[test]
+    fn snapshot_symbol_trading_state_from_ws_returns_seeded_symbol_snapshot() {
+        let state = account_ws_state();
+        let mut guard = state.lock().expect("lock global ws state");
+        *guard = AccountWsState {
+            has_account_update: true,
+            total_wallet_balance: Some(120.0),
+            available_balance: Some(95.0),
+            positions: HashMap::from([(
+                ("TESTUSDT".to_string(), "LONG".to_string()),
+                ActivePositionSnapshot {
+                    position_side: "LONG".to_string(),
+                    position_amt: 0.25,
+                    entry_price: 2200.0,
+                    mark_price: 2204.0,
+                    unrealized_pnl: 1.0,
+                    leverage: 10,
+                },
+            )]),
+            position_snapshot_ready_symbols: HashSet::from(["TESTUSDT".to_string()]),
+            open_orders: HashMap::from([(
+                ("TESTUSDT".to_string(), 9001),
+                OpenOrderSnapshot {
+                    order_id: 9001,
+                    side: "BUY".to_string(),
+                    position_side: "LONG".to_string(),
+                    order_type: "LIMIT".to_string(),
+                    status: "NEW".to_string(),
+                    orig_qty: 0.1,
+                    executed_qty: 0.0,
+                    price: 2198.0,
+                    stop_price: 0.0,
+                    close_position: false,
+                    reduce_only: false,
+                    is_algo_order: false,
+                },
+            )]),
+            open_order_snapshot_ready_symbols: HashSet::from(["TESTUSDT".to_string()]),
+            flattened_at: HashMap::new(),
+        };
+        drop(guard);
+
+        let snapshot =
+            snapshot_symbol_trading_state_from_ws("testusdt").expect("seeded ws trading state");
+        assert_eq!(snapshot.symbol, "TESTUSDT");
+        assert!(snapshot.has_active_positions);
+        assert!(snapshot.has_open_orders);
+        assert_eq!(snapshot.active_positions.len(), 1);
+        assert_eq!(snapshot.open_orders.len(), 1);
+        assert_eq!(snapshot.available_balance, 95.0);
+
+        let mut guard = state.lock().expect("lock global ws state");
+        *guard = AccountWsState::default();
     }
 
     #[test]
@@ -4632,6 +4999,7 @@ mod tests {
             action_type: "UPDATE_TAKE_PROFIT".to_string(),
             context_key: "TESTUSDT:LONG:path_a".to_string(),
             path_id: "path_a".to_string(),
+            execution_price: None,
             reduce_ratio: None,
             new_stop_loss: None,
             take_profit_1: Some(107.0),

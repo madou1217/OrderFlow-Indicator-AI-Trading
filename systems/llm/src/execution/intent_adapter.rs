@@ -23,6 +23,7 @@ pub struct AdaptedManagementAction {
     pub action_type: String,
     pub context_key: String,
     pub path_id: String,
+    pub execution_price: Option<f64>,
     pub reduce_ratio: Option<f64>,
     pub new_stop_loss: Option<f64>,
     pub take_profit_1: Option<f64>,
@@ -91,6 +92,11 @@ pub fn adapt_management_action(
             "management action path_id must match persisted entry snapshot"
         ));
     }
+    if let Some(execution_price) = action.execution_price {
+        if !execution_price.is_finite() {
+            return Err(anyhow!("management action execution_price must be finite"));
+        }
+    }
     match action.action_type.as_str() {
         "HOLD" => {
             if action.reduce_ratio.is_some()
@@ -138,6 +144,7 @@ pub fn adapt_management_action(
         action_type: action.action_type.clone(),
         context_key: action.context_key.clone(),
         path_id: action.path_id.clone(),
+        execution_price: action.execution_price,
         reduce_ratio: action.reduce_ratio,
         new_stop_loss: action.new_stop_loss,
         take_profit_1: action.take_profit_1,
@@ -247,6 +254,7 @@ mod tests {
             action_type: "MOVE_STOP".to_string(),
             context_key: snapshot.context_key.clone(),
             path_id: snapshot.path_id.clone(),
+            execution_price: None,
             reduce_ratio: None,
             new_stop_loss: Some(100.0),
             take_profit_1: None,
@@ -303,6 +311,7 @@ mod tests {
             action_type: "FLATTEN_POSITION".to_string(),
             context_key: snapshot.context_key.clone(),
             path_id: "path_b".to_string(),
+            execution_price: None,
             reduce_ratio: None,
             new_stop_loss: None,
             take_profit_1: None,
@@ -357,6 +366,7 @@ mod tests {
             action_type: "UPDATE_TAKE_PROFIT".to_string(),
             context_key: snapshot.context_key.clone(),
             path_id: snapshot.path_id.clone(),
+            execution_price: None,
             reduce_ratio: None,
             new_stop_loss: None,
             take_profit_1: Some(105.0),

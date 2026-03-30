@@ -991,7 +991,9 @@ fn to_f64(value: &Value) -> Result<f64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_engine_event, decode_contract_body, EngineEventEnvelope, MarketKind, MdData};
+    use super::{
+        build_engine_event, decode_contract_body, EngineEventEnvelope, MarketKind, MdData,
+    };
     use chrono::{TimeZone, Utc};
     use serde_json::json;
     use uuid::Uuid;

@@ -148,10 +148,10 @@ fn time_weighted_avg(
 #[cfg(test)]
 mod tests {
     use super::{compute_funding_window_metrics, funding_change_json};
-use crate::indicators::context::{
-    DivergenceSigTestMode, IndicatorContext, IndicatorRuntimeOptions, KlineHistorySupplement,
-};
-use crate::indicators::shared::incremental::IncrementalIndicatorOutputs;
+    use crate::indicators::context::{
+        DivergenceSigTestMode, IndicatorContext, IndicatorRuntimeOptions, KlineHistorySupplement,
+    };
+    use crate::indicators::shared::incremental::IncrementalIndicatorOutputs;
     use crate::ingest::decoder::MarketKind;
     use crate::runtime::state_store::{
         FundingChange, LatestFundingState, LatestMarkState, MinuteWindowData, WindowBundle,

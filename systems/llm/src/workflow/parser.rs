@@ -1,7 +1,7 @@
 use crate::workflow::schema::{
     CurrentPath, EntryPlan, PendingOrderManagementAction, PendingOrderManagementPlan,
-    PositionManagementAction, PositionManagementPlan, PriceZone, Stage1Output, Stage2AOutput,
-    Stage2BOutput, Stage2COutput,
+    PositionManagementAction, PositionManagementPlan, PriceTriggerCondition, PriceZone,
+    Stage1Output, Stage2AOutput, Stage2BOutput, Stage2COutput,
 };
 use anyhow::{anyhow, Result};
 use serde_json::Value;
@@ -52,7 +52,7 @@ const ALLOWED_PENDING_ORDER_EXPOSURE_STATES: &[&str] = &[
     "flat_with_live_entry_orders",
     "in_position_with_live_entry_orders",
 ];
-const ALLOWED_WATCHER_TRIGGER_TYPES: &[&str] = &["price_above_on_close", "price_below_on_close"];
+const ALLOWED_PRICE_TRIGGER_TYPES: &[&str] = &["price_above", "price_below"];
 
 pub fn parse_json_from_text(text: &str) -> Result<Value> {
     let trimmed = text.trim();
@@ -588,17 +588,14 @@ pub fn parse_stage2a_output(value: Value, stage1_output: &Stage1Output) -> Resul
     Ok(output)
 }
 
-fn validate_watcher_trigger_condition(
-    field: &str,
-    trigger: &crate::workflow::schema::WatcherTriggerCondition,
-) -> Result<()> {
-    if !ALLOWED_WATCHER_TRIGGER_TYPES.contains(&trigger.trigger_type.as_str()) {
+fn validate_price_trigger_condition(field: &str, trigger: &PriceTriggerCondition) -> Result<()> {
+    if !ALLOWED_PRICE_TRIGGER_TYPES.contains(&trigger.trigger_type.as_str()) {
         return Err(anyhow!(
-            "{field}.trigger_type must be one of [price_above_on_close, price_below_on_close]"
+            "{field}.trigger_type must be one of [price_above, price_below]"
         ));
     }
-    if !trigger.trigger_level.is_finite() {
-        return Err(anyhow!("{field}.trigger_level must be finite"));
+    if !trigger.trigger_price.is_finite() {
+        return Err(anyhow!("{field}.trigger_price must be finite"));
     }
     Ok(())
 }
@@ -626,26 +623,18 @@ fn validate_position_management_action(
     }
 
     match action.action_type.as_str() {
-        "hold" => {
-            if action.watcher_trigger_condition.is_some()
-                || action.add_ratio.is_some()
-                || action.reuse_current_entry_template.is_some()
-                || action.reduce_ratio.is_some()
-                || action.new_stop_loss.is_some()
-                || action.reuse_current_bracket_template.is_some()
-                || action.take_profit_1.is_some()
-                || action.take_profit_2.is_some()
-            {
-                return Err(anyhow!("hold must not include action patch fields"));
-            }
-        }
         "add" => {
-            validate_watcher_trigger_condition(
-                "position_management_plan.actions[].watcher_trigger_condition",
+            validate_price_trigger_condition(
+                "position_management_plan.actions[].trigger_condition",
                 action
-                    .watcher_trigger_condition
+                    .trigger_condition
                     .as_ref()
-                    .ok_or_else(|| anyhow!("add requires watcher_trigger_condition"))?,
+                    .ok_or_else(|| anyhow!("add requires trigger_condition"))?,
+            )?;
+            ensure_action_field_absent(
+                "position_management_plan.actions[].execution_price",
+                action.execution_price.is_some(),
+                "add",
             )?;
             ensure_action_field_absent(
                 "position_management_plan.actions[].reduce_ratio",
@@ -683,12 +672,12 @@ fn validate_position_management_action(
             }
         }
         "reduce" => {
-            validate_watcher_trigger_condition(
-                "position_management_plan.actions[].watcher_trigger_condition",
+            validate_price_trigger_condition(
+                "position_management_plan.actions[].trigger_condition",
                 action
-                    .watcher_trigger_condition
+                    .trigger_condition
                     .as_ref()
-                    .ok_or_else(|| anyhow!("reduce requires watcher_trigger_condition"))?,
+                    .ok_or_else(|| anyhow!("reduce requires trigger_condition"))?,
             )?;
             ensure_action_field_absent(
                 "position_management_plan.actions[].add_ratio",
@@ -726,14 +715,20 @@ fn validate_position_management_action(
             if !(0.0 < reduce_ratio && reduce_ratio <= 1.0) {
                 return Err(anyhow!("reduce_ratio must be between 0 and 1"));
             }
+            let execution_price = action
+                .execution_price
+                .ok_or_else(|| anyhow!("reduce requires execution_price"))?;
+            if !execution_price.is_finite() {
+                return Err(anyhow!("execution_price must be finite"));
+            }
         }
         "exit_full" => {
-            validate_watcher_trigger_condition(
-                "position_management_plan.actions[].watcher_trigger_condition",
+            validate_price_trigger_condition(
+                "position_management_plan.actions[].trigger_condition",
                 action
-                    .watcher_trigger_condition
+                    .trigger_condition
                     .as_ref()
-                    .ok_or_else(|| anyhow!("exit_full requires watcher_trigger_condition"))?,
+                    .ok_or_else(|| anyhow!("exit_full requires trigger_condition"))?,
             )?;
             ensure_action_field_absent(
                 "position_management_plan.actions[].add_ratio",
@@ -770,14 +765,25 @@ fn validate_position_management_action(
                 action.take_profit_2.is_some(),
                 "exit_full",
             )?;
+            let execution_price = action
+                .execution_price
+                .ok_or_else(|| anyhow!("exit_full requires execution_price"))?;
+            if !execution_price.is_finite() {
+                return Err(anyhow!("execution_price must be finite"));
+            }
         }
         "move_stop" => {
-            validate_watcher_trigger_condition(
-                "position_management_plan.actions[].watcher_trigger_condition",
+            validate_price_trigger_condition(
+                "position_management_plan.actions[].trigger_condition",
                 action
-                    .watcher_trigger_condition
+                    .trigger_condition
                     .as_ref()
-                    .ok_or_else(|| anyhow!("move_stop requires watcher_trigger_condition"))?,
+                    .ok_or_else(|| anyhow!("move_stop requires trigger_condition"))?,
+            )?;
+            ensure_action_field_absent(
+                "position_management_plan.actions[].execution_price",
+                action.execution_price.is_some(),
+                "move_stop",
             )?;
             ensure_action_field_absent(
                 "position_management_plan.actions[].add_ratio",
@@ -814,11 +820,17 @@ fn validate_position_management_action(
             }
         }
         "update_take_profit" => {
-            validate_watcher_trigger_condition(
-                "position_management_plan.actions[].watcher_trigger_condition",
-                action.watcher_trigger_condition.as_ref().ok_or_else(|| {
-                    anyhow!("update_take_profit requires watcher_trigger_condition")
-                })?,
+            validate_price_trigger_condition(
+                "position_management_plan.actions[].trigger_condition",
+                action
+                    .trigger_condition
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("update_take_profit requires trigger_condition"))?,
+            )?;
+            ensure_action_field_absent(
+                "position_management_plan.actions[].execution_price",
+                action.execution_price.is_some(),
+                "update_take_profit",
             )?;
             ensure_action_field_absent(
                 "position_management_plan.actions[].add_ratio",
@@ -885,11 +897,6 @@ fn validate_position_management_plan(
             "position_management_plan.path_live_assessment must be one of [live, degraded, invalidated]"
         ));
     }
-    if plan.actions.is_empty() {
-        return Err(anyhow!(
-            "position_management_plan.actions must be non-empty"
-        ));
-    }
     for action in &plan.actions {
         validate_position_management_action(action, &plan.path_id)?;
         if action.context_key != expected_context_key {
@@ -944,23 +951,18 @@ fn validate_pending_order_management_action(
     }
 
     match action.action_type.as_str() {
-        "keep_order" => {
-            if action.watcher_trigger_condition.is_some()
-                || action.replacement_entry_zone.is_some()
-                || action.replacement_entry_invalidation_level.is_some()
-                || action.replacement_stop_loss.is_some()
-                || action.reuse_current_entry_template.is_some()
-                || action.post_fill_bracket_template.is_some()
-            {
-                return Err(anyhow!("keep_order must not include action patch fields"));
-            }
-        }
         "cancel_pending_order" => {
-            validate_watcher_trigger_condition(
-                "pending_order_management_plan.actions[].watcher_trigger_condition",
-                action.watcher_trigger_condition.as_ref().ok_or_else(|| {
-                    anyhow!("cancel_pending_order requires watcher_trigger_condition")
-                })?,
+            validate_price_trigger_condition(
+                "pending_order_management_plan.actions[].trigger_condition",
+                action
+                    .trigger_condition
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("cancel_pending_order requires trigger_condition"))?,
+            )?;
+            ensure_action_field_absent(
+                "pending_order_management_plan.actions[].execution_price",
+                action.execution_price.is_some(),
+                "cancel_pending_order",
             )?;
             ensure_action_field_absent(
                 "pending_order_management_plan.actions[].replacement_entry_zone",
@@ -989,12 +991,17 @@ fn validate_pending_order_management_action(
             )?;
         }
         "replace_entry" => {
-            validate_watcher_trigger_condition(
-                "pending_order_management_plan.actions[].watcher_trigger_condition",
+            validate_price_trigger_condition(
+                "pending_order_management_plan.actions[].trigger_condition",
                 action
-                    .watcher_trigger_condition
+                    .trigger_condition
                     .as_ref()
-                    .ok_or_else(|| anyhow!("replace_entry requires watcher_trigger_condition"))?,
+                    .ok_or_else(|| anyhow!("replace_entry requires trigger_condition"))?,
+            )?;
+            ensure_action_field_absent(
+                "pending_order_management_plan.actions[].execution_price",
+                action.execution_price.is_some(),
+                "replace_entry",
             )?;
             ensure_action_field_absent(
                 "pending_order_management_plan.actions[].post_fill_bracket_template",
@@ -1031,11 +1038,16 @@ fn validate_pending_order_management_action(
             }
         }
         "update_post_fill_bracket_template" => {
-            validate_watcher_trigger_condition(
-                "pending_order_management_plan.actions[].watcher_trigger_condition",
-                action.watcher_trigger_condition.as_ref().ok_or_else(|| {
-                    anyhow!("update_post_fill_bracket_template requires watcher_trigger_condition")
+            validate_price_trigger_condition(
+                "pending_order_management_plan.actions[].trigger_condition",
+                action.trigger_condition.as_ref().ok_or_else(|| {
+                    anyhow!("update_post_fill_bracket_template requires trigger_condition")
                 })?,
+            )?;
+            ensure_action_field_absent(
+                "pending_order_management_plan.actions[].execution_price",
+                action.execution_price.is_some(),
+                "update_post_fill_bracket_template",
             )?;
             ensure_action_field_absent(
                 "pending_order_management_plan.actions[].replacement_entry_zone",
@@ -1101,11 +1113,6 @@ fn validate_pending_order_management_plan(
     if !ALLOWED_PATH_LIVE_ASSESSMENTS.contains(&plan.path_live_assessment.as_str()) {
         return Err(anyhow!(
             "pending_order_management_plan.path_live_assessment must be one of [live, degraded, invalidated]"
-        ));
-    }
-    if plan.actions.is_empty() {
-        return Err(anyhow!(
-            "pending_order_management_plan.actions must be non-empty"
         ));
     }
     for action in &plan.actions {
@@ -1466,21 +1473,8 @@ mod tests {
                 "exposure_state": "in_position",
                 "path_live_assessment": "live",
                 "path_assessment_reason": null,
-                "actions": [{
-                    "action_type": "hold",
-                    "context_key": "ctx_1",
-                    "path_id": "path_1",
-                    "watcher_trigger_condition": null,
-                    "add_ratio": null,
-                    "reuse_current_entry_template": null,
-                    "reduce_ratio": null,
-                    "new_stop_loss": null,
-                    "reuse_current_bracket_template": null,
-                    "take_profit_1": null,
-                    "take_profit_2": null,
-                    "reason": "hold"
-                }],
-                "management_note": "hold"
+                "actions": [],
+                "management_note": "no incremental changes"
             }
         });
         let parsed = parse_stage2b_output(value, &stage1_output, "ctx_1").expect("parse");
@@ -1501,11 +1495,11 @@ mod tests {
                     "action_type": "add",
                     "context_key": "ctx_1",
                     "path_id": "path_1",
-                    "watcher_trigger_condition": {
-                        "trigger_type": "price_above_on_close",
-                        "trigger_level": 2005.0,
-                        "note": "confirm"
+                    "trigger_condition": {
+                        "trigger_type": "price_above",
+                        "trigger_price": 2005.0
                     },
+                    "execution_price": null,
                     "add_ratio": 0.25,
                     "reuse_current_entry_template": true,
                     "reduce_ratio": null,
@@ -1525,6 +1519,42 @@ mod tests {
     }
 
     #[test]
+    fn stage2b_parser_requires_execution_price_for_reduce() {
+        let stage1_output = sample_stage1_output();
+        let value = json!({
+            "stage2b_decision": "MANAGE_POSITION",
+            "position_management_plan": {
+                "path_id": "path_1",
+                "exposure_state": "in_position",
+                "path_live_assessment": "degraded",
+                "path_assessment_reason": "risk is worsening",
+                "actions": [{
+                    "action_type": "reduce",
+                    "context_key": "ctx_1",
+                    "path_id": "path_1",
+                    "trigger_condition": {
+                        "trigger_type": "price_below",
+                        "trigger_price": 1995.0
+                    },
+                    "execution_price": null,
+                    "add_ratio": null,
+                    "reuse_current_entry_template": null,
+                    "reduce_ratio": 0.5,
+                    "new_stop_loss": null,
+                    "reuse_current_bracket_template": null,
+                    "take_profit_1": null,
+                    "take_profit_2": null,
+                    "reason": "cut risk"
+                }],
+                "management_note": "de-risk if support breaks"
+            }
+        });
+
+        let err = parse_stage2b_output(value, &stage1_output, "ctx_1").expect_err("should fail");
+        assert!(err.to_string().contains("reduce requires execution_price"));
+    }
+
+    #[test]
     fn stage2c_parser_rejects_extraneous_fields_for_replace_entry() {
         let stage1_output = sample_stage1_output();
         let value = json!({
@@ -1538,11 +1568,11 @@ mod tests {
                     "action_type": "replace_entry",
                     "context_key": "ctx_1",
                     "path_id": "path_1",
-                    "watcher_trigger_condition": {
-                        "trigger_type": "price_above_on_close",
-                        "trigger_level": 2005.0,
-                        "note": "confirm"
+                    "trigger_condition": {
+                        "trigger_type": "price_above",
+                        "trigger_price": 2005.0
                     },
+                    "execution_price": null,
                     "replacement_entry_zone": {
                         "low": 2004.0,
                         "high": 2006.0,
@@ -1593,18 +1623,7 @@ mod tests {
                 "exposure_state": "in_position_with_live_entry_orders",
                 "path_live_assessment": "degraded",
                 "path_assessment_reason": "pending order still valid while the live position is already on",
-                "actions": [{
-                    "action_type": "keep_order",
-                    "context_key": "ctx_1",
-                    "path_id": "path_1",
-                    "watcher_trigger_condition": null,
-                    "replacement_entry_zone": null,
-                    "replacement_entry_invalidation_level": null,
-                    "replacement_stop_loss": null,
-                    "reuse_current_entry_template": null,
-                    "post_fill_bracket_template": null,
-                    "reason": "keep secondary entry order active"
-                }],
+                "actions": [],
                 "management_note": "coexisting pending order plan"
             }
         });
@@ -1633,20 +1652,24 @@ mod tests {
                 "path_live_assessment": "live",
                 "path_assessment_reason": null,
                 "actions": [{
-                    "action_type": "hold",
+                    "action_type": "move_stop",
                     "context_key": "ctx_2",
                     "path_id": "path_1",
-                    "watcher_trigger_condition": null,
+                    "trigger_condition": {
+                        "trigger_type": "price_above",
+                        "trigger_price": 2001.0
+                    },
+                    "execution_price": null,
                     "add_ratio": null,
                     "reuse_current_entry_template": null,
                     "reduce_ratio": null,
-                    "new_stop_loss": null,
-                    "reuse_current_bracket_template": null,
+                    "new_stop_loss": 1997.5,
+                    "reuse_current_bracket_template": true,
                     "take_profit_1": null,
                     "take_profit_2": null,
-                    "reason": "hold"
+                    "reason": "tighten"
                 }],
-                "management_note": "hold"
+                "management_note": "tighten"
             }
         });
 
@@ -1667,18 +1690,22 @@ mod tests {
                 "path_live_assessment": "live",
                 "path_assessment_reason": null,
                 "actions": [{
-                    "action_type": "keep_order",
+                    "action_type": "cancel_pending_order",
                     "context_key": "ctx_2",
                     "path_id": "path_1",
-                    "watcher_trigger_condition": null,
+                    "trigger_condition": {
+                        "trigger_type": "price_below",
+                        "trigger_price": 1994.0
+                    },
+                    "execution_price": null,
                     "replacement_entry_zone": null,
                     "replacement_entry_invalidation_level": null,
                     "replacement_stop_loss": null,
                     "reuse_current_entry_template": null,
                     "post_fill_bracket_template": null,
-                    "reason": "keep"
+                    "reason": "cancel"
                 }],
-                "management_note": "keep"
+                "management_note": "cancel"
             }
         });
 

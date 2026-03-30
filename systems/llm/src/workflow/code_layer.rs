@@ -231,18 +231,40 @@ fn parse_ts(value: &Value, key: &str) -> Option<DateTime<Utc>> {
         .map(|ts| ts.with_timezone(&Utc))
 }
 
-fn extract_recent_15m_bars(indicators: &Value) -> Vec<RecentBar> {
-    let bars = indicators
+fn extract_kline_history_market_bars(
+    indicators: &Value,
+    interval_code: &str,
+    market: &str,
+) -> Vec<Value> {
+    let Some(market_node) = indicators
         .get("kline_history")
         .and_then(|value| value.get("payload"))
         .and_then(|value| value.get("intervals"))
-        .and_then(|value| value.get("15m"))
+        .and_then(|value| value.get(interval_code))
         .and_then(|value| value.get("markets"))
-        .and_then(|value| value.get("futures"))
-        .and_then(|value| value.get("bars"))
+        .and_then(|value| value.get(market))
+    else {
+        return Vec::new();
+    };
+
+    let bars = market_node
+        .get("bars")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
+    if !bars.is_empty() {
+        return bars;
+    }
+
+    market_node
+        .get("latest_bar")
+        .cloned()
+        .map(|bar| vec![bar])
+        .unwrap_or_default()
+}
+
+fn extract_recent_15m_bars(indicators: &Value) -> Vec<RecentBar> {
+    let bars = extract_kline_history_market_bars(indicators, "15m", "futures");
 
     bars.into_iter()
         .rev()
@@ -456,6 +478,51 @@ mod tests {
             summary.trigger_layer["initiation"]["confirmed_price"],
             json!(2010.5)
         );
+    }
+
+    #[test]
+    fn code_layer_uses_compact_15m_latest_bar_when_bars_are_missing() {
+        let now = Utc::now();
+        let input = ModelInvocationInput {
+            symbol: "ETHUSDT".to_string(),
+            ts_bucket: now,
+            window_code: "15m".to_string(),
+            indicator_count: 1,
+            source_routing_key: "test".to_string(),
+            source_published_at: None,
+            received_at: now,
+            indicators: json!({
+                "kline_history": {
+                    "payload": {
+                        "intervals": {
+                            "15m": {
+                                "markets": {
+                                    "futures": {
+                                        "returned_count": 120,
+                                        "latest_bar": {
+                                            "open_time": "2026-03-27T11:45:00Z",
+                                            "close_time": "2026-03-27T12:00:00Z",
+                                            "open": 1998.0,
+                                            "high": 2002.0,
+                                            "low": 1997.5,
+                                            "close": 2000.5,
+                                            "is_closed": true
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }),
+            missing_indicator_codes: vec![],
+            trading_state: None,
+            management_snapshot: None,
+        };
+
+        let summary = build_indicator_summary(&input, &[]).expect("build indicator summary");
+        assert_eq!(summary.auction_context.recent_15m_bars.len(), 1);
+        assert_eq!(summary.auction_context.recent_15m_bars[0].close, 2000.5);
     }
 
     #[test]

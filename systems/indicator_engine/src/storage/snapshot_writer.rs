@@ -777,17 +777,18 @@ fn should_blob_ref_field(indicator_code: &str, key: &str, value: &Value) -> bool
         return false;
     }
 
-    matches!(
-        (indicator_code, key),
-        (
-            "footprint",
-            "by_window"
-                | "buy_imbalance_prices"
-                | "sell_imbalance_prices"
-                | "buy_stacks"
-                | "sell_stacks"
+    matches!((indicator_code, key), ("kline_history", "bars"))
+        || matches!(
+            (indicator_code, key),
+            (
+                "footprint",
+                "by_window"
+                    | "buy_imbalance_prices"
+                    | "sell_imbalance_prices"
+                    | "buy_stacks"
+                    | "sell_stacks"
+            )
         )
-    )
 }
 
 fn refize_recent_7d_array(
@@ -1020,11 +1021,14 @@ async fn set_indicator_progress_exact(
 }
 
 fn compact_snapshot_payload(indicator_code: &str, payload: &Value) -> Value {
+    if indicator_code == "kline_history" {
+        return payload.clone();
+    }
+
     let targeted = match indicator_code {
         "price_volume_structure" => compact_pvs_payload(payload),
         "footprint" => compact_footprint_payload(payload),
         "orderbook_depth" => compact_orderbook_depth_payload(payload),
-        "kline_history" => compact_kline_history_payload(payload),
         _ => payload.clone(),
     };
     compact_payload_value(None, &targeted)
@@ -1102,64 +1106,6 @@ fn compact_orderbook_depth_payload(payload: &Value) -> Value {
     let mut out = obj.clone();
     if let Some(levels) = out.remove("levels").and_then(|v| v.as_array().cloned()) {
         out.insert("levels_count".to_string(), json!(levels.len()));
-    }
-    Value::Object(out)
-}
-
-fn compact_kline_history_payload(payload: &Value) -> Value {
-    let Some(obj) = payload.as_object() else {
-        return payload.clone();
-    };
-    let mut out = Map::new();
-    for (key, value) in obj {
-        if key != "intervals" {
-            out.insert(key.clone(), value.clone());
-            continue;
-        }
-        let Some(intervals_obj) = value.as_object() else {
-            out.insert(key.clone(), value.clone());
-            continue;
-        };
-        let mut compact_intervals = Map::new();
-        for (interval_code, interval_value) in intervals_obj {
-            let Some(interval_obj) = interval_value.as_object() else {
-                compact_intervals.insert(interval_code.clone(), interval_value.clone());
-                continue;
-            };
-            let mut compact_interval = Map::new();
-            for (interval_key, interval_field) in interval_obj {
-                if interval_key != "markets" {
-                    compact_interval.insert(interval_key.clone(), interval_field.clone());
-                    continue;
-                }
-                let Some(markets_obj) = interval_field.as_object() else {
-                    compact_interval.insert(interval_key.clone(), interval_field.clone());
-                    continue;
-                };
-                let mut compact_markets = Map::new();
-                for (market_code, market_value) in markets_obj {
-                    let Some(market_obj) = market_value.as_object() else {
-                        compact_markets.insert(market_code.clone(), market_value.clone());
-                        continue;
-                    };
-                    let mut compact_market = market_obj.clone();
-                    if let Some(bars) = compact_market
-                        .remove("bars")
-                        .and_then(|v| v.as_array().cloned())
-                    {
-                        compact_market.insert("bars_count".to_string(), json!(bars.len()));
-                        compact_market.insert(
-                            "latest_bar".to_string(),
-                            bars.last().cloned().unwrap_or(Value::Null),
-                        );
-                    }
-                    compact_markets.insert(market_code.clone(), Value::Object(compact_market));
-                }
-                compact_interval.insert("markets".to_string(), Value::Object(compact_markets));
-            }
-            compact_intervals.insert(interval_code.clone(), Value::Object(compact_interval));
-        }
-        out.insert("intervals".to_string(), Value::Object(compact_intervals));
     }
     Value::Object(out)
 }
@@ -1351,7 +1297,7 @@ mod tests {
     }
 
     #[test]
-    fn compacts_kline_history_bars() {
+    fn preserves_kline_history_bars_in_snapshot_payload() {
         let payload = json!({
             "intervals": {
                 "1m": {
@@ -1366,17 +1312,7 @@ mod tests {
             }
         });
         let compacted = compact_snapshot_payload("kline_history", &payload);
-        assert_eq!(
-            compacted["intervals"]["1m"]["markets"]["futures"]["bars_count"],
-            json!(2)
-        );
-        assert_eq!(
-            compacted["intervals"]["1m"]["markets"]["futures"]["latest_bar"]["close"],
-            json!(2.0)
-        );
-        assert!(compacted["intervals"]["1m"]["markets"]["futures"]
-            .get("bars")
-            .is_none());
+        assert_eq!(compacted, payload);
     }
 
     #[test]
@@ -1577,6 +1513,55 @@ mod tests {
         ] {
             assert!(refized[key].get("__snapshot_blob_ref_v1").is_some());
         }
+
+        let blob_map = blobs
+            .values()
+            .map(|blob| (blob.blob_hash.clone(), blob.payload_json.clone()))
+            .collect::<HashMap<_, _>>();
+
+        let mut hydrated = refized.clone();
+        hydrate_snapshot_payload_value(&mut hydrated, &blob_map).unwrap();
+        assert_eq!(hydrated, payload);
+    }
+
+    #[test]
+    fn refizes_large_kline_history_bars_and_hydrates_them_back() {
+        let bars = (0..600)
+            .map(|idx| {
+                json!({
+                    "open_time": format!("2026-03-29T10:{:02}:00Z", idx % 60),
+                    "close_time": format!("2026-03-29T10:{:02}:59Z", idx % 60),
+                    "open": 2000.0 + idx as f64,
+                    "high": 2000.5 + idx as f64,
+                    "low": 1999.5 + idx as f64,
+                    "close": 2000.2 + idx as f64,
+                    "is_closed": true,
+                    "volume_base": 10.0 + idx as f64,
+                    "volume_quote": 20.0 + idx as f64
+                })
+            })
+            .collect::<Vec<_>>();
+        let payload = json!({
+            "indicator": "kline_history",
+            "window": "1m",
+            "intervals": {
+                "1m": {
+                    "markets": {
+                        "futures": {
+                            "returned_count": bars.len(),
+                            "bars": bars
+                        }
+                    }
+                }
+            }
+        });
+
+        let mut blobs = BTreeMap::new();
+        let refized = refize_snapshot_payload("kline_history", &payload, &mut blobs).unwrap();
+        assert!(refized["intervals"]["1m"]["markets"]["futures"]["bars"]
+            .get("__snapshot_blob_ref_v1")
+            .is_some());
+        assert!(!blobs.is_empty());
 
         let blob_map = blobs
             .values()

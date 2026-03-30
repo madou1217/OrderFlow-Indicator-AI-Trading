@@ -1188,7 +1188,7 @@ where
 }
 
 fn extract_futures_bars(interval_value: &Map<String, Value>) -> Vec<Value> {
-    interval_value
+    let bars = interval_value
         .get("markets")
         .and_then(Value::as_object)
         .and_then(|markets| markets.get("futures"))
@@ -1204,6 +1204,26 @@ fn extract_futures_bars(interval_value: &Map<String, Value>) -> Vec<Value> {
                 .and_then(Value::as_array)
                 .cloned()
         })
+        .unwrap_or_default();
+    if !bars.is_empty() {
+        return bars;
+    }
+
+    interval_value
+        .get("markets")
+        .and_then(Value::as_object)
+        .and_then(|markets| markets.get("futures"))
+        .and_then(Value::as_object)
+        .and_then(|market| market.get("latest_bar"))
+        .cloned()
+        .or_else(|| {
+            interval_value
+                .get("futures")
+                .and_then(Value::as_object)
+                .and_then(|market| market.get("latest_bar"))
+                .cloned()
+        })
+        .map(|bar| vec![bar])
         .unwrap_or_default()
 }
 
