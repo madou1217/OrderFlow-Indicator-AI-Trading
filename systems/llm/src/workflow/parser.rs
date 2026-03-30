@@ -71,14 +71,6 @@ fn same_zone(level: f64, other: f64) -> bool {
     (level - other).abs() <= f64::EPSILON
 }
 
-fn is_machine_identifier(value: &str) -> bool {
-    let trimmed = value.trim();
-    !trimmed.is_empty()
-        && trimmed
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
-}
-
 fn validate_quality(name: &str, value: Option<&str>) -> Result<()> {
     let Some(value) = value else {
         return Ok(());
@@ -377,12 +369,8 @@ pub fn parse_stage1_output(value: Value) -> Result<Stage1Output> {
                 ));
             }
             if let Some(failure_switch) = path.failure_switch.as_ref() {
-                if !ALLOWED_CURRENT_SCRIPTS.contains(&failure_switch.as_str())
-                    && !is_machine_identifier(failure_switch)
-                {
-                    return Err(anyhow!(
-                        "failure_switch must be a script name or machine-style identifier"
-                    ));
+                if failure_switch.trim().is_empty() {
+                    return Err(anyhow!("failure_switch must be non-empty when provided"));
                 }
             }
 
@@ -1288,6 +1276,26 @@ mod tests {
             Some("medium")
         );
         assert!(parsed.current_path.is_some());
+    }
+
+    #[test]
+    fn stage1_parser_accepts_natural_language_failure_switch() {
+        let mut sample = sample_stage1_output();
+        sample.current_path.as_mut().expect("path").failure_switch = Some(
+            "If 4H price is accepted back below 1996.81-2000.00, stop treating the move as the active repair long."
+                .to_string(),
+        );
+        let value = serde_json::to_value(sample).expect("encode");
+        let parsed = parse_stage1_output(value).expect("parse");
+        assert_eq!(
+            parsed
+                .current_path
+                .as_ref()
+                .and_then(|path| path.failure_switch.as_deref()),
+            Some(
+                "If 4H price is accepted back below 1996.81-2000.00, stop treating the move as the active repair long."
+            )
+        );
     }
 
     #[test]
