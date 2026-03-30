@@ -1,50 +1,58 @@
 [
   {
-    "zone_id": "z_breakout_acceptance",
+    "zone_id": "z_breakout_hold",
     "timeframe": "4h-1d",
     "role": "support",
-    "low": 2017.03,
-    "high": 2025.35,
-    "reason": "4H/1D TPO VAH, broken IB high, and the nearest major bid wall define the continuation hold shelf."
+    "low": 2020.06,
+    "high": 2026.2,
+    "reason": "4H/1D TPO VAH at 2020.06, the broken IB high at 2023.28, and dense buy-imbalance support through 2026.20 define the higher-value hold shelf."
   },
   {
-    "zone_id": "z_single_print_repair",
+    "zone_id": "z_repair_gate",
     "timeframe": "4h-1d",
     "role": "resistance",
-    "low": 2038.0,
+    "low": 2039.0,
     "high": 2043.26,
-    "reason": "Stacked asks and the current 4H/1D single-print repair high define the first upside objective."
+    "reason": "The 2039 ask wall fronts the 3D/4H single-print repair band up to the session high at 2043.26."
   },
   {
-    "zone_id": "z_liquidity_cap_2050",
+    "zone_id": "z_ask_cluster_2050",
     "timeframe": "4h-1d",
     "role": "resistance",
-    "low": 2046.89,
-    "high": 2056.37,
-    "reason": "Dense overhead ask walls cluster here after the 2043 repair band."
+    "low": 2045.0,
+    "high": 2050.0,
+    "reason": "Stacked overhead ask liquidity clusters at 2045, 2048, and 2050 once 2043 is accepted."
   },
   {
     "zone_id": "z_ema200_supply",
     "timeframe": "4h-1d",
     "role": "resistance",
-    "low": 2065.95,
-    "high": 2070.0,
-    "reason": "Ask walls and the 4H EMA200 converge here, making it the next major supply shelf if 2056.37 breaks."
+    "low": 2062.25,
+    "high": 2072.29,
+    "reason": "Major ask walls from 2062.25 through 2072.29 bracket the 4H EMA200 near 2069.27."
   },
   {
-    "zone_id": "z_composite_reaccept",
+    "zone_id": "z_composite_poc",
     "timeframe": "4h-1d",
     "role": "magnet",
     "low": 2004.07,
     "high": 2009.47,
-    "reason": "3D TPO POC, 1D/4H TPO POC, and daily composite center create the first higher-timeframe balance reacceptance zone."
+    "reason": "3D TPO POC and the current 4H/1D POC cluster here, forming the first balance-reacceptance magnet if the breakout shelf fails."
   },
   {
     "zone_id": "z_value_failure",
     "timeframe": "4h-1d",
     "role": "support",
-    "low": 1993.51,
+    "low": 1991.81,
     "high": 2000.0,
-    "reason": "7D AVWAP, 1D/4H TPO VAL, and 1D/3D volume POC form the hard invalidation cluster for the current long continuation path."
+    "reason": "1D/4H TPO VAL, the 7D AVWAP reclaim area, and the 1D/3D volume POC cluster here as deeper higher-timeframe failure support."
+  },
+  {
+    "zone_id": "z_bear_fvg_supply",
+    "timeframe": "4h-1d",
+    "role": "resistance",
+    "low": 2093.64,
+    "high": 2110.72,
+    "reason": "Fresh 4H bear FVG is the next major higher-timeframe supply if the EMA200 resistance shelf gives way."
   }
 ]

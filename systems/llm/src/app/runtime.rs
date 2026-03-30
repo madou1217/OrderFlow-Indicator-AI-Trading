@@ -168,6 +168,22 @@ struct LatestBundle {
     received_at: DateTime<Utc>,
 }
 
+fn update_pending_invoke_bundle(
+    pending_invoke_bundle: &mut Option<LatestBundle>,
+    incoming_bundle: LatestBundle,
+) -> bool {
+    let should_replace = pending_invoke_bundle
+        .as_ref()
+        .map(|pending| incoming_bundle.raw.ts_bucket >= pending.raw.ts_bucket)
+        .unwrap_or(true);
+    if should_replace {
+        *pending_invoke_bundle = Some(incoming_bundle);
+        true
+    } else {
+        false
+    }
+}
+
 fn decode_minute_bundle_body<'a>(
     raw: &'a [u8],
     content_encoding: Option<&str>,
@@ -364,11 +380,28 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                                     "llm received minute indicator bundle"
                                 );
 
-                                pending_invoke_bundle = Some(current_bundle);
-                                settle_timer.as_mut().reset(
-                                    Instant::now()
-                                        + Duration::from_millis(ctx.config.llm.bundle_settle_ms)
-                                );
+                                let incoming_ts_bucket = current_bundle.raw.ts_bucket;
+                                let pending_ts_bucket = pending_invoke_bundle
+                                    .as_ref()
+                                    .map(|pending| pending.raw.ts_bucket);
+                                if update_pending_invoke_bundle(
+                                    &mut pending_invoke_bundle,
+                                    current_bundle,
+                                ) {
+                                    settle_timer.as_mut().reset(
+                                        Instant::now()
+                                            + Duration::from_millis(
+                                                ctx.config.llm.bundle_settle_ms,
+                                            ),
+                                    );
+                                } else if let Some(pending_ts_bucket) = pending_ts_bucket {
+                                    warn!(
+                                        symbol = %bundle.symbol,
+                                        incoming_ts_bucket = %incoming_ts_bucket,
+                                        pending_ts_bucket = %pending_ts_bucket,
+                                        "llm ignored late out-of-order minute bundle because a newer pending bundle is already queued"
+                                    );
+                                }
                             }
                             Err(err) => {
                                 warn!(
@@ -6169,6 +6202,92 @@ mod tests {
         assert_eq!(
             workflow_stage1_refresh_reason(&config, &bundle, &state, None).as_deref(),
             Some("thesis_invalidated")
+        );
+    }
+
+    #[test]
+    fn update_pending_invoke_bundle_keeps_newer_ts_bucket_when_older_arrives() {
+        let newer_ts = parse_rfc3339_utc("2026-03-30T03:45:00Z").expect("parse newer ts");
+        let older_ts = parse_rfc3339_utc("2026-03-30T03:44:00Z").expect("parse older ts");
+        let symbol = "ETHUSDT";
+        let mut pending = Some(LatestBundle {
+            raw: MinuteBundleEnvelope {
+                msg_type: "bundle".to_string(),
+                routing_key: "test.route".to_string(),
+                symbol: symbol.to_string(),
+                ts_bucket: newer_ts,
+                window_code: "1m".to_string(),
+                indicator_count: 0,
+                published_at: None,
+                indicators: json!({}),
+            },
+            indicators: json!({}),
+            missing_indicator_codes: vec![],
+            received_at: newer_ts,
+        });
+        let older_bundle = LatestBundle {
+            raw: MinuteBundleEnvelope {
+                msg_type: "bundle".to_string(),
+                routing_key: "test.route".to_string(),
+                symbol: symbol.to_string(),
+                ts_bucket: older_ts,
+                window_code: "1m".to_string(),
+                indicator_count: 0,
+                published_at: None,
+                indicators: json!({}),
+            },
+            indicators: json!({}),
+            missing_indicator_codes: vec![],
+            received_at: older_ts,
+        };
+
+        assert!(!update_pending_invoke_bundle(&mut pending, older_bundle));
+        assert_eq!(
+            pending.as_ref().map(|bundle| bundle.raw.ts_bucket),
+            Some(newer_ts)
+        );
+    }
+
+    #[test]
+    fn update_pending_invoke_bundle_replaces_pending_when_newer_arrives() {
+        let older_ts = parse_rfc3339_utc("2026-03-30T03:44:00Z").expect("parse older ts");
+        let newer_ts = parse_rfc3339_utc("2026-03-30T03:45:00Z").expect("parse newer ts");
+        let symbol = "ETHUSDT";
+        let mut pending = Some(LatestBundle {
+            raw: MinuteBundleEnvelope {
+                msg_type: "bundle".to_string(),
+                routing_key: "test.route".to_string(),
+                symbol: symbol.to_string(),
+                ts_bucket: older_ts,
+                window_code: "1m".to_string(),
+                indicator_count: 0,
+                published_at: None,
+                indicators: json!({}),
+            },
+            indicators: json!({}),
+            missing_indicator_codes: vec![],
+            received_at: older_ts,
+        });
+        let newer_bundle = LatestBundle {
+            raw: MinuteBundleEnvelope {
+                msg_type: "bundle".to_string(),
+                routing_key: "test.route".to_string(),
+                symbol: symbol.to_string(),
+                ts_bucket: newer_ts,
+                window_code: "1m".to_string(),
+                indicator_count: 0,
+                published_at: None,
+                indicators: json!({}),
+            },
+            indicators: json!({}),
+            missing_indicator_codes: vec![],
+            received_at: newer_ts,
+        };
+
+        assert!(update_pending_invoke_bundle(&mut pending, newer_bundle));
+        assert_eq!(
+            pending.as_ref().map(|bundle| bundle.raw.ts_bucket),
+            Some(newer_ts)
         );
     }
 
