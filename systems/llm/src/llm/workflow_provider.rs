@@ -351,15 +351,7 @@ fn workflow_stage1_schema() -> Value {
                 }
             },
             "monitoring_status": {"type": "string", "enum": ["active", "no_edge"]},
-            "no_trade_reason": {
-                "type": ["string", "null"],
-                "enum": [
-                    "conflict_no_edge",
-                    "script_not_unique",
-                    "path_not_actionable",
-                    null
-                ]
-            },
+            "no_trade_reason": {"type": ["string", "null"]},
             "refresh_hints": {"type": "array", "items": {"type": "string"}},
             "map_summary": map_summary_schema(),
             "opportunity_assessment": opportunity_assessment_schema(),
@@ -1030,6 +1022,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(current_path_required.contains(&"strategic_activation_level"));
         assert!(!current_path_required.contains(&"activation_level"));
+        assert_eq!(schema["properties"]["no_trade_reason"], json!({"type": ["string", "null"]}));
     }
 
     #[test]

@@ -8,11 +8,6 @@ use serde_json::Value;
 use std::collections::HashSet;
 
 const ALLOWED_CURRENT_SCRIPTS: &[&str] = &["continuation", "crowded_reversal", "value_return"];
-const ALLOWED_NO_EDGE_REASONS: &[&str] = &[
-    "conflict_no_edge",
-    "script_not_unique",
-    "path_not_actionable",
-];
 const ALLOWED_PRICE_LOCATION_CLASSES: &[&str] = &[
     "inside_value_middle",
     "value_edge",
@@ -83,13 +78,16 @@ fn validate_quality(name: &str, value: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-fn infer_anchor_id(path: &CurrentPath, role: &str, zone: &PriceZone) -> Option<String> {
+fn infer_anchor_id(path: &CurrentPath, zone: &PriceZone) -> Option<String> {
     path.tracked_zones
         .iter()
         .find(|tracked| {
-            tracked.role == role
-                && same_zone(tracked.low, zone.low)
+            same_zone(tracked.low, zone.low)
                 && same_zone(tracked.high, zone.high)
+                && match (&tracked.timeframe, &zone.timeframe) {
+                    (_, None) => true,
+                    (tracked_tf, Some(zone_tf)) => tracked_tf == zone_tf,
+                }
         })
         .map(|tracked| tracked.zone_id.clone())
 }
@@ -97,7 +95,7 @@ fn infer_anchor_id(path: &CurrentPath, role: &str, zone: &PriceZone) -> Option<S
 fn validate_anchor_id(
     path: &CurrentPath,
     anchor_id: &Option<String>,
-    expected_role: &str,
+    expected_zone: &PriceZone,
     field: &str,
 ) -> Result<()> {
     let Some(anchor_id) = anchor_id.as_deref() else {
@@ -111,10 +109,17 @@ fn validate_anchor_id(
         .iter()
         .find(|tracked| tracked.zone_id == anchor_id)
         .ok_or_else(|| anyhow!("{field} must match one of current_path.tracked_zones[].zone_id"))?;
-    if zone.role != expected_role {
+    if !same_zone(zone.low, expected_zone.low) || !same_zone(zone.high, expected_zone.high) {
         return Err(anyhow!(
-            "{field} must point to a tracked zone with role={expected_role}"
+            "{field} must align with the low/high of its corresponding current_path zone"
         ));
+    }
+    if let Some(expected_timeframe) = expected_zone.timeframe.as_deref() {
+        if zone.timeframe != expected_timeframe {
+            return Err(anyhow!(
+                "{field} must align with the timeframe of its corresponding current_path zone"
+            ));
+        }
     }
     Ok(())
 }
@@ -276,15 +281,6 @@ fn validate_driver_reevaluation_trigger(
             ));
         }
     }
-    if trigger
-        .invalidate_when_drivers
-        .iter()
-        .any(|item| item == expected_flow_driver)
-    {
-        return Err(anyhow!(
-            "reevaluation_trigger.driver_change.invalidate_when_drivers must exclude expected_flow_driver"
-        ));
-    }
     if let Some(driver_signal) = trigger.driver_signal.as_deref() {
         if !ALLOWED_DRIVER_SIGNALS.contains(&driver_signal) {
             return Err(anyhow!(
@@ -400,42 +396,39 @@ pub fn parse_stage1_output(value: Value) -> Result<Stage1Output> {
             )?;
 
             if path.activation_anchor_id.is_none() {
-                path.activation_anchor_id =
-                    infer_anchor_id(path, "activation", &path.strategic_activation_level);
+                path.activation_anchor_id = infer_anchor_id(path, &path.strategic_activation_level);
             }
             if path.first_path_target_anchor_id.is_none() {
-                path.first_path_target_anchor_id =
-                    infer_anchor_id(path, "target", &path.first_path_target);
+                path.first_path_target_anchor_id = infer_anchor_id(path, &path.first_path_target);
             }
             if path.next_path_target_anchor_id.is_none() {
-                path.next_path_target_anchor_id =
-                    infer_anchor_id(path, "target", &path.next_path_target);
+                path.next_path_target_anchor_id = infer_anchor_id(path, &path.next_path_target);
             }
             if path.failure_anchor_id.is_none() {
-                path.failure_anchor_id = infer_anchor_id(path, "failure", &path.failure_level);
+                path.failure_anchor_id = infer_anchor_id(path, &path.failure_level);
             }
             validate_anchor_id(
                 path,
                 &path.activation_anchor_id,
-                "activation",
+                &path.strategic_activation_level,
                 "current_path.activation_anchor_id",
             )?;
             validate_anchor_id(
                 path,
                 &path.first_path_target_anchor_id,
-                "target",
+                &path.first_path_target,
                 "current_path.first_path_target_anchor_id",
             )?;
             validate_anchor_id(
                 path,
                 &path.next_path_target_anchor_id,
-                "target",
+                &path.next_path_target,
                 "current_path.next_path_target_anchor_id",
             )?;
             validate_anchor_id(
                 path,
                 &path.failure_anchor_id,
-                "failure",
+                &path.failure_level,
                 "current_path.failure_anchor_id",
             )?;
 
@@ -456,10 +449,8 @@ pub fn parse_stage1_output(value: Value) -> Result<Stage1Output> {
         }
         "no_edge" => {
             if let Some(reason) = output.no_trade_reason.as_ref() {
-                if !ALLOWED_NO_EDGE_REASONS.contains(&reason.as_str()) {
-                    return Err(anyhow!(
-                        "no_trade_reason must be one of [conflict_no_edge, script_not_unique, path_not_actionable]"
-                    ));
+                if reason.trim().is_empty() {
+                    return Err(anyhow!("no_trade_reason must be non-empty when provided"));
                 }
             }
             output.current_script = None;
@@ -1296,6 +1287,122 @@ mod tests {
                 "If 4H price is accepted back below 1996.81-2000.00, stop treating the move as the active repair long."
             )
         );
+    }
+
+    #[test]
+    fn stage1_parser_accepts_support_resistance_tracked_zone_roles_for_anchor_ids() {
+        let mut sample = sample_stage1_output();
+        let path = sample.current_path.as_mut().expect("path");
+        path.activation_anchor_id = Some("z_support".to_string());
+        path.first_path_target_anchor_id = Some("z_res_1".to_string());
+        path.next_path_target_anchor_id = Some("z_res_2".to_string());
+        path.failure_anchor_id = Some("z_support_fail".to_string());
+        path.tracked_zones = vec![
+            crate::workflow::schema::TrackedZone {
+                zone_id: "z_support".to_string(),
+                timeframe: "4h".to_string(),
+                role: "support".to_string(),
+                low: path.strategic_activation_level.low,
+                high: path.strategic_activation_level.high,
+                reason: Some("reaccept support".to_string()),
+            },
+            crate::workflow::schema::TrackedZone {
+                zone_id: "z_res_1".to_string(),
+                timeframe: "4h".to_string(),
+                role: "resistance".to_string(),
+                low: path.first_path_target.low,
+                high: path.first_path_target.high,
+                reason: Some("first target".to_string()),
+            },
+            crate::workflow::schema::TrackedZone {
+                zone_id: "z_res_2".to_string(),
+                timeframe: "4h".to_string(),
+                role: "resistance".to_string(),
+                low: path.next_path_target.low,
+                high: path.next_path_target.high,
+                reason: Some("second target".to_string()),
+            },
+            crate::workflow::schema::TrackedZone {
+                zone_id: "z_support_fail".to_string(),
+                timeframe: "4h".to_string(),
+                role: "support".to_string(),
+                low: path.failure_level.low,
+                high: path.failure_level.high,
+                reason: Some("failure support".to_string()),
+            },
+        ];
+        let value = serde_json::to_value(sample).expect("encode");
+        let parsed = parse_stage1_output(value).expect("parse");
+        let parsed_path = parsed.current_path.as_ref().expect("path");
+        assert_eq!(parsed_path.activation_anchor_id.as_deref(), Some("z_support"));
+        assert_eq!(
+            parsed_path.first_path_target_anchor_id.as_deref(),
+            Some("z_res_1")
+        );
+        assert_eq!(
+            parsed_path.next_path_target_anchor_id.as_deref(),
+            Some("z_res_2")
+        );
+        assert_eq!(
+            parsed_path.failure_anchor_id.as_deref(),
+            Some("z_support_fail")
+        );
+    }
+
+    #[test]
+    fn stage1_parser_accepts_driver_change_that_references_current_driver() {
+        let mut sample = sample_stage1_output();
+        sample.driver_attribution.as_mut().expect("driver").flow_driver =
+            "futures_led".to_string();
+        let driver_change = &mut sample
+            .current_path
+            .as_mut()
+            .expect("path")
+            .reevaluation_trigger
+            .driver_change;
+        driver_change.kind = Some("spot_confirmation_lost".to_string());
+        driver_change.expected_flow_driver = Some("futures_led".to_string());
+        driver_change.invalidate_when_drivers = vec!["futures_led".to_string()];
+        driver_change.require_spot_confirmation = Some(true);
+        driver_change.driver_signal = Some("spot_confirmation_lost".to_string());
+        driver_change.min_confirmed_windows = Some(2);
+        driver_change.summary = "If spot confirmation disappears, remap.".to_string();
+        driver_change.evidence = vec!["Current flow remains futures-led.".to_string()];
+        let value = serde_json::to_value(sample).expect("encode");
+        let parsed = parse_stage1_output(value).expect("parse");
+        assert_eq!(
+            parsed
+                .current_path
+                .as_ref()
+                .and_then(|path| path.reevaluation_trigger.driver_change.expected_flow_driver.as_deref()),
+            Some("futures_led")
+        );
+    }
+
+    #[test]
+    fn stage1_parser_accepts_freeform_no_trade_reason() {
+        let mut sample = sample_stage1_output();
+        sample.monitoring_status = "no_edge".to_string();
+        sample.no_trade_reason = Some(
+            "ETH is pinned around the 4H/1D control cluster and the auction is balanced."
+                .to_string(),
+        );
+        sample.current_script = Some("value_return".to_string());
+        sample.current_path = Some(sample_stage1_output().current_path.expect("path"));
+        sample.driver_attribution = Some(DriverAttribution {
+            flow_driver: "mixed".to_string(),
+            spot_confirming: true,
+            driver_note: "balanced".to_string(),
+        });
+        let value = serde_json::to_value(sample).expect("encode");
+        let parsed = parse_stage1_output(value).expect("parse");
+        assert_eq!(
+            parsed.no_trade_reason.as_deref(),
+            Some("ETH is pinned around the 4H/1D control cluster and the auction is balanced.")
+        );
+        assert!(parsed.current_script.is_none());
+        assert!(parsed.current_path.is_none());
+        assert!(parsed.driver_attribution.is_none());
     }
 
     #[test]
