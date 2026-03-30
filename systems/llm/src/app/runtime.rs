@@ -2966,6 +2966,15 @@ async fn invoke_workflow_bundle_models(
                             bundle.raw.ts_bucket,
                             payload.clone(),
                         );
+                        if print_response {
+                            println!(
+                                "WORKFLOW_STAGE2A_RESPONSE ts_bucket={} trigger={} symbol={} payload={}",
+                                bundle.raw.ts_bucket,
+                                &*trigger,
+                                symbol,
+                                render_pretty_json_value(&payload)
+                            );
+                        }
                         if stage2a_output.is_some() {
                             continue;
                         }
@@ -3130,6 +3139,15 @@ async fn invoke_workflow_bundle_models(
                                 bundle.raw.ts_bucket,
                                 payload.clone(),
                             );
+                            if print_response {
+                                println!(
+                                    "WORKFLOW_STAGE2B_RESPONSE ts_bucket={} trigger={} symbol={} payload={}",
+                                    bundle.raw.ts_bucket,
+                                    &*trigger,
+                                    symbol,
+                                    render_pretty_json_value(&payload)
+                                );
+                            }
                             if stage2b_output_for_context.is_some() {
                                 continue;
                             }
@@ -3254,6 +3272,15 @@ async fn invoke_workflow_bundle_models(
                                 bundle.raw.ts_bucket,
                                 payload.clone(),
                             );
+                            if print_response {
+                                println!(
+                                    "WORKFLOW_STAGE2C_RESPONSE ts_bucket={} trigger={} symbol={} payload={}",
+                                    bundle.raw.ts_bucket,
+                                    &*trigger,
+                                    symbol,
+                                    render_pretty_json_value(&payload)
+                                );
+                            }
                             if stage2c_output_for_context.is_some() {
                                 continue;
                             }
