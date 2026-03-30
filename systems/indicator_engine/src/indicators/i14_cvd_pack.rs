@@ -5,7 +5,8 @@ use chrono::{DateTime, Duration, TimeZone, Utc};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
-const WINDOWS: [(&str, i64); 5] = [
+const WINDOWS: [(&str, i64); 6] = [
+    ("5m", 5),
     ("15m", 15),
     ("1h", 60),
     ("4h", 240),
@@ -492,7 +493,7 @@ fn round2(value: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_partial_window, classify_partial_regime};
+    use super::{build_partial_window, classify_partial_regime, WINDOWS};
     use crate::ingest::decoder::MarketKind;
     use crate::runtime::state_store::MinuteHistory;
     use chrono::{TimeZone, Utc};
@@ -567,6 +568,11 @@ mod tests {
             classify_partial_regime(Some(1.0), Some(5.0), 8),
             "decelerating"
         );
+    }
+
+    #[test]
+    fn cvd_pack_windows_include_5m_confirmation_window() {
+        assert!(WINDOWS.iter().any(|(label, mins)| *label == "5m" && *mins == 5));
     }
 
     #[test]

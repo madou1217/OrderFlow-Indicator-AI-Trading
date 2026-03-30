@@ -417,29 +417,12 @@ pub struct CandidateEvent {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(deny_unknown_fields)]
-pub struct PathAuditFlags {
-    pub extreme_location: bool,
-    pub reverse_confirmation: bool,
-    pub driver_change: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-#[serde(deny_unknown_fields)]
 pub struct PathRuntimeState {
     pub path_id: String,
     pub monitoring_status: String,
     pub latest_price: f64,
     #[serde(default)]
-    pub hard_invalidation: bool,
-    #[serde(default)]
     pub failure_level_breached: bool,
-    #[serde(default)]
-    pub path_alive: bool,
-    #[serde(default)]
-    pub strategic_activation_level_touched: bool,
-    #[serde(default)]
-    pub opposing_pressure_detected: bool,
-    pub audit_flags: PathAuditFlags,
     #[serde(default)]
     pub active_entry_context_keys: Vec<String>,
     #[serde(default)]

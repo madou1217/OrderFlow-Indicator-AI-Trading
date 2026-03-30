@@ -1968,12 +1968,13 @@ fn select_entry_plan<'a>(
     tactical_plan: &'a crate::workflow::schema::TacticalEntryPlan,
     workflow_state: &crate::workflow::state::WorkflowState,
     path_runtime_state: &crate::workflow::schema::PathRuntimeState,
+    hard_invalidation_hit: bool,
     trading_state: &TradingStateSnapshot,
     entry_snapshots: &HashMap<String, crate::workflow::schema::EntrySnapshot>,
     indicators: &Value,
     watcher_cfg: &crate::app::config::WorkflowWatcherConfig,
 ) -> Option<SelectedEntryPlan<'a>> {
-    if path_runtime_state.monitoring_status != "active" || path_runtime_state.hard_invalidation {
+    if path_runtime_state.monitoring_status != "active" || hard_invalidation_hit {
         return None;
     }
     let side = tactical_plan.entry_plan.side.as_str();
@@ -2685,7 +2686,7 @@ async fn invoke_workflow_bundle_models(
         stage1_refresh_reason.clone(),
     )
     .await?;
-    let stage1_refreshed_this_bundle = stage1_attempt.refreshed;
+    let mut stage1_refreshed_this_bundle = stage1_attempt.refreshed;
 
     if stage1_output.is_none() {
         if stage1_attempt.inflight_suppressed
@@ -2714,7 +2715,7 @@ async fn invoke_workflow_bundle_models(
         return Ok(());
     }
 
-    let stage1_output =
+    let mut stage1_output =
         stage1_output.ok_or_else(|| anyhow!("workflow stage1 output missing after refresh"))?;
 
     let trading_state = fetch_symbol_trading_state(
@@ -2792,15 +2793,7 @@ async fn invoke_workflow_bundle_models(
         &stage1_output,
         &entry_snapshots,
     )?;
-    append_workflow_journal_event(
-        "workflow_path_runtime_state",
-        &symbol,
-        bundle.raw.ts_bucket,
-        json!({
-            "trigger": &*trigger,
-            "path_runtime_state": path_runtime_state,
-        }),
-    );
+    let hard_invalidation_hit = path_runtime_state.failure_level_breached;
 
     let mut management_signal_report: Option<ManagementExecutionReport> = None;
     let mut management_signal_action: Option<crate::workflow::schema::ManagementAction> = None;
@@ -2814,23 +2807,89 @@ async fn invoke_workflow_bundle_models(
     let mut selected_stage2a_model_name: Option<String> = None;
     let mut selected_stage2b_model_names: HashMap<String, String> = HashMap::new();
     let mut selected_stage2c_model_names: HashMap<String, String> = HashMap::new();
-    if path_runtime_state.hard_invalidation && workflow_state.approved_tactical_plan.is_some() {
+    if hard_invalidation_hit {
+        let had_approved_workflow_plans = workflow_state.approved_tactical_plan.is_some()
+            || !workflow_state.approved_position_management_plans.is_empty()
+            || !workflow_state.approved_pending_order_management_plans.is_empty();
         clear_approved_tactical_plan(&mut workflow_state);
         clear_position_management_plans(&mut workflow_state);
         clear_pending_order_management_plans(&mut workflow_state);
+        workflow_state.pending_stage1_refresh_reason = Some("hard_invalidation".to_string());
         crate::workflow::persistence::save_workflow_state(&state_dir, &workflow_state)?;
+        if had_approved_workflow_plans {
+            append_workflow_journal_event(
+                "workflow_tactical_plan_cleared",
+                &symbol,
+                bundle.raw.ts_bucket,
+                json!({
+                    "trigger": &*trigger,
+                    "path_id": path_runtime_state.path_id,
+                    "reason": "hard_invalidation",
+                }),
+            );
+        }
         append_workflow_journal_event(
-            "workflow_tactical_plan_cleared",
+            "workflow_hard_invalidation_detected",
             &symbol,
             bundle.raw.ts_bucket,
             json!({
                 "trigger": &*trigger,
                 "path_id": path_runtime_state.path_id,
-                "reason": "hard_invalidation",
-                "audit_flags": path_runtime_state.audit_flags,
+                "latest_price": path_runtime_state.latest_price,
+                "failure_level_breached": true,
+                "action": "request_stage1_rebuild",
             }),
         );
+
+        let mut stage1_output_slot = Some(stage1_output);
+        let hard_invalidation_attempt = maybe_refresh_stage1(
+            &config,
+            &http_client,
+            &loopback_http_client,
+            print_response,
+            &bundle,
+            trigger.as_ref(),
+            &symbol,
+            &state_dir,
+            retention_minutes,
+            &input,
+            &mut workflow_state,
+            &mut stage1_output_slot,
+            &mut tracked_zones,
+            Some("hard_invalidation".to_string()),
+        )
+        .await?;
+        stage1_refreshed_this_bundle |= hard_invalidation_attempt.refreshed;
+        stage1_output = stage1_output_slot
+            .ok_or_else(|| anyhow!("workflow stage1 output missing after hard invalidation"))?;
+        if !hard_invalidation_attempt.refreshed {
+            append_workflow_journal_event(
+                "workflow_stage1_waiting",
+                &symbol,
+                bundle.raw.ts_bucket,
+                json!({
+                    "trigger": &*trigger,
+                    "reason": "hard_invalidation_stage1_refresh_pending",
+                }),
+            );
+            return Ok(());
+        }
+        path_runtime_state = crate::workflow::stage2::build_path_runtime_state(
+            &indicator_summary,
+            &stage1_output,
+            &entry_snapshots,
+        )?;
     }
+
+    append_workflow_journal_event(
+        "workflow_path_runtime_state",
+        &symbol,
+        bundle.raw.ts_bucket,
+        json!({
+            "trigger": &*trigger,
+            "path_runtime_state": path_runtime_state,
+        }),
+    );
 
     let stage1_refresh_blocking = (stage1_refresh_reason.is_some()
         && !stage1_refreshed_this_bundle)
@@ -4192,6 +4251,7 @@ async fn invoke_workflow_bundle_models(
                 tactical_plan,
                 &workflow_state,
                 &path_runtime_state,
+                path_runtime_state.failure_level_breached,
                 &trading_state,
                 &entry_snapshots,
                 &input.indicators,
@@ -4323,10 +4383,6 @@ async fn invoke_workflow_bundle_models(
                         "trigger": &*trigger,
                         "execution_enabled": config.llm.execution.enabled,
                         "execution_blocked_due_to_stale": execution_blocked_due_to_stale,
-                        "path_alive": path_runtime_state.path_alive,
-                        "strategic_activation_level_touched": path_runtime_state
-                            .strategic_activation_level_touched,
-                        "opposing_pressure_detected": path_runtime_state.opposing_pressure_detected,
                         "filled_stopout_attempts": workflow_state.filled_stopout_attempts,
                         "path_id": tactical_plan.path_id,
                     }),
@@ -5794,7 +5850,7 @@ mod tests {
     use crate::app::config::load_config;
     use crate::execution::binance::TradingStateSnapshot;
     use crate::workflow::schema::{
-        AttemptPolicy, MapSummary, PathAuditFlags, PathRuntimeState, PriceZone, Stage1Meta,
+        AttemptPolicy, MapSummary, PathRuntimeState, PriceZone, Stage1Meta,
         Stage1Output, TacticalEntryPlan, TacticalEntrySnapshot,
     };
     use crate::workflow::state::WorkflowState;
@@ -6820,16 +6876,7 @@ mod tests {
             path_id: "path_a".to_string(),
             monitoring_status: "active".to_string(),
             latest_price: 115.0,
-            hard_invalidation: false,
             failure_level_breached: false,
-            path_alive: false,
-            strategic_activation_level_touched: false,
-            opposing_pressure_detected: true,
-            audit_flags: PathAuditFlags {
-                extreme_location: true,
-                reverse_confirmation: true,
-                driver_change: true,
-            },
             active_entry_context_keys: Vec::new(),
             notes: Vec::new(),
         };
@@ -6842,9 +6889,11 @@ mod tests {
         let watcher_cfg = workflow_test_config().llm.workflow.watcher;
 
         let selected = select_entry_plan(
+            "ETHUSDT",
             &tactical_plan,
             &workflow_state,
             &soft_only_runtime_state,
+            false,
             &sample_flat_trading_state(),
             &std::collections::HashMap::new(),
             &indicators,
@@ -6861,14 +6910,12 @@ mod tests {
             Some(102.4)
         );
 
-        let hard_invalidated_state = PathRuntimeState {
-            hard_invalidation: true,
-            ..soft_only_runtime_state
-        };
         assert!(select_entry_plan(
+            "ETHUSDT",
             &tactical_plan,
             &workflow_state,
-            &hard_invalidated_state,
+            &soft_only_runtime_state,
+            true,
             &sample_flat_trading_state(),
             &std::collections::HashMap::new(),
             &indicators,

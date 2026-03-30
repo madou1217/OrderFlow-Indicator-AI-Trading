@@ -538,7 +538,7 @@ fn validate_stage2a_entry_plan(entry_plan: &EntryPlan, current_path: &CurrentPat
 pub fn parse_stage2a_output(
     value: Value,
     stage1_output: &Stage1Output,
-    path_runtime_state: &PathRuntimeState,
+    _path_runtime_state: &PathRuntimeState,
 ) -> Result<Stage2AOutput> {
     let output: Stage2AOutput = serde_json::from_value(value)?;
     if !matches!(
@@ -549,10 +549,6 @@ pub fn parse_stage2a_output(
             "stage2_decision must be PATH_CONFIRMED or REQUEST_STAGE1_REEVALUATION"
         ));
     }
-
-    let soft_invalidation_triplet = path_runtime_state.audit_flags.extreme_location
-        && path_runtime_state.audit_flags.reverse_confirmation
-        && path_runtime_state.audit_flags.driver_change;
 
     if output.stage2_decision == "REQUEST_STAGE1_REEVALUATION" {
         if output
@@ -571,19 +567,9 @@ pub fn parse_stage2a_output(
                 "REQUEST_STAGE1_REEVALUATION must set tactical_entry_plan=null"
             ));
         }
-        if !(path_runtime_state.hard_invalidation || soft_invalidation_triplet) {
-            return Err(anyhow!(
-                "REQUEST_STAGE1_REEVALUATION requires hard invalidation or the soft-invalidation triplet"
-            ));
-        }
         return Ok(output);
     }
 
-    if path_runtime_state.hard_invalidation || soft_invalidation_triplet {
-        return Err(anyhow!(
-            "path invalidation requires REQUEST_STAGE1_REEVALUATION"
-        ));
-    }
     if output.reevaluation_reason.is_some() {
         return Err(anyhow!("PATH_CONFIRMED must set reevaluation_reason=null"));
     }
@@ -1172,8 +1158,8 @@ mod tests {
         parse_stage1_output, parse_stage2a_output, parse_stage2b_output, parse_stage2c_output,
     };
     use crate::workflow::schema::{
-        CurrentPath, DriverAttribution, MapSummary, OpportunityAssessment, PathAuditFlags,
-        PathRuntimeState, PriceZone, ReevaluationTrigger, Stage1Meta, Stage1Output,
+        CurrentPath, DriverAttribution, MapSummary, OpportunityAssessment, PathRuntimeState,
+        PriceZone, ReevaluationTrigger, Stage1Meta, Stage1Output,
     };
     use chrono::Utc;
     use serde_json::json;
@@ -1412,12 +1398,60 @@ mod tests {
             path_id: "path_1".to_string(),
             monitoring_status: "active".to_string(),
             latest_price: 2000.0,
-            hard_invalidation: false,
             failure_level_breached: false,
-            path_alive: true,
-            strategic_activation_level_touched: true,
-            opposing_pressure_detected: false,
-            audit_flags: PathAuditFlags::default(),
+            active_entry_context_keys: vec![],
+            notes: vec![],
+        };
+        let value = json!({
+            "stage2_decision": "PATH_CONFIRMED",
+            "tactical_entry_plan": {
+                "path_id": "path_1",
+                "entry_plan": {
+                    "side": "LONG",
+                    "entry_profile": "reclaim_then_hold",
+                    "intent_mode": "immediate",
+                    "entry_activation_level": {"low": 1998.0, "high": 2002.0, "timeframe": "15m", "label": "activation", "reason": "ok"},
+                    "entry_zone": {"low": 1999.0, "high": 2001.0, "timeframe": "15m", "label": "entry", "reason": "ok"},
+                    "entry_invalidation_level": {"low": 1992.0, "high": 1994.0, "timeframe": "15m", "label": "invalid", "reason": "ok"},
+                    "stop_loss": 1993.0,
+                    "max_drift_pct": 0.12,
+                    "entry_note": "ok"
+                }
+            },
+            "reevaluation_reason": null
+        });
+        let parsed = parse_stage2a_output(value, &stage1_output, &runtime_state).expect("parse");
+        assert_eq!(parsed.stage2_decision, "PATH_CONFIRMED");
+    }
+
+    #[test]
+    fn stage2a_parser_allows_reevaluation_without_runtime_soft_invalidation() {
+        let stage1_output = sample_stage1_output();
+        let runtime_state = PathRuntimeState {
+            path_id: "path_1".to_string(),
+            monitoring_status: "active".to_string(),
+            latest_price: 2000.0,
+            failure_level_breached: false,
+            active_entry_context_keys: vec![],
+            notes: vec![],
+        };
+        let value = json!({
+            "stage2_decision": "REQUEST_STAGE1_REEVALUATION",
+            "tactical_entry_plan": null,
+            "reevaluation_reason": "Path quality degraded and needs a fresh strategic review."
+        });
+        let parsed = parse_stage2a_output(value, &stage1_output, &runtime_state).expect("parse");
+        assert_eq!(parsed.stage2_decision, "REQUEST_STAGE1_REEVALUATION");
+    }
+
+    #[test]
+    fn stage2a_parser_does_not_force_reevaluation_from_soft_runtime_flags() {
+        let stage1_output = sample_stage1_output();
+        let runtime_state = PathRuntimeState {
+            path_id: "path_1".to_string(),
+            monitoring_status: "active".to_string(),
+            latest_price: 2000.0,
+            failure_level_breached: false,
             active_entry_context_keys: vec![],
             notes: vec![],
         };

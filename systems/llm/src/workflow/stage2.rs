@@ -1,15 +1,10 @@
 use crate::execution::binance::{OpenOrderSnapshot, TradingStateSnapshot};
-use crate::workflow::predicate::{
-    failed_auction_confirmed, reaccept_inside_value, zone_acceptance_above, zone_acceptance_below,
-};
 use crate::workflow::schema::{
-    CandidateEvent, EntrySnapshot, PathAuditFlags, PathRuntimeState, PendingOrderManagementPlan,
-    Stage1Output, Stage2APromptInput, Stage2BPromptInput, Stage2CPromptInput,
-    StrategicIndicatorSummary, TacticalEntryPlan, WorkflowAccountContext, WorkflowPendingOrder,
-    WorkflowPosition,
+    CandidateEvent, EntrySnapshot, PathRuntimeState, PendingOrderManagementPlan, Stage1Output,
+    Stage2APromptInput, Stage2BPromptInput, Stage2CPromptInput, StrategicIndicatorSummary,
+    TacticalEntryPlan, WorkflowAccountContext, WorkflowPendingOrder, WorkflowPosition,
 };
 use anyhow::{anyhow, Result};
-use chrono::{DateTime, Utc};
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 
@@ -20,54 +15,6 @@ fn value_present(value: &Value) -> bool {
         Value::String(text) => !text.trim().is_empty(),
         Value::Array(items) => !items.is_empty(),
         Value::Object(map) => !map.is_empty(),
-    }
-}
-
-fn flatten_blob(value: &Value) -> String {
-    value.to_string().to_ascii_lowercase()
-}
-
-fn contains_any_keyword(blob: &str, keywords: &[&str]) -> bool {
-    keywords.iter().any(|keyword| blob.contains(keyword))
-}
-
-fn find_bool_key(value: &Value, target: &str) -> Option<bool> {
-    match value {
-        Value::Object(map) => {
-            for (key, child) in map {
-                if key.eq_ignore_ascii_case(target) {
-                    if let Some(found) = child.as_bool() {
-                        return Some(found);
-                    }
-                }
-                if let Some(found) = find_bool_key(child, target) {
-                    return Some(found);
-                }
-            }
-            None
-        }
-        Value::Array(items) => items.iter().find_map(|child| find_bool_key(child, target)),
-        _ => None,
-    }
-}
-
-fn find_f64_key(value: &Value, target: &str) -> Option<f64> {
-    match value {
-        Value::Object(map) => {
-            for (key, child) in map {
-                if key.eq_ignore_ascii_case(target) {
-                    if let Some(found) = child.as_f64() {
-                        return Some(found);
-                    }
-                }
-                if let Some(found) = find_f64_key(child, target) {
-                    return Some(found);
-                }
-            }
-            None
-        }
-        Value::Array(items) => items.iter().find_map(|child| find_f64_key(child, target)),
-        _ => None,
     }
 }
 
@@ -152,14 +99,6 @@ fn latest_price(summary: &StrategicIndicatorSummary) -> Option<f64> {
         .map(|bar| bar.close)
 }
 
-fn latest_bar_time(summary: &StrategicIndicatorSummary) -> Option<DateTime<Utc>> {
-    summary
-        .auction_context
-        .recent_15m_bars
-        .last()
-        .map(|bar| bar.close_time)
-}
-
 fn orderbook_depth(summary: &StrategicIndicatorSummary) -> &Value {
     context_child(&summary.trigger_layer, "orderbook_depth")
 }
@@ -201,55 +140,6 @@ fn footprint(summary: &StrategicIndicatorSummary) -> &Value {
     context_child(&summary.trigger_layer, "footprint")
 }
 
-fn absorption<'a>(summary: &'a StrategicIndicatorSummary, side: &str) -> &'a Value {
-    match side {
-        "LONG" => {
-            let bullish = context_child(&summary.trigger_layer, "bullish_absorption");
-            if value_present(bullish) {
-                bullish
-            } else {
-                context_child(&summary.trigger_layer, "absorption")
-            }
-        }
-        "SHORT" => {
-            let bearish = context_child(&summary.trigger_layer, "bearish_absorption");
-            if value_present(bearish) {
-                bearish
-            } else {
-                context_child(&summary.trigger_layer, "absorption")
-            }
-        }
-        _ => &Value::Null,
-    }
-}
-
-fn exhaustion<'a>(summary: &'a StrategicIndicatorSummary, side: &str) -> &'a Value {
-    match side {
-        "LONG" => context_child(&summary.trigger_layer, "selling_exhaustion"),
-        "SHORT" => context_child(&summary.trigger_layer, "buying_exhaustion"),
-        _ => &Value::Null,
-    }
-}
-
-fn side_keywords(side: &str) -> (&'static [&'static str], &'static [&'static str]) {
-    match side {
-        "LONG" => (
-            &["buy", "bull", "long", "bid", "up"],
-            &["sell", "bear", "short", "ask", "down"],
-        ),
-        "SHORT" => (
-            &["sell", "bear", "short", "ask", "down"],
-            &["buy", "bull", "long", "bid", "up"],
-        ),
-        _ => (&[], &[]),
-    }
-}
-
-fn blob_conflicts_side(blob: &str, side: &str) -> bool {
-    let (_, negative) = side_keywords(side);
-    contains_any_keyword(blob, negative)
-}
-
 fn failure_level_breached(stage1_output: &Stage1Output, latest_price: f64) -> Result<bool> {
     let path = stage1_output
         .current_path
@@ -260,110 +150,6 @@ fn failure_level_breached(stage1_output: &Stage1Output, latest_price: f64) -> Re
         "SHORT" => latest_price >= path.failure_level.low,
         other => return Err(anyhow!("unsupported path side {}", other)),
     })
-}
-
-fn strategic_activation_level_touched(
-    stage1_output: &Stage1Output,
-    latest_price: f64,
-) -> Result<bool> {
-    let path = stage1_output
-        .current_path
-        .as_ref()
-        .ok_or_else(|| anyhow!("active stage1 path missing"))?;
-    Ok(path.strategic_activation_level.contains(latest_price))
-}
-
-fn extreme_location_hit(summary: &StrategicIndicatorSummary) -> bool {
-    summary.auction_context.zone_states.iter().any(|state| {
-        failed_auction_confirmed(state)
-            || reaccept_inside_value(state)
-            || zone_acceptance_above(state)
-            || zone_acceptance_below(state)
-    })
-}
-
-fn reverse_confirmation_hit(summary: &StrategicIndicatorSummary, side: &str) -> bool {
-    let absorption_blob = flatten_blob(absorption(summary, side));
-    let exhaustion_blob = flatten_blob(exhaustion(summary, side));
-    let divergence_blob = flatten_blob(divergence(summary));
-    let footprint_blob = flatten_blob(footprint(summary));
-    let opposite_stack = match side {
-        "LONG" => find_bool_key(footprint(summary), "stacked_sell").unwrap_or(false),
-        "SHORT" => find_bool_key(footprint(summary), "stacked_buy").unwrap_or(false),
-        _ => false,
-    };
-    blob_conflicts_side(&absorption_blob, side)
-        || blob_conflicts_side(&exhaustion_blob, side)
-        || blob_conflicts_side(&divergence_blob, side)
-        || contains_any_keyword(&footprint_blob, &["failed", "trap", "rejection"])
-        || opposite_stack
-}
-
-fn driver_change_hit(summary: &StrategicIndicatorSummary, stage1_output: &Stage1Output) -> bool {
-    let driver_blob = flatten_blob(&summary.driver_layer);
-    let current_driver = stage1_output
-        .driver_attribution
-        .as_ref()
-        .map(|item| item.flow_driver.to_ascii_lowercase())
-        .unwrap_or_default();
-    driver_blob.contains("flip")
-        || driver_blob.contains("driver_change")
-        || driver_blob.contains("driver_shift")
-        || (!current_driver.is_empty()
-            && !driver_blob.contains(&current_driver)
-            && contains_any_keyword(&driver_blob, &["spot_led", "futures_led", "mixed"]))
-}
-
-fn opposing_pressure_detected(summary: &StrategicIndicatorSummary, side: &str) -> bool {
-    let depth = orderbook_depth(summary);
-    let depth_blob = flatten_blob(depth);
-    let state_blob = format!(
-        "{} {} {} {}",
-        flatten_blob(open_interest(summary)),
-        flatten_blob(long_short_ratios(summary)),
-        flatten_blob(funding_rate(summary)),
-        flatten_blob(vpin(summary))
-    );
-    let microprice = find_f64_key(depth, "microprice")
-        .or_else(|| find_f64_key(depth, "microprice_fut"))
-        .or_else(|| find_f64_key(depth, "microprice_adj_fut"));
-    let obi = find_f64_key(depth, "obi")
-        .or_else(|| find_f64_key(depth, "obi_fut"))
-        .or_else(|| find_f64_key(depth, "obi_k_dw_twa_fut"));
-    let ofi = find_f64_key(depth, "ofi_fut").or_else(|| find_f64_key(depth, "ofi_norm_fut"));
-    match side {
-        "LONG" => {
-            [microprice, obi, ofi]
-                .into_iter()
-                .flatten()
-                .any(|value| value < 0.0)
-                || blob_conflicts_side(&depth_blob, side)
-                || contains_any_keyword(
-                    &state_blob,
-                    &[
-                        "fresh_short_build",
-                        "crowded_long",
-                        "positive_funding_extreme",
-                    ],
-                )
-        }
-        "SHORT" => {
-            [microprice, obi, ofi]
-                .into_iter()
-                .flatten()
-                .any(|value| value > 0.0)
-                || blob_conflicts_side(&depth_blob, side)
-                || contains_any_keyword(
-                    &state_blob,
-                    &[
-                        "fresh_long_build",
-                        "crowded_short",
-                        "negative_funding_extreme",
-                    ],
-                )
-        }
-        _ => false,
-    }
 }
 
 fn active_context_keys_for_path(
@@ -396,112 +182,34 @@ pub fn build_path_runtime_state(
             path_id,
             monitoring_status: stage1_output.monitoring_status.clone(),
             latest_price,
-            hard_invalidation: false,
             failure_level_breached: false,
-            path_alive: false,
-            strategic_activation_level_touched: false,
-            opposing_pressure_detected: false,
-            audit_flags: PathAuditFlags::default(),
             active_entry_context_keys: Vec::new(),
             notes: vec!["stage1_no_edge".to_string()],
         });
     }
 
-    let path = stage1_output
+    stage1_output
         .current_path
         .as_ref()
         .ok_or_else(|| anyhow!("active stage1 path missing"))?;
     let failure_breached = failure_level_breached(stage1_output, latest_price)?;
-    let flags = PathAuditFlags {
-        extreme_location: extreme_location_hit(summary),
-        reverse_confirmation: reverse_confirmation_hit(summary, &path.side),
-        driver_change: driver_change_hit(summary, stage1_output),
-    };
-    let hard_invalidation = failure_breached;
-    let soft_invalidation_ready =
-        flags.extreme_location && flags.reverse_confirmation && flags.driver_change;
     Ok(PathRuntimeState {
         path_id,
         monitoring_status: stage1_output.monitoring_status.clone(),
         latest_price,
-        hard_invalidation,
         failure_level_breached: failure_breached,
-        path_alive: !hard_invalidation && !soft_invalidation_ready,
-        strategic_activation_level_touched: strategic_activation_level_touched(
-            stage1_output,
-            latest_price,
-        )?,
-        opposing_pressure_detected: opposing_pressure_detected(summary, &path.side),
-        audit_flags: flags,
         active_entry_context_keys: active_context_keys_for_path(stage1_output, entry_snapshots),
         notes: Vec::new(),
     })
 }
 
 pub fn build_candidate_event(
-    summary: &StrategicIndicatorSummary,
+    _summary: &StrategicIndicatorSummary,
     stage1_output: &Stage1Output,
-    path_runtime_state: &PathRuntimeState,
+    _path_runtime_state: &PathRuntimeState,
 ) -> Result<Option<CandidateEvent>> {
-    let Some(event_ts) = latest_bar_time(summary) else {
-        return Ok(None);
-    };
-    let latest_price = path_runtime_state.latest_price;
-
     if stage1_output.monitoring_status == "no_edge" {
         return Ok(None);
-    }
-
-    if path_runtime_state.hard_invalidation {
-        return Ok(Some(CandidateEvent {
-            event_type: "hard_invalidation".to_string(),
-            event_ts,
-            latest_price,
-            reason: "failure_level_breached".to_string(),
-            details: json!({
-                "failure_level_breached": true
-            }),
-        }));
-    }
-
-    if path_runtime_state.audit_flags.extreme_location
-        && path_runtime_state.audit_flags.reverse_confirmation
-        && path_runtime_state.audit_flags.driver_change
-    {
-        return Ok(Some(CandidateEvent {
-            event_type: "path_review_candidate".to_string(),
-            event_ts,
-            latest_price,
-            reason: "soft_invalidation_triplet".to_string(),
-            details: json!({
-                "extreme_location": true,
-                "reverse_confirmation": true,
-                "driver_change": true
-            }),
-        }));
-    }
-
-    if path_runtime_state.strategic_activation_level_touched
-        || path_runtime_state.opposing_pressure_detected
-    {
-        return Ok(Some(CandidateEvent {
-            event_type: if path_runtime_state.strategic_activation_level_touched {
-                "entry_candidate".to_string()
-            } else {
-                "path_review_candidate".to_string()
-            },
-            event_ts,
-            latest_price,
-            reason: if path_runtime_state.strategic_activation_level_touched {
-                "strategic_activation_level_touched".to_string()
-            } else {
-                "opposing_15m_pressure".to_string()
-            },
-            details: json!({
-                "strategic_activation_level_touched": path_runtime_state.strategic_activation_level_touched,
-                "opposing_pressure_detected": path_runtime_state.opposing_pressure_detected
-            }),
-        }));
     }
 
     Ok(None)

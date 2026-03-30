@@ -10,7 +10,7 @@ use std::cmp::Ordering;
 use std::collections::HashSet;
 
 const OFI_NORM_LOOKBACK: usize = 60;
-const WINDOW_SPECS: [(&str, i64); 2] = [("15m", 15), ("1h", 60)];
+const WINDOW_SPECS: [(&str, i64); 3] = [("5m", 5), ("15m", 15), ("1h", 60)];
 const RAW_AUDIT_TOP_TOTAL_LEVELS: usize = 64;
 const RAW_AUDIT_TOP_ABS_NET_LEVELS: usize = 32;
 const RAW_AUDIT_TOP_BID_LEVELS: usize = 16;
@@ -694,6 +694,32 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(direct_levels, upgraded_levels);
         assert!(!direct.level_rows.is_empty());
+    }
+
+    #[test]
+    fn snapshot_includes_5m_window_summary() {
+        let ts = Utc
+            .with_ymd_and_hms(2026, 3, 24, 2, 20, 0)
+            .single()
+            .unwrap();
+        let runtime_options = test_runtime_options();
+
+        let mut store = StateStore::new("TESTUSDT".to_string(), 1_000.0);
+        let mut latest_bundle = None;
+        for minute in 0..5 {
+            store.ingest(orderbook_event(ts + Duration::minutes(minute), true));
+            latest_bundle = Some(store.finalize_minute(ts + Duration::minutes(minute)));
+        }
+
+        let ctx = IndicatorContext::from_bundle(
+            latest_bundle.expect("latest bundle"),
+            &runtime_options,
+            KlineHistorySupplement::default(),
+        );
+
+        let indicator = I05OrderbookDepth;
+        let snapshot = indicator.evaluate(&ctx).snapshot.expect("snapshot");
+        assert!(snapshot.payload_json["by_window"]["5m"].is_object());
     }
 
     #[test]
