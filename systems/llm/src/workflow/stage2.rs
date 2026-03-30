@@ -119,13 +119,13 @@ fn latest_series_point(value: &Value, key: &str, window: &str) -> Value {
 fn zone_envelope(stage1_output: &Stage1Output) -> Option<(f64, f64)> {
     let path = stage1_output.current_path.as_ref()?;
     let mut lows = vec![
-        path.activation_level.low,
+        path.strategic_activation_level.low,
         path.first_path_target.low,
         path.next_path_target.low,
         path.failure_level.low,
     ];
     let mut highs = vec![
-        path.activation_level.high,
+        path.strategic_activation_level.high,
         path.first_path_target.high,
         path.next_path_target.high,
         path.failure_level.high,
@@ -262,12 +262,15 @@ fn failure_level_breached(stage1_output: &Stage1Output, latest_price: f64) -> Re
     })
 }
 
-fn activation_level_touched(stage1_output: &Stage1Output, latest_price: f64) -> Result<bool> {
+fn strategic_activation_level_touched(
+    stage1_output: &Stage1Output,
+    latest_price: f64,
+) -> Result<bool> {
     let path = stage1_output
         .current_path
         .as_ref()
         .ok_or_else(|| anyhow!("active stage1 path missing"))?;
-    Ok(path.activation_level.contains(latest_price))
+    Ok(path.strategic_activation_level.contains(latest_price))
 }
 
 fn extreme_location_hit(summary: &StrategicIndicatorSummary) -> bool {
@@ -396,7 +399,7 @@ pub fn build_path_runtime_state(
             hard_invalidation: false,
             failure_level_breached: false,
             path_alive: false,
-            activation_level_touched: false,
+            strategic_activation_level_touched: false,
             opposing_pressure_detected: false,
             audit_flags: PathAuditFlags::default(),
             active_entry_context_keys: Vec::new(),
@@ -424,7 +427,10 @@ pub fn build_path_runtime_state(
         hard_invalidation,
         failure_level_breached: failure_breached,
         path_alive: !hard_invalidation && !soft_invalidation_ready,
-        activation_level_touched: activation_level_touched(stage1_output, latest_price)?,
+        strategic_activation_level_touched: strategic_activation_level_touched(
+            stage1_output,
+            latest_price,
+        )?,
         opposing_pressure_detected: opposing_pressure_detected(summary, &path.side),
         audit_flags: flags,
         active_entry_context_keys: active_context_keys_for_path(stage1_output, entry_snapshots),
@@ -475,23 +481,24 @@ pub fn build_candidate_event(
         }));
     }
 
-    if path_runtime_state.activation_level_touched || path_runtime_state.opposing_pressure_detected
+    if path_runtime_state.strategic_activation_level_touched
+        || path_runtime_state.opposing_pressure_detected
     {
         return Ok(Some(CandidateEvent {
-            event_type: if path_runtime_state.activation_level_touched {
+            event_type: if path_runtime_state.strategic_activation_level_touched {
                 "entry_candidate".to_string()
             } else {
                 "path_review_candidate".to_string()
             },
             event_ts,
             latest_price,
-            reason: if path_runtime_state.activation_level_touched {
-                "activation_level_touched".to_string()
+            reason: if path_runtime_state.strategic_activation_level_touched {
+                "strategic_activation_level_touched".to_string()
             } else {
                 "opposing_15m_pressure".to_string()
             },
             details: json!({
-                "activation_level_touched": path_runtime_state.activation_level_touched,
+                "strategic_activation_level_touched": path_runtime_state.strategic_activation_level_touched,
                 "opposing_pressure_detected": path_runtime_state.opposing_pressure_detected
             }),
         }));
@@ -534,7 +541,7 @@ fn build_tactical_position_slice(
     json!({
         "path_id": path.map(|item| item.id.clone()),
         "path_side": path.map(|item| item.side.clone()),
-        "activation_level": path.map(|item| item.activation_level.clone()),
+        "strategic_activation_level": path.map(|item| item.strategic_activation_level.clone()),
         "first_path_target": path.map(|item| item.first_path_target.clone()),
         "next_path_target": path.map(|item| item.next_path_target.clone()),
         "failure_level": path.map(|item| item.failure_level.clone()),
@@ -962,7 +969,7 @@ mod tests {
                 thesis: "bounce".to_string(),
                 risk_grade: "countertrend_repair".to_string(),
                 activation_anchor_id: None,
-                activation_level: price_zone(1998.0, 2002.0),
+                strategic_activation_level: price_zone(1998.0, 2002.0),
                 first_path_target_anchor_id: None,
                 first_path_target: price_zone(2020.0, 2025.0),
                 next_path_target_anchor_id: None,

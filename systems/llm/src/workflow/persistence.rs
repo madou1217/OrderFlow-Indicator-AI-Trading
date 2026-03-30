@@ -52,19 +52,44 @@ fn migrate_legacy_stage1_output_fields(value: &mut Value) -> bool {
         migrated |= root.remove(field).is_some();
     }
     let Some(map_summary) = root.get_mut("map_summary").and_then(Value::as_object_mut) else {
+        if let Some(current_path) = root.get_mut("current_path").and_then(Value::as_object_mut) {
+            if !current_path.contains_key("strategic_activation_level") {
+                if let Some(legacy_activation_level) = current_path.remove("activation_level") {
+                    current_path.insert(
+                        "strategic_activation_level".to_string(),
+                        legacy_activation_level,
+                    );
+                    migrated = true;
+                }
+            } else {
+                migrated |= current_path.remove("activation_level").is_some();
+            }
+        }
         return migrated;
     };
 
     if map_summary.contains_key("location_3d") {
         migrated |= map_summary.remove("regime_3d").is_some();
-        return migrated;
+    } else if let Some(regime_3d) = map_summary.remove("regime_3d") {
+        map_summary.insert("location_3d".to_string(), regime_3d);
+        migrated = true;
     }
 
-    let Some(regime_3d) = map_summary.remove("regime_3d") else {
-        return migrated;
-    };
-    map_summary.insert("location_3d".to_string(), regime_3d);
-    true
+    if let Some(current_path) = root.get_mut("current_path").and_then(Value::as_object_mut) {
+        if !current_path.contains_key("strategic_activation_level") {
+            if let Some(legacy_activation_level) = current_path.remove("activation_level") {
+                current_path.insert(
+                    "strategic_activation_level".to_string(),
+                    legacy_activation_level,
+                );
+                migrated = true;
+            }
+        } else {
+            migrated |= current_path.remove("activation_level").is_some();
+        }
+    }
+
+    migrated
 }
 
 fn migrate_legacy_plan_fields(
@@ -557,6 +582,114 @@ mod tests {
             .expect("map summary");
         assert!(map_summary.contains_key("location_3d"));
         assert!(!map_summary.contains_key("regime_3d"));
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn load_stage1_output_migrates_legacy_activation_level_to_strategic_name() {
+        let state_dir = format!(
+            "/tmp/workflow_test_stage1_activation_migrate_{}",
+            Uuid::new_v4()
+        );
+        fs::create_dir_all(&state_dir).expect("create state dir");
+        let path = stage1_output_path(&state_dir, "ETHUSDT").expect("stage1 path");
+        let legacy = serde_json::json!({
+            "meta": {"stage1_ts": Utc::now()},
+            "monitoring_status": "active",
+            "no_trade_reason": null,
+            "refresh_hints": [],
+            "map_summary": {
+                "location_3d": {"summary": "legacy 3d", "notes": []},
+                "location_1d": {"summary": "legacy 1d", "notes": []},
+                "location_4h": {"summary": "legacy 4h", "notes": []},
+                "price_location_class": "value_edge",
+                "key_levels": {"levels": []}
+            },
+            "opportunity_assessment": {
+                "overall_quality": "medium"
+            },
+            "current_script": "value_return",
+            "driver_attribution": {
+                "flow_driver": "mixed",
+                "spot_confirming": true,
+                "driver_note": "legacy"
+            },
+            "current_path": {
+                "id": "path_a",
+                "side": "LONG",
+                "thesis": "legacy path",
+                "risk_grade": "countertrend_repair",
+                "activation_anchor_id": null,
+                "activation_level": {
+                    "low": 100.0,
+                    "high": 101.0,
+                    "timeframe": "4h",
+                    "label": "activation",
+                    "reason": "legacy"
+                },
+                "first_path_target_anchor_id": null,
+                "first_path_target": {
+                    "low": 103.0,
+                    "high": 104.0,
+                    "timeframe": "4h",
+                    "label": "tp1",
+                    "reason": "legacy"
+                },
+                "next_path_target_anchor_id": null,
+                "next_path_target": {
+                    "low": 106.0,
+                    "high": 107.0,
+                    "timeframe": "1d",
+                    "label": "tp2",
+                    "reason": "legacy"
+                },
+                "failure_anchor_id": null,
+                "failure_level": {
+                    "low": 98.0,
+                    "high": 99.0,
+                    "timeframe": "4h",
+                    "label": "failure",
+                    "reason": "legacy"
+                },
+                "failure_switch": null,
+                "setup_type": "B_reversal",
+                "reevaluation_trigger": {
+                    "extreme_location": {},
+                    "reverse_confirmation": {},
+                    "driver_change": {}
+                },
+                "tracked_zones": []
+            }
+        });
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&legacy).expect("serialize legacy"),
+        )
+        .expect("write legacy stage1");
+
+        let loaded = load_stage1_output(&state_dir, "ETHUSDT")
+            .expect("load stage1")
+            .expect("stage1 exists");
+        assert_eq!(
+            loaded
+                .current_path
+                .as_ref()
+                .expect("current path")
+                .strategic_activation_level
+                .low,
+            100.0
+        );
+
+        let rewritten: Value =
+            serde_json::from_slice(&fs::read(&path).expect("read rewritten stage1"))
+                .expect("parse rewritten stage1");
+        let current_path = rewritten
+            .get("current_path")
+            .and_then(Value::as_object)
+            .expect("current path");
+        assert!(current_path.contains_key("strategic_activation_level"));
+        assert!(!current_path.contains_key("activation_level"));
 
         let _ = fs::remove_dir_all(&state_dir);
     }

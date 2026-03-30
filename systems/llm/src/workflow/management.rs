@@ -107,7 +107,7 @@ mod tests {
             thesis: "continuation".to_string(),
             risk_grade: "aligned_trend".to_string(),
             activation_anchor_id: None,
-            activation_level: PriceZone {
+            strategic_activation_level: PriceZone {
                 low: 100.0,
                 high: 101.0,
                 timeframe: None,

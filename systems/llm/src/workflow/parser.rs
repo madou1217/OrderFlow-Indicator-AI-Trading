@@ -167,13 +167,6 @@ fn validate_opportunity_assessment(output: &Stage1Output) -> Result<()> {
         "opportunity_assessment.overall_quality",
         assessment.overall_quality.as_deref(),
     )?;
-    if matches!(output.monitoring_status.as_str(), "active")
-        && assessment.overall_quality.as_deref() != Some("high")
-    {
-        return Err(anyhow!(
-            "active stage1 output requires opportunity_assessment.overall_quality=high"
-        ));
-    }
     Ok(())
 }
 
@@ -394,8 +387,8 @@ pub fn parse_stage1_output(value: Value) -> Result<Stage1Output> {
             }
 
             validate_zone_timeframe(
-                "current_path.activation_level",
-                &path.activation_level,
+                "current_path.strategic_activation_level",
+                &path.strategic_activation_level,
                 ALLOWED_STRATEGIC_TIMEFRAMES,
                 true,
             )?;
@@ -420,7 +413,7 @@ pub fn parse_stage1_output(value: Value) -> Result<Stage1Output> {
 
             if path.activation_anchor_id.is_none() {
                 path.activation_anchor_id =
-                    infer_anchor_id(path, "activation", &path.activation_level);
+                    infer_anchor_id(path, "activation", &path.strategic_activation_level);
             }
             if path.first_path_target_anchor_id.is_none() {
                 path.first_path_target_anchor_id =
@@ -1237,7 +1230,7 @@ mod tests {
                 thesis: "bounce".to_string(),
                 risk_grade: "countertrend_repair".to_string(),
                 activation_anchor_id: None,
-                activation_level: PriceZone {
+                strategic_activation_level: PriceZone {
                     low: 1998.0,
                     high: 2002.0,
                     timeframe: Some("4h".to_string()),
@@ -1285,6 +1278,19 @@ mod tests {
     }
 
     #[test]
+    fn stage1_parser_accepts_active_medium_quality() {
+        let mut sample = sample_stage1_output();
+        sample.opportunity_assessment.overall_quality = Some("medium".to_string());
+        let value = serde_json::to_value(sample).expect("encode");
+        let parsed = parse_stage1_output(value).expect("parse");
+        assert_eq!(
+            parsed.opportunity_assessment.overall_quality.as_deref(),
+            Some("medium")
+        );
+        assert!(parsed.current_path.is_some());
+    }
+
+    #[test]
     fn stage2a_parser_accepts_single_entry_plan() {
         let stage1_output = sample_stage1_output();
         let runtime_state = PathRuntimeState {
@@ -1294,7 +1300,7 @@ mod tests {
             hard_invalidation: false,
             failure_level_breached: false,
             path_alive: true,
-            activation_level_touched: true,
+            strategic_activation_level_touched: true,
             opposing_pressure_detected: false,
             audit_flags: PathAuditFlags::default(),
             active_entry_context_keys: vec![],

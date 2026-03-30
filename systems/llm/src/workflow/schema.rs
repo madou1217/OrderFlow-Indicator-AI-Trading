@@ -214,7 +214,7 @@ pub struct CurrentPath {
     pub risk_grade: String,
     #[serde(default)]
     pub activation_anchor_id: Option<String>,
-    pub activation_level: PriceZone,
+    pub strategic_activation_level: PriceZone,
     #[serde(default)]
     pub first_path_target_anchor_id: Option<String>,
     pub first_path_target: PriceZone,
@@ -436,7 +436,7 @@ pub struct PathRuntimeState {
     #[serde(default)]
     pub path_alive: bool,
     #[serde(default)]
-    pub activation_level_touched: bool,
+    pub strategic_activation_level_touched: bool,
     #[serde(default)]
     pub opposing_pressure_detected: bool,
     pub audit_flags: PathAuditFlags,

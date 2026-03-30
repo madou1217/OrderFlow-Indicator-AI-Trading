@@ -4194,7 +4194,8 @@ async fn invoke_workflow_bundle_models(
                         "execution_enabled": config.llm.execution.enabled,
                         "execution_blocked_due_to_stale": execution_blocked_due_to_stale,
                         "path_alive": path_runtime_state.path_alive,
-                        "activation_level_touched": path_runtime_state.activation_level_touched,
+                        "strategic_activation_level_touched": path_runtime_state
+                            .strategic_activation_level_touched,
                         "opposing_pressure_detected": path_runtime_state.opposing_pressure_detected,
                         "filled_stopout_attempts": workflow_state.filled_stopout_attempts,
                         "path_id": tactical_plan.path_id,
@@ -5004,7 +5005,7 @@ mod tests {
                 thesis: "continuation".to_string(),
                 risk_grade: "aligned_trend".to_string(),
                 activation_anchor_id: None,
-                activation_level: sample_price_zone(100.0, 101.0, "4h"),
+                strategic_activation_level: sample_price_zone(100.0, 101.0, "4h"),
                 first_path_target_anchor_id: None,
                 first_path_target: sample_price_zone(104.0, 104.0, "4h"),
                 next_path_target_anchor_id: None,
@@ -5081,6 +5082,16 @@ mod tests {
             stage2c_exposure_state_for_counts(1, 1),
             Some("in_position_with_live_entry_orders")
         );
+    }
+
+    #[test]
+    fn stage1_quality_gate_honors_configured_threshold() {
+        let mut stage1_output = sample_stage1_output();
+        stage1_output.opportunity_assessment.overall_quality = Some("medium".to_string());
+
+        assert!(stage1_quality_allows_new_entry(&stage1_output, "medium"));
+        assert!(stage1_quality_allows_new_entry(&stage1_output, "low"));
+        assert!(!stage1_quality_allows_new_entry(&stage1_output, "high"));
     }
 
     fn sample_flat_trading_state() -> TradingStateSnapshot {
@@ -6263,7 +6274,7 @@ mod tests {
                 thesis: "thesis".to_string(),
                 risk_grade: "aligned_trend".to_string(),
                 activation_anchor_id: None,
-                activation_level: crate::workflow::schema::PriceZone {
+                strategic_activation_level: crate::workflow::schema::PriceZone {
                     low: 100.0,
                     high: 101.0,
                     timeframe: None,
@@ -6548,7 +6559,7 @@ mod tests {
             hard_invalidation: false,
             failure_level_breached: false,
             path_alive: false,
-            activation_level_touched: false,
+            strategic_activation_level_touched: false,
             opposing_pressure_detected: true,
             audit_flags: PathAuditFlags {
                 extreme_location: true,

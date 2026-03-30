@@ -287,7 +287,7 @@ fn current_path_schema() -> Value {
             "thesis",
             "risk_grade",
             "activation_anchor_id",
-            "activation_level",
+            "strategic_activation_level",
             "first_path_target_anchor_id",
             "first_path_target",
             "next_path_target_anchor_id",
@@ -308,7 +308,7 @@ fn current_path_schema() -> Value {
                 "enum": ["aligned_trend", "countertrend_repair", "high_conflict_repair"]
             },
             "activation_anchor_id": {"type": ["string", "null"]},
-            "activation_level": price_zone_schema(&["4h", "1d", "4h-1d"]),
+            "strategic_activation_level": price_zone_schema(&["4h", "1d", "4h-1d"]),
             "first_path_target_anchor_id": {"type": ["string", "null"]},
             "first_path_target": price_zone_schema(&["4h", "1d", "4h-1d"]),
             "next_path_target_anchor_id": {"type": ["string", "null"]},
@@ -1022,6 +1022,14 @@ mod tests {
                 ["additionalProperties"],
             json!(false)
         );
+        let current_path_required = schema["properties"]["current_path"]["anyOf"][0]["required"]
+            .as_array()
+            .expect("current_path required array")
+            .iter()
+            .filter_map(|value| value.as_str())
+            .collect::<Vec<_>>();
+        assert!(current_path_required.contains(&"strategic_activation_level"));
+        assert!(!current_path_required.contains(&"activation_level"));
     }
 
     #[test]

@@ -195,7 +195,7 @@
     "thesis": "", # path 主论点
     "risk_grade": "aligned_trend | countertrend_repair | high_conflict_repair", # 风险等级
     "activation_anchor_id": "zone_activation", # 激活锚点 ID
-    "activation_level": {
+    "strategic_activation_level": {
       "low": 0.0,
       "high": 0.0,
       "timeframe": "4h | 1d | 4h-1d", # 战略激活区时间框
@@ -560,7 +560,7 @@ Your job:
 - Decide whether a high-quality strategic opportunity exists right now.
 - Choose exactly one current script or return no_edge.
 - When monitoring_status=active, output exactly one strategic path with:
-  - strategic activation
+  - strategic_activation_level
   - strategic targets
   - strategic failure_level
   - reevaluation_trigger
@@ -583,7 +583,7 @@ Strategic reasoning rules:
 
 Path rules:
 - activation_anchor_id, first_path_target_anchor_id, next_path_target_anchor_id, and failure_anchor_id must each point to tracked_zones[].zone_id.
-- activation_level, first_path_target, next_path_target, and failure_level must align with their corresponding anchor zones.
+- strategic_activation_level, first_path_target, next_path_target, and failure_level must align with their corresponding anchor zones.
 - failure_level means the strategic hard invalidation of the current 4H / 1D path.
 - failure_level.timeframe must be one of 4h, 1d, or 4h-1d.
 - reevaluation_trigger defines the confirmed higher-timeframe conditions that should send the current path back for strategic review.
