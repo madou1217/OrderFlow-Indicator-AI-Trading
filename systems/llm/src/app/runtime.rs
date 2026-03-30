@@ -58,9 +58,35 @@ struct WorkflowStageFlights {
 
 static WORKFLOW_STAGE_FLIGHTS: OnceLock<StdMutex<HashMap<String, WorkflowStageFlights>>> =
     OnceLock::new();
+static STARTUP_STAGE1_REFRESHED_SYMBOLS: OnceLock<StdMutex<HashSet<String>>> = OnceLock::new();
 
 fn workflow_stage_flights() -> &'static StdMutex<HashMap<String, WorkflowStageFlights>> {
     WORKFLOW_STAGE_FLIGHTS.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+fn startup_stage1_refreshed_symbols() -> &'static StdMutex<HashSet<String>> {
+    STARTUP_STAGE1_REFRESHED_SYMBOLS.get_or_init(|| StdMutex::new(HashSet::new()))
+}
+
+fn startup_stage1_refresh_due(symbol: &str) -> bool {
+    startup_stage1_refreshed_symbols()
+        .lock()
+        .map(|symbols| !symbols.contains(&symbol.to_ascii_uppercase()))
+        .unwrap_or(true)
+}
+
+fn mark_startup_stage1_refresh_consumed(symbol: &str) {
+    if let Ok(mut symbols) = startup_stage1_refreshed_symbols().lock() {
+        symbols.insert(symbol.to_ascii_uppercase());
+    }
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+fn reset_startup_stage1_refresh_for_symbol(symbol: &str) {
+    if let Ok(mut symbols) = startup_stage1_refreshed_symbols().lock() {
+        symbols.remove(&symbol.to_ascii_uppercase());
+    }
 }
 
 struct WorkflowStageFlightGuard {
@@ -1265,6 +1291,9 @@ fn workflow_stage1_refresh_reason(
     if let Some(reason) = workflow_state.pending_stage1_refresh_reason.as_ref() {
         return Some(reason.clone());
     }
+    if startup_stage1_refresh_due(&bundle.raw.symbol) {
+        return Some("startup_force_stage1".to_string());
+    }
     if stage1_output.is_none() {
         return Some("startup_missing_stage1".to_string());
     }
@@ -2438,6 +2467,10 @@ async fn maybe_refresh_stage1(
             inflight_suppressed: true,
         });
     };
+
+    if refresh_reason == "startup_force_stage1" {
+        mark_startup_stage1_refresh_consumed(symbol);
+    }
 
     if consume_pending_stage1_refresh_reason(workflow_state, &refresh_reason) {
         crate::workflow::persistence::save_workflow_state(state_dir, workflow_state)?;
@@ -6073,11 +6106,13 @@ mod tests {
     #[test]
     fn workflow_stage1_refresh_reason_prefers_pending_reason() {
         let config = workflow_test_config();
+        let symbol = "ETHUSDT_PENDING";
+        reset_startup_stage1_refresh_for_symbol(symbol);
         let bundle = LatestBundle {
             raw: MinuteBundleEnvelope {
                 msg_type: "bundle".to_string(),
                 routing_key: "test.route".to_string(),
-                symbol: "ETHUSDT".to_string(),
+                symbol: symbol.to_string(),
                 ts_bucket: Utc::now(),
                 window_code: "15m".to_string(),
                 indicator_count: 0,
@@ -6089,7 +6124,7 @@ mod tests {
             received_at: Utc::now(),
         };
         let state = WorkflowState {
-            symbol: "ETHUSDT".to_string(),
+            symbol: symbol.to_string(),
             pending_stage1_refresh_reason: Some("thesis_invalidated".to_string()),
             last_stage1_ts: None,
             ..WorkflowState::default()
@@ -6130,6 +6165,9 @@ mod tests {
     #[test]
     fn workflow_stage1_refresh_reason_triggers_on_scheduled_boundary() {
         let config = workflow_test_config();
+        let symbol = "ETHUSDT_SCHEDULED";
+        reset_startup_stage1_refresh_for_symbol(symbol);
+        mark_startup_stage1_refresh_consumed(symbol);
         let ts_bucket = DateTime::parse_from_rfc3339("2026-03-28T04:00:00Z")
             .expect("ts")
             .with_timezone(&Utc);
@@ -6137,7 +6175,7 @@ mod tests {
             raw: MinuteBundleEnvelope {
                 msg_type: "bundle".to_string(),
                 routing_key: "test.route".to_string(),
-                symbol: "ETHUSDT".to_string(),
+                symbol: symbol.to_string(),
                 ts_bucket,
                 window_code: "15m".to_string(),
                 indicator_count: 0,
@@ -6149,7 +6187,7 @@ mod tests {
             received_at: ts_bucket,
         };
         let state = WorkflowState {
-            symbol: "ETHUSDT".to_string(),
+            symbol: symbol.to_string(),
             pending_stage1_refresh_reason: None,
             last_stage1_ts: Some(ts_bucket - ChronoDuration::hours(2)),
             ..WorkflowState::default()
@@ -6167,8 +6205,10 @@ mod tests {
     }
 
     #[test]
-    fn workflow_stage1_refresh_reason_triggers_immediately_when_stage1_missing() {
+    fn workflow_stage1_refresh_reason_forces_once_on_startup_even_with_existing_stage1() {
         let config = workflow_test_config();
+        let symbol = "ETHUSDT_STARTUP_FORCE";
+        reset_startup_stage1_refresh_for_symbol(symbol);
         let ts_bucket = DateTime::parse_from_rfc3339("2026-03-28T05:30:00Z")
             .expect("ts")
             .with_timezone(&Utc);
@@ -6176,7 +6216,7 @@ mod tests {
             raw: MinuteBundleEnvelope {
                 msg_type: "bundle".to_string(),
                 routing_key: "test.route".to_string(),
-                symbol: "ETHUSDT".to_string(),
+                symbol: symbol.to_string(),
                 ts_bucket,
                 window_code: "15m".to_string(),
                 indicator_count: 0,
@@ -6188,9 +6228,46 @@ mod tests {
             received_at: ts_bucket,
         };
         let state = WorkflowState {
-            symbol: "ETHUSDT".to_string(),
+            symbol: symbol.to_string(),
             pending_stage1_refresh_reason: None,
             last_stage1_ts: Some(ts_bucket - ChronoDuration::minutes(30)),
+            ..WorkflowState::default()
+        };
+        assert_eq!(
+            workflow_stage1_refresh_reason(&config, &bundle, &state, Some(&sample_stage1_output()))
+                .as_deref(),
+            Some("startup_force_stage1")
+        );
+    }
+
+    #[test]
+    fn workflow_stage1_refresh_reason_triggers_missing_stage1_after_startup_force_is_consumed() {
+        let config = workflow_test_config();
+        let symbol = "ETHUSDT_STARTUP_MISSING";
+        reset_startup_stage1_refresh_for_symbol(symbol);
+        mark_startup_stage1_refresh_consumed(symbol);
+        let ts_bucket = DateTime::parse_from_rfc3339("2026-03-28T05:15:00Z")
+            .expect("ts")
+            .with_timezone(&Utc);
+        let bundle = LatestBundle {
+            raw: MinuteBundleEnvelope {
+                msg_type: "bundle".to_string(),
+                routing_key: "test.route".to_string(),
+                symbol: symbol.to_string(),
+                ts_bucket,
+                window_code: "15m".to_string(),
+                indicator_count: 0,
+                published_at: None,
+                indicators: json!({}),
+            },
+            indicators: json!({}),
+            missing_indicator_codes: vec![],
+            received_at: ts_bucket,
+        };
+        let state = WorkflowState {
+            symbol: symbol.to_string(),
+            pending_stage1_refresh_reason: None,
+            last_stage1_ts: Some(ts_bucket - ChronoDuration::minutes(15)),
             ..WorkflowState::default()
         };
         assert_eq!(
@@ -6200,8 +6277,12 @@ mod tests {
     }
 
     #[test]
-    fn workflow_stage1_refresh_reason_is_none_off_schedule_with_existing_stage1() {
+    fn workflow_stage1_refresh_reason_is_none_off_schedule_with_existing_stage1_after_startup_force()
+    {
         let config = workflow_test_config();
+        let symbol = "ETHUSDT_OFFSCHEDULE";
+        reset_startup_stage1_refresh_for_symbol(symbol);
+        mark_startup_stage1_refresh_consumed(symbol);
         let ts_bucket = DateTime::parse_from_rfc3339("2026-03-28T05:15:00Z")
             .expect("ts")
             .with_timezone(&Utc);
@@ -6209,7 +6290,7 @@ mod tests {
             raw: MinuteBundleEnvelope {
                 msg_type: "bundle".to_string(),
                 routing_key: "test.route".to_string(),
-                symbol: "ETHUSDT".to_string(),
+                symbol: symbol.to_string(),
                 ts_bucket,
                 window_code: "15m".to_string(),
                 indicator_count: 0,
@@ -6221,7 +6302,7 @@ mod tests {
             received_at: ts_bucket,
         };
         let state = WorkflowState {
-            symbol: "ETHUSDT".to_string(),
+            symbol: symbol.to_string(),
             pending_stage1_refresh_reason: None,
             last_stage1_ts: Some(ts_bucket - ChronoDuration::minutes(15)),
             ..WorkflowState::default()
