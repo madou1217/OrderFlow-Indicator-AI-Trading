@@ -502,30 +502,26 @@ fn validate_stage2a_entry_plan(entry_plan: &EntryPlan, current_path: &CurrentPat
 
     match current_path.side.as_str() {
         "LONG" => {
-            if entry_plan.stop_loss < current_path.failure_level.low - f64::EPSILON {
+            if entry_plan.stop_loss > entry_plan.entry_zone.low + f64::EPSILON {
                 return Err(anyhow!(
-                    "entry_plan.stop_loss must not widen beyond Stage1.failure_level.low"
+                    "entry_plan.stop_loss must remain on the risk side of entry_plan.entry_zone for LONG"
                 ));
             }
-            if entry_plan.entry_invalidation_level.low
-                < current_path.failure_level.low - f64::EPSILON
-            {
+            if entry_plan.stop_loss > entry_plan.entry_invalidation_level.high + f64::EPSILON {
                 return Err(anyhow!(
-                    "entry_plan.entry_invalidation_level must stay inside the strategic failure boundary"
+                    "entry_plan.stop_loss must remain at or below entry_plan.entry_invalidation_level for LONG"
                 ));
             }
         }
         "SHORT" => {
-            if entry_plan.stop_loss > current_path.failure_level.high + f64::EPSILON {
+            if entry_plan.stop_loss < entry_plan.entry_zone.high - f64::EPSILON {
                 return Err(anyhow!(
-                    "entry_plan.stop_loss must not widen beyond Stage1.failure_level.high"
+                    "entry_plan.stop_loss must remain on the risk side of entry_plan.entry_zone for SHORT"
                 ));
             }
-            if entry_plan.entry_invalidation_level.high
-                > current_path.failure_level.high + f64::EPSILON
-            {
+            if entry_plan.stop_loss < entry_plan.entry_invalidation_level.low - f64::EPSILON {
                 return Err(anyhow!(
-                    "entry_plan.entry_invalidation_level must stay inside the strategic failure boundary"
+                    "entry_plan.stop_loss must remain at or above entry_plan.entry_invalidation_level for SHORT"
                 ));
             }
         }
@@ -1461,6 +1457,40 @@ mod tests {
         });
         let parsed = parse_stage2a_output(value, &stage1_output).expect("parse");
         assert_eq!(parsed.stage2_decision, "PATH_CONFIRMED");
+    }
+
+    #[test]
+    fn stage2a_parser_allows_tactical_stop_beyond_stage1_failure_level_when_structure_is_valid() {
+        let stage1_output = sample_stage1_output();
+        let value = json!({
+            "stage2_decision": "PATH_CONFIRMED",
+            "tactical_entry_plan": {
+                "path_id": "path_1",
+                "entry_plan": {
+                    "side": "LONG",
+                    "entry_profile": "reclaim_then_hold",
+                    "intent_mode": "immediate",
+                    "entry_activation_level": {"low": 1998.0, "high": 2002.0, "timeframe": "15m", "label": "activation", "reason": "ok"},
+                    "entry_zone": {"low": 1999.0, "high": 2001.0, "timeframe": "15m", "label": "entry", "reason": "ok"},
+                    "entry_invalidation_level": {"low": 1984.0, "high": 1988.0, "timeframe": "15m", "label": "invalid", "reason": "ok"},
+                    "stop_loss": 1987.5,
+                    "max_drift_pct": 0.12,
+                    "entry_note": "ok"
+                }
+            },
+            "reevaluation_reason": null
+        });
+        let parsed = parse_stage2a_output(value, &stage1_output).expect("parse");
+        assert_eq!(parsed.stage2_decision, "PATH_CONFIRMED");
+        assert_eq!(
+            parsed
+                .tactical_entry_plan
+                .as_ref()
+                .expect("tactical plan")
+                .entry_plan
+                .stop_loss,
+            1987.5
+        );
     }
 
     #[test]

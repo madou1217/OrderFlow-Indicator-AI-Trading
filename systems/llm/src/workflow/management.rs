@@ -38,7 +38,7 @@ pub fn snapshot_from_execution_intent(
         stop_loss: intent.stop_loss,
         take_profit_1: intent.take_profit_1,
         take_profit_2: intent.take_profit_2,
-        allowed_stop_loss_levels: dedup_levels([intent.stop_loss, current_path.failure_level.low]),
+        allowed_stop_loss_levels: dedup_levels([intent.stop_loss]),
         allowed_take_profit_levels: dedup_levels([
             intent.take_profit_1,
             intent.take_profit_2,

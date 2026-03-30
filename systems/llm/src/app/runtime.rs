@@ -1808,13 +1808,9 @@ fn select_fast_entry_plan<'a>(
     entry_snapshots: &HashMap<String, crate::workflow::schema::EntrySnapshot>,
     trigger_price: f64,
     entry_ready: bool,
-    hard_invalidation_hit: bool,
     max_filled_stopout_attempts: u8,
 ) -> Option<SelectedEntryPlan<'a>> {
     if !entry_ready {
-        return None;
-    }
-    if hard_invalidation_hit {
         return None;
     }
     let side = tactical_plan.entry_plan.side.as_str();
@@ -1898,8 +1894,11 @@ fn build_fallback_entry_snapshot(
     current_path: &crate::workflow::schema::CurrentPath,
     fallback_plan: Option<&crate::workflow::schema::EntryPlan>,
     bracket_override: Option<&crate::workflow::schema::PostFillBracketTemplate>,
-) -> crate::workflow::schema::EntrySnapshot {
-    crate::workflow::schema::EntrySnapshot {
+) -> Option<crate::workflow::schema::EntrySnapshot> {
+    let stop_loss = bracket_override
+        .map(|item| item.stop_loss)
+        .or_else(|| fallback_plan.map(|plan| plan.stop_loss))?;
+    Some(crate::workflow::schema::EntrySnapshot {
         symbol: symbol.to_ascii_uppercase(),
         context_key: context_key.to_string(),
         path_id: path_id.to_string(),
@@ -1912,13 +1911,7 @@ fn build_fallback_entry_snapshot(
         entry_zone: fallback_plan.map(|plan| plan.entry_zone.clone()),
         entry_invalidation_level: fallback_plan.map(|plan| plan.entry_invalidation_level.clone()),
         max_drift_pct: fallback_plan.map(|plan| plan.max_drift_pct),
-        stop_loss: bracket_override
-            .map(|item| item.stop_loss)
-            .unwrap_or_else(|| {
-                fallback_plan
-                    .map(|plan| plan.stop_loss)
-                    .unwrap_or_else(|| current_path.failure_level.midpoint())
-            }),
+        stop_loss,
         take_profit_1: bracket_override
             .map(|item| item.take_profit_1)
             .unwrap_or_else(|| current_path.first_path_target.midpoint()),
@@ -1931,7 +1924,7 @@ fn build_fallback_entry_snapshot(
         applied_driver_deterioration_signals: Vec::new(),
         created_at: Utc::now(),
         updated_at: Utc::now(),
-    }
+    })
 }
 
 fn snapshot_for_management_context(
@@ -1941,22 +1934,19 @@ fn snapshot_for_management_context(
     entry_snapshots: &HashMap<String, crate::workflow::schema::EntrySnapshot>,
     context_key: &str,
     path_id: &str,
-) -> crate::workflow::schema::EntrySnapshot {
-    entry_snapshots
-        .get(context_key)
-        .cloned()
-        .unwrap_or_else(|| {
-            build_fallback_entry_snapshot(
-                symbol,
-                context_key,
-                path_id,
-                current_path,
-                matching_tactical_entry_plan(workflow_state, path_id),
-                workflow_state
-                    .pending_entry_bracket_template_override
-                    .as_ref(),
-            )
-        })
+) -> Option<crate::workflow::schema::EntrySnapshot> {
+    entry_snapshots.get(context_key).cloned().or_else(|| {
+        build_fallback_entry_snapshot(
+            symbol,
+            context_key,
+            path_id,
+            current_path,
+            matching_tactical_entry_plan(workflow_state, path_id),
+            workflow_state
+                .pending_entry_bracket_template_override
+                .as_ref(),
+        )
+    })
 }
 
 fn entry_plan_from_snapshot_template(
@@ -2374,15 +2364,11 @@ fn select_entry_plan<'a>(
     tactical_plan: &'a crate::workflow::schema::TacticalEntryPlan,
     workflow_state: &crate::workflow::state::WorkflowState,
     latest_price: f64,
-    hard_invalidation_hit: bool,
     trading_state: &TradingStateSnapshot,
     entry_snapshots: &HashMap<String, crate::workflow::schema::EntrySnapshot>,
     indicators: &Value,
     watcher_cfg: &crate::app::config::WorkflowWatcherConfig,
 ) -> Option<SelectedEntryPlan<'a>> {
-    if hard_invalidation_hit {
-        return None;
-    }
     let side = tactical_plan.entry_plan.side.as_str();
     if has_active_position_for_side(trading_state, side) {
         return None;
@@ -2464,13 +2450,6 @@ async fn handle_fast_market_event(
     );
     sync_fast_watcher_plan_state(fast_state, &plan_version, &context_key);
 
-    let hard_invalidation_hit =
-        crate::workflow::stage2::failure_level_breached(&stage1_output, event.price)?;
-    if hard_invalidation_hit {
-        *fast_state = None;
-        return Ok(());
-    }
-
     let fast_plan_state = fast_state
         .as_mut()
         .ok_or_else(|| anyhow!("fast watcher state unavailable"))?;
@@ -2510,7 +2489,6 @@ async fn handle_fast_market_event(
         &entry_snapshots,
         event.price,
         entry_ready,
-        hard_invalidation_hit,
         ctx.config.llm.workflow.watcher.max_filled_stopout_attempts,
     ) else {
         return Ok(());
@@ -3324,7 +3302,7 @@ async fn invoke_workflow_bundle_models(
         stage1_refresh_reason.clone(),
     )
     .await?;
-    let mut stage1_refreshed_this_bundle = stage1_attempt.refreshed;
+    let stage1_refreshed_this_bundle = stage1_attempt.refreshed;
 
     if stage1_output.is_none() {
         if stage1_attempt.inflight_suppressed
@@ -3353,7 +3331,7 @@ async fn invoke_workflow_bundle_models(
         return Ok(());
     }
 
-    let mut stage1_output =
+    let stage1_output =
         stage1_output.ok_or_else(|| anyhow!("workflow stage1 output missing after refresh"))?;
 
     let trading_state = fetch_symbol_trading_state(
@@ -3439,9 +3417,6 @@ async fn invoke_workflow_bundle_models(
                 .map(|bar| bar.close)
         })
         .ok_or_else(|| anyhow!("missing latest workflow price reference"))?;
-    let hard_invalidation_hit =
-        crate::workflow::stage2::failure_level_breached(&stage1_output, latest_price)?;
-
     let mut management_signal_report: Option<ManagementExecutionReport> = None;
     let mut management_signal_action: Option<crate::workflow::schema::ManagementAction> = None;
     let mut management_signal_model_name: Option<String> = None;
@@ -3454,86 +3429,6 @@ async fn invoke_workflow_bundle_models(
     let mut selected_stage2a_model_name: Option<String> = None;
     let mut selected_stage2b_model_names: HashMap<String, String> = HashMap::new();
     let mut selected_stage2c_model_names: HashMap<String, String> = HashMap::new();
-    if hard_invalidation_hit {
-        let had_approved_workflow_plans = workflow_state.approved_tactical_plan.is_some()
-            || !workflow_state.approved_position_management_plans.is_empty()
-            || !workflow_state
-                .approved_pending_order_management_plans
-                .is_empty();
-        clear_approved_tactical_plan(&mut workflow_state);
-        clear_position_management_plans(&mut workflow_state);
-        clear_pending_order_management_plans(&mut workflow_state);
-        workflow_state.pending_stage1_refresh_reason = Some("hard_invalidation".to_string());
-        crate::workflow::persistence::save_workflow_state(&state_dir, &workflow_state)?;
-        if had_approved_workflow_plans {
-            append_workflow_journal_event(
-                "workflow_tactical_plan_cleared",
-                &symbol,
-                bundle.raw.ts_bucket,
-                json!({
-                    "trigger": &*trigger,
-                    "path_id": stage1_output.current_path.as_ref().map(|path| path.id.clone()),
-                    "reason": "hard_invalidation",
-                }),
-            );
-        }
-        append_workflow_journal_event(
-            "workflow_hard_invalidation_detected",
-            &symbol,
-            bundle.raw.ts_bucket,
-            json!({
-                "trigger": &*trigger,
-                "path_id": stage1_output.current_path.as_ref().map(|path| path.id.clone()),
-                "latest_price": latest_price,
-                "failure_level_breached": true,
-                "action": "request_stage1_rebuild",
-            }),
-        );
-
-        let mut stage1_output_slot = Some(stage1_output);
-        let hard_invalidation_attempt = maybe_refresh_stage1(
-            &config,
-            &http_client,
-            &loopback_http_client,
-            print_response,
-            &bundle,
-            trigger.as_ref(),
-            &symbol,
-            &state_dir,
-            retention_minutes,
-            &input,
-            &mut workflow_state,
-            &mut stage1_output_slot,
-            &mut tracked_zones,
-            Some("hard_invalidation".to_string()),
-        )
-        .await?;
-        stage1_refreshed_this_bundle |= hard_invalidation_attempt.refreshed;
-        stage1_output = stage1_output_slot
-            .ok_or_else(|| anyhow!("workflow stage1 output missing after hard invalidation"))?;
-        if !hard_invalidation_attempt.refreshed {
-            append_workflow_journal_event(
-                "workflow_stage1_waiting",
-                &symbol,
-                bundle.raw.ts_bucket,
-                json!({
-                    "trigger": &*trigger,
-                    "reason": "hard_invalidation_stage1_refresh_pending",
-                }),
-            );
-            return Ok(());
-        }
-        latest_price = latest_closed_1m_price(&input.indicators)
-            .or_else(|| {
-                indicator_summary
-                    .auction_context
-                    .recent_15m_bars
-                    .last()
-                    .map(|bar| bar.close)
-            })
-            .ok_or_else(|| anyhow!("missing latest workflow price reference"))?;
-    }
-
     let stage1_refresh_blocking = (stage1_refresh_reason.is_some()
         && !stage1_refreshed_this_bundle)
         || workflow_stage_inflight(&symbol, WorkflowStageKind::Stage1);
@@ -4078,14 +3973,16 @@ async fn invoke_workflow_bundle_models(
                     continue;
                 };
                 let action = plan.actions[action_index].clone();
-                let snapshot = snapshot_for_management_context(
+                let Some(snapshot) = snapshot_for_management_context(
                     &symbol,
                     current_path,
                     &workflow_state,
                     &entry_snapshots,
                     &action.context_key,
                     &action.path_id,
-                );
+                ) else {
+                    continue;
+                };
                 match action.action_type.as_str() {
                     "add" => {
                         let fallback_plan =
@@ -4487,14 +4384,16 @@ async fn invoke_workflow_bundle_models(
                         continue;
                     };
                     let action = plan.actions[action_index].clone();
-                    let snapshot = snapshot_for_management_context(
+                    let Some(snapshot) = snapshot_for_management_context(
                         &symbol,
                         current_path,
                         &workflow_state,
                         &entry_snapshots,
                         &action.context_key,
                         &action.path_id,
-                    );
+                    ) else {
+                        continue;
+                    };
                     let has_live_position =
                         has_active_position_for_side(&trading_state, &snapshot.side);
                     match action.action_type.as_str() {
@@ -4864,7 +4763,6 @@ async fn invoke_workflow_bundle_models(
                 tactical_plan,
                 &workflow_state,
                 latest_price,
-                hard_invalidation_hit,
                 &trading_state,
                 &entry_snapshots,
                 &input.indicators,
@@ -6304,7 +6202,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_for_management_context_falls_back_to_current_path_template() {
+    fn snapshot_for_management_context_falls_back_to_current_tactical_template() {
         let stage1_output = sample_stage1_output();
         let current_path = stage1_output.current_path.as_ref().expect("path");
         let workflow_state = WorkflowState {
@@ -6319,7 +6217,8 @@ mod tests {
             &HashMap::new(),
             "ETHUSDT:LONG:path_a",
             "path_a",
-        );
+        )
+        .expect("fallback snapshot");
 
         assert_eq!(snapshot.context_key, "ETHUSDT:LONG:path_a");
         assert_eq!(snapshot.side, "LONG");
@@ -6327,6 +6226,27 @@ mod tests {
         assert_eq!(snapshot.take_profit_2, 107.0);
         assert_eq!(snapshot.entry_profile.as_deref(), Some("reclaim_then_hold"));
         assert_eq!(snapshot.intent_mode.as_deref(), Some("breakout"));
+    }
+
+    #[test]
+    fn snapshot_for_management_context_does_not_fabricate_stop_from_stage1_failure_level() {
+        let stage1_output = sample_stage1_output();
+        let current_path = stage1_output.current_path.as_ref().expect("path");
+        let workflow_state = WorkflowState {
+            symbol: "ETHUSDT".to_string(),
+            ..WorkflowState::default()
+        };
+
+        let snapshot = snapshot_for_management_context(
+            "ETHUSDT",
+            current_path,
+            &workflow_state,
+            &HashMap::new(),
+            "ETHUSDT:LONG:path_a",
+            "path_a",
+        );
+
+        assert!(snapshot.is_none());
     }
 
     #[test]
