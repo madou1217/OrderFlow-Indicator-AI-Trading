@@ -35,6 +35,21 @@ pub struct EngineEvent {
 }
 
 #[derive(Debug, Clone)]
+pub struct EngineEventEnvelope {
+    pub schema_version: i32,
+    pub msg_type: String,
+    pub message_id: Uuid,
+    pub trace_id: Uuid,
+    pub routing_key: String,
+    pub market: String,
+    pub symbol: String,
+    pub source_kind: String,
+    pub backfill_in_progress: bool,
+    pub event_ts: DateTime<Utc>,
+    pub published_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
 pub enum MdData {
     Trade(TradeEvent),
     Depth(DepthDeltaEvent),
@@ -346,27 +361,8 @@ pub struct OptionMarkGreeks5mEvent {
     pub risk_free_interest: Option<f64>,
 }
 
-pub fn decode_contract_body(payload: &[u8]) -> Result<EngineEvent> {
-    let root: Value = serde_json::from_slice(payload).context("decode mq body json")?;
-
-    let schema_version = required_i64(&root, "schema_version")? as i32;
-    let msg_type = required_str(&root, "msg_type")?;
-    let message_id = parse_uuid(required_str(&root, "message_id")?, "message_id")?;
-    let trace_id = parse_uuid(required_str(&root, "trace_id")?, "trace_id")?;
-    let routing_key = required_str(&root, "routing_key")?;
-    let market = parse_market(required_str(&root, "market")?)?;
-    let symbol = required_str(&root, "symbol")?.to_uppercase();
-    let source_kind = required_str(&root, "source_kind")?;
-    let backfill_in_progress = required_bool(&root, "backfill_in_progress")?;
-    let event_ts = parse_ts(required_str(&root, "event_ts")?, "event_ts")?;
-    let published_at = parse_ts(required_str(&root, "published_at")?, "published_at")?;
-
-    let data_obj = root
-        .get("data")
-        .ok_or_else(|| anyhow!("missing data"))?
-        .clone();
-
-    let data = match msg_type.as_str() {
+fn parse_md_data(msg_type: &str, data_obj: &Value) -> Result<MdData> {
+    let data = match msg_type {
         "md.trade" => MdData::Trade(parse_trade(&data_obj)?),
         "md.depth" => MdData::Depth(parse_depth(&data_obj)?),
         "md.orderbook_snapshot_l2" => MdData::OrderbookSnapshot(parse_snapshot(&data_obj)?),
@@ -392,6 +388,27 @@ pub fn decode_contract_body(payload: &[u8]) -> Result<EngineEvent> {
         other => return Err(anyhow!("unsupported msg_type: {}", other)),
     };
 
+    Ok(data)
+}
+
+pub fn build_engine_event(envelope: EngineEventEnvelope, data_obj: Value) -> Result<EngineEvent> {
+    let EngineEventEnvelope {
+        schema_version,
+        msg_type,
+        message_id,
+        trace_id,
+        routing_key,
+        market,
+        symbol,
+        source_kind,
+        backfill_in_progress,
+        event_ts,
+        published_at,
+    } = envelope;
+    let market = parse_market(market)?;
+    let symbol = symbol.to_uppercase();
+    let data = parse_md_data(&msg_type, &data_obj)?;
+
     Ok(EngineEvent {
         schema_version,
         msg_type,
@@ -406,6 +423,31 @@ pub fn decode_contract_body(payload: &[u8]) -> Result<EngineEvent> {
         published_at,
         data,
     })
+}
+
+pub fn decode_contract_body(payload: &[u8]) -> Result<EngineEvent> {
+    let root: Value = serde_json::from_slice(payload).context("decode mq body json")?;
+
+    let envelope = EngineEventEnvelope {
+        schema_version: required_i64(&root, "schema_version")? as i32,
+        msg_type: required_str(&root, "msg_type")?,
+        message_id: parse_uuid(required_str(&root, "message_id")?, "message_id")?,
+        trace_id: parse_uuid(required_str(&root, "trace_id")?, "trace_id")?,
+        routing_key: required_str(&root, "routing_key")?,
+        market: required_str(&root, "market")?,
+        symbol: required_str(&root, "symbol")?,
+        source_kind: required_str(&root, "source_kind")?,
+        backfill_in_progress: required_bool(&root, "backfill_in_progress")?,
+        event_ts: parse_ts(required_str(&root, "event_ts")?, "event_ts")?,
+        published_at: parse_ts(required_str(&root, "published_at")?, "published_at")?,
+    };
+
+    let data_obj = root
+        .get("data")
+        .ok_or_else(|| anyhow!("missing data"))?
+        .clone();
+
+    build_engine_event(envelope, data_obj)
 }
 
 fn parse_trade(data: &Value) -> Result<TradeEvent> {
@@ -944,5 +986,114 @@ fn to_f64(value: &Value) -> Result<f64> {
             .as_f64()
             .ok_or_else(|| anyhow!("cannot convert number to f64: {}", n)),
         _ => Err(anyhow!("unsupported decimal type")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_engine_event, decode_contract_body, EngineEventEnvelope, MarketKind, MdData};
+    use chrono::{TimeZone, Utc};
+    use serde_json::json;
+    use uuid::Uuid;
+
+    fn sample_envelope(msg_type: &str, data: serde_json::Value) -> serde_json::Value {
+        json!({
+            "schema_version": 1,
+            "msg_type": msg_type,
+            "message_id": "11111111-1111-1111-1111-111111111111",
+            "trace_id": "22222222-2222-2222-2222-222222222222",
+            "routing_key": "md.futures.trade.1m.btcusdt",
+            "market": "futures",
+            "symbol": "btcusdt",
+            "source_kind": "replay",
+            "backfill_in_progress": true,
+            "event_ts": "2026-03-30T00:21:00Z",
+            "published_at": "2026-03-30T00:21:05Z",
+            "data": data
+        })
+    }
+
+    fn sample_direct_envelope(msg_type: &str) -> EngineEventEnvelope {
+        EngineEventEnvelope {
+            schema_version: 1,
+            msg_type: msg_type.to_string(),
+            message_id: Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap(),
+            trace_id: Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap(),
+            routing_key: "md.futures.trade.1m.btcusdt".to_string(),
+            market: "futures".to_string(),
+            symbol: "btcusdt".to_string(),
+            source_kind: "replay".to_string(),
+            backfill_in_progress: true,
+            event_ts: Utc.with_ymd_and_hms(2026, 3, 30, 0, 21, 0).unwrap(),
+            published_at: Utc.with_ymd_and_hms(2026, 3, 30, 0, 21, 5).unwrap(),
+        }
+    }
+
+    #[test]
+    fn build_engine_event_matches_contract_decode_for_agg_trade_backfill_rows() {
+        let data = json!({
+            "ts_bucket": "2026-03-30T00:21:00Z",
+            "chunk_start_ts": "2026-03-30T00:21:00Z",
+            "chunk_end_ts": "2026-03-30T00:21:59Z",
+            "source_event_count": 120,
+            "trade_count": 50,
+            "buy_qty": 12.5,
+            "sell_qty": 9.25,
+            "buy_notional": 104321.5,
+            "sell_notional": 77221.0,
+            "first_price": 82500.0,
+            "last_price": 82525.5,
+            "high_price": 82555.0,
+            "low_price": 82480.0,
+            "profile_levels": [],
+            "whale": {
+                "trade_count": 2,
+                "buy_count": 1,
+                "sell_count": 1,
+                "notional_total": 400000.0,
+                "notional_buy": 250000.0,
+                "notional_sell": 150000.0,
+                "qty_base_total": 4.0,
+                "delta_qty_base": 1.5,
+                "max_single_notional": 260000.0
+            },
+            "payload_json": {
+                "vpin_state": {
+                    "current_buy": 1.0,
+                    "current_sell": 0.5,
+                    "current_fill": 0.25,
+                    "imbalances": [0.2, 0.4],
+                    "imbalance_sum": 0.6,
+                    "last_vpin": 0.3
+                }
+            }
+        });
+
+        let decoded = decode_contract_body(
+            serde_json::to_vec(&sample_envelope("md.agg.trade.1m", data.clone()))
+                .unwrap()
+                .as_slice(),
+        )
+        .unwrap();
+        let direct = build_engine_event(sample_direct_envelope("md.agg.trade.1m"), data).unwrap();
+
+        assert_eq!(direct.schema_version, decoded.schema_version);
+        assert_eq!(direct.msg_type, decoded.msg_type);
+        assert_eq!(direct.message_id, decoded.message_id);
+        assert_eq!(direct.trace_id, decoded.trace_id);
+        assert_eq!(direct.routing_key, decoded.routing_key);
+        assert_eq!(direct.market, MarketKind::Futures);
+        assert_eq!(direct.market, decoded.market);
+        assert_eq!(direct.symbol, "BTCUSDT");
+        assert_eq!(direct.symbol, decoded.symbol);
+        assert_eq!(direct.source_kind, decoded.source_kind);
+        assert_eq!(direct.backfill_in_progress, decoded.backfill_in_progress);
+        assert_eq!(direct.event_ts, decoded.event_ts);
+        assert_eq!(direct.published_at, decoded.published_at);
+
+        match (&direct.data, &decoded.data) {
+            (MdData::AggTrade1m(left), MdData::AggTrade1m(right)) => assert_eq!(left, right),
+            other => panic!("unexpected variants: {:?}", other),
+        }
     }
 }

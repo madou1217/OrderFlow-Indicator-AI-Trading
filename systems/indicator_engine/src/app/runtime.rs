@@ -6,7 +6,9 @@ use crate::indicators::context::{
 use crate::indicators::i19_kline_history::build_interval_bar_records;
 use crate::indicators::i27_options_surface::OPTIONS_SURFACE_WINDOWS;
 use crate::indicators::shared::incremental::IncrementalIndicatorConfig;
-use crate::ingest::decoder::{decode_contract_body, EngineEvent, MdData};
+use crate::ingest::decoder::{
+    build_engine_event, EngineEvent, EngineEventEnvelope, MdData,
+};
 use crate::ingest::mq_consumer;
 use crate::ingest::watermark::floor_minute;
 use crate::observability::heartbeat;
@@ -5144,23 +5146,23 @@ async fn hydrate_futures_orderbook_heatmaps_for_range(
 }
 
 pub fn replay_row_to_engine_event(row: ReplayRow) -> Result<EngineEvent> {
-    let payload = json!({
-        "schema_version": 1,
-        "msg_type": row.msg_type,
-        "message_id": Uuid::new_v4(),
-        "trace_id": Uuid::new_v4(),
-        "routing_key": row.routing_key,
-        "market": row.market,
-        "symbol": row.symbol,
-        "source_kind": "replay",
-        "backfill_in_progress": true,
-        "event_ts": row.event_ts.to_rfc3339(),
-        "published_at": Utc::now().to_rfc3339(),
-        "data": row.data_json
-    });
-
-    let bytes = serde_json::to_vec(&payload).context("encode startup replay payload")?;
-    decode_contract_body(&bytes).context("decode startup replay payload")
+    build_engine_event(
+        EngineEventEnvelope {
+            schema_version: 1,
+            msg_type: row.msg_type,
+            message_id: Uuid::new_v4(),
+            trace_id: Uuid::new_v4(),
+            routing_key: row.routing_key,
+            market: row.market,
+            symbol: row.symbol,
+            source_kind: "replay".to_string(),
+            backfill_in_progress: true,
+            event_ts: row.event_ts,
+            published_at: Utc::now(),
+        },
+        row.data_json,
+    )
+    .context("decode startup replay payload")
 }
 
 async fn export_snapshots(
