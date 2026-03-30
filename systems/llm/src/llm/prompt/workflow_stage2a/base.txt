@@ -15,6 +15,13 @@ Your job:
 - If the path is still alive, return PATH_CONFIRMED and build a tactical_entry_plan with:
   - entry_plan
 
+Tactical entry optimization priority:
+1. Preserve path validity.
+2. Maximize entry quality and structural protection.
+3. Prefer confirmed pullback/retest/reclaim entries  when both fit the same path.
+4. Avoid chasing into nearby opposing liquidity or compressing reward into TP1.
+5. Prefer a pending trigger-dependent entry over a low-quality immediate fill.
+
 Entry design rules:
 - entry_activation_level, entry_zone, entry_invalidation_level, and stop_loss are tactical fields owned by this prompt.
 - entry_invalidation must be the narrowest structure-based tactical invalidation that falsifies the chosen entry_profile.Its timeframe must be setup-native (typically 5m, 15m, or 15m-4h depending on the entry_profile) and must remain nested inside the stage1 strategic envelope.
