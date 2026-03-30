@@ -9,6 +9,9 @@
 /systems/llm/temp_indicator/
 /systems/llm/temp_model_input/
 /systems/llm/temp_model_output/
+/systems/llm/state/workflow/ETHUSDT.stage1_output.json
+/systems/llm/state/workflow/ETHUSDT.tracked_zones.json
+/systems/llm/state/workflow/ETHUSDT.workflow_state.json
 
 # Local config / secrets / IDE state
 /config/*.yaml
