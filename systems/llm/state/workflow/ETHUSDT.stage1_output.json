@@ -1,40 +1,42 @@
 {
   "meta": {
-    "stage1_ts": "2026-03-30T03:27:00Z"
+    "stage1_ts": "2026-03-30T03:56:00Z"
   },
   "monitoring_status": "active",
   "no_trade_reason": null,
   "refresh_hints": [
-    "Refresh if 2 confirmed 4H bars accept back into 2004.07-2009.47; that would confirm failed extension and return the auction to balance.",
-    "Refresh if a confirmed 4H bar accepts above 2062.25-2072.29 and starts trading toward 2093.64-2110.72; that would extend the repair into a new higher-timeframe supply regime.",
-    "Refresh if OI stops expanding for 2 monitoring windows while price remains below 2043.26; that would signal the futures-led squeeze is stalling."
+    "Refresh on a confirmed 4H acceptance through 2041.24-2043.26; that would activate the continuation path into 2045.00-2050.00.",
+    "Refresh if a confirmed 4H loss of 2022.39-2030.33 occurs; that would invalidate the breakout-hold shelf and reopen rotation toward 2004.07-2009.47.",
+    "Refresh if 4H OI stops expanding for 2 monitoring windows while price still cannot secure 2041.24-2043.26; that would signal the futures-led squeeze engine is fading."
   ],
   "map_summary": {
     "location_3d": {
-      "summary": "3D background remains a bearish-repair regime, but ETH is firmly reaccepted above 3D value and above the 7D AVWAP. That keeps the strategic bias pointed higher into repair, while larger overhead supply still sits above 2062 and again at 2093-2111.",
+      "summary": "3D background remains an upside repair inside a broader bearish-repair regime. ETH is accepted above 3D value and well above the 7D AVWAP, but it is still traveling into overhead 4H supply rather than through clean open air.",
       "notes": [
-        "3D volume value is 1979.84-2016.50 and 3D TPO value is 1988.23-2006.58; current price is above both value areas.",
-        "7D AVWAP is 1994.74 in futures and 1993.99 in spot, so higher-timeframe value has been reclaimed by roughly 42 points.",
-        "3D open interest is still long-unwind over the full window, which says the current rise is still a repair after deleveraging rather than a mature macro trend.",
-        "The next major 3D/4H overhead constraints are the 2062.25-2072.29 ask/EMA200 shelf and then the fresh 4H bear FVG at 2093.64-2110.72."
+        "3D TPO value is 1988.23-2008.24 and 3D volume value is 1978.68-2017.50; current price is above both.",
+        "7D futures AVWAP is 1995.45, so price is holding roughly 40 points above the main strategic reference anchor.",
+        "3D OI state is still long-unwind over the full window, which says the current rise is a repair after deleveraging, not a fully mature higher-timeframe expansion.",
+        "Major higher-timeframe overhead supply still begins with the 2061-2071 ask/EMA200 shelf and then the fresh 4H bear FVG at 2093.64-2110.72."
       ]
     },
     "location_1d": {
-      "summary": "1D location is accepted above value but stretched. ETH is above daily VAH and TPO VAH, trading around the daily +2σ RVWAP band and just under the 2039-2043 repair area.",
+      "summary": "1D location is bullish but stretched. ETH is above daily value and daily TPO value, trading near the daily +2σ RVWAP extension, with short-cover and still-negative funding keeping squeeze pressure alive.",
       "notes": [
-        "1D volume value is 1979.84-2016.57 and 1D TPO value is 1991.81-2020.06; price is above both.",
-        "1D RVWAP is 1994.82, +1σ is 2015.65, and +2σ is 2036.48; current trade is at that upper extension band.",
-        "1D state is still short-cover while funding remains mildly negative, so squeeze conditions still support upside continuation better than an outright reversal.",
-        "Daily liquidation density is heavily skewed toward short-side risk, so upside fuel remains if higher-value acceptance holds."
+        "1D volume value is 1978.68-2017.92 and 1D TPO value is 1990.81-2029.14; price is above both value areas.",
+        "1D RVWAP is 1995.49, +1σ is 2016.84, and +2σ is 2038.19; current trade is near that +2σ extension band.",
+        "1D OI state is short-cover while funding remains mildly negative, so the broader daily backdrop still favors upside squeezes more than clean bearish reversal.",
+        "Daily liquidation density is heavily skewed to short-side risk, which keeps upside fuel available if higher-value acceptance holds.",
+        "Options are compressed and put-skewed/back-rich, which tempers chase quality but does not override the reclaimed value structure."
       ]
     },
     "location_4h": {
-      "summary": "4H direct geometry is still bullish continuation from the 2009-2026 breakout complex, but the move is now in a more fragile phase: the prior upside repair zone was already probed once, and continuation now needs reacceptance through 2039-2043 with spot still absent from confirmation.",
+      "summary": "4H direct geometry is still continuation from the 2009-2030 breakout, but the move is currently pausing beneath the 2041.24-2043.26 single-print/repair gate. Continuation remains valid only if that gate is accepted while the 2022.39-2030.33 breakout-hold shelf stays intact.",
       "notes": [
-        "Current 4H session POC is 2009.47, VAH is 2020.06, and the IB high is 2023.28; all sit below price, so acceptance above prior balance still holds.",
-        "Since the previous Stage1 map, price already reached the old first-target region and printed the session high at 2043.26 before rotating back.",
-        "Recent bearish absorption at 2033.01 and buying exhaustion at 2021.62 show growing friction overhead even though the broader continuation structure has not failed.",
-        "Immediate higher-timeframe support remains the reclaimed 2020.06-2026.20 breakout shelf, followed by the 2004.07-2009.47 composite POC if that shelf breaks."
+        "The current 4H session expanded from the 1978.70-2023.28 IB into a 2043.26 high, leaving a 4H/1D single-print band at 2041.24-2043.26.",
+        "Current 4H/TPO value is 1990.81-2029.14 and 4H volume VAH is 2030.33, so price is still above session value even after rotating back to 2035-2036.",
+        "4H OI is in leveraged-long-build mode and futures whales were net buyers, so the squeeze engine is still futures-led rather than spot-led.",
+        "Since the prior Stage1 map, price re-tested the old upside gate but still has not secured confirmed 4H acceptance through the single-print cap.",
+        "Immediate structural support is the reclaimed 2022.39-2030.33 shelf; below that, the first balance magnet remains the 2004.07-2009.47 composite POC zone."
       ]
     },
     "price_location_class": "outside_value_extended",
@@ -44,17 +46,17 @@
           "zone_id": "z_breakout_hold",
           "timeframe": "4h-1d",
           "role": "support",
-          "low": 2020.06,
-          "high": 2026.2,
-          "reason": "4H/1D TPO VAH at 2020.06, the broken IB high at 2023.28, and dense buy-imbalance support through 2026.20 define the higher-value hold shelf."
+          "low": 2022.39,
+          "high": 2030.33,
+          "reason": "Dense 4H buy-imbalance support from 2022.39 upward overlaps the broken IB high at 2023.28 and the reclaimed 4H/1D VAH area into 2030.33."
         },
         {
           "zone_id": "z_repair_gate",
           "timeframe": "4h-1d",
           "role": "resistance",
-          "low": 2039,
+          "low": 2041.24,
           "high": 2043.26,
-          "reason": "The 2039 ask wall fronts the 3D/4H single-print repair band up to the session high at 2043.26."
+          "reason": "4H/1D single-print repair band and session high; this is the immediate acceptance gate for further continuation."
         },
         {
           "zone_id": "z_ask_cluster_2050",
@@ -62,15 +64,15 @@
           "role": "resistance",
           "low": 2045,
           "high": 2050,
-          "reason": "Stacked overhead ask liquidity clusters at 2045, 2048, and 2050 once 2043 is accepted."
+          "reason": "Stacked overhead ask liquidity and visible orderbook supply sit at 2045, 2048, and 2050 after the repair gate."
         },
         {
           "zone_id": "z_ema200_supply",
           "timeframe": "4h-1d",
           "role": "resistance",
-          "low": 2062.25,
-          "high": 2072.29,
-          "reason": "Major ask walls from 2062.25 through 2072.29 bracket the 4H EMA200 near 2069.27."
+          "low": 2061.13,
+          "high": 2071.05,
+          "reason": "Large ask walls at 2061 and 2071 bracket the 4H EMA200 near 2069.27, making this the next major repair shelf."
         },
         {
           "zone_id": "z_composite_poc",
@@ -78,15 +80,15 @@
           "role": "magnet",
           "low": 2004.07,
           "high": 2009.47,
-          "reason": "3D TPO POC and the current 4H/1D POC cluster here, forming the first balance-reacceptance magnet if the breakout shelf fails."
+          "reason": "3D TPO POC and 4H/1D TPO POC cluster here, forming the first strategic balance magnet if the breakout shelf fails."
         },
         {
           "zone_id": "z_value_failure",
           "timeframe": "4h-1d",
           "role": "support",
-          "low": 1991.81,
+          "low": 1990.81,
           "high": 2000,
-          "reason": "1D/4H TPO VAL, the 7D AVWAP reclaim area, and the 1D/3D volume POC cluster here as deeper higher-timeframe failure support."
+          "reason": "1D/4H TPO VAL, the 7D AVWAP reclaim zone, and 1D/3D volume POC clustering define the deeper higher-timeframe failure support."
         },
         {
           "zone_id": "z_bear_fvg_supply",
@@ -94,7 +96,7 @@
           "role": "resistance",
           "low": 2093.64,
           "high": 2110.72,
-          "reason": "Fresh 4H bear FVG is the next major higher-timeframe supply if the EMA200 resistance shelf gives way."
+          "reason": "Fresh 4H bear FVG is the next higher-timeframe supply if the 2061-2071 shelf gives way."
         }
       ]
     }
@@ -107,55 +109,55 @@
     "uniqueness_quality": "medium",
     "overall_quality": "medium",
     "disqualifiers": [
-      "The prior upside repair already tagged 2043.26 intrabar, so continuation now needs reacceptance rather than blind chasing.",
-      "Current upside drive is futures-led with spot confirmation absent while 4H OI is expanding.",
-      "Price is trading around the daily +2σ RVWAP extension, so reward-to-risk worsens unless 2039.00-2043.26 is reclaimed cleanly."
+      "Price is still near the daily +2σ RVWAP extension, so continuation is no longer cheap.",
+      "The move remains futures-led with expanding 4H OI while spot whale participation is still absent.",
+      "Recent bearish absorption and buying-exhaustion signals near the upper repair band show real friction into resistance rather than clean acceptance."
     ]
   },
   "current_script": "continuation",
   "driver_attribution": {
     "flow_driver": "futures_led",
     "spot_confirming": false,
-    "driver_note": "The move is being carried by futures whale buying and 4H leveraged-long OI expansion. Daily short-cover and mildly negative funding still support the upside backdrop, but immediate spot confirmation is currently absent, so continuation quality is more fragile than in the prior map."
+    "driver_note": "The higher-timeframe squeeze is still being carried by futures: 4H OI is expanding in leveraged-long-build mode and futures whale flow has been decisively net buy, while daily short-cover and mildly negative funding keep the backdrop supportive. Spot participation remains too weak to call this spot-led acceptance, so the continuation path needs a clean price reclaim through resistance rather than blind continuation."
   },
   "current_path": {
     "id": "p_continuation_reaccept_2043_long",
     "side": "LONG",
-    "thesis": "ETH remains above the 7D AVWAP and above 1D/3D value, so the higher-timeframe bias is still upside repair. But because the prior first target at 2043.26 was probed and rejected, the current continuation path now requires 4H reacceptance through 2039.00-2043.26; if that occurs while 2020.06-2026.20 holds below, the next path is into 2045-2050 and then the 2062.25-2072.29 EMA200 supply shelf.",
+    "thesis": "ETH remains above the 7D AVWAP and above both 3D and 1D value, so the dominant strategic script is still upside repair. But because price already probed the repair highs and rotated back, the valid continuation path now requires fresh 4H acceptance through 2041.24-2043.26. If that happens while 2022.39-2030.33 continues to hold as support, the next path is 2045.00-2050.00 and then the 2061.13-2071.05 EMA200/ask-wall shelf.",
     "risk_grade": "high_conflict_repair",
     "activation_anchor_id": "z_repair_gate",
     "strategic_activation_level": {
-      "low": 2039.0,
+      "low": 2041.24,
       "high": 2043.26,
       "timeframe": "4h-1d",
-      "label": "repair reacceptance gate",
-      "reason": "A fresh 4H acceptance back through the 2039 ask wall and 2043.26 single-print high is needed to prove the earlier probe was not a failed auction."
+      "label": "repair gate reclaim",
+      "reason": "A confirmed 4H reclaim of the 2041.24-2043.26 single-print band is needed to prove the prior probe was not another failed auction into supply."
     },
     "first_path_target_anchor_id": "z_ask_cluster_2050",
     "first_path_target": {
       "low": 2045.0,
       "high": 2050.0,
       "timeframe": "4h-1d",
-      "label": "post-reclaim ask cluster",
-      "reason": "Once 2043 is accepted, the next strategic destination is the tight overhead liquidity band at 2045-2050."
+      "label": "post-gate ask cluster",
+      "reason": "Once the single-print gate is accepted, the next strategic destination is the concentrated overhead liquidity at 2045-2050."
     },
     "next_path_target_anchor_id": "z_ema200_supply",
     "next_path_target": {
-      "low": 2062.25,
-      "high": 2072.29,
+      "low": 2061.13,
+      "high": 2071.05,
       "timeframe": "4h-1d",
-      "label": "EMA200 major supply shelf",
-      "reason": "Above 2050, the next major 4H/1D destination is the ask-wall complex around 2062-2072, which includes the 4H EMA200."
+      "label": "EMA200 ask shelf",
+      "reason": "Above 2050, the next major higher-timeframe objective is the 2061-2071 supply band, which includes the 4H EMA200 and visible ask walls."
     },
     "failure_anchor_id": "z_breakout_hold",
     "failure_level": {
-      "low": 2020.06,
-      "high": 2026.2,
+      "low": 2022.39,
+      "high": 2030.33,
       "timeframe": "4h-1d",
-      "label": "breakout hold shelf",
-      "reason": "A 4H loss of the reclaimed VAH/IB shelf would invalidate the current higher-high continuation attempt and reopen rotation back to the composite POC."
+      "label": "breakout-hold shelf",
+      "reason": "A 4H acceptance back below the reclaimed 2022.39-2030.33 breakout shelf would invalidate the current continuation geometry and reopen rotation toward balance."
     },
-    "failure_switch": "If 4H price accepts below 2020.06-2026.20, abandon the current continuation path and reassess for a value return toward 2004.07-2009.47.",
+    "failure_switch": "If 4H price accepts below 2022.39-2030.33, abandon the current continuation path and reassess for a value return toward 2004.07-2009.47.",
     "setup_type": "A_continuation",
     "reevaluation_trigger": {
       "extreme_location": {
@@ -163,10 +165,11 @@
         "zone_id": "z_bear_fvg_supply",
         "timeframe": "4h-1d",
         "min_confirmed_bars": 1,
-        "summary": "A confirmed 4H acceptance into 2093.64-2110.72 would push the move into fresh higher-timeframe supply and require a new strategic map.",
+        "summary": "A confirmed 4H acceptance into 2093.64-2110.72 would push ETH into fresh higher-timeframe supply and require a new strategic map.",
         "evidence": [
-          "The 2062.25-2072.29 EMA200 supply shelf is the current final mapped target; above it the next major resistance is the fresh 4H bear FVG.",
-          "The 2093.64-2110.72 FVG is materially different higher-timeframe supply and changes the path geometry."
+          "The current mapped continuation path ends at the 2061-2071 repair shelf.",
+          "Above that shelf, the next materially different higher-timeframe structure is the fresh 4H bear FVG at 2093.64-2110.72.",
+          "Acceptance into that FVG changes the strategic geometry from repair continuation to supply engagement."
         ]
       },
       "reverse_confirmation": {
@@ -176,8 +179,9 @@
         "min_confirmed_bars": 2,
         "summary": "Two confirmed 4H bars back inside 2004.07-2009.47 would confirm failed extension and send the auction back into balance review.",
         "evidence": [
-          "This zone combines the 3D TPO POC with the 4H/1D session POC cluster.",
-          "Reacceptance into the composite center would show the 2020.06-2026.20 breakout shelf failed as higher-value support."
+          "This zone combines the 3D TPO POC with the current 4H/1D TPO POC cluster.",
+          "Reacceptance into the composite center after losing 2022.39-2030.33 would show the breakout failed as higher-value support.",
+          "That outcome would shift the active script away from continuation and toward value return."
         ]
       },
       "driver_change": {
@@ -189,11 +193,11 @@
         "require_spot_confirmation": false,
         "driver_signal": "oi_support_lost",
         "min_confirmed_windows": 2,
-        "summary": "If the rally remains futures-led but loses OI expansion for two monitoring windows while price still cannot reclaim 2043.26, remap the path because the leverage engine is no longer supporting continuation.",
+        "summary": "If the rally remains futures-led but loses OI expansion for two monitoring windows while price still cannot secure 2041.24-2043.26, remap the path because the leverage engine is no longer supporting continuation.",
         "evidence": [
-          "4H OI is in a leveraged-long-build regime with zscore above 2.",
-          "Whale and CVD data show futures are carrying the move while spot is not confirming.",
-          "Without ongoing OI support, late-stage continuation beneath the repair gate is vulnerable to unwind."
+          "4H OI is currently in leveraged-long-build mode with elevated z-score.",
+          "Futures whale flow has been the dominant driver while spot whale participation remains negligible.",
+          "A futures-led continuation that stops getting OI support beneath resistance is vulnerable to unwind rather than acceptance."
         ]
       }
     },
@@ -202,17 +206,17 @@
         "zone_id": "z_breakout_hold",
         "timeframe": "4h-1d",
         "role": "support",
-        "low": 2020.06,
-        "high": 2026.2,
-        "reason": "4H/1D TPO VAH at 2020.06, the broken IB high at 2023.28, and dense buy-imbalance support through 2026.20 define the higher-value hold shelf."
+        "low": 2022.39,
+        "high": 2030.33,
+        "reason": "Dense 4H buy-imbalance support from 2022.39 upward overlaps the broken IB high at 2023.28 and the reclaimed 4H/1D VAH area into 2030.33."
       },
       {
         "zone_id": "z_repair_gate",
         "timeframe": "4h-1d",
         "role": "resistance",
-        "low": 2039.0,
+        "low": 2041.24,
         "high": 2043.26,
-        "reason": "The 2039 ask wall fronts the 3D/4H single-print repair band up to the session high at 2043.26."
+        "reason": "4H/1D single-print repair band and session high; this is the immediate acceptance gate for further continuation."
       },
       {
         "zone_id": "z_ask_cluster_2050",
@@ -220,15 +224,15 @@
         "role": "resistance",
         "low": 2045.0,
         "high": 2050.0,
-        "reason": "Stacked overhead ask liquidity clusters at 2045, 2048, and 2050 once 2043 is accepted."
+        "reason": "Stacked overhead ask liquidity and visible orderbook supply sit at 2045, 2048, and 2050 after the repair gate."
       },
       {
         "zone_id": "z_ema200_supply",
         "timeframe": "4h-1d",
         "role": "resistance",
-        "low": 2062.25,
-        "high": 2072.29,
-        "reason": "Major ask walls from 2062.25 through 2072.29 bracket the 4H EMA200 near 2069.27."
+        "low": 2061.13,
+        "high": 2071.05,
+        "reason": "Large ask walls at 2061 and 2071 bracket the 4H EMA200 near 2069.27, making this the next major repair shelf."
       },
       {
         "zone_id": "z_composite_poc",
@@ -236,15 +240,15 @@
         "role": "magnet",
         "low": 2004.07,
         "high": 2009.47,
-        "reason": "3D TPO POC and the current 4H/1D POC cluster here, forming the first balance-reacceptance magnet if the breakout shelf fails."
+        "reason": "3D TPO POC and 4H/1D TPO POC cluster here, forming the first strategic balance magnet if the breakout shelf fails."
       },
       {
         "zone_id": "z_value_failure",
         "timeframe": "4h-1d",
         "role": "support",
-        "low": 1991.81,
+        "low": 1990.81,
         "high": 2000.0,
-        "reason": "1D/4H TPO VAL, the 7D AVWAP reclaim area, and the 1D/3D volume POC cluster here as deeper higher-timeframe failure support."
+        "reason": "1D/4H TPO VAL, the 7D AVWAP reclaim zone, and 1D/3D volume POC clustering define the deeper higher-timeframe failure support."
       },
       {
         "zone_id": "z_bear_fvg_supply",
@@ -252,7 +256,7 @@
         "role": "resistance",
         "low": 2093.64,
         "high": 2110.72,
-        "reason": "Fresh 4H bear FVG is the next major higher-timeframe supply if the EMA200 resistance shelf gives way."
+        "reason": "Fresh 4H bear FVG is the next higher-timeframe supply if the 2061-2071 shelf gives way."
       }
     ]
   }
