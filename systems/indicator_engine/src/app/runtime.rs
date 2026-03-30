@@ -48,6 +48,7 @@ const STARTUP_BACKFILL_MARKET: &str = "all";
 const STALE_DROP_REPORT_INTERVAL_SECS: u64 = 10;
 const INGEST_TRADE_CHANNEL_CAPACITY: usize = 50_000;
 const INGEST_NON_TRADE_CHANNEL_CAPACITY: usize = 100_000;
+const PREPARE_INGEST_QUEUE_CAPACITY: usize = 150_000;
 const INGEST_DRAIN_PER_TICK_LIMIT: usize = 25_000;
 const DIRTY_RECOMPUTE_BATCH_SIZE: usize = 5;
 const DIRTY_RECOMPUTE_WINDOW_BUDGET_PER_TICK: usize = 50;
@@ -160,6 +161,17 @@ impl MaterializeWorkerKind {
             Self::DirtyRecompute => "dirty_recompute",
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IngestQueueLane {
+    Trade,
+    NonTrade,
+}
+
+struct QueuedIngestEvent {
+    lane: IngestQueueLane,
+    event: EngineEvent,
 }
 
 impl LiveCanonicalRepairController {
@@ -425,12 +437,47 @@ fn window_code_minutes(code: &str) -> Option<i64> {
     }
 }
 
+fn decrement_ingest_pending(
+    lane: IngestQueueLane,
+    trade_ingest_pending: &Arc<AtomicUsize>,
+    non_trade_ingest_pending: &Arc<AtomicUsize>,
+) {
+    match lane {
+        IngestQueueLane::Trade => {
+            trade_ingest_pending.fetch_sub(1, Ordering::AcqRel);
+        }
+        IngestQueueLane::NonTrade => {
+            non_trade_ingest_pending.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
+
+async fn run_ingest_forwarder(
+    lane: IngestQueueLane,
+    mut source_rx: mpsc::Receiver<EngineEvent>,
+    prepare_tx: mpsc::Sender<QueuedIngestEvent>,
+    pending_counter: Arc<AtomicUsize>,
+) -> Result<()> {
+    while let Some(event) = source_rx.recv().await {
+        pending_counter.fetch_add(1, Ordering::AcqRel);
+        if prepare_tx
+            .send(QueuedIngestEvent { lane, event })
+            .await
+            .is_err()
+        {
+            pending_counter.fetch_sub(1, Ordering::AcqRel);
+            break;
+        }
+    }
+    Ok(())
+}
+
 pub async fn run(ctx: AppContext) -> Result<()> {
     let ctx = Arc::new(ctx);
 
     let metrics = Arc::new(AppMetrics::default());
-    let (trade_tx, mut trade_rx) = mpsc::channel(INGEST_TRADE_CHANNEL_CAPACITY);
-    let (non_trade_tx, mut non_trade_rx) = mpsc::channel(INGEST_NON_TRADE_CHANNEL_CAPACITY);
+    let (trade_tx, trade_rx) = mpsc::channel(INGEST_TRADE_CHANNEL_CAPACITY);
+    let (non_trade_tx, non_trade_rx) = mpsc::channel(INGEST_NON_TRADE_CHANNEL_CAPACITY);
 
     let consumer_handles =
         mq_consumer::spawn_consumers(ctx.clone(), trade_tx, non_trade_tx, metrics.clone());
@@ -633,8 +680,25 @@ pub async fn run(ctx: AppContext) -> Result<()> {
     let snapshot_fanout_handle =
         tokio::spawn(async move { snapshot_fanout_projector.run_loop().await });
 
-    let mut trade_channel_closed = false;
-    let mut non_trade_channel_closed = false;
+    let (prepare_ingest_tx, mut prepare_ingest_rx) =
+        mpsc::channel(PREPARE_INGEST_QUEUE_CAPACITY);
+    let trade_ingest_pending = Arc::new(AtomicUsize::new(0));
+    let non_trade_ingest_pending = Arc::new(AtomicUsize::new(0));
+    let mut trade_ingest_forwarder_handle = Some(tokio::spawn(run_ingest_forwarder(
+        IngestQueueLane::Trade,
+        trade_rx,
+        prepare_ingest_tx.clone(),
+        trade_ingest_pending.clone(),
+    )));
+    let mut non_trade_ingest_forwarder_handle = Some(tokio::spawn(run_ingest_forwarder(
+        IngestQueueLane::NonTrade,
+        non_trade_rx,
+        prepare_ingest_tx.clone(),
+        non_trade_ingest_pending.clone(),
+    )));
+    drop(prepare_ingest_tx);
+
+    let mut ingest_channel_closed = false;
     let mut shutdown_requested = false;
     let mut shutdown_closed_minute: Option<DateTime<Utc>> = None;
     let mut stall_detector =
@@ -658,10 +722,15 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                 shutdown_closed_minute = Some(cutoff);
                 break;
             }
-            maybe_event = trade_rx.recv(), if !trade_channel_closed => {
-                if let Some(event) = maybe_event {
+            maybe_event = prepare_ingest_rx.recv(), if !ingest_channel_closed => {
+                if let Some(queued) = maybe_event {
+                    decrement_ingest_pending(
+                        queued.lane,
+                        &trade_ingest_pending,
+                        &non_trade_ingest_pending,
+                    );
                     handle_ingest_event(
-                        event,
+                        queued.event,
                         startup_replay_cutoff_bucket,
                         &mut startup_cutover_completed,
                         consume_mode_live,
@@ -679,39 +748,9 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                         &mut scheduler,
                     );
                 } else {
-                    trade_channel_closed = true;
-                    if non_trade_channel_closed {
-                        warn!("all mq consumers ended, stopping indicator engine");
-                        break;
-                    }
-                }
-            }
-            maybe_event = non_trade_rx.recv(), if !non_trade_channel_closed => {
-                if let Some(event) = maybe_event {
-                    handle_ingest_event(
-                        event,
-                        startup_replay_cutoff_bucket,
-                        &mut startup_cutover_completed,
-                        consume_mode_live,
-                        live_drop_stale_enabled,
-                        stale_limit_secs,
-                        &mut stale_drop_count,
-                        &mut stale_drop_max_lag_secs,
-                        &mut stale_drop_max_publish_delay_secs,
-                        &mut stale_drop_max_transport_lag_secs,
-                        &mut stale_drop_oldest_ts,
-                        &mut stale_drop_newest_ts,
-                        &mut stale_drop_by_msg_type,
-                        &metrics,
-                        &mut state_store,
-                        &mut scheduler,
-                    );
-                } else {
-                    non_trade_channel_closed = true;
-                    if trade_channel_closed {
-                        warn!("all mq consumers ended, stopping indicator engine");
-                        break;
-                    }
+                    ingest_channel_closed = true;
+                    warn!("all mq consumers ended, stopping indicator engine");
+                    break;
                 }
             }
             _ = tick.tick() => {
@@ -730,10 +769,10 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                 .await?;
 
                 let drain_result = drain_pending_ingest_events(
-                    &mut trade_rx,
-                    &mut non_trade_rx,
-                    &mut trade_channel_closed,
-                    &mut non_trade_channel_closed,
+                    &mut prepare_ingest_rx,
+                    &mut ingest_channel_closed,
+                    &trade_ingest_pending,
+                    &non_trade_ingest_pending,
                     startup_replay_cutoff_bucket,
                     &mut startup_cutover_completed,
                     consume_mode_live,
@@ -755,7 +794,9 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                     break;
                 }
 
-                let queue_lag = (trade_rx.len() + non_trade_rx.len()) as i64;
+                let trade_channel_len = trade_ingest_pending.load(Ordering::Acquire);
+                let non_trade_channel_len = non_trade_ingest_pending.load(Ordering::Acquire);
+                let queue_lag = (trade_channel_len + non_trade_channel_len) as i64;
                 metrics.set_queue_lag(queue_lag);
                 if stale_drop_count > 0
                     && stale_drop_last_report.elapsed()
@@ -769,8 +810,8 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                         max_publish_delay_secs = stale_drop_max_publish_delay_secs,
                         max_transport_lag_secs = stale_drop_max_transport_lag_secs,
                         stale_limit_secs = stale_limit_secs,
-                        trade_channel_len = trade_rx.len(),
-                        non_trade_channel_len = non_trade_rx.len(),
+                        trade_channel_len = trade_channel_len,
+                        non_trade_channel_len = non_trade_channel_len,
                         drop_by_msg_type = %format_stale_msg_type_distribution(&stale_drop_by_msg_type),
                         "drop stale md event in live mode (aggregated)"
                     );
@@ -944,8 +985,8 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                     &state_store,
                     next_minute,
                     ready_through_ts,
-                    trade_rx.len(),
-                    non_trade_rx.len(),
+                    trade_channel_len,
+                    non_trade_channel_len,
                 );
                 let next_minute_presence = next_minute
                     .map(|minute| state_store.canonical_minute_presence(minute))
@@ -957,8 +998,8 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                     next_minute,
                     ready_through_ts,
                     &next_minute_presence,
-                    trade_rx.len(),
-                    non_trade_rx.len(),
+                    trade_channel_len,
+                    non_trade_channel_len,
                 );
 
                 let Some(_next_minute) = next_minute else {
@@ -1055,10 +1096,10 @@ pub async fn run(ctx: AppContext) -> Result<()> {
             &mut state_store,
             &mut scheduler,
             &runtime_options,
-            &mut trade_rx,
-            &mut non_trade_rx,
-            &mut trade_channel_closed,
-            &mut non_trade_channel_closed,
+            &mut prepare_ingest_rx,
+            &mut ingest_channel_closed,
+            &trade_ingest_pending,
+            &non_trade_ingest_pending,
             startup_replay_cutoff_bucket,
             &mut startup_cutover_completed,
             shutdown_closed_minute,
@@ -1102,6 +1143,14 @@ pub async fn run(ctx: AppContext) -> Result<()> {
     }
 
     heartbeat_handle.abort();
+    if let Some(handle) = trade_ingest_forwarder_handle.take() {
+        handle.abort();
+        let _ = handle.await;
+    }
+    if let Some(handle) = non_trade_ingest_forwarder_handle.take() {
+        handle.abort();
+        let _ = handle.await;
+    }
     drop(live_ready_job_tx.take());
     drop(dirty_ready_job_tx.take());
     if let Some(handle) = live_materialize_handle.take() {
@@ -1127,10 +1176,10 @@ struct DrainPendingIngestResult {
 }
 
 fn drain_pending_ingest_events(
-    trade_rx: &mut mpsc::Receiver<EngineEvent>,
-    non_trade_rx: &mut mpsc::Receiver<EngineEvent>,
-    trade_channel_closed: &mut bool,
-    non_trade_channel_closed: &mut bool,
+    ingest_rx: &mut mpsc::Receiver<QueuedIngestEvent>,
+    ingest_channel_closed: &mut bool,
+    trade_ingest_pending: &Arc<AtomicUsize>,
+    non_trade_ingest_pending: &Arc<AtomicUsize>,
     startup_replay_cutoff_bucket: Option<DateTime<Utc>>,
     startup_cutover_completed: &mut bool,
     consume_mode_live: bool,
@@ -1150,77 +1199,43 @@ fn drain_pending_ingest_events(
     let mut drained = 0usize;
 
     while drained < INGEST_DRAIN_PER_TICK_LIMIT {
-        let mut progressed = false;
-
-        if !*trade_channel_closed {
-            match trade_rx.try_recv() {
-                Ok(event) => {
-                    handle_ingest_event(
-                        event,
-                        startup_replay_cutoff_bucket,
-                        startup_cutover_completed,
-                        consume_mode_live,
-                        live_drop_stale_enabled,
-                        stale_limit_secs,
-                        stale_drop_count,
-                        stale_drop_max_lag_secs,
-                        stale_drop_max_publish_delay_secs,
-                        stale_drop_max_transport_lag_secs,
-                        stale_drop_oldest_ts,
-                        stale_drop_newest_ts,
-                        stale_drop_by_msg_type,
-                        metrics,
-                        state_store,
-                        scheduler,
-                    );
-                    drained += 1;
-                    progressed = true;
-                }
-                Err(mpsc::error::TryRecvError::Empty) => {}
-                Err(mpsc::error::TryRecvError::Disconnected) => {
-                    *trade_channel_closed = true;
-                }
+        match ingest_rx.try_recv() {
+            Ok(queued) => {
+                decrement_ingest_pending(
+                    queued.lane,
+                    trade_ingest_pending,
+                    non_trade_ingest_pending,
+                );
+                handle_ingest_event(
+                    queued.event,
+                    startup_replay_cutoff_bucket,
+                    startup_cutover_completed,
+                    consume_mode_live,
+                    live_drop_stale_enabled,
+                    stale_limit_secs,
+                    stale_drop_count,
+                    stale_drop_max_lag_secs,
+                    stale_drop_max_publish_delay_secs,
+                    stale_drop_max_transport_lag_secs,
+                    stale_drop_oldest_ts,
+                    stale_drop_newest_ts,
+                    stale_drop_by_msg_type,
+                    metrics,
+                    state_store,
+                    scheduler,
+                );
+                drained += 1;
             }
-        }
-
-        if !*non_trade_channel_closed {
-            match non_trade_rx.try_recv() {
-                Ok(event) => {
-                    handle_ingest_event(
-                        event,
-                        startup_replay_cutoff_bucket,
-                        startup_cutover_completed,
-                        consume_mode_live,
-                        live_drop_stale_enabled,
-                        stale_limit_secs,
-                        stale_drop_count,
-                        stale_drop_max_lag_secs,
-                        stale_drop_max_publish_delay_secs,
-                        stale_drop_max_transport_lag_secs,
-                        stale_drop_oldest_ts,
-                        stale_drop_newest_ts,
-                        stale_drop_by_msg_type,
-                        metrics,
-                        state_store,
-                        scheduler,
-                    );
-                    drained += 1;
-                    progressed = true;
-                }
-                Err(mpsc::error::TryRecvError::Empty) => {}
-                Err(mpsc::error::TryRecvError::Disconnected) => {
-                    *non_trade_channel_closed = true;
-                }
+            Err(mpsc::error::TryRecvError::Empty) => break,
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                *ingest_channel_closed = true;
+                break;
             }
-        }
-
-        if !progressed {
-            break;
         }
     }
 
     DrainPendingIngestResult {
-        all_channels_closed: *trade_channel_closed && *non_trade_channel_closed,
+        all_channels_closed: *ingest_channel_closed,
         drained_count: drained,
     }
 }
@@ -1232,10 +1247,10 @@ async fn shutdown_drain_and_persist(
     state_store: &mut StateStore,
     scheduler: &mut WindowScheduler,
     runtime_options: &IndicatorRuntimeOptions,
-    trade_rx: &mut mpsc::Receiver<EngineEvent>,
-    non_trade_rx: &mut mpsc::Receiver<EngineEvent>,
-    trade_channel_closed: &mut bool,
-    non_trade_channel_closed: &mut bool,
+    ingest_rx: &mut mpsc::Receiver<QueuedIngestEvent>,
+    ingest_channel_closed: &mut bool,
+    trade_ingest_pending: &Arc<AtomicUsize>,
+    non_trade_ingest_pending: &Arc<AtomicUsize>,
     startup_replay_cutoff_bucket: Option<DateTime<Utc>>,
     startup_cutover_completed: &mut bool,
     shutdown_closed_minute: DateTime<Utc>,
@@ -1262,10 +1277,10 @@ async fn shutdown_drain_and_persist(
         let dirty_pending_before = state_store.has_pending_dirty_recompute();
 
         let drain_result = drain_pending_ingest_events(
-            trade_rx,
-            non_trade_rx,
-            trade_channel_closed,
-            non_trade_channel_closed,
+            ingest_rx,
+            ingest_channel_closed,
+            trade_ingest_pending,
+            non_trade_ingest_pending,
             startup_replay_cutoff_bucket,
             startup_cutover_completed,
             consume_mode_live,
