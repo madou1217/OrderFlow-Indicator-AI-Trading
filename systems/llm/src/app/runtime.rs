@@ -2897,6 +2897,16 @@ async fn invoke_workflow_bundle_models(
                         )
                         .await?;
                     }
+                    info!(
+                        symbol = %symbol,
+                        ts_bucket = %bundle.raw.ts_bucket,
+                        trigger = &*trigger,
+                        path_id = %path_runtime_state.path_id,
+                        candidate_event_type = %candidate_event.event_type,
+                        exposure_state = %prompt_input.exposure_state,
+                        had_previous_tactical_plan = previous_tactical_plan_for_review.is_some(),
+                        "invoking workflow stage2a models"
+                    );
                     for out in crate::llm::workflow_provider::invoke_stage2a_models(
                         &http_client,
                         &loopback_http_client,
@@ -3018,20 +3028,21 @@ async fn invoke_workflow_bundle_models(
                 if should_run_stage2b {
                     let mut next_position_plans = BTreeMap::new();
                     for active_position in &stage2b_contexts {
+                        let previous_management_plan = position_management_plan_for_context(
+                            workflow_state
+                                .approved_position_management_plans
+                                .get(&active_position.context_key)
+                                .cloned(),
+                            &path_runtime_state.path_id,
+                            &active_position.context_key,
+                        );
                         let prompt_input = crate::workflow::stage2::build_stage2b_prompt_input(
                             indicator_summary.clone(),
                             stage1_output.clone(),
                             candidate_event.clone(),
                             path_runtime_state.clone(),
                             active_position.clone(),
-                            position_management_plan_for_context(
-                                workflow_state
-                                    .approved_position_management_plans
-                                    .get(&active_position.context_key)
-                                    .cloned(),
-                                &path_runtime_state.path_id,
-                                &active_position.context_key,
-                            ),
+                            previous_management_plan.clone(),
                             &trading_state,
                         );
                         let prompt_value = serde_json::to_value(&prompt_input)
@@ -3045,6 +3056,17 @@ async fn invoke_workflow_bundle_models(
                             )
                             .await?;
                         }
+                        info!(
+                            symbol = %symbol,
+                            ts_bucket = %bundle.raw.ts_bucket,
+                            trigger = &*trigger,
+                            path_id = %path_runtime_state.path_id,
+                            context_key = %active_position.context_key,
+                            candidate_event_type = %candidate_event.event_type,
+                            exposure_state = %prompt_input.exposure_state,
+                            had_previous_management_plan = previous_management_plan.is_some(),
+                            "invoking workflow stage2b models"
+                        );
                         let mut stage2b_output_for_context: Option<
                             crate::workflow::schema::Stage2BOutput,
                         > = None;
@@ -3125,13 +3147,7 @@ async fn invoke_workflow_bundle_models(
                     let expected_stage2c_exposure_state = stage2c_exposure_state
                         .expect("Stage2C exposure state must exist when Stage2C is enabled");
                     for active_order in &stage2c_contexts {
-                        let prompt_input = crate::workflow::stage2::build_stage2c_prompt_input(
-                            indicator_summary.clone(),
-                            stage1_output.clone(),
-                            candidate_event.clone(),
-                            path_runtime_state.clone(),
-                            expected_stage2c_exposure_state,
-                            active_order.clone(),
+                        let previous_pending_order_management_plan =
                             pending_order_management_plan_for_context(
                                 workflow_state
                                     .approved_pending_order_management_plans
@@ -3139,7 +3155,15 @@ async fn invoke_workflow_bundle_models(
                                     .cloned(),
                                 &path_runtime_state.path_id,
                                 &active_order.context_key,
-                            ),
+                            );
+                        let prompt_input = crate::workflow::stage2::build_stage2c_prompt_input(
+                            indicator_summary.clone(),
+                            stage1_output.clone(),
+                            candidate_event.clone(),
+                            path_runtime_state.clone(),
+                            expected_stage2c_exposure_state,
+                            active_order.clone(),
+                            previous_pending_order_management_plan.clone(),
                             &trading_state,
                         );
                         let prompt_value = serde_json::to_value(&prompt_input)
@@ -3153,6 +3177,19 @@ async fn invoke_workflow_bundle_models(
                             )
                             .await?;
                         }
+                        info!(
+                            symbol = %symbol,
+                            ts_bucket = %bundle.raw.ts_bucket,
+                            trigger = &*trigger,
+                            path_id = %path_runtime_state.path_id,
+                            context_key = %active_order.context_key,
+                            order_id = active_order.order_id,
+                            candidate_event_type = %candidate_event.event_type,
+                            exposure_state = %prompt_input.exposure_state,
+                            had_previous_pending_order_management_plan =
+                                previous_pending_order_management_plan.is_some(),
+                            "invoking workflow stage2c models"
+                        );
                         let mut stage2c_output_for_context: Option<
                             crate::workflow::schema::Stage2COutput,
                         > = None;

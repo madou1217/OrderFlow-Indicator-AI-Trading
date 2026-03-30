@@ -1,1 +1,50 @@
-[]
+[
+  {
+    "zone_id": "z_breakout_acceptance",
+    "timeframe": "4h-1d",
+    "role": "support",
+    "low": 2017.03,
+    "high": 2025.35,
+    "reason": "4H/1D TPO VAH, broken IB high, and the nearest major bid wall define the continuation hold shelf."
+  },
+  {
+    "zone_id": "z_single_print_repair",
+    "timeframe": "4h-1d",
+    "role": "resistance",
+    "low": 2038.0,
+    "high": 2043.26,
+    "reason": "Stacked asks and the current 4H/1D single-print repair high define the first upside objective."
+  },
+  {
+    "zone_id": "z_liquidity_cap_2050",
+    "timeframe": "4h-1d",
+    "role": "resistance",
+    "low": 2046.89,
+    "high": 2056.37,
+    "reason": "Dense overhead ask walls cluster here after the 2043 repair band."
+  },
+  {
+    "zone_id": "z_ema200_supply",
+    "timeframe": "4h-1d",
+    "role": "resistance",
+    "low": 2065.95,
+    "high": 2070.0,
+    "reason": "Ask walls and the 4H EMA200 converge here, making it the next major supply shelf if 2056.37 breaks."
+  },
+  {
+    "zone_id": "z_composite_reaccept",
+    "timeframe": "4h-1d",
+    "role": "magnet",
+    "low": 2004.07,
+    "high": 2009.47,
+    "reason": "3D TPO POC, 1D/4H TPO POC, and daily composite center create the first higher-timeframe balance reacceptance zone."
+  },
+  {
+    "zone_id": "z_value_failure",
+    "timeframe": "4h-1d",
+    "role": "support",
+    "low": 1993.51,
+    "high": 2000.0,
+    "reason": "7D AVWAP, 1D/4H TPO VAL, and 1D/3D volume POC form the hard invalidation cluster for the current long continuation path."
+  }
+]
