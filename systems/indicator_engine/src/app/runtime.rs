@@ -36,7 +36,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
 use tokio::time::{interval, Instant, MissedTickBehavior};
 use tracing::{debug, error, info, warn};
@@ -58,13 +58,14 @@ const OI_RATIO_PATCH_BATCH_SIZE: usize = 6;
 const OI_RATIO_PATCH_WINDOW_BUDGET_PER_TICK: usize = 24;
 const PROCESS_READY_MINUTES_WARN_MS: u128 = 2_000;
 const LIVE_READY_JOB_QUEUE_CAPACITY: usize = 8;
+const LIVE_PREPARE_TASK_QUEUE_CAPACITY: usize = 8;
 const DIRTY_READY_JOB_QUEUE_CAPACITY: usize = 4;
 const LIVE_TAIL_RECONCILE_MAX_BACKLOG_MINUTES: i64 = 5;
 const OI_RATIO_PATCH_MAX_BACKLOG_MINUTES: i64 = 5;
 const STUCK_PROGRESS_IDLE_SECS: u64 = 60;
 const STUCK_WARN_INTERVAL_SECS: u64 = 60;
 const LIVE_CANONICAL_GAP_REPAIR_RETRY_SECS: u64 = 15;
-const LIVE_CANONICAL_TAIL_RECONCILE_INTERVAL_SECS: u64 = 60;
+const LIVE_CANONICAL_TAIL_RECONCILE_INTERVAL_SECS: u64 = 24 * 60;
 const LIVE_CANONICAL_TAIL_RECONCILE_LOOKBACK_MINUTES: i64 = 31;
 const CANONICAL_REPLAY_FETCH_WINDOW_MINUTES: i64 = 360;
 const STARTUP_BACKFILL_YIELD_EVERY_MINUTES: usize = 64;
@@ -85,7 +86,7 @@ async fn build_publish_db_pool(config: &Arc<RootConfig>) -> Result<PgPool> {
                 .as_ref()
                 .and_then(|p| p.max_connections)
                 .unwrap_or(20)
-                .min(4),
+                .min(36),
         ),
         acquire_timeout_secs: existing.as_ref().and_then(|p| p.acquire_timeout_secs),
         idle_timeout_secs: existing.as_ref().and_then(|p| p.idle_timeout_secs),
@@ -148,6 +149,12 @@ struct ReadyMinuteJob {
     source: ReadyJobSource,
     enqueued_at: Instant,
     bundle: crate::runtime::state_store::WindowBundle,
+}
+
+struct PrepareMinuteTask {
+    minutes: Vec<DateTime<Utc>>,
+    mode: DispatchMode,
+    enqueued_at: Instant,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -560,33 +567,6 @@ pub async fn run(ctx: AppContext) -> Result<()> {
     state_store.set_incremental_runtime_options(build_incremental_indicator_config(
         &runtime_options,
     ));
-    let (live_ready_job_tx_raw, live_ready_job_rx) =
-        mpsc::channel(LIVE_READY_JOB_QUEUE_CAPACITY);
-    let mut live_ready_job_tx = Some(live_ready_job_tx_raw);
-    let live_ready_job_pending = Arc::new(AtomicUsize::new(0));
-    let mut live_materialize_handle = Some(tokio::spawn(run_live_materialize_loop(
-        ctx.clone(),
-        metrics.clone(),
-        dispatcher.clone(),
-        runtime_options.clone(),
-        MaterializeWorkerKind::Live,
-        live_ready_job_rx,
-        live_ready_job_pending.clone(),
-    )));
-    let (dirty_ready_job_tx_raw, dirty_ready_job_rx) =
-        mpsc::channel(DIRTY_READY_JOB_QUEUE_CAPACITY);
-    let mut dirty_ready_job_tx = Some(dirty_ready_job_tx_raw);
-    let dirty_ready_job_pending = Arc::new(AtomicUsize::new(0));
-    let mut dirty_materialize_handle = Some(tokio::spawn(run_live_materialize_loop(
-        ctx.clone(),
-        metrics.clone(),
-        dispatcher.clone(),
-        runtime_options.clone(),
-        MaterializeWorkerKind::DirtyRecompute,
-        dirty_ready_job_rx,
-        dirty_ready_job_pending.clone(),
-    )));
-
     let mut tick = interval(Duration::from_secs(1));
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
@@ -673,6 +653,49 @@ pub async fn run(ctx: AppContext) -> Result<()> {
     }
     metrics.set_backfill_mode(false);
 
+    let state_store = Arc::new(Mutex::new(state_store));
+    let (live_ready_job_tx_raw, live_ready_job_rx) =
+        mpsc::channel(LIVE_READY_JOB_QUEUE_CAPACITY);
+    let mut live_ready_job_tx = Some(live_ready_job_tx_raw);
+    let live_ready_job_pending = Arc::new(AtomicUsize::new(0));
+    let (live_prepare_task_tx_raw, live_prepare_task_rx) =
+        mpsc::channel(LIVE_PREPARE_TASK_QUEUE_CAPACITY);
+    let mut live_prepare_task_tx = Some(live_prepare_task_tx_raw);
+    let live_prepare_minute_pending = Arc::new(AtomicUsize::new(0));
+    let mut live_prepare_handle = Some(tokio::spawn(run_live_prepare_loop(
+        ctx.clone(),
+        state_store.clone(),
+        live_prepare_task_rx,
+        live_prepare_minute_pending.clone(),
+        live_ready_job_tx
+            .as_ref()
+            .expect("live ready job sender must exist before prepare worker spawn")
+            .clone(),
+        live_ready_job_pending.clone(),
+    )));
+    let mut live_materialize_handle = Some(tokio::spawn(run_live_materialize_loop(
+        ctx.clone(),
+        metrics.clone(),
+        dispatcher.clone(),
+        runtime_options.clone(),
+        MaterializeWorkerKind::Live,
+        live_ready_job_rx,
+        live_ready_job_pending.clone(),
+    )));
+    let (dirty_ready_job_tx_raw, dirty_ready_job_rx) =
+        mpsc::channel(DIRTY_READY_JOB_QUEUE_CAPACITY);
+    let mut dirty_ready_job_tx = Some(dirty_ready_job_tx_raw);
+    let dirty_ready_job_pending = Arc::new(AtomicUsize::new(0));
+    let mut dirty_materialize_handle = Some(tokio::spawn(run_live_materialize_loop(
+        ctx.clone(),
+        metrics.clone(),
+        dispatcher.clone(),
+        runtime_options.clone(),
+        MaterializeWorkerKind::DirtyRecompute,
+        dirty_ready_job_rx,
+        dirty_ready_job_pending.clone(),
+    )));
+
     let mut startup_cutover_completed = startup_replay_cutoff_bucket.is_none();
     let outbox_handle = tokio::spawn(async move { outbox_dispatcher.run_loop().await });
     snapshot_fanout_projector
@@ -731,6 +754,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                         &trade_ingest_pending,
                         &non_trade_ingest_pending,
                     );
+                    let mut state_store = state_store.lock().await;
                     handle_ingest_event(
                         queued.event,
                         startup_replay_cutoff_bucket,
@@ -758,10 +782,11 @@ pub async fn run(ctx: AppContext) -> Result<()> {
             _ = tick.tick() => {
                 settle_finished_oi_ratio_patch_task(
                     &mut oi_ratio_patch_task,
-                    &mut state_store,
+                    &state_store,
                     &metrics,
                 )
                 .await;
+                poll_prepare_handle(&mut live_prepare_handle).await?;
                 poll_materialize_handle(&mut live_materialize_handle, MaterializeWorkerKind::Live)
                     .await?;
                 poll_materialize_handle(
@@ -770,7 +795,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                 )
                 .await?;
 
-                let drain_result = drain_pending_ingest_events(
+                let drain_result = drain_pending_ingest_events_shared(
                     &mut prepare_ingest_rx,
                     &mut ingest_channel_closed,
                     &trade_ingest_pending,
@@ -788,9 +813,10 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                     &mut stale_drop_newest_ts,
                     &mut stale_drop_by_msg_type,
                     &metrics,
-                    &mut state_store,
+                    &state_store,
                     &mut scheduler,
-                );
+                )
+                .await;
                 if drain_result.all_channels_closed {
                     warn!("all mq consumers ended, stopping indicator engine");
                     break;
@@ -831,13 +857,17 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                 let next_minute_before_repairs = scheduler.next_minute_to_emit();
                 if startup_cutover_completed {
                     if let Some(next_minute) = next_minute_before_repairs {
-                        let next_minute_presence = state_store.canonical_minute_presence(next_minute);
+                        let next_minute_presence = {
+                            let state_store = state_store.lock().await;
+                            state_store.canonical_minute_presence(next_minute)
+                        };
                         if next_minute <= latest_closed
                             && !next_minute_presence.complete_under_current_policy()
                             && live_repair_controller.gap_repair_due(next_minute)
                         {
                             live_repair_controller.mark_gap_repair_attempt(next_minute);
                             let repair_to_ts = latest_closed + ChronoDuration::minutes(1);
+                            let mut state_store = state_store.lock().await;
                             match ingest_canonical_range_from_db(
                                 &ctx.db_pool,
                                 &ctx.config.indicator.symbol,
@@ -909,24 +939,35 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                         }
                     }
 
-                    if let Some(last_finalized_minute) = state_store.last_finalized_minute() {
-                        if live_repair_controller.tail_reconcile_due()
-                            && allow_live_tail_reconcile(
-                                &state_store,
-                                next_minute_before_repairs,
-                                latest_closed,
-                            )
-                        {
+                    let last_finalized_minute = {
+                        let state_store = state_store.lock().await;
+                        state_store.last_finalized_minute()
+                    };
+                    if let Some(last_finalized_minute) = last_finalized_minute {
+                        let allow_tail_reconcile = {
+                            let state_store = state_store.lock().await;
+                            live_repair_controller.tail_reconcile_due()
+                                && allow_live_tail_reconcile(
+                                    &state_store,
+                                    next_minute_before_repairs,
+                                    latest_closed,
+                                )
+                        };
+                        if allow_tail_reconcile {
                             live_repair_controller.mark_tail_reconcile_attempt();
-                            let effective_history_floor_ts = state_store
-                                .canonical_frontier_snapshot()
-                                .effective_history_floor_ts;
+                            let effective_history_floor_ts = {
+                                let state_store = state_store.lock().await;
+                                state_store
+                                    .canonical_frontier_snapshot()
+                                    .effective_history_floor_ts
+                            };
                             let tail_start_ts = live_tail_reconcile_start_ts(
                                 last_finalized_minute,
                                 effective_history_floor_ts,
                             );
                             let tail_to_ts =
                                 last_finalized_minute + ChronoDuration::minutes(1);
+                            let mut state_store = state_store.lock().await;
                             match ingest_canonical_range_from_db(
                                 &ctx.db_pool,
                                 &ctx.config.indicator.symbol,
@@ -977,22 +1018,35 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                 }
 
                 let next_minute = scheduler.next_minute_to_emit();
-                let ready_through_ts = next_minute.and_then(|minute| {
-                    state_store.latest_contiguous_complete_canonical_minute_from(minute, latest_closed)
-                });
+                let (ready_through_ts, frontier_snapshot, next_minute_presence, has_pending_oi_ratio_patch) =
+                    {
+                        let state_store = state_store.lock().await;
+                        let ready_through_ts = next_minute.and_then(|minute| {
+                            state_store.latest_contiguous_complete_canonical_minute_from(
+                                minute,
+                                latest_closed,
+                            )
+                        });
+                        let frontier_snapshot = refresh_runtime_observability_metrics(
+                            &metrics,
+                            &state_store,
+                            next_minute,
+                            ready_through_ts,
+                            trade_channel_len,
+                            non_trade_channel_len,
+                        );
+                        let next_minute_presence = next_minute
+                            .map(|minute| state_store.canonical_minute_presence(minute))
+                            .unwrap_or_default();
+                        (
+                            ready_through_ts,
+                            frontier_snapshot,
+                            next_minute_presence,
+                            state_store.has_pending_oi_ratio_patch(),
+                        )
+                    };
                 let allow_oi_ratio_patches =
                     allow_oi_ratio_patch_processing(next_minute, latest_closed);
-                let frontier_snapshot = refresh_runtime_observability_metrics(
-                    &metrics,
-                    &state_store,
-                    next_minute,
-                    ready_through_ts,
-                    trade_channel_len,
-                    non_trade_channel_len,
-                );
-                let next_minute_presence = next_minute
-                    .map(|minute| state_store.canonical_minute_presence(minute))
-                    .unwrap_or_default();
                 maybe_warn_runtime_stall(
                     &mut stall_detector,
                     &metrics,
@@ -1005,10 +1059,8 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                 );
 
                 let Some(_next_minute) = next_minute else {
-                    if state_store.has_pending_oi_ratio_patch()
-                        && allow_oi_ratio_patches
-                        && oi_ratio_patch_task.is_none()
-                    {
+                    if has_pending_oi_ratio_patch && allow_oi_ratio_patches && oi_ratio_patch_task.is_none() {
+                        let mut state_store = state_store.lock().await;
                         oi_ratio_patch_task = spawn_oi_ratio_patch_task(
                             dispatcher.clone(),
                             &mut state_store,
@@ -1019,10 +1071,8 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                     continue;
                 };
                 let Some(ready_through_ts) = ready_through_ts else {
-                    if state_store.has_pending_oi_ratio_patch()
-                        && allow_oi_ratio_patches
-                        && oi_ratio_patch_task.is_none()
-                    {
+                    if has_pending_oi_ratio_patch && allow_oi_ratio_patches && oi_ratio_patch_task.is_none() {
+                        let mut state_store = state_store.lock().await;
                         oi_ratio_patch_task = spawn_oi_ratio_patch_task(
                             dispatcher.clone(),
                             &mut state_store,
@@ -1035,11 +1085,12 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                 if let Err(err) = enqueue_live_ready_jobs(
                     &ctx,
                     metrics.clone(),
-                    &mut state_store,
+                    &state_store,
                     &mut scheduler,
-                    live_ready_job_tx
+                    live_prepare_task_tx
                         .as_ref()
-                        .expect("live ready job sender must exist while runtime loop is active"),
+                        .expect("live prepare task sender must exist while runtime loop is active"),
+                    &live_prepare_minute_pending,
                     &live_ready_job_pending,
                     dirty_ready_job_tx
                         .as_ref()
@@ -1053,22 +1104,25 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                     error!(error = %err, "enqueue ready indicator minutes failed");
                     return Err(err).context("enqueue ready indicator minutes failed");
                 }
-                if state_store.has_pending_oi_ratio_patch()
-                    && allow_oi_ratio_patches
-                    && oi_ratio_patch_task.is_none()
-                {
-                    oi_ratio_patch_task = spawn_oi_ratio_patch_task(
-                        dispatcher.clone(),
-                        &mut state_store,
-                        &runtime_options,
-                        &metrics,
-                    )?;
+                if allow_oi_ratio_patches && oi_ratio_patch_task.is_none() {
+                    let mut state_store = state_store.lock().await;
+                    if state_store.has_pending_oi_ratio_patch() {
+                        oi_ratio_patch_task = spawn_oi_ratio_patch_task(
+                            dispatcher.clone(),
+                            &mut state_store,
+                            &runtime_options,
+                            &metrics,
+                        )?;
+                    }
                 }
             }
         }
     }
 
-    abort_oi_ratio_patch_task(&mut oi_ratio_patch_task, &mut state_store).await;
+    {
+        let mut state_store = state_store.lock().await;
+        abort_oi_ratio_patch_task(&mut oi_ratio_patch_task, &mut state_store).await;
+    }
 
     if shutdown_requested {
         let shutdown_closed_minute =
@@ -1080,8 +1134,10 @@ pub async fn run(ctx: AppContext) -> Result<()> {
         for h in &consumer_handles {
             h.abort();
         }
+        drop(live_prepare_task_tx.take());
         drop(live_ready_job_tx.take());
         drop(dirty_ready_job_tx.take());
+        drain_prepare_handle(&mut live_prepare_handle).await;
         drain_materialize_handle(&mut live_materialize_handle, MaterializeWorkerKind::Live).await;
         drain_materialize_handle(
             &mut dirty_materialize_handle,
@@ -1090,6 +1146,10 @@ pub async fn run(ctx: AppContext) -> Result<()> {
         .await;
         outbox_handle.abort();
         snapshot_fanout_handle.abort();
+
+        let mut state_store = Arc::try_unwrap(state_store)
+            .map_err(|_| anyhow::anyhow!("state_store still shared during shutdown drain"))?
+            .into_inner();
 
         if let Err(err) = shutdown_drain_and_persist(
             &ctx,
@@ -1120,15 +1180,81 @@ pub async fn run(ctx: AppContext) -> Result<()> {
         {
             warn!(error = %err, "shutdown drain + persist failed before snapshot save");
         }
+
+        let snapshot_path = ctx
+            .config
+            .indicator
+            .snapshot_file_path
+            .replace("{symbol}", &ctx.config.indicator.symbol);
+        if !snapshot_path.is_empty() {
+            info!("Saving state snapshot before exit...");
+            let snap = state_store.extract_snapshot();
+            match save_state_snapshot(&snap, &snapshot_path).await {
+                Ok(()) => info!(
+                    path = %snapshot_path,
+                    futures_bars = snap.history_futures.len(),
+                    spot_bars = snap.history_spot.len(),
+                    last_ts = %snap.last_finalized_ts,
+                    "State snapshot saved successfully"
+                ),
+                Err(e) => warn!(error = %e, "Failed to save state snapshot"),
+            }
+        }
+
+        heartbeat_handle.abort();
+        if let Some(handle) = trade_ingest_forwarder_handle.take() {
+            handle.abort();
+            let _ = handle.await;
+        }
+        if let Some(handle) = non_trade_ingest_forwarder_handle.take() {
+            handle.abort();
+            let _ = handle.await;
+        }
+        outbox_handle.abort();
+        snapshot_fanout_handle.abort();
+        for h in consumer_handles {
+            h.abort();
+        }
+
+        return Ok(());
     }
 
-    // Save state snapshot for fast next startup
-    // Support {symbol} placeholder in path (e.g. "/tmp/indicator_engine_{symbol}.json.gz")
+    heartbeat_handle.abort();
+    if let Some(handle) = trade_ingest_forwarder_handle.take() {
+        handle.abort();
+        let _ = handle.await;
+    }
+    if let Some(handle) = non_trade_ingest_forwarder_handle.take() {
+        handle.abort();
+        let _ = handle.await;
+    }
+    drop(live_prepare_task_tx.take());
+    drop(live_ready_job_tx.take());
+    drop(dirty_ready_job_tx.take());
+    drain_prepare_handle(&mut live_prepare_handle).await;
+    if let Some(handle) = live_materialize_handle.take() {
+        handle.abort();
+        let _ = handle.await;
+    }
+    if let Some(handle) = dirty_materialize_handle.take() {
+        handle.abort();
+        let _ = handle.await;
+    }
+    outbox_handle.abort();
+    snapshot_fanout_handle.abort();
+    for h in consumer_handles {
+        h.abort();
+    }
+
     let snapshot_path = ctx
         .config
         .indicator
         .snapshot_file_path
         .replace("{symbol}", &ctx.config.indicator.symbol);
+    let state_store = Arc::try_unwrap(state_store)
+        .map_err(|_| anyhow::anyhow!("state_store still shared while saving snapshot"))?
+        .into_inner();
+    let state_store = state_store;
     if !snapshot_path.is_empty() {
         info!("Saving state snapshot before exit...");
         let snap = state_store.extract_snapshot();
@@ -1144,31 +1270,6 @@ pub async fn run(ctx: AppContext) -> Result<()> {
         }
     }
 
-    heartbeat_handle.abort();
-    if let Some(handle) = trade_ingest_forwarder_handle.take() {
-        handle.abort();
-        let _ = handle.await;
-    }
-    if let Some(handle) = non_trade_ingest_forwarder_handle.take() {
-        handle.abort();
-        let _ = handle.await;
-    }
-    drop(live_ready_job_tx.take());
-    drop(dirty_ready_job_tx.take());
-    if let Some(handle) = live_materialize_handle.take() {
-        handle.abort();
-        let _ = handle.await;
-    }
-    if let Some(handle) = dirty_materialize_handle.take() {
-        handle.abort();
-        let _ = handle.await;
-    }
-    outbox_handle.abort();
-    snapshot_fanout_handle.abort();
-    for h in consumer_handles {
-        h.abort();
-    }
-
     Ok(())
 }
 
@@ -1177,7 +1278,80 @@ struct DrainPendingIngestResult {
     drained_count: usize,
 }
 
-fn drain_pending_ingest_events(
+async fn drain_pending_ingest_events_shared(
+    ingest_rx: &mut mpsc::Receiver<QueuedIngestEvent>,
+    ingest_channel_closed: &mut bool,
+    trade_ingest_pending: &Arc<AtomicUsize>,
+    non_trade_ingest_pending: &Arc<AtomicUsize>,
+    startup_replay_cutoff_bucket: Option<DateTime<Utc>>,
+    startup_cutover_completed: &mut bool,
+    consume_mode_live: bool,
+    live_drop_stale_enabled: bool,
+    stale_limit_secs: i64,
+    stale_drop_count: &mut u64,
+    stale_drop_max_lag_secs: &mut i64,
+    stale_drop_max_publish_delay_secs: &mut i64,
+    stale_drop_max_transport_lag_secs: &mut i64,
+    stale_drop_oldest_ts: &mut Option<DateTime<Utc>>,
+    stale_drop_newest_ts: &mut Option<DateTime<Utc>>,
+    stale_drop_by_msg_type: &mut HashMap<String, u64>,
+    metrics: &Arc<AppMetrics>,
+    state_store: &Arc<Mutex<StateStore>>,
+    scheduler: &mut WindowScheduler,
+) -> DrainPendingIngestResult {
+    let mut drained = 0usize;
+    let mut drained_events = Vec::new();
+
+    while drained < INGEST_DRAIN_PER_TICK_LIMIT {
+        match ingest_rx.try_recv() {
+            Ok(queued) => {
+                decrement_ingest_pending(
+                    queued.lane,
+                    trade_ingest_pending,
+                    non_trade_ingest_pending,
+                );
+                drained_events.push(queued.event);
+                drained += 1;
+            }
+            Err(mpsc::error::TryRecvError::Empty) => break,
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                *ingest_channel_closed = true;
+                break;
+            }
+        }
+    }
+
+    if !drained_events.is_empty() {
+        let mut state_store = state_store.lock().await;
+        for event in drained_events {
+            handle_ingest_event(
+                event,
+                startup_replay_cutoff_bucket,
+                startup_cutover_completed,
+                consume_mode_live,
+                live_drop_stale_enabled,
+                stale_limit_secs,
+                stale_drop_count,
+                stale_drop_max_lag_secs,
+                stale_drop_max_publish_delay_secs,
+                stale_drop_max_transport_lag_secs,
+                stale_drop_oldest_ts,
+                stale_drop_newest_ts,
+                stale_drop_by_msg_type,
+                metrics,
+                &mut state_store,
+                scheduler,
+            );
+        }
+    }
+
+    DrainPendingIngestResult {
+        all_channels_closed: *ingest_channel_closed,
+        drained_count: drained,
+    }
+}
+
+fn drain_pending_ingest_events_owned(
     ingest_rx: &mut mpsc::Receiver<QueuedIngestEvent>,
     ingest_channel_closed: &mut bool,
     trade_ingest_pending: &Arc<AtomicUsize>,
@@ -1278,7 +1452,7 @@ async fn shutdown_drain_and_persist(
         let next_minute_before = scheduler.next_minute_to_emit();
         let dirty_pending_before = state_store.has_pending_dirty_recompute();
 
-        let drain_result = drain_pending_ingest_events(
+        let drain_result = drain_pending_ingest_events_owned(
             ingest_rx,
             ingest_channel_closed,
             trade_ingest_pending,
@@ -2801,7 +2975,7 @@ fn spawn_oi_ratio_patch_task(
 
 async fn settle_finished_oi_ratio_patch_task(
     task_slot: &mut Option<OiRatioPatchTask>,
-    state_store: &mut StateStore,
+    state_store: &Arc<Mutex<StateStore>>,
     metrics: &Arc<AppMetrics>,
 ) {
     let finished = task_slot
@@ -2830,6 +3004,7 @@ async fn settle_finished_oi_ratio_patch_task(
             );
         }
         Ok(Err(err)) => {
+            let mut state_store = state_store.lock().await;
             state_store.requeue_oi_ratio_patch_batch(&task.minutes);
             metrics.inc_db_error();
             warn!(
@@ -2841,6 +3016,7 @@ async fn settle_finished_oi_ratio_patch_task(
             );
         }
         Err(err) => {
+            let mut state_store = state_store.lock().await;
             state_store.requeue_oi_ratio_patch_batch(&task.minutes);
             metrics.inc_db_error();
             warn!(
@@ -2885,6 +3061,17 @@ fn available_ready_job_slots(
     )
 }
 
+fn available_live_pipeline_slots(
+    queue_capacity: usize,
+    ready_job_pending: &Arc<AtomicUsize>,
+    prepare_minute_pending: &Arc<AtomicUsize>,
+) -> usize {
+    queue_capacity.saturating_sub(
+        (ready_job_pending.load(Ordering::Acquire) + prepare_minute_pending.load(Ordering::Acquire))
+            .min(queue_capacity),
+    )
+}
+
 fn try_enqueue_ready_minute_job(
     ready_job_tx: &mpsc::Sender<ReadyMinuteJob>,
     ready_job_pending: &Arc<AtomicUsize>,
@@ -2900,6 +3087,26 @@ fn try_enqueue_ready_minute_job(
         Err(tokio::sync::mpsc::error::TrySendError::Closed(_job)) => {
             ready_job_pending.fetch_sub(1, Ordering::AcqRel);
             anyhow::bail!("live materialize worker queue is closed");
+        }
+    }
+}
+
+fn try_enqueue_prepare_minute_task(
+    prepare_task_tx: &mpsc::Sender<PrepareMinuteTask>,
+    prepare_minute_pending: &Arc<AtomicUsize>,
+    task: PrepareMinuteTask,
+) -> Result<bool> {
+    let minute_count = task.minutes.len();
+    prepare_minute_pending.fetch_add(minute_count, Ordering::AcqRel);
+    match prepare_task_tx.try_send(task) {
+        Ok(()) => Ok(true),
+        Err(tokio::sync::mpsc::error::TrySendError::Full(task)) => {
+            prepare_minute_pending.fetch_sub(task.minutes.len(), Ordering::AcqRel);
+            Ok(false)
+        }
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(task)) => {
+            prepare_minute_pending.fetch_sub(task.minutes.len(), Ordering::AcqRel);
+            anyhow::bail!("live prepare worker queue is closed");
         }
     }
 }
@@ -3006,6 +3213,134 @@ async fn run_live_materialize_loop(
     Ok(())
 }
 
+async fn run_live_prepare_loop(
+    ctx: Arc<AppContext>,
+    state_store: Arc<Mutex<StateStore>>,
+    mut prepare_task_rx: mpsc::Receiver<PrepareMinuteTask>,
+    prepare_minute_pending: Arc<AtomicUsize>,
+    ready_job_tx: mpsc::Sender<ReadyMinuteJob>,
+    ready_job_pending: Arc<AtomicUsize>,
+) -> Result<()> {
+    while let Some(task) = prepare_task_rx.recv().await {
+        let first_minute = task.minutes.first().copied();
+        let last_minute = task.minutes.last().copied();
+        let fetched_rows = if let (Some(first_minute), Some(last_minute)) = (first_minute, last_minute)
+        {
+            let needs_hydration = {
+                let state_store = state_store.lock().await;
+                state_store.has_unhydrated_futures_orderbook_heatmap_in_range(first_minute, last_minute)
+            };
+            if needs_hydration {
+                fetch_futures_orderbook_heatmap_rows_for_range(
+                    &ctx.db_pool,
+                    &ctx.config.indicator.symbol,
+                    first_minute,
+                    last_minute + ChronoDuration::minutes(1),
+                    "live ready minute materialization",
+                )
+                .await?
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+
+        let mut prepared_jobs = Vec::with_capacity(task.minutes.len());
+        {
+            let mut state_store = state_store.lock().await;
+            if let (Some(first_minute), Some(last_minute)) = (first_minute, last_minute) {
+                let last_minute_exclusive = last_minute + ChronoDuration::minutes(1);
+                if state_store.has_unhydrated_futures_orderbook_heatmap_in_range(
+                    first_minute,
+                    last_minute,
+                ) {
+                    let ingested_rows = ingest_futures_orderbook_heatmap_rows(
+                        &mut state_store,
+                        fetched_rows,
+                        first_minute,
+                        last_minute_exclusive,
+                        "live ready minute materialization",
+                    )?;
+                    if state_store.has_unhydrated_futures_orderbook_heatmap_in_range(
+                        first_minute,
+                        last_minute,
+                    ) {
+                        anyhow::bail!(
+                            "live ready minute materialization left unhydrated futures orderbook heatmap in range {first_minute}..={last_minute}"
+                        );
+                    }
+                    if ingested_rows > 0 {
+                        info!(
+                            reason = "live ready minute materialization",
+                            from_ts = %first_minute,
+                            to_ts_exclusive = %last_minute_exclusive,
+                            fetched_rows = ingested_rows,
+                            "hydrated futures orderbook heatmaps for live prepare range"
+                        );
+                    }
+                }
+            }
+
+            for minute in &task.minutes {
+                let bundle = state_store.finalize_minute_for_live_job(*minute);
+                prepared_jobs.push(ReadyMinuteJob {
+                    ts_bucket: *minute,
+                    mode: task.mode,
+                    source: ReadyJobSource::Live,
+                    enqueued_at: task.enqueued_at,
+                    bundle,
+                });
+            }
+        }
+
+        for job in prepared_jobs {
+            let minute = job.ts_bucket;
+            let enqueued = try_enqueue_ready_minute_job(&ready_job_tx, &ready_job_pending, job)?;
+            prepare_minute_pending.fetch_sub(1, Ordering::AcqRel);
+            if !enqueued {
+                anyhow::bail!("live materialize worker queue was unexpectedly full during prepare handoff for minute={minute}");
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn poll_prepare_handle(handle_slot: &mut Option<JoinHandle<Result<()>>>) -> Result<()> {
+    if !handle_slot
+        .as_ref()
+        .map(|handle| handle.is_finished())
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
+
+    let handle = handle_slot
+        .take()
+        .expect("finished prepare handle must exist");
+    match handle.await {
+        Ok(Ok(())) => anyhow::bail!("live prepare worker exited unexpectedly"),
+        Ok(Err(err)) => Err(err).context("live prepare worker failed"),
+        Err(err) => Err(err).context("live prepare worker join failed"),
+    }
+}
+
+async fn drain_prepare_handle(handle_slot: &mut Option<JoinHandle<Result<()>>>) {
+    let Some(handle) = handle_slot.take() else {
+        return;
+    };
+    match handle.await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            warn!(error = %err, "prepare worker failed during shutdown drain");
+        }
+        Err(err) => {
+            warn!(error = %err, "prepare worker join failed during shutdown drain");
+        }
+    }
+}
+
 async fn poll_materialize_handle(
     handle_slot: &mut Option<JoinHandle<Result<()>>>,
     worker_kind: MaterializeWorkerKind,
@@ -3064,9 +3399,10 @@ async fn drain_materialize_handle(
 async fn enqueue_live_ready_jobs(
     ctx: &Arc<AppContext>,
     metrics: Arc<AppMetrics>,
-    state_store: &mut StateStore,
+    state_store: &Arc<Mutex<StateStore>>,
     scheduler: &mut WindowScheduler,
-    live_ready_job_tx: &mpsc::Sender<ReadyMinuteJob>,
+    live_prepare_task_tx: &mpsc::Sender<PrepareMinuteTask>,
+    live_prepare_minute_pending: &Arc<AtomicUsize>,
     live_ready_job_pending: &Arc<AtomicUsize>,
     dirty_ready_job_tx: &mpsc::Sender<ReadyMinuteJob>,
     dirty_ready_job_pending: &Arc<AtomicUsize>,
@@ -3083,8 +3419,11 @@ async fn enqueue_live_ready_jobs(
     let mut first_bucket: Option<DateTime<Utc>> = None;
     let mut last_bucket: Option<DateTime<Utc>> = None;
 
-    let available_slots =
-        available_ready_job_slots(LIVE_READY_JOB_QUEUE_CAPACITY, live_ready_job_pending);
+    let available_slots = available_live_pipeline_slots(
+        LIVE_READY_JOB_QUEUE_CAPACITY,
+        live_ready_job_pending,
+        live_prepare_minute_pending,
+    );
     if available_slots == 0 {
         return Ok(());
     }
@@ -3102,43 +3441,27 @@ async fn enqueue_live_ready_jobs(
         next_minute = Some(minute + ChronoDuration::minutes(1));
     }
 
-    if let (Some(first_ready_minute), Some(last_ready_minute)) = (
-        ready_minutes.first().copied(),
-        ready_minutes.last().copied(),
-    ) {
-        hydrate_futures_orderbook_heatmaps_for_range(
-            &ctx.db_pool,
-            &ctx.config.indicator.symbol,
-            state_store,
-            first_ready_minute,
-            last_ready_minute + ChronoDuration::minutes(1),
-            "live ready minute materialization",
-        )
-        .await?;
-    }
-
-    for minute in ready_minutes {
-        let window = state_store.finalize_minute_for_live_job(minute);
-        let enqueued = try_enqueue_ready_minute_job(
-            live_ready_job_tx,
-            live_ready_job_pending,
-            ReadyMinuteJob {
-                ts_bucket: minute,
+    if !ready_minutes.is_empty() {
+        let enqueued = try_enqueue_prepare_minute_task(
+            live_prepare_task_tx,
+            live_prepare_minute_pending,
+            PrepareMinuteTask {
+                minutes: ready_minutes.clone(),
                 mode: dispatch_mode,
-                source: ReadyJobSource::Live,
                 enqueued_at: Instant::now(),
-                bundle: window,
             },
         )?;
         if !enqueued {
-            break;
+            return Ok(());
         }
-        scheduler.mark_emitted_through(minute);
-        live_windows_enqueued += 1;
-        if first_bucket.is_none() {
-            first_bucket = Some(minute);
+        for minute in ready_minutes {
+            scheduler.mark_emitted_through(minute);
+            live_windows_enqueued += 1;
+            if first_bucket.is_none() {
+                first_bucket = Some(minute);
+            }
+            last_bucket = Some(minute);
         }
-        last_bucket = Some(minute);
     }
 
     let live_queue_pending = live_ready_job_pending.load(Ordering::Acquire);
@@ -3146,12 +3469,16 @@ async fn enqueue_live_ready_jobs(
     let live_minutes_still_ready = next_live_minute
         .map(|minute| minute <= ready_through_ts)
         .unwrap_or(false);
+    let dirty_pending = {
+        let state_store = state_store.lock().await;
+        state_store.has_pending_dirty_recompute()
+    };
     let allow_dirty_enqueue = should_enqueue_dirty_ready_jobs(
         live_windows_enqueued,
         live_queue_pending,
         next_live_minute,
         ready_through_ts,
-        state_store.has_pending_dirty_recompute(),
+        dirty_pending,
     );
 
     if allow_dirty_enqueue {
@@ -3170,20 +3497,54 @@ async fn enqueue_live_ready_jobs(
             let batch_limit = DIRTY_RECOMPUTE_BATCH_SIZE
                 .min(remaining_budget)
                 .min(available_dirty_slots);
-            if let Some((dirty_from, dirty_to)) =
-                state_store.pending_dirty_recompute_batch_range(batch_limit)
-            {
-                hydrate_futures_orderbook_heatmaps_for_range(
+            let dirty_batch_plan = {
+                let state_store = state_store.lock().await;
+                state_store
+                    .pending_dirty_recompute_batch_range(batch_limit)
+                    .map(|(dirty_from, dirty_to)| {
+                        (
+                            dirty_from,
+                            dirty_to,
+                            state_store.has_unhydrated_futures_orderbook_heatmap_in_range(
+                                dirty_from,
+                                dirty_to,
+                            ),
+                        )
+                    })
+            };
+            let Some((dirty_from, dirty_to, needs_hydration)) = dirty_batch_plan else {
+                break;
+            };
+            let heatmap_rows = if needs_hydration {
+                fetch_futures_orderbook_heatmap_rows_for_range(
                     &ctx.db_pool,
                     &ctx.config.indicator.symbol,
-                    state_store,
                     dirty_from,
                     dirty_to + ChronoDuration::minutes(1),
                     "live dirty recompute",
                 )
-                .await?;
-            }
-            let dirty_batch = state_store.recompute_dirty_finalized_minutes(batch_limit);
+                .await?
+            } else {
+                Vec::new()
+            };
+            let dirty_batch = {
+                let mut state_store = state_store.lock().await;
+                if needs_hydration
+                    && state_store.has_unhydrated_futures_orderbook_heatmap_in_range(
+                        dirty_from,
+                        dirty_to,
+                    )
+                {
+                    ingest_futures_orderbook_heatmap_rows(
+                        &mut state_store,
+                        heatmap_rows,
+                        dirty_from,
+                        dirty_to + ChronoDuration::minutes(1),
+                        "live dirty recompute",
+                    )?;
+                }
+                state_store.recompute_dirty_finalized_minutes(batch_limit)
+            };
             if dirty_batch.is_empty() {
                 break;
             }
@@ -3211,7 +3572,11 @@ async fn enqueue_live_ready_jobs(
         }
     }
 
-    if state_store.has_pending_dirty_recompute() && !allow_dirty_enqueue {
+    let dirty_still_pending = {
+        let state_store = state_store.lock().await;
+        state_store.has_pending_dirty_recompute()
+    };
+    if dirty_still_pending && !allow_dirty_enqueue {
         let elapsed_ms = batch_started_at.elapsed().as_millis();
         if elapsed_ms >= PROCESS_READY_MINUTES_WARN_MS || live_queue_pending > 0 {
             info!(
@@ -5143,6 +5508,71 @@ async fn hydrate_futures_orderbook_heatmaps_for_range(
         },
     )
     .await
+}
+
+async fn fetch_futures_orderbook_heatmap_rows_for_range(
+    pool: &PgPool,
+    symbol: &str,
+    from_ts: DateTime<Utc>,
+    to_ts_exclusive: DateTime<Utc>,
+    reason: &'static str,
+) -> Result<Vec<ReplayRow>> {
+    let Some(to_ts_inclusive) = to_ts_exclusive.checked_sub_signed(ChronoDuration::minutes(1))
+    else {
+        return Ok(Vec::new());
+    };
+    if from_ts > to_ts_inclusive {
+        return Ok(Vec::new());
+    }
+
+    let symbol_upper = symbol.to_uppercase();
+    let mut rows = Vec::new();
+    let mut window_from_ts = from_ts;
+    while window_from_ts < to_ts_exclusive {
+        let window_to_ts = (window_from_ts
+            + ChronoDuration::minutes(CANONICAL_REPLAY_FETCH_WINDOW_MINUTES))
+        .min(to_ts_exclusive);
+        let mut batch = fetch_backfill_source_rows(
+            pool,
+            ORDERBOOK_BACKFILL_WINDOW_SQL_WITH_HEATMAP,
+            "orderbook",
+            window_from_ts,
+            window_to_ts,
+            &symbol_upper,
+            "futures",
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "{reason} fetch futures orderbook heatmap rows from_ts={window_from_ts} to_ts_exclusive={window_to_ts}"
+            )
+        })?;
+        rows.append(&mut batch);
+        window_from_ts = window_to_ts;
+    }
+
+    Ok(rows)
+}
+
+fn ingest_futures_orderbook_heatmap_rows(
+    state_store: &mut StateStore,
+    rows: Vec<ReplayRow>,
+    from_ts: DateTime<Utc>,
+    to_ts_exclusive: DateTime<Utc>,
+    reason: &'static str,
+) -> Result<usize> {
+    let mut ingested_rows = 0usize;
+    for row in rows {
+        let event = replay_row_to_engine_event(row).with_context(|| {
+            format!(
+                "{reason} decode futures orderbook heatmap row from_ts={from_ts} to_ts_exclusive={to_ts_exclusive}"
+            )
+        })?;
+        state_store.ingest(event);
+        ingested_rows += 1;
+    }
+
+    Ok(ingested_rows)
 }
 
 pub fn replay_row_to_engine_event(row: ReplayRow) -> Result<EngineEvent> {

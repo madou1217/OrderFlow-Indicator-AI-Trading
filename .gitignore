@@ -32,6 +32,8 @@
 *.sqlite3
 *.db
 *.parquet
+perf.data
+perf.data.*
 *.swp
 *.swo
 *~
