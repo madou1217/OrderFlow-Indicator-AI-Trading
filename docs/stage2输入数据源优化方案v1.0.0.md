@@ -104,6 +104,13 @@ watcher 不负责替 `Stage2A` 做战略审计。
 - `i26 long_short_ratios`: `4h`
 - `i27 ATM IV / RR-skew`: `1d regime`
 
+来源说明：
+
+- 这一层大部分字段直接来自上游最新指标产物的高周期窗口。
+- `i18 AVWAP: Stage1 选出的 anchor` 不是上游 27 指标里的现成字段，而是 `Stage1.current_path` 的锚点结果。
+- 具体实现上，应由 `Stage1.current_path.activation_anchor_id / first_path_target_anchor_id / next_path_target_anchor_id / failure_anchor_id` 与 `tracked_zones` 共同确定当前 path 真正引用的战略锚点，再映射到 `i18 AVWAP` 原始产物中的对应 anchor / reference。
+- 也就是说，这一项属于 `Stage1 carry + Stage2 侧派生计算`，不是上游分钟 bundle 直接给出的成品字段。
+
 原则：
 
 - 这一层是战略背景，不是入场 trigger。
@@ -127,6 +134,17 @@ watcher 不负责替 `Stage2A` 做战略审计。
 - `i17 VPIN`: `15m`
 - `i2 footprint`: `15m summary`
 
+来源说明：
+
+- `i1 / i4 / i21 / i14 / i17` 这几项可以直接读取上游 `15m` 窗口产物。
+- `i18 AVWAP: 当前价格到各 anchor 的距离` 不是上游直接给好的统一矩阵，而是基于：
+  - 当前价格
+  - `Stage1` 选出的 anchor 集合
+  - `i18 AVWAP` 原始数值
+  在 `Stage2` 侧做距离计算。
+- `i3 divergence: 15m` 当前上游更接近事件流 / 最近事件集合，因此进入 `Stage2` 前应整理成偏 `15m` 审核可读的摘要，而不是原样把长事件列表塞给模型。
+- `i2 footprint: 15m summary` 也应在 `Stage2` 侧整理成轻量 summary；目标是提供 `15m` 的确认信息，而不是把完整 footprint 明细直接输入模型。
+
 ### C. 5m 持续性确认层
 
 用途：
@@ -140,6 +158,14 @@ watcher 不负责替 `Stage2A` 做战略审计。
 - `i25 OI`: `5m`
 - `i26 ratios`: `5m`
 - `i19 kline_history`: `5m`   #特别注意，该指标通过1m聚合，不从上游获取
+
+来源说明：
+
+- `i5 orderbook_depth: 5m summary` 直接读取上游新增后的 `5m` window summary。
+- `i14 CVD pack: 5m` 直接读取上游新增后的 `5m` window。
+- `i25 OI: 5m` 与 `i26 ratios: 5m` 直接读取上游已有 `5m` window。
+- `i19 kline_history: 5m` 不从上游单独拉取；统一由 `kline_history: 1m` 在 `Stage2` 侧聚合生成 `5m OHLCV`。
+- 这层的聚合原则是只服务于“持续性确认”，不额外引入新的战略解释。
 
 ## 5. 对 Stage2A 的删减建议
 

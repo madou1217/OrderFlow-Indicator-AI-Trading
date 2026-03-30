@@ -12,7 +12,7 @@ Your work is always two-step:
   - If the path is still alive, return conditional management actions such as add, reduce, move_stop, update_take_profit, or hold.
 
 Your job:
-- Read the active positions, path runtime state, latest_15m_trigger_facts, guardrails, previous_management_plan, and stage1_output.
+- Read the active positions, previous_management_plan, stage1_output, strategic_context_frozen, entry_location_context_15m, continuity_confirmation_context_5m, and guardrails.
 - Decide whether the current position is still supported by the strategic path.
 - If the path is invalidated, output management actions that close or strongly de-risk the position.
 - If the path is live or degraded-but-valid, output a position_management_plan that maximizes收益 while remaining inside the strategic path envelope.

@@ -1,7 +1,7 @@
 use crate::workflow::schema::{
-    CurrentPath, EntryPlan, PathRuntimeState, PendingOrderManagementAction,
-    PendingOrderManagementPlan, PositionManagementAction, PositionManagementPlan, PriceZone,
-    Stage1Output, Stage2AOutput, Stage2BOutput, Stage2COutput,
+    CurrentPath, EntryPlan, PendingOrderManagementAction, PendingOrderManagementPlan,
+    PositionManagementAction, PositionManagementPlan, PriceZone, Stage1Output, Stage2AOutput,
+    Stage2BOutput, Stage2COutput,
 };
 use anyhow::{anyhow, Result};
 use serde_json::Value;
@@ -535,11 +535,7 @@ fn validate_stage2a_entry_plan(entry_plan: &EntryPlan, current_path: &CurrentPat
     Ok(())
 }
 
-pub fn parse_stage2a_output(
-    value: Value,
-    stage1_output: &Stage1Output,
-    _path_runtime_state: &PathRuntimeState,
-) -> Result<Stage2AOutput> {
+pub fn parse_stage2a_output(value: Value, stage1_output: &Stage1Output) -> Result<Stage2AOutput> {
     let output: Stage2AOutput = serde_json::from_value(value)?;
     if !matches!(
         output.stage2_decision.as_str(),
@@ -1158,8 +1154,8 @@ mod tests {
         parse_stage1_output, parse_stage2a_output, parse_stage2b_output, parse_stage2c_output,
     };
     use crate::workflow::schema::{
-        CurrentPath, DriverAttribution, MapSummary, OpportunityAssessment, PathRuntimeState,
-        PriceZone, ReevaluationTrigger, Stage1Meta, Stage1Output,
+        CurrentPath, DriverAttribution, MapSummary, OpportunityAssessment, PriceZone,
+        ReevaluationTrigger, Stage1Meta, Stage1Output,
     };
     use chrono::Utc;
     use serde_json::json;
@@ -1320,7 +1316,10 @@ mod tests {
         let value = serde_json::to_value(sample).expect("encode");
         let parsed = parse_stage1_output(value).expect("parse");
         let parsed_path = parsed.current_path.as_ref().expect("path");
-        assert_eq!(parsed_path.activation_anchor_id.as_deref(), Some("z_support"));
+        assert_eq!(
+            parsed_path.activation_anchor_id.as_deref(),
+            Some("z_support")
+        );
         assert_eq!(
             parsed_path.first_path_target_anchor_id.as_deref(),
             Some("z_res_1")
@@ -1338,8 +1337,11 @@ mod tests {
     #[test]
     fn stage1_parser_accepts_driver_change_that_references_current_driver() {
         let mut sample = sample_stage1_output();
-        sample.driver_attribution.as_mut().expect("driver").flow_driver =
-            "futures_led".to_string();
+        sample
+            .driver_attribution
+            .as_mut()
+            .expect("driver")
+            .flow_driver = "futures_led".to_string();
         let driver_change = &mut sample
             .current_path
             .as_mut()
@@ -1357,10 +1359,11 @@ mod tests {
         let value = serde_json::to_value(sample).expect("encode");
         let parsed = parse_stage1_output(value).expect("parse");
         assert_eq!(
-            parsed
-                .current_path
-                .as_ref()
-                .and_then(|path| path.reevaluation_trigger.driver_change.expected_flow_driver.as_deref()),
+            parsed.current_path.as_ref().and_then(|path| path
+                .reevaluation_trigger
+                .driver_change
+                .expected_flow_driver
+                .as_deref()),
             Some("futures_led")
         );
     }
@@ -1394,14 +1397,6 @@ mod tests {
     #[test]
     fn stage2a_parser_accepts_single_entry_plan() {
         let stage1_output = sample_stage1_output();
-        let runtime_state = PathRuntimeState {
-            path_id: "path_1".to_string(),
-            monitoring_status: "active".to_string(),
-            latest_price: 2000.0,
-            failure_level_breached: false,
-            active_entry_context_keys: vec![],
-            notes: vec![],
-        };
         let value = json!({
             "stage2_decision": "PATH_CONFIRMED",
             "tactical_entry_plan": {
@@ -1420,41 +1415,25 @@ mod tests {
             },
             "reevaluation_reason": null
         });
-        let parsed = parse_stage2a_output(value, &stage1_output, &runtime_state).expect("parse");
+        let parsed = parse_stage2a_output(value, &stage1_output).expect("parse");
         assert_eq!(parsed.stage2_decision, "PATH_CONFIRMED");
     }
 
     #[test]
     fn stage2a_parser_allows_reevaluation_without_runtime_soft_invalidation() {
         let stage1_output = sample_stage1_output();
-        let runtime_state = PathRuntimeState {
-            path_id: "path_1".to_string(),
-            monitoring_status: "active".to_string(),
-            latest_price: 2000.0,
-            failure_level_breached: false,
-            active_entry_context_keys: vec![],
-            notes: vec![],
-        };
         let value = json!({
             "stage2_decision": "REQUEST_STAGE1_REEVALUATION",
             "tactical_entry_plan": null,
             "reevaluation_reason": "Path quality degraded and needs a fresh strategic review."
         });
-        let parsed = parse_stage2a_output(value, &stage1_output, &runtime_state).expect("parse");
+        let parsed = parse_stage2a_output(value, &stage1_output).expect("parse");
         assert_eq!(parsed.stage2_decision, "REQUEST_STAGE1_REEVALUATION");
     }
 
     #[test]
-    fn stage2a_parser_does_not_force_reevaluation_from_soft_runtime_flags() {
+    fn stage2a_parser_allows_path_confirmation_without_runtime_path_verdict() {
         let stage1_output = sample_stage1_output();
-        let runtime_state = PathRuntimeState {
-            path_id: "path_1".to_string(),
-            monitoring_status: "active".to_string(),
-            latest_price: 2000.0,
-            failure_level_breached: false,
-            active_entry_context_keys: vec![],
-            notes: vec![],
-        };
         let value = json!({
             "stage2_decision": "PATH_CONFIRMED",
             "tactical_entry_plan": {
@@ -1473,7 +1452,7 @@ mod tests {
             },
             "reevaluation_reason": null
         });
-        let parsed = parse_stage2a_output(value, &stage1_output, &runtime_state).expect("parse");
+        let parsed = parse_stage2a_output(value, &stage1_output).expect("parse");
         assert_eq!(parsed.stage2_decision, "PATH_CONFIRMED");
     }
 

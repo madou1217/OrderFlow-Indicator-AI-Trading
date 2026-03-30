@@ -10,7 +10,7 @@ use chrono::{DateTime, Utc};
 use serde_json::{json, Map, Value};
 use std::cmp::Ordering;
 
-const AVWAP_LIMITS: &[(&str, usize)] = &[("15m", 5), ("4h", 3), ("1d", 2)];
+const AVWAP_LIMITS: &[(&str, usize)] = &[("15m", 5), ("4h", 3), ("1d", 2), ("3d", 2)];
 const KLINE_LIMITS: &[(&str, usize)] = &[("15m", 20), ("4h", 12), ("1d", 8)];
 const CVD_LIMITS: &[(&str, usize)] = &[("15m", 15), ("4h", 8), ("1d", 5)];
 const ENTRY_TOP_LIQUIDITY_LEVELS_LIMIT: usize = 20;
@@ -203,7 +203,6 @@ fn filter_ema_trend_regime_entry_v4(payload: &Value) -> Value {
     let mut filtered = filter_ema_trend_regime(payload);
     if let Some(object) = filtered.as_object_mut() {
         object.remove("trend_regime");
-        object.remove("trend_regime_by_tf");
         if let Some(output_sampling) = object
             .get_mut("output_sampling")
             .and_then(Value::as_object_mut)

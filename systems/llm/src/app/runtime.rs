@@ -1407,23 +1407,6 @@ fn clear_approved_tactical_plan(workflow_state: &mut crate::workflow::state::Wor
     workflow_state.pending_entry_bracket_template_override = None;
 }
 
-fn scheduled_stage2_candidate_event(
-    bundle: &LatestBundle,
-    path_runtime_state: &crate::workflow::schema::PathRuntimeState,
-    derived: Option<crate::workflow::schema::CandidateEvent>,
-) -> crate::workflow::schema::CandidateEvent {
-    derived.unwrap_or_else(|| crate::workflow::schema::CandidateEvent {
-        event_type: "path_review_candidate".to_string(),
-        event_ts: bundle.raw.ts_bucket,
-        latest_price: path_runtime_state.latest_price,
-        reason: "scheduled_15m_review".to_string(),
-        details: json!({
-            "scheduled_review": true,
-            "review_minute": bundle.raw.ts_bucket.minute(),
-        }),
-    })
-}
-
 #[derive(Debug, Clone, Copy)]
 struct SelectedEntryPlan<'a> {
     plan: &'a crate::workflow::schema::EntryPlan,
@@ -1967,14 +1950,14 @@ fn select_entry_plan<'a>(
     symbol: &str,
     tactical_plan: &'a crate::workflow::schema::TacticalEntryPlan,
     workflow_state: &crate::workflow::state::WorkflowState,
-    path_runtime_state: &crate::workflow::schema::PathRuntimeState,
+    latest_price: f64,
     hard_invalidation_hit: bool,
     trading_state: &TradingStateSnapshot,
     entry_snapshots: &HashMap<String, crate::workflow::schema::EntrySnapshot>,
     indicators: &Value,
     watcher_cfg: &crate::app::config::WorkflowWatcherConfig,
 ) -> Option<SelectedEntryPlan<'a>> {
-    if path_runtime_state.monitoring_status != "active" || hard_invalidation_hit {
+    if hard_invalidation_hit {
         return None;
     }
     let side = tactical_plan.entry_plan.side.as_str();
@@ -1985,20 +1968,13 @@ fn select_entry_plan<'a>(
         return None;
     }
     let candidate = &tactical_plan.entry_plan;
-    let watch_price = watcher_reference_price(indicators, path_runtime_state.latest_price);
+    let watch_price = watcher_reference_price(indicators, latest_price);
     let watch_facts = build_watcher_price_facts(indicators, watch_price);
     if !watcher_entry_ready(candidate, &watch_facts, watcher_cfg) {
         return None;
     }
     let context_key = workflow_entry_context_key(symbol, &candidate.side, &tactical_plan.path_id);
     if entry_snapshots.contains_key(&context_key) {
-        return None;
-    }
-    if path_runtime_state
-        .active_entry_context_keys
-        .iter()
-        .any(|key| key == &context_key)
-    {
         return None;
     }
     Some(SelectedEntryPlan {
@@ -2773,27 +2749,36 @@ async fn invoke_workflow_bundle_models(
         );
     }
 
-    let mut path_runtime_state = crate::workflow::stage2::build_path_runtime_state(
-        &indicator_summary,
-        &stage1_output,
-        &entry_snapshots,
-    )?;
+    let mut latest_price = latest_closed_1m_price(&input.indicators)
+        .or_else(|| {
+            indicator_summary
+                .auction_context
+                .recent_15m_bars
+                .last()
+                .map(|bar| bar.close)
+        })
+        .ok_or_else(|| anyhow!("missing latest workflow price reference"))?;
     let approved_plan_before_review = workflow_state.approved_tactical_plan.clone();
     maybe_record_stopout_and_cleanup(
         &mut workflow_state,
         approved_plan_before_review.as_ref(),
         &symbol,
         &trading_state,
-        path_runtime_state.latest_price,
+        latest_price,
         &mut entry_snapshots,
         &state_dir,
     )?;
-    path_runtime_state = crate::workflow::stage2::build_path_runtime_state(
-        &indicator_summary,
-        &stage1_output,
-        &entry_snapshots,
-    )?;
-    let hard_invalidation_hit = path_runtime_state.failure_level_breached;
+    latest_price = latest_closed_1m_price(&input.indicators)
+        .or_else(|| {
+            indicator_summary
+                .auction_context
+                .recent_15m_bars
+                .last()
+                .map(|bar| bar.close)
+        })
+        .ok_or_else(|| anyhow!("missing latest workflow price reference"))?;
+    let hard_invalidation_hit =
+        crate::workflow::stage2::failure_level_breached(&stage1_output, latest_price)?;
 
     let mut management_signal_report: Option<ManagementExecutionReport> = None;
     let mut management_signal_action: Option<crate::workflow::schema::ManagementAction> = None;
@@ -2810,7 +2795,9 @@ async fn invoke_workflow_bundle_models(
     if hard_invalidation_hit {
         let had_approved_workflow_plans = workflow_state.approved_tactical_plan.is_some()
             || !workflow_state.approved_position_management_plans.is_empty()
-            || !workflow_state.approved_pending_order_management_plans.is_empty();
+            || !workflow_state
+                .approved_pending_order_management_plans
+                .is_empty();
         clear_approved_tactical_plan(&mut workflow_state);
         clear_position_management_plans(&mut workflow_state);
         clear_pending_order_management_plans(&mut workflow_state);
@@ -2823,7 +2810,7 @@ async fn invoke_workflow_bundle_models(
                 bundle.raw.ts_bucket,
                 json!({
                     "trigger": &*trigger,
-                    "path_id": path_runtime_state.path_id,
+                    "path_id": stage1_output.current_path.as_ref().map(|path| path.id.clone()),
                     "reason": "hard_invalidation",
                 }),
             );
@@ -2834,8 +2821,8 @@ async fn invoke_workflow_bundle_models(
             bundle.raw.ts_bucket,
             json!({
                 "trigger": &*trigger,
-                "path_id": path_runtime_state.path_id,
-                "latest_price": path_runtime_state.latest_price,
+                "path_id": stage1_output.current_path.as_ref().map(|path| path.id.clone()),
+                "latest_price": latest_price,
                 "failure_level_breached": true,
                 "action": "request_stage1_rebuild",
             }),
@@ -2874,22 +2861,16 @@ async fn invoke_workflow_bundle_models(
             );
             return Ok(());
         }
-        path_runtime_state = crate::workflow::stage2::build_path_runtime_state(
-            &indicator_summary,
-            &stage1_output,
-            &entry_snapshots,
-        )?;
+        latest_price = latest_closed_1m_price(&input.indicators)
+            .or_else(|| {
+                indicator_summary
+                    .auction_context
+                    .recent_15m_bars
+                    .last()
+                    .map(|bar| bar.close)
+            })
+            .ok_or_else(|| anyhow!("missing latest workflow price reference"))?;
     }
-
-    append_workflow_journal_event(
-        "workflow_path_runtime_state",
-        &symbol,
-        bundle.raw.ts_bucket,
-        json!({
-            "trigger": &*trigger,
-            "path_runtime_state": path_runtime_state,
-        }),
-    );
 
     let stage1_refresh_blocking = (stage1_refresh_reason.is_some()
         && !stage1_refreshed_this_bundle)
@@ -2902,28 +2883,14 @@ async fn invoke_workflow_bundle_models(
     );
 
     if stage2_review_due {
-        let candidate_event = scheduled_stage2_candidate_event(
-            &bundle,
-            &path_runtime_state,
-            crate::workflow::stage2::build_candidate_event(
-                &indicator_summary,
-                &stage1_output,
-                &path_runtime_state,
-            )?,
-        );
-        append_workflow_journal_event(
-            "workflow_candidate_event",
-            &symbol,
-            bundle.raw.ts_bucket,
-            json!({
-                "trigger": &*trigger,
-                "candidate_event": candidate_event.clone(),
-            }),
-        );
-
         if let Some(_stage2_guard) = try_acquire_workflow_stage(&symbol, WorkflowStageKind::Stage2)
         {
             if config.llm.request_enabled {
+                let current_path_id = stage1_output
+                    .current_path
+                    .as_ref()
+                    .map(|path| path.id.clone())
+                    .unwrap_or_default();
                 let path_side = stage1_output
                     .current_path
                     .as_ref()
@@ -2948,13 +2915,13 @@ async fn invoke_workflow_bundle_models(
                     &config.llm.workflow.limits,
                 );
                 let stage2b_contexts =
-                    crate::workflow::stage2::stage2b_active_positions_for_current_path(
+                    crate::workflow::stage2_input::stage2b_active_positions_for_current_path(
                         &stage1_output,
                         &trading_state,
                         &entry_snapshots,
                     );
                 let stage2c_contexts =
-                    crate::workflow::stage2::stage2c_active_orders_for_current_path(
+                    crate::workflow::stage2_input::stage2c_active_orders_for_current_path(
                         &stage1_output,
                         &trading_state,
                         &entry_snapshots,
@@ -2970,12 +2937,10 @@ async fn invoke_workflow_bundle_models(
                 );
 
                 if should_run_stage2a {
-                    let prompt_input = crate::workflow::stage2::build_stage2a_prompt_input(
-                        indicator_summary.clone(),
-                        stage1_output.clone(),
-                        candidate_event.clone(),
-                        path_runtime_state.clone(),
-                        previous_tactical_plan_for_review.clone(),
+                    let prompt_input = crate::workflow::stage2_input::build_stage2a_prompt_input(
+                        &input,
+                        &indicator_summary,
+                        &stage1_output,
                         &trading_state,
                     );
                     let prompt_value = serde_json::to_value(&prompt_input)
@@ -2993,10 +2958,7 @@ async fn invoke_workflow_bundle_models(
                         symbol = %symbol,
                         ts_bucket = %bundle.raw.ts_bucket,
                         trigger = &*trigger,
-                        path_id = %path_runtime_state.path_id,
-                        candidate_event_type = %candidate_event.event_type,
-                        exposure_state = %prompt_input.exposure_state,
-                        had_previous_tactical_plan = previous_tactical_plan_for_review.is_some(),
+                        path_id = %current_path_id,
                         "invoking workflow stage2a models"
                     );
                     for out in crate::llm::workflow_provider::invoke_stage2a_models(
@@ -3040,11 +3002,7 @@ async fn invoke_workflow_bundle_models(
                         let Some(value) = payload.get("parsed_value").cloned() else {
                             continue;
                         };
-                        match crate::workflow::parser::parse_stage2a_output(
-                            value,
-                            &stage1_output,
-                            &path_runtime_state,
-                        ) {
+                        match crate::workflow::parser::parse_stage2a_output(value, &stage1_output) {
                             Ok(parsed) => {
                                 selected_stage2a_model_name = Some(out.model_name.clone());
                                 stage2a_output = Some(parsed);
@@ -3134,18 +3092,18 @@ async fn invoke_workflow_bundle_models(
                                 .approved_position_management_plans
                                 .get(&active_position.context_key)
                                 .cloned(),
-                            &path_runtime_state.path_id,
+                            &current_path_id,
                             &active_position.context_key,
                         );
-                        let prompt_input = crate::workflow::stage2::build_stage2b_prompt_input(
-                            indicator_summary.clone(),
-                            stage1_output.clone(),
-                            candidate_event.clone(),
-                            path_runtime_state.clone(),
-                            active_position.clone(),
-                            previous_management_plan.clone(),
-                            &trading_state,
-                        );
+                        let prompt_input =
+                            crate::workflow::stage2_input::build_stage2b_prompt_input(
+                                &input,
+                                &indicator_summary,
+                                &stage1_output,
+                                active_position.clone(),
+                                previous_management_plan.clone(),
+                                &trading_state,
+                            );
                         let prompt_value = serde_json::to_value(&prompt_input)
                             .context("serialize workflow stage2b prompt input")?;
                         if config.llm.workflow.persist_prompt_inputs {
@@ -3161,9 +3119,8 @@ async fn invoke_workflow_bundle_models(
                             symbol = %symbol,
                             ts_bucket = %bundle.raw.ts_bucket,
                             trigger = &*trigger,
-                            path_id = %path_runtime_state.path_id,
+                            path_id = %current_path_id,
                             context_key = %active_position.context_key,
-                            candidate_event_type = %candidate_event.event_type,
                             exposure_state = %prompt_input.exposure_state,
                             had_previous_management_plan = previous_management_plan.is_some(),
                             "invoking workflow stage2b models"
@@ -3263,19 +3220,19 @@ async fn invoke_workflow_bundle_models(
                                     .approved_pending_order_management_plans
                                     .get(&active_order.context_key)
                                     .cloned(),
-                                &path_runtime_state.path_id,
+                                &current_path_id,
                                 &active_order.context_key,
                             );
-                        let prompt_input = crate::workflow::stage2::build_stage2c_prompt_input(
-                            indicator_summary.clone(),
-                            stage1_output.clone(),
-                            candidate_event.clone(),
-                            path_runtime_state.clone(),
-                            expected_stage2c_exposure_state,
-                            active_order.clone(),
-                            previous_pending_order_management_plan.clone(),
-                            &trading_state,
-                        );
+                        let prompt_input =
+                            crate::workflow::stage2_input::build_stage2c_prompt_input(
+                                &input,
+                                &indicator_summary,
+                                &stage1_output,
+                                expected_stage2c_exposure_state,
+                                active_order.clone(),
+                                previous_pending_order_management_plan.clone(),
+                                &trading_state,
+                            );
                         let prompt_value = serde_json::to_value(&prompt_input)
                             .context("serialize workflow stage2c prompt input")?;
                         if config.llm.workflow.persist_prompt_inputs {
@@ -3291,10 +3248,9 @@ async fn invoke_workflow_bundle_models(
                             symbol = %symbol,
                             ts_bucket = %bundle.raw.ts_bucket,
                             trigger = &*trigger,
-                            path_id = %path_runtime_state.path_id,
+                            path_id = %current_path_id,
                             context_key = %active_order.context_key,
                             order_id = active_order.order_id,
-                            candidate_event_type = %candidate_event.event_type,
                             exposure_state = %prompt_input.exposure_state,
                             had_previous_pending_order_management_plan =
                                 previous_pending_order_management_plan.is_some(),
@@ -3431,8 +3387,7 @@ async fn invoke_workflow_bundle_models(
 
     if config.llm.execution.enabled && !execution_blocked_due_to_stale {
         if let Some(current_path) = stage1_output.current_path.as_ref() {
-            let watch_price =
-                watcher_reference_price(&input.indicators, path_runtime_state.latest_price);
+            let watch_price = watcher_reference_price(&input.indicators, latest_price);
             let watch_facts = build_watcher_price_facts(&input.indicators, watch_price);
 
             let position_plan_context_keys = workflow_state
@@ -4250,8 +4205,8 @@ async fn invoke_workflow_bundle_models(
                 &symbol,
                 tactical_plan,
                 &workflow_state,
-                &path_runtime_state,
-                path_runtime_state.failure_level_breached,
+                latest_price,
+                hard_invalidation_hit,
                 &trading_state,
                 &entry_snapshots,
                 &input.indicators,

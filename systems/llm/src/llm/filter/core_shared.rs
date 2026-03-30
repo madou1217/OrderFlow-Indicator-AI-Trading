@@ -495,6 +495,7 @@ pub(super) fn filter_ema_trend_regime(payload: &Value) -> Value {
         &[
             "as_of_ts",
             "output_sampling",
+            "trend_regime_by_tf",
             "ema_13",
             "ema_21",
             "ema_34",

@@ -404,31 +404,6 @@ pub struct WorkflowAccountContext {
     pub has_open_orders: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-#[serde(deny_unknown_fields)]
-pub struct CandidateEvent {
-    pub event_type: String,
-    pub event_ts: DateTime<Utc>,
-    pub latest_price: f64,
-    pub reason: String,
-    #[serde(default)]
-    pub details: Value,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-#[serde(deny_unknown_fields)]
-pub struct PathRuntimeState {
-    pub path_id: String,
-    pub monitoring_status: String,
-    pub latest_price: f64,
-    #[serde(default)]
-    pub failure_level_breached: bool,
-    #[serde(default)]
-    pub active_entry_context_keys: Vec<String>,
-    #[serde(default)]
-    pub notes: Vec<String>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct EntryPlan {
@@ -560,13 +535,9 @@ pub struct Stage2COutput {
 #[serde(deny_unknown_fields)]
 pub struct Stage2APromptInput {
     pub task: String,
-    pub candidate_event: CandidateEvent,
-    pub path_runtime_state: PathRuntimeState,
-    #[serde(default)]
-    pub previous_tactical_plan: Option<TacticalEntryPlan>,
-    pub exposure_state: String,
-    pub tactical_position_slice: Value,
-    pub latest_15m_trigger_facts: Value,
+    pub strategic_context_frozen: Value,
+    pub entry_location_context_15m: Value,
+    pub continuity_confirmation_context_5m: Value,
     pub state_guardrail_snapshot: Value,
     pub driver_guardrail_snapshot: Value,
     #[serde(default)]
@@ -579,12 +550,12 @@ pub struct Stage2APromptInput {
 #[serde(deny_unknown_fields)]
 pub struct Stage2BPromptInput {
     pub task: String,
-    pub candidate_event: CandidateEvent,
-    pub path_runtime_state: PathRuntimeState,
     pub exposure_state: String,
     #[serde(default)]
     pub active_positions: Vec<WorkflowPosition>,
-    pub latest_15m_trigger_facts: Value,
+    pub strategic_context_frozen: Value,
+    pub entry_location_context_15m: Value,
+    pub continuity_confirmation_context_5m: Value,
     pub state_guardrail_snapshot: Value,
     pub driver_guardrail_snapshot: Value,
     #[serde(default)]
@@ -599,12 +570,12 @@ pub struct Stage2BPromptInput {
 #[serde(deny_unknown_fields)]
 pub struct Stage2CPromptInput {
     pub task: String,
-    pub candidate_event: CandidateEvent,
-    pub path_runtime_state: PathRuntimeState,
     pub exposure_state: String,
     #[serde(default)]
     pub active_orders: Vec<WorkflowPendingOrder>,
-    pub latest_15m_trigger_facts: Value,
+    pub strategic_context_frozen: Value,
+    pub entry_location_context_15m: Value,
+    pub continuity_confirmation_context_5m: Value,
     pub state_guardrail_snapshot: Value,
     pub driver_guardrail_snapshot: Value,
     #[serde(default)]

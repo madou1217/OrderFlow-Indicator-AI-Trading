@@ -12,7 +12,7 @@ use super::core_shared::{
 use chrono::{DateTime, Utc};
 use serde_json::{Map, Value};
 
-const AVWAP_LIMITS: &[(&str, usize)] = &[("15m", 3), ("4h", 2), ("1d", 2)];
+const AVWAP_LIMITS: &[(&str, usize)] = &[("15m", 3), ("4h", 2), ("1d", 2), ("3d", 2)];
 const KLINE_LIMITS: &[(&str, usize)] = &[("15m", 16), ("4h", 15), ("1d", 10)];
 const CVD_LIMITS: &[(&str, usize)] = &[("15m", 12), ("4h", 10), ("1d", 6)];
 const MGMT_TOP_LIQUIDITY_LEVELS_LIMIT: usize = 60;
@@ -193,7 +193,6 @@ fn filter_ema_management_v4(payload: &Value) -> Value {
     let mut filtered = filter_ema_trend_regime(payload);
     if let Some(object) = filtered.as_object_mut() {
         object.remove("trend_regime");
-        object.remove("trend_regime_by_tf");
         if let Some(output_sampling) = object
             .get_mut("output_sampling")
             .and_then(Value::as_object_mut)

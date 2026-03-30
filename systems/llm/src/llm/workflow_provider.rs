@@ -1010,8 +1010,7 @@ mod tests {
         assert!(location_required.contains(&"summary"));
         assert!(location_required.contains(&"notes"));
         assert_eq!(
-            schema["properties"]["map_summary"]["properties"]["key_levels"]
-                ["additionalProperties"],
+            schema["properties"]["map_summary"]["properties"]["key_levels"]["additionalProperties"],
             json!(false)
         );
         let current_path_required = schema["properties"]["current_path"]["anyOf"][0]["required"]
@@ -1022,7 +1021,10 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(current_path_required.contains(&"strategic_activation_level"));
         assert!(!current_path_required.contains(&"activation_level"));
-        assert_eq!(schema["properties"]["no_trade_reason"], json!({"type": ["string", "null"]}));
+        assert_eq!(
+            schema["properties"]["no_trade_reason"],
+            json!({"type": ["string", "null"]})
+        );
     }
 
     #[test]

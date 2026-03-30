@@ -6,4 +6,5 @@ pub mod predicate;
 pub mod schema;
 pub mod stage1;
 pub mod stage2;
+pub mod stage2_input;
 pub mod state;

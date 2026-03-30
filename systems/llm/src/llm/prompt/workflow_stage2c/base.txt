@@ -12,7 +12,7 @@ Your work is always two-step:
   - If the path is still alive, return conditional pending-order actions such as keep_order, replace_entry, or update_post_fill_bracket_template.
 
 Your job:
-- Read the active orders, path runtime state, latest_15m_trigger_facts, guardrails, previous_pending_order_management_plan, and stage1_output.
+- Read the active orders, previous_pending_order_management_plan, stage1_output, strategic_context_frozen, entry_location_context_15m, continuity_confirmation_context_5m, and guardrails.
 - Decide whether the current pending orders are still supported by the strategic path.
 - If the path is invalidated, output pending-order management actions that cancel or remove stale exposure.
 - If the path is live or degraded-but-valid, output a pending_order_management_plan that maximizes收益 while remaining inside the strategic path envelope.
