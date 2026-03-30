@@ -1,121 +1,121 @@
 {
   "meta": {
-    "stage1_ts": "2026-03-29T12:01:00Z"
+    "stage1_ts": "2026-03-30T00:01:00Z"
   },
   "monitoring_status": "no_edge",
-  "no_trade_reason": "path_not_actionable",
+  "no_trade_reason": "conflict_no_edge",
   "refresh_hints": [
-    "若4H确认接受在z_1d_vah_resistance与z_askwall_2008上方，再刷新；那会把当前已回收的value-return转成可执行的上行挤仓路径。",
-    "若4H重新跌回z_4h_session_acceptance下方并进一步确认跌破z_1d_val_support，再刷新；那会把今天的reacceptance变成失败回收，重新打开向z_failed_auction_low的下行延续。",
-    "若驱动从当前mixed状态完成分流——要么spot继续确认并伴随short build回补，要么spot确认丢失且futures卖盘/OI再度同步扩张——再刷新。"
+    "Refresh if 4H accepts above z_time_value_reentry for at least 2 confirmed 4H bars and spot starts confirming the move; that would reopen a cleaner LONG value-return toward z_composite_poc and z_upper_value_cap.",
+    "Refresh if price loses z_avwap_value_support and then accepts below z_breakdown_edge with fresh 4H OI expansion from short build; that would restore a cleaner SHORT continuation toward z_lower_support_1962.",
+    "Refresh if price revisits z_rejection_pivot and rejects again while the bounce remains futures-led and spot whales stay absent; that would create a more unique SHORT from higher supply."
   ],
   "map_summary": {
     "location_3d": {
-      "summary": "3D背景仍是从2200一线急跌到1966后的空头修复/再平衡；价格已重新回到1996.39-2006.61多日价值区并站回7D AVWAP上方，但仍远低于4H EMA100/200与上方2093.64-2110.72的未回补4H bear FVG，说明这里更像下跌后的价值修复，而不是新的趋势扩张。",
+      "summary": "3D background remains bearish repair after the late-March collapse. Price has rotated from the prior inside-value middle down to the lower edge of 1D/3D volume value and into the 7D AVWAP cluster, but it is still below 3D TPO value acceptance, so the larger repair is unresolved.",
       "notes": [
-        "3D/1D TPO价值区为1998.51-2006.22，复合成交量价值区为1996.39-2006.61，现价仍在区间内部。",
-        "7D AVWAP期货/现货分别在2000.66/2002.19，已经被收回，说明早前跌破更像一次下探而非持续接受在低位。",
-        "但4H EMA100/200仍在2092.47/2071.68，中期上方压制依旧明显。"
+        "3D/1D volume value is 1981.94-2005.9 with volume POC at 2000.0, while 3D TPO value is higher at 1990.17-2006.38 with TPO POC at 2003.26; current price near 1985 sits between those frameworks.",
+        "7D AVWAP is 1985.54 in futures and 1984.05 in spot, so price is trading directly on the strategic anchor rather than clearly above or below it.",
+        "3D OI is long-unwind (-3.72%) with price -3.58%, and 4H/1D futures CVD and whale flow remain materially negative versus much lighter spot participation, so the decline has been futures-led deleveraging rather than clean spot-led continuation."
       ]
     },
     "location_1d": {
-      "summary": "1D位置已从上午的1990.4下探回收至价值内部，现位于公平价值带上半区，站在1D TPO POC 2002.77附近，但距离1D VAH 2006.22-2006.61和2008.13上方卖墙已不远；这不是新的边缘位置，而是回到中值后的再平衡。",
+      "summary": "1D location is a lower-value-edge test, not a clean trend continuation or clean reversal. ETH is holding the 1982-1986 support shelf around 1D RVWAP and 7D AVWAP, but it remains below the 1990/2000 daily composite pivots needed to confirm higher-timeframe re-acceptance.",
       "notes": [
-        "1D RVWAP为2000.69，现价仅在其上方约+0.45σ，不是日线级别拉伸。",
-        "1D OI显示leveraged_long_build，但4H OI同时是fresh_short_build，状态是对冲混合而不是单边。",
-        "与上一版no-edge相比，关键变化是价格先扫到1990.4后重新接受回价值；但主要value-return路程已经走掉一段。"
+        "1D RVWAP is 1985.72, 7D futures AVWAP is 1985.54, 7D spot AVWAP is 1984.05, and 1D/3D volume VAL is 1981.94, creating a meaningful support cluster.",
+        "Funding remains mildly negative while 1D and 4H OI are both long-unwind, which supports squeeze risk if 1990+ is reclaimed, but long/short ratios are only balanced rather than truly stretched.",
+        "Options context is compressed but put-skewed and back-rich on 4H, which adds downside-hedging pressure overhead without overriding the lower-value support shelf."
       ]
     },
     "location_4h": {
-      "summary": "4H直接路径虽然因1990.4处的selling exhaustion和随后bullish initiation而改善，但现价只是在新4H会话价值区2002.15-2002.88上方小幅持有，并正顶在2003.99-2006.85的多次买方衰竭/卖方不平衡带下沿，局部上行空间被明显压缩。",
+      "summary": "4H direct geometry is a sharp bearish impulse from the 2004-2009 supply zone into 1936.54, followed by stabilization inside a fresh 1983.45-1985.68 balance. Immediate path is trapped between support at 1982-1986 and resistance at 1990-1994.66.",
       "notes": [
-        "4H RVWAP为1999.16，现价接近其+1σ（2003.22），说明本轮均值回归已到第一伸展位。",
-        "11:34确认的buying exhaustion在2004.73，之前还出现于2003.99与2006.85，构成头顶连续供应带。",
-        "11:39的bullish absorption在2003.25且spot_confirm=true，令空头也缺少干净的继续下破条件。"
+        "The last closed 4H bar was a wide-range down bar from 1995.05 to 1983.44 after rejecting 2008.99; the new 4H session is building value at 1983.45-1985.02 with POC at 1983.47.",
+        "Recent bearish initiation confirmed at 1994.66, buying exhaustion at 1992.88, and multiple bearish divergences from 1992.88-2004.25 keep overhead repair supply active.",
+        "Orderbook structure reinforces the trap: notable ask liquidity sits at 1990.27, 2000.0, and 2005.59, while the nearest meaningful bid support sits at 1979.58 and then 1967/1963."
       ]
     },
-    "price_location_class": "inside_value_middle",
+    "price_location_class": "value_edge",
     "key_levels": {
       "levels": [
         {
-          "zone_id": "z_failed_auction_low",
+          "zone_id": "z_avwap_value_support",
+          "timeframe": "4h-1d",
+          "role": "support",
+          "low": 1981.94,
+          "high": 1985.72,
+          "reason": "1D/3D volume VAL 1981.94, 7D futures AVWAP 1985.54, 7D spot AVWAP 1984.05, and 1D RVWAP 1985.72 form the main lower-value support shelf."
+        },
+        {
+          "zone_id": "z_current_4h_balance",
+          "timeframe": "4h",
+          "role": "magnet",
+          "low": 1983.45,
+          "high": 1985.68,
+          "reason": "Current 4H session TPO VAL-IB high and the new micro-balance define the immediate local acceptance zone."
+        },
+        {
+          "zone_id": "z_breakdown_edge",
           "timeframe": "4h",
           "role": "support",
-          "low": 1990.4,
-          "high": 1990.81,
-          "reason": "10:24 selling exhaustion确认低点，同时对应1D/3D TPO下方single-print尾部。"
+          "low": 1979.4,
+          "high": 1980.0,
+          "reason": "Nearest lower balance edge, aligned with 15m VAL/POC and the strongest nearby bid wall at 1979.58."
         },
         {
-          "zone_id": "z_1d_val_support",
-          "timeframe": "1d",
-          "role": "support",
-          "low": 1996.39,
-          "high": 1998.51,
-          "reason": "1D复合VAL 1996.39 与 1D/3D TPO VAL 1998.51构成下沿价值支撑带。"
-        },
-        {
-          "zone_id": "z_fair_value_shelf",
+          "zone_id": "z_lower_support_1962",
           "timeframe": "4h-1d",
+          "role": "support",
+          "low": 1961.95,
+          "high": 1968.0,
+          "reason": "4H volume VAL is 1961.95 and major resting bid support sits around 1963-1967, making this the next clean downside destination if 1980 fails."
+        },
+        {
+          "zone_id": "z_time_value_reentry",
+          "timeframe": "4h-1d",
+          "role": "resistance",
+          "low": 1990.0,
+          "high": 1991.0,
+          "reason": "4H volume POC 1990.0, 1D volume node 1991.0, and 3D TPO VAL 1990.17 define the minimum zone needed to re-enter higher time value."
+        },
+        {
+          "zone_id": "z_rejection_pivot",
+          "timeframe": "4h",
+          "role": "resistance",
+          "low": 1992.88,
+          "high": 1994.66,
+          "reason": "Recent buying exhaustion at 1992.88 and bearish initiation pivot at 1994.66 define the first meaningful overhead rejection band."
+        },
+        {
+          "zone_id": "z_composite_poc",
+          "timeframe": "1d",
           "role": "magnet",
           "low": 2000.0,
-          "high": 2002.77,
-          "reason": "1D复合POC 2000.0、7D futures AVWAP 2000.66、7D spot AVWAP 2002.19 与 1D TPO POC 2002.77共同形成公平价值磁铁区。"
+          "high": 2003.26,
+          "reason": "1D/3D volume POC at 2000.0 and 3D TPO POC at 2003.26 are the main composite value magnets if support holds."
         },
         {
-          "zone_id": "z_4h_session_acceptance",
-          "timeframe": "4h",
-          "role": "support",
-          "low": 2002.15,
-          "high": 2002.88,
-          "reason": "当前4H会话TPO VAL/VAH区间，价格若继续站稳其上，才算保留短线reacceptance。"
-        },
-        {
-          "zone_id": "z_rejection_band_2004_2007",
-          "timeframe": "4h",
+          "zone_id": "z_upper_value_cap",
+          "timeframe": "4h-1d",
           "role": "resistance",
-          "low": 2003.99,
-          "high": 2006.85,
-          "reason": "11:23/11:34/11:09多次buying exhaustion分别出现在2003.99、2004.73、2006.85，且15m卖方堆叠不平衡集中在2004.96上方。"
-        },
-        {
-          "zone_id": "z_1d_vah_resistance",
-          "timeframe": "1d",
-          "role": "resistance",
-          "low": 2006.22,
-          "high": 2006.61,
-          "reason": "1D/3D TPO VAH 2006.22 与复合VAH 2006.61重合，是当前日内上沿价值阻力。"
-        },
-        {
-          "zone_id": "z_askwall_2008",
-          "timeframe": "4h",
-          "role": "resistance",
-          "low": 2008.13,
-          "high": 2008.2,
-          "reason": "最近可见的大型上方卖墙在2008.13附近，若不能吸收，向上扩展难以持续。"
-        },
-        {
-          "zone_id": "z_single_print_2012",
-          "timeframe": "1d",
-          "role": "resistance",
-          "low": 2011.9,
-          "high": 2012.3,
-          "reason": "1D/3D TPO上方single-print区，只有真正站上2008后才有机会去测试。"
+          "low": 2004.69,
+          "high": 2006.38,
+          "reason": "4H/1D upper value references cluster here, including 1D volume VAH 2005.9 and 3D TPO VAH 2006.38, with additional overhead supply near 2005.59."
         }
       ]
     }
   },
   "opportunity_assessment": {
-    "location_quality": "low",
-    "state_quality": "medium",
-    "driver_quality": "medium",
-    "geometry_quality": "low",
-    "uniqueness_quality": "medium",
+    "location_quality": "medium",
+    "state_quality": "low",
+    "driver_quality": "low",
+    "geometry_quality": "medium",
+    "uniqueness_quality": "low",
     "overall_quality": "low",
     "disqualifiers": [
-      "价格已经从1990.4的异常低点回收到价值内部，目前位于中值附近而不是新的高时间框架边缘。",
-      "4H均值回归已接近+1σ，且上方2003.99-2008.13存在连续衰竭与卖墙，首段上行空间过于拥挤。",
-      "驱动并未单边化：期货端仍是short build和净卖压，但spot/跨市场确认在吸收，导致上下都缺少干净接受。",
-      "3D仍属于更大级别下跌后的修复，价格远低于4H EMA100/200，中期趋势约束没有解除。"
+      "Price is at a better lower-edge location than the prior Stage1 map, but it is still split between 1D/3D volume support and non-acceptance below 3D TPO value.",
+      "4H/1D/3D OI state is long-unwind while the short-term bounce is futures-led leveraged-long rebuilding, so the higher-timeframe state is transitional rather than clean.",
+      "Recent bearish initiation, buying exhaustion, and hidden bearish divergences remain directly overhead at 1992.88-1994.66.",
+      "Bounce sponsorship is still futures-led with negligible spot whale confirmation, while negative funding and balanced crowding leave squeeze risk alive against any immediate short."
     ]
   },
   "current_script": null,
