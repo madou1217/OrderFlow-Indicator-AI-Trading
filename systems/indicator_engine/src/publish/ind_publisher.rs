@@ -31,7 +31,7 @@ pub struct BundleOutboxMessage {
     pub ts_bucket: DateTime<Utc>,
     pub indicator_count: i32,
     pub payload_encoding: String,
-    pub payload_bytes: Vec<u8>,
+    pub payload_template_json: Value,
     pub payload_json: Value,
 }
 
@@ -119,7 +119,12 @@ impl IndPublisher {
         indicator_count: usize,
     ) -> Result<OutboxMessage> {
         let (routing_key, message_id, _trace_id, payload_json) =
-            self.build_minute_bundle_payload(ts_bucket, symbol, indicators_json, indicator_count)?;
+            self.build_minute_bundle_payload_template(
+                ts_bucket,
+                symbol,
+                indicators_json,
+                indicator_count,
+            )?;
 
         Ok(OutboxMessage {
             exchange_name: self.exchange_name.clone(),
@@ -155,9 +160,8 @@ impl IndPublisher {
         indicator_count: usize,
         extra_headers: Option<Value>,
     ) -> Result<BundleOutboxMessage> {
-        let (routing_key, message_id, _trace_id, payload_json) =
-            self.build_minute_bundle_payload(ts_bucket, symbol, indicators_json, indicator_count)?;
-        let payload_bytes = gzip_json_bytes(&payload_json)?;
+        let (routing_key, message_id, _trace_id, payload_template_json) =
+            self.build_minute_bundle_payload_template(ts_bucket, symbol, indicators_json, indicator_count)?;
         let headers_json = merge_headers(self.build_headers_json(), extra_headers);
 
         Ok(BundleOutboxMessage {
@@ -170,7 +174,7 @@ impl IndPublisher {
             ts_bucket,
             indicator_count: indicator_count as i32,
             payload_encoding: "gzip".to_string(),
-            payload_bytes,
+            payload_template_json,
             payload_json: json!({
                 "symbol": symbol,
                 "ts_bucket": ts_bucket.to_rfc3339(),
@@ -181,7 +185,7 @@ impl IndPublisher {
         })
     }
 
-    fn build_minute_bundle_payload(
+    fn build_minute_bundle_payload_template(
         &self,
         ts_bucket: DateTime<Utc>,
         symbol: &str,
@@ -213,7 +217,6 @@ impl IndPublisher {
                 "ts_bucket": ts_bucket.to_rfc3339(),
                 "window_code": "1m",
                 "indicator_count": indicator_count,
-                "published_at": Utc::now().to_rfc3339(),
                 "producer": {
                     "service": "indicator_engine",
                     "instance_id": self.producer_instance_id,
@@ -229,6 +232,23 @@ impl IndPublisher {
             "producer_service": "indicator_engine",
             "producer_instance_id": self.producer_instance_id,
         })
+    }
+}
+
+impl BundleOutboxMessage {
+    pub fn payload_with_published_at(&self, published_at: DateTime<Utc>) -> Value {
+        let mut payload = self.payload_template_json.clone();
+        if let Value::Object(map) = &mut payload {
+            map.insert(
+                "published_at".to_string(),
+                Value::String(published_at.to_rfc3339()),
+            );
+        }
+        payload
+    }
+
+    pub fn payload_bytes_with_published_at(&self, published_at: DateTime<Utc>) -> Result<Vec<u8>> {
+        gzip_json_bytes(&self.payload_with_published_at(published_at))
     }
 }
 
@@ -323,6 +343,7 @@ mod tests {
     fn minute_bundle_outbox_payload_round_trips() {
         let publisher = publisher();
         let ts_bucket = chrono::Utc.with_ymd_and_hms(2026, 3, 21, 3, 0, 0).unwrap();
+        let published_at = chrono::Utc.with_ymd_and_hms(2026, 3, 21, 3, 0, 5).unwrap();
         let indicators_json = json!({
             "footprint": {
                 "window_code": "1m",
@@ -338,13 +359,15 @@ mod tests {
             .unwrap();
         assert_eq!(msg.payload_encoding, "gzip");
 
-        let mut decoder = GzDecoder::new(msg.payload_bytes.as_slice());
+        let payload_bytes = msg.payload_bytes_with_published_at(published_at).unwrap();
+        let mut decoder = GzDecoder::new(payload_bytes.as_slice());
         let mut raw = Vec::new();
         decoder.read_to_end(&mut raw).unwrap();
         let decoded: serde_json::Value = serde_json::from_slice(&raw).unwrap();
         assert_eq!(decoded["msg_type"], "ind.minute_bundle");
         assert_eq!(decoded["symbol"], "BTCUSDT");
         assert_eq!(decoded["indicators"], indicators_json);
+        assert_eq!(decoded["published_at"], published_at.to_rfc3339());
     }
 
     #[test]

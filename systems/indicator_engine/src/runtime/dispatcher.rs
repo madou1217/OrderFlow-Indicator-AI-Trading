@@ -5,7 +5,7 @@ use crate::indicators::context::{
 };
 use crate::indicators::indicator_trait::Indicator;
 use crate::indicators::registry::build_registry;
-use crate::publish::ind_publisher::IndPublisher;
+use crate::publish::ind_publisher::{BundleOutboxMessage, IndPublisher};
 use crate::storage::event_writer::EventWriter;
 use crate::storage::feature_writer::FeatureWriter;
 use crate::storage::level_writer::LevelWriter;
@@ -48,6 +48,23 @@ pub struct Dispatcher {
     level_writer: LevelWriter,
     event_writer: EventWriter,
     publisher: IndPublisher,
+}
+
+pub struct ProcessedWindowArtifacts {
+    pub ctx: Arc<IndicatorContext>,
+    pub mode: DispatchMode,
+    pub started_at: Instant,
+    pub compute_ms: u128,
+    pub group_snapshot_counts: Vec<String>,
+    pub snapshots: Vec<IndicatorSnapshotRow>,
+    pub levels: Vec<IndicatorLevelRow>,
+    pub events: Vec<IndicatorEventRow>,
+    pub divergence_rows: Vec<DivergenceEventRow>,
+    pub absorption_rows: Vec<AbsorptionEventRow>,
+    pub initiation_rows: Vec<InitiationEventRow>,
+    pub exhaustion_rows: Vec<ExhaustionEventRow>,
+    pub liq_rows: Vec<LiquidationLevelRow>,
+    pub live_messages: Option<Vec<BundleOutboxMessage>>,
 }
 
 #[derive(Clone)]
@@ -147,6 +164,15 @@ impl Dispatcher {
         ctx: Arc<IndicatorContext>,
         mode: DispatchMode,
     ) -> Result<Vec<IndicatorSnapshotRow>> {
+        let artifacts = self.compute_window_artifacts(ctx, mode).await?;
+        self.persist_window_artifacts(artifacts).await
+    }
+
+    pub async fn compute_window_artifacts(
+        &self,
+        ctx: Arc<IndicatorContext>,
+        mode: DispatchMode,
+    ) -> Result<ProcessedWindowArtifacts> {
         let total_started_at = Instant::now();
         let mut group_handles: Vec<(&'static str, JoinHandle<GroupOutput>)> = self
             .flow_groups
@@ -230,6 +256,63 @@ impl Dispatcher {
             None
         };
 
+        let total_ms = total_started_at.elapsed().as_millis();
+        debug!(
+            ts_bucket = %ctx.ts_bucket,
+            mode = ?mode,
+            snapshot_count = snapshots.len(),
+            group_snapshot_counts = %group_snapshot_counts.join(","),
+            level_count = levels.len(),
+            event_count = events.len(),
+            divergence_count = divergence_rows.len(),
+            absorption_count = absorption_rows.len(),
+            initiation_count = initiation_rows.len(),
+            exhaustion_count = exhaustion_rows.len(),
+            liq_levels = liq_rows.len(),
+            compute_ms = compute_ms,
+            total_ms = total_ms,
+            "indicator window processed"
+        );
+
+        Ok(ProcessedWindowArtifacts {
+            ctx,
+            mode,
+            started_at: total_started_at,
+            compute_ms,
+            group_snapshot_counts,
+            snapshots,
+            levels,
+            events,
+            divergence_rows,
+            absorption_rows,
+            initiation_rows,
+            exhaustion_rows,
+            liq_rows,
+            live_messages,
+        })
+    }
+
+    pub async fn persist_window_artifacts(
+        &self,
+        artifacts: ProcessedWindowArtifacts,
+    ) -> Result<Vec<IndicatorSnapshotRow>> {
+        let ProcessedWindowArtifacts {
+            ctx,
+            mode,
+            started_at,
+            compute_ms,
+            group_snapshot_counts: _group_snapshot_counts,
+            snapshots,
+            levels,
+            events,
+            divergence_rows,
+            absorption_rows,
+            initiation_rows,
+            exhaustion_rows,
+            liq_rows,
+            live_messages,
+        } = artifacts;
+
         if mode.persist_outputs() {
             let snapshot_started_at = Instant::now();
             self.snapshot_writer
@@ -302,7 +385,7 @@ impl Dispatcher {
                     .await?;
             }
             let progress_commit_ms = progress_started_at.elapsed().as_millis();
-            let total_ms = total_started_at.elapsed().as_millis();
+            let total_ms = started_at.elapsed().as_millis();
 
             if total_ms >= PROCESS_WINDOW_WARN_MS
                 || snapshot_write_ms >= PROCESS_WINDOW_STAGE_WARN_MS
@@ -334,24 +417,6 @@ impl Dispatcher {
                 );
             }
         }
-
-        let total_ms = total_started_at.elapsed().as_millis();
-        debug!(
-            ts_bucket = %ctx.ts_bucket,
-            mode = ?mode,
-            snapshot_count = snapshots.len(),
-            group_snapshot_counts = %group_snapshot_counts.join(","),
-            level_count = levels.len(),
-            event_count = events.len(),
-            divergence_count = divergence_rows.len(),
-            absorption_count = absorption_rows.len(),
-            initiation_count = initiation_rows.len(),
-            exhaustion_count = exhaustion_rows.len(),
-            liq_levels = liq_rows.len(),
-            compute_ms = compute_ms,
-            total_ms = total_ms,
-            "indicator window processed"
-        );
 
         Ok(snapshots)
     }

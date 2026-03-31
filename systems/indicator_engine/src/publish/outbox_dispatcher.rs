@@ -433,7 +433,9 @@ impl OutboxDispatcher {
             .context("rebuild minute bundle payload from snapshots")?;
 
         Ok(PublishPayload {
-            body: rebuilt.payload_bytes,
+            body: rebuilt
+                .payload_bytes_with_published_at(Utc::now())
+                .context("materialize rebuilt minute bundle payload bytes")?,
             content_encoding: normalize_payload_encoding(&rebuilt.payload_encoding)?,
         })
     }

@@ -14,7 +14,7 @@ use crate::observability::metrics::AppMetrics;
 use crate::publish::ind_publisher::IndPublisher;
 use crate::publish::outbox_dispatcher::OutboxDispatcher;
 use crate::publish::snapshot_fanout_projector::SnapshotFanoutProjector;
-use crate::runtime::dispatcher::{DispatchMode, Dispatcher};
+use crate::runtime::dispatcher::{DispatchMode, Dispatcher, ProcessedWindowArtifacts};
 use crate::runtime::state_store::{
     CanonicalFrontierSnapshot, CanonicalMinutePresence, IngestOutcome, MinuteHistory,
     StateSnapshot, StateStore, HISTORY_LIMIT_MINUTES, STATE_SNAPSHOT_VERSION,
@@ -28,7 +28,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Duration as ChronoDuration, TimeZone, Utc};
 use serde_json::{json, Value};
 use sqlx::{postgres::PgRow, PgPool, Row};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -57,6 +57,8 @@ const OI_RATIO_PATCH_WINDOW_BUDGET_PER_TICK: usize = 24;
 const PROCESS_READY_MINUTES_WARN_MS: u128 = 2_000;
 const LIVE_READY_JOB_QUEUE_CAPACITY: usize = 8;
 const LIVE_PREPARE_TASK_QUEUE_CAPACITY: usize = 8;
+const LIVE_COMPUTED_JOB_QUEUE_CAPACITY: usize = LIVE_READY_JOB_QUEUE_CAPACITY * 3;
+const LIVE_MATERIALIZE_WORKER_COUNT: usize = 3;
 const DIRTY_READY_JOB_QUEUE_CAPACITY: usize = 4;
 const LIVE_TAIL_RECONCILE_MAX_BACKLOG_MINUTES: i64 = 5;
 const OI_RATIO_PATCH_MAX_BACKLOG_MINUTES: i64 = 5;
@@ -147,6 +149,13 @@ struct ReadyMinuteJob {
     source: ReadyJobSource,
     enqueued_at: Instant,
     bundle: crate::runtime::state_store::WindowBundle,
+}
+
+struct ComputedMinuteJob {
+    ts_bucket: DateTime<Utc>,
+    source: ReadyJobSource,
+    enqueued_at: Instant,
+    artifacts: ProcessedWindowArtifacts,
 }
 
 struct PrepareMinuteTask {
@@ -651,9 +660,13 @@ pub async fn run(ctx: AppContext) -> Result<()> {
     metrics.set_backfill_mode(false);
 
     let state_store = Arc::new(Mutex::new(state_store));
-    let (live_ready_job_tx_raw, live_ready_job_rx) = mpsc::channel(LIVE_READY_JOB_QUEUE_CAPACITY);
+    let (live_ready_job_tx_raw, live_ready_job_rx_raw) =
+        mpsc::channel(LIVE_READY_JOB_QUEUE_CAPACITY);
     let mut live_ready_job_tx = Some(live_ready_job_tx_raw);
     let live_ready_job_pending = Arc::new(AtomicUsize::new(0));
+    let live_ready_job_rx = Arc::new(Mutex::new(live_ready_job_rx_raw));
+    let (live_computed_job_tx, live_computed_job_rx) =
+        mpsc::channel(LIVE_COMPUTED_JOB_QUEUE_CAPACITY);
     let (live_prepare_task_tx_raw, live_prepare_task_rx) =
         mpsc::channel(LIVE_PREPARE_TASK_QUEUE_CAPACITY);
     let mut live_prepare_task_tx = Some(live_prepare_task_tx_raw);
@@ -669,14 +682,26 @@ pub async fn run(ctx: AppContext) -> Result<()> {
             .clone(),
         live_ready_job_pending.clone(),
     )));
-    let mut live_materialize_handle = Some(tokio::spawn(run_live_materialize_loop(
-        ctx.clone(),
+    let mut live_materialize_handles = (0..LIVE_MATERIALIZE_WORKER_COUNT)
+        .map(|_| {
+            tokio::spawn(run_live_materialize_compute_loop(
+                ctx.clone(),
+                dispatcher.clone(),
+                runtime_options.clone(),
+                live_ready_job_rx.clone(),
+                live_computed_job_tx.clone(),
+            ))
+        })
+        .collect::<Vec<_>>();
+    drop(live_computed_job_tx);
+    let live_commit_initial_persisted_ts =
+        ts_from_millis(metrics.snapshot().last_persisted_ts_ms);
+    let mut live_commit_handle = Some(tokio::spawn(run_live_ordered_commit_loop(
         metrics.clone(),
         dispatcher.clone(),
-        runtime_options.clone(),
-        MaterializeWorkerKind::Live,
-        live_ready_job_rx,
+        live_computed_job_rx,
         live_ready_job_pending.clone(),
+        live_commit_initial_persisted_ts,
     )));
     let (dirty_ready_job_tx_raw, dirty_ready_job_rx) =
         mpsc::channel(DIRTY_READY_JOB_QUEUE_CAPACITY);
@@ -782,7 +807,8 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                 )
                 .await;
                 poll_prepare_handle(&mut live_prepare_handle).await?;
-                poll_materialize_handle(&mut live_materialize_handle, MaterializeWorkerKind::Live)
+                poll_live_materialize_handles(&mut live_materialize_handles).await?;
+                poll_materialize_handle(&mut live_commit_handle, MaterializeWorkerKind::Live)
                     .await?;
                 poll_materialize_handle(
                     &mut dirty_materialize_handle,
@@ -1133,7 +1159,8 @@ pub async fn run(ctx: AppContext) -> Result<()> {
         drop(live_ready_job_tx.take());
         drop(dirty_ready_job_tx.take());
         drain_prepare_handle(&mut live_prepare_handle).await;
-        drain_materialize_handle(&mut live_materialize_handle, MaterializeWorkerKind::Live).await;
+        drain_live_materialize_handles(&mut live_materialize_handles).await;
+        drain_materialize_handle(&mut live_commit_handle, MaterializeWorkerKind::Live).await;
         drain_materialize_handle(
             &mut dirty_materialize_handle,
             MaterializeWorkerKind::DirtyRecompute,
@@ -1227,7 +1254,8 @@ pub async fn run(ctx: AppContext) -> Result<()> {
     drop(live_ready_job_tx.take());
     drop(dirty_ready_job_tx.take());
     drain_prepare_handle(&mut live_prepare_handle).await;
-    if let Some(handle) = live_materialize_handle.take() {
+    abort_live_materialize_handles(&mut live_materialize_handles).await;
+    if let Some(handle) = live_commit_handle.take() {
         handle.abort();
         let _ = handle.await;
     }
@@ -3183,8 +3211,8 @@ async fn run_live_materialize_loop(
         match result {
             Ok(snapshots) => {
                 metrics.inc_exported_window();
-                metrics.set_last_persisted_ts(Some(ts_bucket.timestamp_millis()));
                 if matches!(worker_kind, MaterializeWorkerKind::Live) {
+                    metrics.set_last_persisted_ts(Some(ts_bucket.timestamp_millis()));
                     metrics.set_live_ready_to_bundle_ms(enqueued_at.elapsed().as_millis());
                 }
                 log_materialized_coverage(source, ts_bucket, &snapshots, enqueued_at);
@@ -3203,6 +3231,111 @@ async fn run_live_materialize_loop(
         }
     }
 
+    Ok(())
+}
+
+async fn run_live_materialize_compute_loop(
+    ctx: Arc<AppContext>,
+    dispatcher: Arc<Dispatcher>,
+    runtime_options: IndicatorRuntimeOptions,
+    ready_job_rx: Arc<Mutex<mpsc::Receiver<ReadyMinuteJob>>>,
+    computed_job_tx: mpsc::Sender<ComputedMinuteJob>,
+) -> Result<()> {
+    loop {
+        let job = {
+            let mut ready_job_rx = ready_job_rx.lock().await;
+            ready_job_rx.recv().await
+        };
+        let Some(job) = job else {
+            break;
+        };
+        let artifacts = compute_window_bundle_artifacts(
+            &ctx,
+            dispatcher.as_ref(),
+            &runtime_options,
+            job.bundle,
+            job.mode,
+        )
+        .await?;
+        computed_job_tx
+            .send(ComputedMinuteJob {
+                ts_bucket: job.ts_bucket,
+                source: job.source,
+                enqueued_at: job.enqueued_at,
+                artifacts,
+            })
+            .await
+            .context("send computed live minute to ordered commit worker")?;
+    }
+
+    Ok(())
+}
+
+async fn run_live_ordered_commit_loop(
+    metrics: Arc<AppMetrics>,
+    dispatcher: Arc<Dispatcher>,
+    mut computed_job_rx: mpsc::Receiver<ComputedMinuteJob>,
+    live_ready_job_pending: Arc<AtomicUsize>,
+    initial_last_persisted_ts: Option<DateTime<Utc>>,
+) -> Result<()> {
+    let mut next_commit_ts = initial_last_persisted_ts.map(|ts| ts + ChronoDuration::minutes(1));
+    let mut pending = BTreeMap::<DateTime<Utc>, ComputedMinuteJob>::new();
+
+    while let Some(job) = computed_job_rx.recv().await {
+        pending.insert(job.ts_bucket, job);
+        commit_live_jobs_in_order(
+            &metrics,
+            dispatcher.as_ref(),
+            &live_ready_job_pending,
+            &mut next_commit_ts,
+            &mut pending,
+        )
+        .await?;
+    }
+
+    if next_commit_ts.is_none() {
+        next_commit_ts = pending.keys().next().copied();
+    }
+    commit_live_jobs_in_order(
+        &metrics,
+        dispatcher.as_ref(),
+        &live_ready_job_pending,
+        &mut next_commit_ts,
+        &mut pending,
+    )
+    .await?;
+    if !pending.is_empty() {
+        anyhow::bail!(
+            "live ordered commit worker exited with {} uncommitted minute(s)",
+            pending.len()
+        );
+    }
+
+    Ok(())
+}
+
+async fn commit_live_jobs_in_order(
+    metrics: &Arc<AppMetrics>,
+    dispatcher: &Dispatcher,
+    live_ready_job_pending: &Arc<AtomicUsize>,
+    next_commit_ts: &mut Option<DateTime<Utc>>,
+    pending: &mut BTreeMap<DateTime<Utc>, ComputedMinuteJob>,
+) -> Result<()> {
+    if next_commit_ts.is_none() {
+        *next_commit_ts = pending.keys().next().copied();
+    }
+    while let Some(expected_ts) = *next_commit_ts {
+        let Some(job) = pending.remove(&expected_ts) else {
+            break;
+        };
+        let snapshots = dispatcher.persist_window_artifacts(job.artifacts).await?;
+        live_ready_job_pending.fetch_sub(1, Ordering::AcqRel);
+        metrics.inc_exported_window();
+        metrics.set_last_persisted_ts(Some(expected_ts.timestamp_millis()));
+        metrics.set_live_ready_to_bundle_ms(job.enqueued_at.elapsed().as_millis());
+        log_materialized_coverage(job.source, expected_ts, &snapshots, job.enqueued_at);
+        *next_commit_ts = Some(expected_ts + ChronoDuration::minutes(1));
+    }
     Ok(())
 }
 
@@ -3332,6 +3465,54 @@ async fn drain_prepare_handle(handle_slot: &mut Option<JoinHandle<Result<()>>>) 
         Err(err) => {
             warn!(error = %err, "prepare worker join failed during shutdown drain");
         }
+    }
+}
+
+async fn poll_live_materialize_handles(handles: &mut Vec<JoinHandle<Result<()>>>) -> Result<()> {
+    let mut idx = 0usize;
+    while idx < handles.len() {
+        if !handles[idx].is_finished() {
+            idx += 1;
+            continue;
+        }
+        let handle = handles.remove(idx);
+        match handle.await {
+            Ok(Ok(())) => anyhow::bail!("live materialize compute worker exited unexpectedly"),
+            Ok(Err(err)) => {
+                return Err(err).context("live materialize compute worker failed");
+            }
+            Err(err) => {
+                return Err(err).context("live materialize compute worker join failed");
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn drain_live_materialize_handles(handles: &mut Vec<JoinHandle<Result<()>>>) {
+    while let Some(handle) = handles.pop() {
+        match handle.await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                warn!(
+                    error = %err,
+                    "live materialize compute worker failed during shutdown drain"
+                );
+            }
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    "live materialize compute worker join failed during shutdown drain"
+                );
+            }
+        }
+    }
+}
+
+async fn abort_live_materialize_handles(handles: &mut Vec<JoinHandle<Result<()>>>) {
+    while let Some(handle) = handles.pop() {
+        handle.abort();
+        let _ = handle.await;
     }
 }
 
@@ -3618,6 +3799,18 @@ async fn process_window_bundle(
     window: crate::runtime::state_store::WindowBundle,
     mode: DispatchMode,
 ) -> Result<Vec<IndicatorSnapshotRow>> {
+    let artifacts =
+        compute_window_bundle_artifacts(ctx, dispatcher, runtime_options, window, mode).await?;
+    dispatcher.persist_window_artifacts(artifacts).await
+}
+
+async fn compute_window_bundle_artifacts(
+    ctx: &Arc<AppContext>,
+    dispatcher: &Dispatcher,
+    runtime_options: &IndicatorRuntimeOptions,
+    window: crate::runtime::state_store::WindowBundle,
+    mode: DispatchMode,
+) -> Result<ProcessedWindowArtifacts> {
     let minute = window.ts_bucket;
     let mut kline_history_supplement = load_kline_history_supplement(
         &ctx.db_pool,
@@ -3665,7 +3858,7 @@ async fn process_window_bundle(
         kline_history_supplement,
     ));
 
-    dispatcher.process_window(ictx, mode).await
+    dispatcher.compute_window_artifacts(ictx, mode).await
 }
 
 #[allow(dead_code)]
