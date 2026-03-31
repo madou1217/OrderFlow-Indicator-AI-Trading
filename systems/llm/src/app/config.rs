@@ -993,7 +993,7 @@ fn default_workflow_max_live_entry_orders_per_direction() -> usize {
 }
 
 fn default_watcher_evaluate_on() -> String {
-    "1m_close".to_string()
+    "fast_price".to_string()
 }
 
 fn default_watcher_entry_attempt_window() -> String {
@@ -1160,8 +1160,10 @@ fn validate_required_predicates(predicates: &[String], field_name: &str) -> Resu
 }
 
 fn validate_workflow_watcher_config(cfg: &WorkflowWatcherConfig) -> Result<()> {
-    if cfg.evaluate_on.trim() != "1m_close" {
-        return Err(anyhow!("llm.workflow.watcher.evaluate_on must be 1m_close"));
+    if !matches!(cfg.evaluate_on.trim(), "1m_close" | "fast_price") {
+        return Err(anyhow!(
+            "llm.workflow.watcher.evaluate_on must be one of: 1m_close, fast_price"
+        ));
     }
     if cfg.entry_attempt_window.trim() != "same_15m_window" {
         return Err(anyhow!(
@@ -1438,7 +1440,7 @@ mod tests {
     #[test]
     fn default_workflow_watcher_config_is_stricter_and_valid() {
         let watcher = WorkflowWatcherConfig::default();
-        assert_eq!(watcher.evaluate_on, "1m_close");
+        assert_eq!(watcher.evaluate_on, "fast_price");
         assert_eq!(watcher.entry_attempt_window, "same_15m_window");
         assert_eq!(watcher.entry_ttl_minutes, 15);
         assert_eq!(watcher.max_filled_stopout_attempts, 2);

@@ -27,7 +27,7 @@ use serde_json::{json, Value};
 use sqlx::{PgPool, Row};
 use std::borrow::Cow;
 use std::cmp::Ordering as CmpOrdering;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -44,6 +44,7 @@ const LLM_JOURNAL_FILE: &str = "systems/llm/journal/llm_trade_journal.jsonl";
 const KLINE_DB_BACKFILL_INTERVALS: [(&str, i64); 2] = [("4h", 240), ("1d", 1440)];
 const KLINE_RANGE_CACHE_TTL_MINUTES: i64 = 30;
 const KLINE_RANGE_CACHE_MAX_SERIES: usize = 8;
+const FAST_EVENT_BUFFER_RETENTION_SECS: i64 = 15 * 60;
 
 #[derive(Debug, Clone, Copy)]
 enum WorkflowStageKind {
@@ -60,6 +61,8 @@ struct WorkflowStageFlights {
 static WORKFLOW_STAGE_FLIGHTS: OnceLock<StdMutex<HashMap<String, WorkflowStageFlights>>> =
     OnceLock::new();
 static STARTUP_STAGE1_REFRESHED_SYMBOLS: OnceLock<StdMutex<HashSet<String>>> = OnceLock::new();
+static FAST_PRICE_EVENT_BUFFER: OnceLock<StdMutex<HashMap<String, VecDeque<FastPriceEvent>>>> =
+    OnceLock::new();
 
 fn workflow_stage_flights() -> &'static StdMutex<HashMap<String, WorkflowStageFlights>> {
     WORKFLOW_STAGE_FLIGHTS.get_or_init(|| StdMutex::new(HashMap::new()))
@@ -67,6 +70,10 @@ fn workflow_stage_flights() -> &'static StdMutex<HashMap<String, WorkflowStageFl
 
 fn startup_stage1_refreshed_symbols() -> &'static StdMutex<HashSet<String>> {
     STARTUP_STAGE1_REFRESHED_SYMBOLS.get_or_init(|| StdMutex::new(HashSet::new()))
+}
+
+fn fast_price_event_buffer() -> &'static StdMutex<HashMap<String, VecDeque<FastPriceEvent>>> {
+    FAST_PRICE_EVENT_BUFFER.get_or_init(|| StdMutex::new(HashMap::new()))
 }
 
 fn startup_stage1_refresh_due(symbol: &str) -> bool {
@@ -222,6 +229,8 @@ struct FastWatcherPlanState {
     breakout_extreme_price: Option<f64>,
     invalidation_probe_seen_at: Option<DateTime<Utc>>,
     recovery_started_at: Option<DateTime<Utc>>,
+    ready_logged: bool,
+    last_dispatch_block_reason: Option<String>,
     fired: bool,
 }
 
@@ -553,6 +562,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                                 if let Some(event) =
                                     extract_fast_price_event(&envelope, &ctx.config.llm.symbol)
                                 {
+                                    record_fast_price_event_in_buffer(&event);
                                     if let Err(err) =
                                         handle_fast_market_event(&ctx, &mut fast_watcher_state, event)
                                             .await
@@ -1566,6 +1576,7 @@ fn reset_watcher_window_if_needed(
     workflow_state.last_filled_context_key = None;
     workflow_state.approved_tactical_plan = None;
     workflow_state.approved_tactical_plan_updated_at = None;
+    workflow_state.approved_tactical_plan_source_ts_bucket = None;
     workflow_state.pending_entry_bracket_template_override = None;
     expired_tactical_plan
 }
@@ -1573,6 +1584,7 @@ fn reset_watcher_window_if_needed(
 fn clear_approved_tactical_plan(workflow_state: &mut crate::workflow::state::WorkflowState) {
     workflow_state.approved_tactical_plan = None;
     workflow_state.approved_tactical_plan_updated_at = None;
+    workflow_state.approved_tactical_plan_source_ts_bucket = None;
     workflow_state.last_filled_context_key = None;
     workflow_state.filled_stopout_attempts = 0;
     workflow_state.pending_entry_bracket_template_override = None;
@@ -1591,6 +1603,25 @@ fn workflow_entry_context_key(symbol: &str, side: &str, path_id: &str) -> String
         side.to_ascii_uppercase(),
         path_id
     )
+}
+
+fn entry_plan_log_payload(
+    path_id: &str,
+    context_key: &str,
+    plan: &crate::workflow::schema::EntryPlan,
+) -> Value {
+    json!({
+        "path_id": path_id,
+        "context_key": context_key,
+        "side": &plan.side,
+        "entry_profile": &plan.entry_profile,
+        "intent_mode": &plan.intent_mode,
+        "entry_activation_level": &plan.entry_activation_level,
+        "entry_zone": &plan.entry_zone,
+        "entry_invalidation_level": &plan.entry_invalidation_level,
+        "stop_loss": plan.stop_loss,
+        "max_drift_pct": plan.max_drift_pct,
+    })
 }
 
 fn extract_fast_price_event(
@@ -1630,6 +1661,42 @@ fn extract_fast_price_event(
     })
 }
 
+fn record_fast_price_event_in_buffer(event: &FastPriceEvent) {
+    let retention = ChronoDuration::seconds(FAST_EVENT_BUFFER_RETENTION_SECS);
+    let min_ts = event.event_ts - retention;
+    if let Ok(mut guard) = fast_price_event_buffer().lock() {
+        let queue = guard
+            .entry(event.symbol.to_ascii_uppercase())
+            .or_insert_with(VecDeque::new);
+        queue.push_back(event.clone());
+        while queue
+            .front()
+            .map(|item| item.event_ts < min_ts)
+            .unwrap_or(false)
+        {
+            queue.pop_front();
+        }
+    }
+}
+
+fn buffered_fast_price_events_in_range(
+    symbol: &str,
+    start_inclusive: DateTime<Utc>,
+    end_exclusive: DateTime<Utc>,
+) -> Vec<FastPriceEvent> {
+    fast_price_event_buffer()
+        .lock()
+        .ok()
+        .and_then(|guard| guard.get(&symbol.to_ascii_uppercase()).cloned())
+        .map(|queue| {
+            queue
+                .into_iter()
+                .filter(|event| event.event_ts >= start_inclusive && event.event_ts < end_exclusive)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
 fn fast_plan_version(
     tactical_plan: &crate::workflow::schema::TacticalEntryPlan,
     updated_at: Option<DateTime<Utc>>,
@@ -1644,7 +1711,7 @@ fn sync_fast_watcher_plan_state(
     fast_state: &mut Option<FastWatcherPlanState>,
     plan_version: &str,
     context_key: &str,
-) {
+) -> bool {
     let should_reset = fast_state
         .as_ref()
         .map(|state| state.plan_version != plan_version || state.context_key != context_key)
@@ -1656,6 +1723,32 @@ fn sync_fast_watcher_plan_state(
             ..FastWatcherPlanState::default()
         });
     }
+    should_reset
+}
+
+fn fast_entry_selection_block_reason(
+    symbol: &str,
+    tactical_plan: &crate::workflow::schema::TacticalEntryPlan,
+    workflow_state: &crate::workflow::state::WorkflowState,
+    trading_state: &TradingStateSnapshot,
+    entry_snapshots: &HashMap<String, crate::workflow::schema::EntrySnapshot>,
+    max_filled_stopout_attempts: u8,
+) -> Option<&'static str> {
+    let side = tactical_plan.entry_plan.side.as_str();
+    if has_active_position_for_side(trading_state, side) {
+        return Some("active_position_exists");
+    }
+    if live_entry_order_count_for_side(trading_state, side) > 0 {
+        return Some("live_entry_order_exists");
+    }
+    if workflow_state.filled_stopout_attempts >= max_filled_stopout_attempts {
+        return Some("max_filled_stopout_attempts_reached");
+    }
+    let context_key = workflow_entry_context_key(symbol, side, &tactical_plan.path_id);
+    if entry_snapshots.contains_key(&context_key) {
+        return Some("entry_snapshot_exists");
+    }
+    None
 }
 
 fn favorable_beyond_zone(
@@ -1832,6 +1925,311 @@ fn select_fast_entry_plan<'a>(
         plan: candidate,
         trigger_price,
     })
+}
+
+async fn process_fast_market_event_for_plan(
+    ctx: &AppContext,
+    workflow_state: &mut crate::workflow::state::WorkflowState,
+    current_path: &crate::workflow::schema::CurrentPath,
+    tactical_plan: &crate::workflow::schema::TacticalEntryPlan,
+    symbol: &str,
+    state_dir: &str,
+    fast_plan_state: &mut FastWatcherPlanState,
+    context_key: &str,
+    entry_snapshots: &mut HashMap<String, crate::workflow::schema::EntrySnapshot>,
+    event: &FastPriceEvent,
+) -> Result<()> {
+    if entry_snapshots.contains_key(context_key) {
+        fast_plan_state.fired = true;
+        return Ok(());
+    }
+
+    let entry_ready = fast_watcher_entry_ready(
+        fast_plan_state,
+        &tactical_plan.entry_plan,
+        event,
+        &ctx.config.llm.workflow.watcher,
+    );
+    if !entry_ready {
+        fast_plan_state.ready_logged = false;
+        fast_plan_state.last_dispatch_block_reason = None;
+        return Ok(());
+    }
+    if !fast_plan_state.ready_logged {
+        info!(
+            symbol = %symbol,
+            trigger = "watcher_fast_consumer",
+            path_id = %tactical_plan.path_id,
+            context_key = %context_key,
+            price_source = event.source.as_str(),
+            routing_key = %event.routing_key,
+            trigger_price = event.price,
+            side = %tactical_plan.entry_plan.side,
+            entry_profile = %tactical_plan.entry_plan.entry_profile,
+            intent_mode = %tactical_plan.entry_plan.intent_mode,
+            entry_zone_low = tactical_plan.entry_plan.entry_zone.low,
+            entry_zone_high = tactical_plan.entry_plan.entry_zone.high,
+            invalidation_low = tactical_plan.entry_plan.entry_invalidation_level.low,
+            invalidation_high = tactical_plan.entry_plan.entry_invalidation_level.high,
+            stop_loss = tactical_plan.entry_plan.stop_loss,
+            "workflow watcher entry ready"
+        );
+        append_workflow_journal_event(
+            "workflow_entry_ready",
+            symbol,
+            event.event_ts,
+            json!({
+                "trigger": "watcher_fast_consumer",
+                "path_id": &tactical_plan.path_id,
+                "context_key": context_key,
+                "price_source": event.source.as_str(),
+                "routing_key": &event.routing_key,
+                "trigger_price": event.price,
+                "entry_plan": entry_plan_log_payload(
+                    &tactical_plan.path_id,
+                    context_key,
+                    &tactical_plan.entry_plan,
+                ),
+            }),
+        );
+        fast_plan_state.ready_logged = true;
+    }
+
+    let trading_state = fetch_symbol_trading_state_for_fast_path(
+        &ctx.http_client,
+        &ctx.config.api.binance,
+        &ctx.config.llm.execution,
+        symbol,
+    )
+    .await?;
+    if let Some(reason) = fast_entry_selection_block_reason(
+        symbol,
+        tactical_plan,
+        workflow_state,
+        &trading_state,
+        entry_snapshots,
+        ctx.config.llm.workflow.watcher.max_filled_stopout_attempts,
+    ) {
+        if fast_plan_state.last_dispatch_block_reason.as_deref() != Some(reason) {
+            info!(
+                symbol = %symbol,
+                trigger = "watcher_fast_consumer",
+                path_id = %tactical_plan.path_id,
+                context_key = %context_key,
+                block_reason = reason,
+                trigger_price = event.price,
+                "workflow watcher entry ready but dispatch blocked"
+            );
+            append_workflow_journal_event(
+                "workflow_entry_blocked",
+                symbol,
+                event.event_ts,
+                json!({
+                    "trigger": "watcher_fast_consumer",
+                    "path_id": &tactical_plan.path_id,
+                    "context_key": context_key,
+                    "block_reason": reason,
+                    "trigger_price": event.price,
+                    "price_source": event.source.as_str(),
+                    "routing_key": &event.routing_key,
+                    "filled_stopout_attempts": workflow_state.filled_stopout_attempts,
+                }),
+            );
+        }
+        fast_plan_state.last_dispatch_block_reason = Some(reason.to_string());
+        return Ok(());
+    }
+    fast_plan_state.last_dispatch_block_reason = None;
+    let Some(selected_entry_plan) = select_fast_entry_plan(
+        symbol,
+        tactical_plan,
+        workflow_state,
+        &trading_state,
+        entry_snapshots,
+        event.price,
+        entry_ready,
+        ctx.config.llm.workflow.watcher.max_filled_stopout_attempts,
+    ) else {
+        return Ok(());
+    };
+
+    let intent = execution_intent_from_entry_plan(
+        symbol,
+        &tactical_plan.path_id,
+        selected_entry_plan.plan,
+        current_path,
+        workflow_state
+            .pending_entry_bracket_template_override
+            .as_ref(),
+        selected_entry_plan.trigger_price,
+        ctx.config.llm.workflow.watcher.entry_ttl_minutes,
+        None,
+    );
+    info!(
+        symbol = %symbol,
+        trigger = "watcher_fast_consumer",
+        path_id = %intent.path_id,
+        context_key = %intent.entry_snapshot.context_key,
+        price_source = event.source.as_str(),
+        routing_key = %event.routing_key,
+        trigger_price = event.price,
+        side = %intent.side,
+        intent_mode = %intent.intent_mode,
+        stop_loss = intent.stop_loss,
+        take_profit_1 = intent.take_profit_1,
+        take_profit_2 = intent.take_profit_2,
+        "workflow watcher dispatching entry intent"
+    );
+    append_workflow_journal_event(
+        "workflow_entry_dispatch",
+        symbol,
+        event.event_ts,
+        json!({
+            "trigger": "watcher_fast_consumer",
+            "path_id": &intent.path_id,
+            "context_key": &intent.entry_snapshot.context_key,
+            "trigger_price": event.price,
+            "price_source": event.source.as_str(),
+            "routing_key": &event.routing_key,
+            "entry_plan": entry_plan_log_payload(
+                &tactical_plan.path_id,
+                context_key,
+                selected_entry_plan.plan,
+            ),
+            "execution_intent": {
+                "side": &intent.side,
+                "intent_mode": &intent.intent_mode,
+                "stop_loss": intent.stop_loss,
+                "take_profit_1": intent.take_profit_1,
+                "take_profit_2": intent.take_profit_2,
+                "ttl_minutes": intent.ttl_minutes,
+            }
+        }),
+    );
+
+    match adapt_execution_intent(&intent) {
+        Ok(adapted_intent) => match execute_workflow_execution_intent(
+            &ctx.http_client,
+            &ctx.config.api.binance,
+            &ctx.config.llm.execution,
+            symbol,
+            &adapted_intent,
+        )
+        .await
+        {
+            Ok(report) => {
+                append_workflow_journal_event(
+                    "workflow_execution_report",
+                    symbol,
+                    event.event_ts,
+                    json!({
+                        "trigger": "watcher_fast_consumer",
+                        "path_id": &intent.path_id,
+                        "context_key": &intent.entry_snapshot.context_key,
+                        "price_source": event.source.as_str(),
+                        "routing_key": &event.routing_key,
+                        "trigger_price": event.price,
+                        "report": {
+                            "decision": report.decision,
+                            "quantity": report.quantity,
+                            "leverage": report.leverage,
+                            "position_side": report.position_side,
+                            "maker_entry_price": report.maker_entry_price,
+                            "take_profit": report.actual_take_profit,
+                            "stop_loss": report.actual_stop_loss,
+                            "risk_reward_ratio": report.actual_risk_reward_ratio,
+                            "dry_run": report.dry_run,
+                        }
+                    }),
+                );
+                fast_plan_state.fired = true;
+                if !report.dry_run {
+                    let snapshot = crate::workflow::management::snapshot_from_execution_intent(
+                        symbol,
+                        &intent,
+                        current_path,
+                        Utc::now(),
+                    );
+                    crate::workflow::persistence::save_entry_snapshot(state_dir, &snapshot)?;
+                    entry_snapshots.insert(snapshot.context_key.clone(), snapshot);
+                    workflow_state.last_filled_context_key =
+                        Some(intent.entry_snapshot.context_key.clone());
+                    crate::workflow::persistence::save_workflow_state(state_dir, workflow_state)?;
+                }
+
+                let signal = build_execution_trade_signal(
+                    event.event_ts,
+                    "watcher_fast_consumer",
+                    symbol,
+                    "workflow_watcher_fast",
+                    &trading_state,
+                    &intent,
+                    Some(&report),
+                    intent.reason.as_deref(),
+                );
+                let telegram_operator = TelegramOperator::from_config(&ctx.config.api.telegram);
+                let x_operator = XOperator::from_config(&ctx.config.api.x);
+                send_trade_signal_notifications(
+                    telegram_operator.as_ref(),
+                    x_operator.as_ref(),
+                    &ctx.config.llm.telegram_signal_decisions,
+                    &ctx.config.llm.x_signal_decisions,
+                    &ctx.http_client,
+                    &signal,
+                )
+                .await;
+            }
+            Err(err) => {
+                let blocked = err
+                    .downcast_ref::<TradeExecutionBlockedByCurrentPriceBeyondStopLoss>()
+                    .map(|item| {
+                        json!({
+                            "decision": item.decision.as_str(),
+                            "current_reference_price": item.current_reference_price,
+                            "current_price_source": item.current_price_source,
+                            "entry_price": item.entry_price,
+                            "stop_loss": item.stop_loss,
+                            "best_bid_price": item.best_bid_price,
+                            "best_ask_price": item.best_ask_price,
+                        })
+                    });
+                append_workflow_journal_event(
+                    "workflow_execution_error",
+                    symbol,
+                    event.event_ts,
+                    json!({
+                        "trigger": "watcher_fast_consumer",
+                        "path_id": &intent.path_id,
+                        "context_key": &intent.entry_snapshot.context_key,
+                        "price_source": event.source.as_str(),
+                        "routing_key": &event.routing_key,
+                        "trigger_price": event.price,
+                        "error": format!("{err:#}"),
+                        "blocked": blocked,
+                    }),
+                );
+            }
+        },
+        Err(err) => {
+            append_workflow_journal_event(
+                "workflow_execution_error",
+                symbol,
+                event.event_ts,
+                json!({
+                    "trigger": "watcher_fast_consumer",
+                    "path_id": &intent.path_id,
+                    "context_key": &intent.entry_snapshot.context_key,
+                    "price_source": event.source.as_str(),
+                    "routing_key": &event.routing_key,
+                    "trigger_price": event.price,
+                    "error": format!("{err:#}"),
+                    "phase": "intent_adapter",
+                }),
+            );
+        }
+    }
+
+    Ok(())
 }
 
 fn execution_intent_from_entry_plan(
@@ -2418,6 +2816,7 @@ async fn handle_fast_market_event(
         *fast_state = None;
         return Ok(());
     };
+    let current_path = current_path.clone();
     if workflow_state.pending_stage1_refresh_reason.is_some() {
         *fast_state = None;
         return Ok(());
@@ -2426,6 +2825,7 @@ async fn handle_fast_market_event(
         *fast_state = None;
         return Ok(());
     };
+    let tactical_plan = tactical_plan.clone();
     if tactical_plan.path_id != current_path.id {
         *fast_state = None;
         return Ok(());
@@ -2445,14 +2845,46 @@ async fn handle_fast_market_event(
         &tactical_plan.path_id,
     );
     let plan_version = fast_plan_version(
-        tactical_plan,
+        &tactical_plan,
         workflow_state.approved_tactical_plan_updated_at,
     );
-    sync_fast_watcher_plan_state(fast_state, &plan_version, &context_key);
+    let plan_state_reset = sync_fast_watcher_plan_state(fast_state, &plan_version, &context_key);
 
     let fast_plan_state = fast_state
         .as_mut()
         .ok_or_else(|| anyhow!("fast watcher state unavailable"))?;
+    if plan_state_reset {
+        info!(
+            symbol = %symbol,
+            trigger = "watcher_fast_consumer",
+            path_id = %tactical_plan.path_id,
+            context_key = %context_key,
+            side = %tactical_plan.entry_plan.side,
+            entry_profile = %tactical_plan.entry_plan.entry_profile,
+            intent_mode = %tactical_plan.entry_plan.intent_mode,
+            entry_zone_low = tactical_plan.entry_plan.entry_zone.low,
+            entry_zone_high = tactical_plan.entry_plan.entry_zone.high,
+            invalidation_low = tactical_plan.entry_plan.entry_invalidation_level.low,
+            invalidation_high = tactical_plan.entry_plan.entry_invalidation_level.high,
+            stop_loss = tactical_plan.entry_plan.stop_loss,
+            "workflow watcher armed tactical entry plan"
+        );
+        append_workflow_journal_event(
+            "workflow_tactical_plan_armed",
+            &symbol,
+            event.event_ts,
+            json!({
+                "trigger": "watcher_fast_consumer",
+                "price_source": event.source.as_str(),
+                "routing_key": &event.routing_key,
+                "entry_plan": entry_plan_log_payload(
+                    &tactical_plan.path_id,
+                    &context_key,
+                    &tactical_plan.entry_plan,
+                ),
+            }),
+        );
+    }
 
     let mut entry_snapshots =
         crate::workflow::persistence::load_entry_snapshots_for_symbol(&state_dir, &symbol)?
@@ -2464,172 +2896,93 @@ async fn handle_fast_market_event(
         return Ok(());
     }
 
-    let entry_ready = fast_watcher_entry_ready(
-        fast_plan_state,
-        &tactical_plan.entry_plan,
-        &event,
-        &ctx.config.llm.workflow.watcher,
-    );
-    if !entry_ready {
-        return Ok(());
-    }
-
-    let trading_state = fetch_symbol_trading_state_for_fast_path(
-        &ctx.http_client,
-        &ctx.config.api.binance,
-        &ctx.config.llm.execution,
-        &symbol,
-    )
-    .await?;
-    let Some(selected_entry_plan) = select_fast_entry_plan(
-        &symbol,
-        tactical_plan,
-        &workflow_state,
-        &trading_state,
-        &entry_snapshots,
-        event.price,
-        entry_ready,
-        ctx.config.llm.workflow.watcher.max_filled_stopout_attempts,
-    ) else {
-        return Ok(());
-    };
-
-    let intent = execution_intent_from_entry_plan(
-        &symbol,
-        &tactical_plan.path_id,
-        selected_entry_plan.plan,
-        current_path,
-        workflow_state
-            .pending_entry_bracket_template_override
-            .as_ref(),
-        selected_entry_plan.trigger_price,
-        ctx.config.llm.workflow.watcher.entry_ttl_minutes,
-        None,
-    );
-
-    match adapt_execution_intent(&intent) {
-        Ok(adapted_intent) => match execute_workflow_execution_intent(
-            &ctx.http_client,
-            &ctx.config.api.binance,
-            &ctx.config.llm.execution,
-            &symbol,
-            &adapted_intent,
-        )
-        .await
-        {
-            Ok(report) => {
-                append_workflow_journal_event(
-                    "workflow_execution_report",
-                    &symbol,
-                    event.event_ts,
-                    json!({
-                        "trigger": "watcher_fast_consumer",
-                        "path_id": intent.path_id,
-                        "context_key": intent.entry_snapshot.context_key,
-                        "price_source": event.source.as_str(),
-                        "routing_key": event.routing_key,
-                        "trigger_price": event.price,
-                        "report": {
-                            "decision": report.decision,
-                            "quantity": report.quantity,
-                            "leverage": report.leverage,
-                            "position_side": report.position_side,
-                            "maker_entry_price": report.maker_entry_price,
-                            "take_profit": report.actual_take_profit,
-                            "stop_loss": report.actual_stop_loss,
-                            "risk_reward_ratio": report.actual_risk_reward_ratio,
-                            "dry_run": report.dry_run,
-                        }
-                    }),
-                );
-                fast_plan_state.fired = true;
-                if !report.dry_run {
-                    let snapshot = crate::workflow::management::snapshot_from_execution_intent(
-                        &symbol,
-                        &intent,
-                        current_path,
-                        Utc::now(),
-                    );
-                    crate::workflow::persistence::save_entry_snapshot(&state_dir, &snapshot)?;
-                    entry_snapshots.insert(snapshot.context_key.clone(), snapshot);
-                    workflow_state.last_filled_context_key =
-                        Some(intent.entry_snapshot.context_key.clone());
-                    crate::workflow::persistence::save_workflow_state(&state_dir, &workflow_state)?;
-                }
-
-                let signal = build_execution_trade_signal(
-                    event.event_ts,
-                    "watcher_fast_consumer",
-                    &symbol,
-                    "workflow_watcher_fast",
-                    &trading_state,
-                    &intent,
-                    Some(&report),
-                    intent.reason.as_deref(),
-                );
-                let telegram_operator = TelegramOperator::from_config(&ctx.config.api.telegram);
-                let x_operator = XOperator::from_config(&ctx.config.api.x);
-                send_trade_signal_notifications(
-                    telegram_operator.as_ref(),
-                    x_operator.as_ref(),
-                    &ctx.config.llm.telegram_signal_decisions,
-                    &ctx.config.llm.x_signal_decisions,
-                    &ctx.http_client,
-                    &signal,
-                )
-                .await;
-            }
-            Err(err) => {
-                let blocked = err
-                    .downcast_ref::<TradeExecutionBlockedByCurrentPriceBeyondStopLoss>()
-                    .map(|item| {
-                        json!({
-                            "decision": item.decision.as_str(),
-                            "current_reference_price": item.current_reference_price,
-                            "current_price_source": item.current_price_source,
-                            "entry_price": item.entry_price,
-                            "stop_loss": item.stop_loss,
-                            "best_bid_price": item.best_bid_price,
-                            "best_ask_price": item.best_ask_price,
-                        })
-                    });
-                append_workflow_journal_event(
-                    "workflow_execution_error",
-                    &symbol,
-                    event.event_ts,
-                    json!({
-                        "trigger": "watcher_fast_consumer",
-                        "path_id": intent.path_id,
-                        "context_key": intent.entry_snapshot.context_key,
-                        "price_source": event.source.as_str(),
-                        "routing_key": event.routing_key,
-                        "trigger_price": event.price,
-                        "error": format!("{err:#}"),
-                        "blocked": blocked,
-                    }),
-                );
-            }
-        },
-        Err(err) => {
+    if plan_state_reset {
+        let approval_ts = workflow_state.approved_tactical_plan_updated_at;
+        if let Some(replay_start) = workflow_state.approved_tactical_plan_source_ts_bucket {
+            let replay_events =
+                buffered_fast_price_events_in_range(&symbol, replay_start, event.event_ts);
+            info!(
+                symbol = %symbol,
+                trigger = "watcher_fast_consumer",
+                path_id = %tactical_plan.path_id,
+                context_key = %context_key,
+                replay_start = %replay_start,
+                replay_end = %event.event_ts,
+                replay_count = replay_events.len(),
+                approval_ts = ?approval_ts,
+                source_ts_bucket = %replay_start,
+                "workflow watcher replaying fast market events since tactical plan source timestamp"
+            );
             append_workflow_journal_event(
-                "workflow_execution_error",
+                "workflow_tactical_plan_replay",
                 &symbol,
                 event.event_ts,
                 json!({
                     "trigger": "watcher_fast_consumer",
-                    "path_id": intent.path_id,
-                    "context_key": intent.entry_snapshot.context_key,
-                    "price_source": event.source.as_str(),
-                    "routing_key": event.routing_key,
-                    "trigger_price": event.price,
-                    "error": format!("{err:#}"),
-                    "phase": "intent_adapter",
+                    "path_id": &tactical_plan.path_id,
+                    "context_key": &context_key,
+                    "replay_start": replay_start,
+                    "replay_end": event.event_ts,
+                    "replay_count": replay_events.len(),
+                    "approval_ts": approval_ts,
+                    "source_ts_bucket": replay_start,
+                }),
+            );
+            for replay_event in replay_events {
+                process_fast_market_event_for_plan(
+                    ctx,
+                    &mut workflow_state,
+                    &current_path,
+                    &tactical_plan,
+                    &symbol,
+                    &state_dir,
+                    fast_plan_state,
+                    &context_key,
+                    &mut entry_snapshots,
+                    &replay_event,
+                )
+                .await?;
+                if fast_plan_state.fired {
+                    return Ok(());
+                }
+            }
+        } else {
+            info!(
+                symbol = %symbol,
+                trigger = "watcher_fast_consumer",
+                path_id = %tactical_plan.path_id,
+                context_key = %context_key,
+                approval_ts = ?approval_ts,
+                "workflow watcher replay skipped because tactical plan source timestamp is missing"
+            );
+            append_workflow_journal_event(
+                "workflow_tactical_plan_replay_skipped",
+                &symbol,
+                event.event_ts,
+                json!({
+                    "trigger": "watcher_fast_consumer",
+                    "path_id": &tactical_plan.path_id,
+                    "context_key": &context_key,
+                    "approval_ts": approval_ts,
+                    "reason": "missing_source_ts_bucket",
                 }),
             );
         }
     }
 
-    Ok(())
+    process_fast_market_event_for_plan(
+        ctx,
+        &mut workflow_state,
+        &current_path,
+        &tactical_plan,
+        &symbol,
+        &state_dir,
+        fast_plan_state,
+        &context_key,
+        &mut entry_snapshots,
+        &event,
+    )
+    .await
 }
 
 #[derive(Debug, Clone)]
@@ -2724,9 +3077,9 @@ fn entry_reclaim_confirmed(
             .map(|bars| {
                 bars.iter().all(|bar| {
                     if predicate.allow_equal {
-                        bar.close >= level.high
+                        bar.high >= level.high
                     } else {
-                        bar.close > level.high
+                        bar.high > level.high
                     }
                 })
             })
@@ -2735,9 +3088,9 @@ fn entry_reclaim_confirmed(
             .map(|bars| {
                 bars.iter().all(|bar| {
                     if predicate.allow_equal {
-                        bar.close <= level.low
+                        bar.low <= level.low
                     } else {
-                        bar.close < level.low
+                        bar.low < level.low
                     }
                 })
             })
@@ -2757,13 +3110,13 @@ fn entry_hold_confirmed(
         "LONG" => recent_bars(facts, predicate.hold_bars)
             .map(|bars| {
                 let hold_floor = level.high * (1.0 - tolerance);
-                bars.iter().all(|bar| bar.close >= hold_floor)
+                bars.iter().all(|bar| bar.low >= hold_floor)
             })
             .unwrap_or(false),
         "SHORT" => recent_bars(facts, predicate.hold_bars)
             .map(|bars| {
                 let hold_ceiling = level.low * (1.0 + tolerance);
-                bars.iter().all(|bar| bar.close <= hold_ceiling)
+                bars.iter().all(|bar| bar.high <= hold_ceiling)
             })
             .unwrap_or(false),
         _ => false,
@@ -2782,13 +3135,13 @@ fn pullback_acceptance_confirmed(
                 let touched = !predicate.require_touch_entry_zone
                     || bars.iter().any(|bar| bar.low <= plan.entry_zone.high);
                 let floor = plan.entry_zone.low * (1.0 - overshoot);
-                touched && bars.iter().all(|bar| bar.close >= floor)
+                touched && bars.iter().all(|bar| bar.low >= floor)
             }
             "SHORT" => {
                 let touched = !predicate.require_touch_entry_zone
                     || bars.iter().any(|bar| bar.high >= plan.entry_zone.low);
                 let ceiling = plan.entry_zone.high * (1.0 + overshoot);
-                touched && bars.iter().all(|bar| bar.close <= ceiling)
+                touched && bars.iter().all(|bar| bar.high <= ceiling)
             }
             _ => false,
         })
@@ -2805,11 +3158,11 @@ fn breakout_confirmed(
         .map(|bars| match plan.side.as_str() {
             "LONG" => {
                 let breakout_level = plan.entry_zone.high * (1.0 + threshold);
-                bars.iter().all(|bar| bar.close >= breakout_level)
+                bars.iter().all(|bar| bar.high >= breakout_level)
             }
             "SHORT" => {
                 let breakout_level = plan.entry_zone.low * (1.0 - threshold);
-                bars.iter().all(|bar| bar.close <= breakout_level)
+                bars.iter().all(|bar| bar.low <= breakout_level)
             }
             _ => false,
         })
@@ -3605,6 +3958,8 @@ async fn invoke_workflow_bundle_models(
                             workflow_state.approved_tactical_plan =
                                 parsed_stage2a.tactical_entry_plan.clone();
                             workflow_state.approved_tactical_plan_updated_at = Some(Utc::now());
+                            workflow_state.approved_tactical_plan_source_ts_bucket =
+                                Some(bundle.raw.ts_bucket);
                             workflow_state.pending_stage1_refresh_reason = None;
                             crate::workflow::persistence::save_workflow_state(
                                 &state_dir,
@@ -3616,9 +3971,30 @@ async fn invoke_workflow_bundle_models(
                                 bundle.raw.ts_bucket,
                                 json!({
                                     "trigger": &*trigger,
-                                    "tactical_entry_plan": parsed_stage2a.tactical_entry_plan,
+                                    "model_name": selected_stage2a_model_name.clone(),
+                                    "source_ts_bucket": bundle.raw.ts_bucket,
+                                    "tactical_entry_plan": parsed_stage2a.tactical_entry_plan.clone(),
                                 }),
                             );
+                            if let Some(tactical_plan) =
+                                workflow_state.approved_tactical_plan.as_ref()
+                            {
+                                info!(
+                                    symbol = %symbol,
+                                    trigger = &*trigger,
+                                    source_ts_bucket = %bundle.raw.ts_bucket,
+                                    path_id = %tactical_plan.path_id,
+                                    side = %tactical_plan.entry_plan.side,
+                                    entry_profile = %tactical_plan.entry_plan.entry_profile,
+                                    intent_mode = %tactical_plan.entry_plan.intent_mode,
+                                    entry_zone_low = tactical_plan.entry_plan.entry_zone.low,
+                                    entry_zone_high = tactical_plan.entry_plan.entry_zone.high,
+                                    invalidation_low = tactical_plan.entry_plan.entry_invalidation_level.low,
+                                    invalidation_high = tactical_plan.entry_plan.entry_invalidation_level.high,
+                                    stop_loss = tactical_plan.entry_plan.stop_loss,
+                                    "workflow tactical plan approved"
+                                );
+                            }
                         }
                         other => return Err(anyhow!("unsupported stage2a decision {}", other)),
                     }
@@ -4549,6 +4925,9 @@ async fn invoke_workflow_bundle_models(
                                                                     .approved_tactical_plan_updated_at =
                                                                     Some(Utc::now());
                                                                 workflow_state
+                                                                    .approved_tactical_plan_source_ts_bucket =
+                                                                    Some(bundle.raw.ts_bucket);
+                                                                workflow_state
                                                                     .pending_entry_bracket_template_override =
                                                                     Some(bracket_template);
                                                                 let next_snapshot =
@@ -4771,6 +5150,43 @@ async fn invoke_workflow_bundle_models(
                 let current_path = stage1_output.current_path.as_ref().ok_or_else(|| {
                     anyhow!("workflow stage1 current_path missing during entry execution")
                 })?;
+                let context_key = workflow_entry_context_key(
+                    &symbol,
+                    &entry_plan.plan.side,
+                    &tactical_plan.path_id,
+                );
+                info!(
+                    symbol = %symbol,
+                    trigger = &*trigger,
+                    path_id = %tactical_plan.path_id,
+                    context_key = %context_key,
+                    trigger_price = entry_plan.trigger_price,
+                    side = %entry_plan.plan.side,
+                    entry_profile = %entry_plan.plan.entry_profile,
+                    intent_mode = %entry_plan.plan.intent_mode,
+                    entry_zone_low = entry_plan.plan.entry_zone.low,
+                    entry_zone_high = entry_plan.plan.entry_zone.high,
+                    invalidation_low = entry_plan.plan.entry_invalidation_level.low,
+                    invalidation_high = entry_plan.plan.entry_invalidation_level.high,
+                    stop_loss = entry_plan.plan.stop_loss,
+                    "workflow watcher entry ready"
+                );
+                append_workflow_journal_event(
+                    "workflow_entry_ready",
+                    &symbol,
+                    bundle.raw.ts_bucket,
+                    json!({
+                        "trigger": &*trigger,
+                        "path_id": &tactical_plan.path_id,
+                        "context_key": &context_key,
+                        "trigger_price": entry_plan.trigger_price,
+                        "entry_plan": entry_plan_log_payload(
+                            &tactical_plan.path_id,
+                            &context_key,
+                            entry_plan.plan,
+                        ),
+                    }),
+                );
                 let intent = execution_intent_from_entry_plan(
                     &symbol,
                     &tactical_plan.path_id,
@@ -4782,6 +5198,43 @@ async fn invoke_workflow_bundle_models(
                     entry_plan.trigger_price,
                     config.llm.workflow.watcher.entry_ttl_minutes,
                     None,
+                );
+                info!(
+                    symbol = %symbol,
+                    trigger = &*trigger,
+                    path_id = %intent.path_id,
+                    context_key = %intent.entry_snapshot.context_key,
+                    trigger_price = entry_plan.trigger_price,
+                    side = %intent.side,
+                    intent_mode = %intent.intent_mode,
+                    stop_loss = intent.stop_loss,
+                    take_profit_1 = intent.take_profit_1,
+                    take_profit_2 = intent.take_profit_2,
+                    "workflow watcher dispatching entry intent"
+                );
+                append_workflow_journal_event(
+                    "workflow_entry_dispatch",
+                    &symbol,
+                    bundle.raw.ts_bucket,
+                    json!({
+                        "trigger": &*trigger,
+                        "path_id": &intent.path_id,
+                        "context_key": &intent.entry_snapshot.context_key,
+                        "trigger_price": entry_plan.trigger_price,
+                        "entry_plan": entry_plan_log_payload(
+                            &tactical_plan.path_id,
+                            &context_key,
+                            entry_plan.plan,
+                        ),
+                        "execution_intent": {
+                            "side": &intent.side,
+                            "intent_mode": &intent.intent_mode,
+                            "stop_loss": intent.stop_loss,
+                            "take_profit_1": intent.take_profit_1,
+                            "take_profit_2": intent.take_profit_2,
+                            "ttl_minutes": intent.ttl_minutes,
+                        }
+                    }),
                 );
                 match adapt_execution_intent(&intent) {
                     Ok(adapted_intent) => match execute_workflow_execution_intent(
@@ -4800,8 +5253,8 @@ async fn invoke_workflow_bundle_models(
                                 bundle.raw.ts_bucket,
                                 json!({
                                     "trigger": &*trigger,
-                                    "path_id": intent.path_id,
-                                    "context_key": intent.entry_snapshot.context_key,
+                                    "path_id": &intent.path_id,
+                                    "context_key": &intent.entry_snapshot.context_key,
                                     "report": {
                                         "decision": report.decision,
                                         "quantity": report.quantity,
@@ -4862,8 +5315,8 @@ async fn invoke_workflow_bundle_models(
                                 bundle.raw.ts_bucket,
                                 json!({
                                     "trigger": &*trigger,
-                                    "path_id": intent.path_id,
-                                    "context_key": intent.entry_snapshot.context_key,
+                                    "path_id": &intent.path_id,
+                                    "context_key": &intent.entry_snapshot.context_key,
                                     "error": format!("{err:#}"),
                                     "blocked": blocked,
                                 }),
@@ -4877,8 +5330,8 @@ async fn invoke_workflow_bundle_models(
                             bundle.raw.ts_bucket,
                             json!({
                                 "trigger": &*trigger,
-                                "path_id": intent.path_id,
-                                "context_key": intent.entry_snapshot.context_key,
+                                "path_id": &intent.path_id,
+                                "context_key": &intent.entry_snapshot.context_key,
                                 "error": format!("{err:#}"),
                                 "phase": "intent_adapter",
                             }),
@@ -4895,7 +5348,7 @@ async fn invoke_workflow_bundle_models(
                         "execution_enabled": config.llm.execution.enabled,
                         "execution_blocked_due_to_stale": execution_blocked_due_to_stale,
                         "filled_stopout_attempts": workflow_state.filled_stopout_attempts,
-                        "path_id": tactical_plan.path_id,
+                        "path_id": &tactical_plan.path_id,
                     }),
                 );
             }
@@ -5702,6 +6155,12 @@ mod tests {
         }
     }
 
+    fn clear_fast_price_event_buffer_for_symbol(symbol: &str) {
+        if let Ok(mut guard) = fast_price_event_buffer().lock() {
+            guard.remove(&symbol.to_ascii_uppercase());
+        }
+    }
+
     fn sample_fast_watcher_config() -> crate::app::config::WorkflowWatcherConfig {
         let mut watcher_cfg = crate::app::config::WorkflowWatcherConfig::default();
         watcher_cfg
@@ -6496,6 +6955,29 @@ mod tests {
             &sample_fast_price_event("2026-03-30T09:35:03Z", 100.9),
             &watcher_cfg,
         ));
+    }
+
+    #[test]
+    fn buffered_fast_price_events_in_range_replays_15m_slice_in_order() {
+        clear_fast_price_event_buffer_for_symbol("ETHUSDT");
+        record_fast_price_event_in_buffer(&sample_fast_price_event("2026-03-30T09:34:59Z", 100.0));
+        record_fast_price_event_in_buffer(&sample_fast_price_event("2026-03-30T09:35:00Z", 100.1));
+        record_fast_price_event_in_buffer(&sample_fast_price_event("2026-03-30T09:35:01Z", 100.2));
+
+        let replay = buffered_fast_price_events_in_range(
+            "ETHUSDT",
+            DateTime::parse_from_rfc3339("2026-03-30T09:35:00Z")
+                .expect("range start")
+                .with_timezone(&Utc),
+            DateTime::parse_from_rfc3339("2026-03-30T09:35:02Z")
+                .expect("range end")
+                .with_timezone(&Utc),
+        );
+
+        assert_eq!(replay.len(), 2);
+        assert_eq!(replay[0].price, 100.1);
+        assert_eq!(replay[1].price, 100.2);
+        clear_fast_price_event_buffer_for_symbol("ETHUSDT");
     }
 
     /*
@@ -7477,6 +7959,38 @@ mod tests {
     }
 
     #[test]
+    fn entry_reclaim_confirmation_accepts_intrabar_touch_without_close_break() {
+        let predicate = crate::app::config::EntryReclaimPredicateConfig {
+            confirm_bars: 2,
+            allow_equal: false,
+        };
+        let level = PriceZone {
+            low: 100.0,
+            high: 101.0,
+            timeframe: None,
+            label: None,
+            reason: None,
+        };
+        let facts = WatcherPriceFacts {
+            current_price: 100.7,
+            recent_bars: vec![
+                WatcherBar {
+                    close: 100.4,
+                    high: 101.2,
+                    low: 100.0,
+                },
+                WatcherBar {
+                    close: 100.6,
+                    high: 101.3,
+                    low: 100.2,
+                },
+            ],
+        };
+
+        assert!(entry_reclaim_confirmed("LONG", &level, &facts, &predicate));
+    }
+
+    #[test]
     fn entry_hold_confirmation_uses_reclaimed_edge_not_activation_floor() {
         let predicate = crate::app::config::EntryHoldPredicateConfig {
             hold_bars: 3,
@@ -7514,11 +8028,87 @@ mod tests {
     }
 
     #[test]
+    fn pullback_acceptance_confirmation_uses_intrabar_overshoot_guard() {
+        let predicate = crate::app::config::PullbackAcceptancePredicateConfig {
+            confirm_bars: 2,
+            require_touch_entry_zone: true,
+            max_overshoot_bps: 10.0,
+        };
+        let plan = crate::workflow::schema::EntryPlan {
+            side: "LONG".to_string(),
+            entry_profile: "pullback_acceptance".to_string(),
+            intent_mode: "pullback".to_string(),
+            entry_activation_level: sample_price_zone(100.0, 101.0, "15m"),
+            entry_zone: sample_price_zone(100.0, 101.0, "15m"),
+            entry_invalidation_level: sample_price_zone(98.0, 99.0, "15m"),
+            stop_loss: 98.8,
+            max_drift_pct: 0.2,
+            entry_note: "entry".to_string(),
+        };
+        let facts = WatcherPriceFacts {
+            current_price: 100.2,
+            recent_bars: vec![
+                WatcherBar {
+                    close: 99.92,
+                    high: 100.4,
+                    low: 100.0,
+                },
+                WatcherBar {
+                    close: 99.95,
+                    high: 100.3,
+                    low: 99.95,
+                },
+            ],
+        };
+
+        assert!(pullback_acceptance_confirmed(&plan, &facts, &predicate));
+    }
+
+    #[test]
+    fn breakout_confirmation_accepts_intrabar_break_without_close_break() {
+        let predicate = crate::app::config::BreakoutPredicateConfig {
+            confirm_bars: 2,
+            min_break_bps: 3.0,
+        };
+        let plan = crate::workflow::schema::EntryPlan {
+            side: "LONG".to_string(),
+            entry_profile: "reclaim_then_hold".to_string(),
+            intent_mode: "breakout".to_string(),
+            entry_activation_level: sample_price_zone(100.0, 101.0, "15m"),
+            entry_zone: sample_price_zone(100.0, 101.0, "15m"),
+            entry_invalidation_level: sample_price_zone(98.0, 99.0, "15m"),
+            stop_loss: 98.8,
+            max_drift_pct: 0.2,
+            entry_note: "entry".to_string(),
+        };
+        let facts = WatcherPriceFacts {
+            current_price: 100.9,
+            recent_bars: vec![
+                WatcherBar {
+                    close: 100.7,
+                    high: 101.05,
+                    low: 100.3,
+                },
+                WatcherBar {
+                    close: 100.8,
+                    high: 101.04,
+                    low: 100.4,
+                },
+            ],
+        };
+
+        assert!(breakout_confirmed(&plan, &facts, &predicate));
+    }
+
+    #[test]
     fn reset_watcher_window_if_needed_resets_attempts_on_new_window() {
         let ts = DateTime::parse_from_rfc3339("2026-03-28T05:17:00Z")
             .expect("ts")
             .with_timezone(&Utc);
         let tactical_plan = sample_tactical_plan();
+        let source_ts = DateTime::parse_from_rfc3339("2026-03-28T05:15:00Z")
+            .expect("source ts")
+            .with_timezone(&Utc);
         let mut state = WorkflowState {
             symbol: "ETHUSDT".to_string(),
             active_15m_window_start: Some(
@@ -7528,6 +8118,7 @@ mod tests {
             ),
             approved_tactical_plan: Some(tactical_plan.clone()),
             approved_tactical_plan_updated_at: Some(ts - ChronoDuration::minutes(5)),
+            approved_tactical_plan_source_ts_bucket: Some(source_ts),
             filled_stopout_attempts: 2,
             last_filled_context_key: Some("ETHUSDT:LONG:path_a:primary".to_string()),
             last_executed_plan_role: Some("secondary".to_string()),
@@ -7547,6 +8138,7 @@ mod tests {
         assert_eq!(expired_plan, Some(tactical_plan));
         assert!(state.approved_tactical_plan.is_none());
         assert!(state.approved_tactical_plan_updated_at.is_none());
+        assert!(state.approved_tactical_plan_source_ts_bucket.is_none());
         assert_eq!(state.filled_stopout_attempts, 0);
         assert!(state.last_filled_context_key.is_none());
         assert!(state.last_executed_plan_role.is_none());

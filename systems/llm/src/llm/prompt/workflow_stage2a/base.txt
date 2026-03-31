@@ -26,9 +26,11 @@ Tactical entry optimization priority:
 
 Entry design rules:
 - entry_activation_level, entry_zone, entry_invalidation_level, and stop_loss are tactical fields owned by this prompt.
-- entry_invalidation must be the structure-based tactical invalidation that falsifies the chosen entry_profile. Its timeframe must be setup-native (typically 5m, 15m, or 15m-4h depending on the entry_profile).
-- Tactical stop_loss must be the executable stop for this setup, not a restatement of Stage1.failure_level.
-- Use stage1 failure_level to judge whether the broader path still deserves confirmation or reevaluation, but do not treat it as a hard cap on the tactical stop.
+- entry_invalidation_level is the tactical structure invalidation zone for the setup. It says where the chosen setup is no longer valid in market-structure terms.
+- stop_loss is the executable stop used by the execution layer. It is the actual live risk price for the trade.
+- entry_invalidation_level and stop_loss are related but not mechanically identical. Keep the meaning of each field clear.
+- stop_loss must be evaluated independently as the live executable risk stop. Do not default to placing it just beyond entry_invalidation_level unless that is truly the best executable risk placement.
+- Use stage1 failure_level to judge whether the broader path still deserves confirmation or reevaluation, but do not treat it as the tactical stop.
 - Output only the single highest-quality entry plan you believe is valid right now.
 
 Output contract:

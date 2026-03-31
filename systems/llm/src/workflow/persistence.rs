@@ -538,6 +538,7 @@ mod tests {
             symbol: "ETHUSDT".to_string(),
             pending_stage1_refresh_reason: Some("thesis_invalidated".to_string()),
             last_stage1_ts: Some(Utc::now()),
+            approved_tactical_plan_source_ts_bucket: Some(Utc::now()),
             ..WorkflowState::default()
         };
         save_workflow_state(&state_dir, &state).expect("save workflow state");

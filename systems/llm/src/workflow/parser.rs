@@ -507,21 +507,11 @@ fn validate_stage2a_entry_plan(entry_plan: &EntryPlan, current_path: &CurrentPat
                     "entry_plan.stop_loss must remain on the risk side of entry_plan.entry_zone for LONG"
                 ));
             }
-            if entry_plan.stop_loss > entry_plan.entry_invalidation_level.high + f64::EPSILON {
-                return Err(anyhow!(
-                    "entry_plan.stop_loss must remain at or below entry_plan.entry_invalidation_level for LONG"
-                ));
-            }
         }
         "SHORT" => {
             if entry_plan.stop_loss < entry_plan.entry_zone.high - f64::EPSILON {
                 return Err(anyhow!(
                     "entry_plan.stop_loss must remain on the risk side of entry_plan.entry_zone for SHORT"
-                ));
-            }
-            if entry_plan.stop_loss < entry_plan.entry_invalidation_level.low - f64::EPSILON {
-                return Err(anyhow!(
-                    "entry_plan.stop_loss must remain at or above entry_plan.entry_invalidation_level for SHORT"
                 ));
             }
         }
@@ -1491,6 +1481,37 @@ mod tests {
                 .stop_loss,
             1987.5
         );
+    }
+
+    #[test]
+    fn stage2a_parser_allows_execution_stop_to_differ_from_structural_invalidation() {
+        let stage1_output = sample_stage1_output();
+        let value = json!({
+            "stage2_decision": "PATH_CONFIRMED",
+            "tactical_entry_plan": {
+                "path_id": "path_1",
+                "entry_plan": {
+                    "side": "LONG",
+                    "entry_profile": "reclaim_then_hold",
+                    "intent_mode": "immediate",
+                    "entry_activation_level": {"low": 1998.0, "high": 2002.0, "timeframe": "15m", "label": "activation", "reason": "ok"},
+                    "entry_zone": {"low": 1999.0, "high": 2001.0, "timeframe": "15m", "label": "entry", "reason": "ok"},
+                    "entry_invalidation_level": {"low": 1992.0, "high": 1994.0, "timeframe": "15m", "label": "invalid", "reason": "ok"},
+                    "stop_loss": 1997.5,
+                    "max_drift_pct": 0.12,
+                    "entry_note": "structural invalidation and execution stop are intentionally different"
+                }
+            },
+            "reevaluation_reason": null
+        });
+        let parsed = parse_stage2a_output(value, &stage1_output).expect("parse");
+        let entry_plan = &parsed
+            .tactical_entry_plan
+            .as_ref()
+            .expect("tactical plan")
+            .entry_plan;
+        assert_eq!(entry_plan.entry_invalidation_level.high, 1994.0);
+        assert_eq!(entry_plan.stop_loss, 1997.5);
     }
 
     #[test]
