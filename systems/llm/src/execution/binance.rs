@@ -1244,7 +1244,16 @@ fn workflow_entry_plan_from_intent(intent: &AdaptedExecutionIntent) -> Result<Wo
         WorkflowEntryMode::Immediate => intent
             .trigger_price
             .unwrap_or_else(|| intent.entry_zone.midpoint()),
-        WorkflowEntryMode::Pullback => intent.entry_zone.midpoint(),
+        WorkflowEntryMode::Pullback => match intent.side.as_str() {
+            "LONG" => intent.entry_zone.low,
+            "SHORT" => intent.entry_zone.high,
+            other => {
+                return Err(anyhow!(
+                    "unsupported workflow execution side {} for pullback intent",
+                    other
+                ))
+            }
+        },
         WorkflowEntryMode::Breakout => {
             if let Some(trigger_price) = intent.trigger_price {
                 trigger_price
@@ -4087,8 +4096,17 @@ mod tests {
             Some(101.5),
         ))
         .expect("pullback");
-        assert_eq!(pullback.requested_entry_price, 101.0);
+        assert_eq!(pullback.requested_entry_price, 100.0);
         assert!(!pullback.allow_taker_fallback);
+
+        let pullback_short = workflow_entry_plan_from_intent(&sample_workflow_execution_intent(
+            "SHORT",
+            "pullback",
+            Some(101.5),
+        ))
+        .expect("pullback short");
+        assert_eq!(pullback_short.requested_entry_price, 102.0);
+        assert!(!pullback_short.allow_taker_fallback);
 
         let breakout_long = workflow_entry_plan_from_intent(&sample_workflow_execution_intent(
             "LONG", "breakout", None,
