@@ -26,12 +26,12 @@ Tactical entry optimization priority:
 Entry design rules:
 - entry_activation_level, entry_zone, entry_invalidation_level, and stop_loss are tactical fields owned by this prompt.
 - Design entry and stop as two separate tasks: first decide when and where the trade should be entered, then decide where the live executable stop should actually sit.
-- entry_invalidation_level is the tactical structure invalidation zone for the setup. It says where the chosen setup is no longer valid in market-structure terms.
-- stop_loss is the executable stop used by the execution layer. It is the actual live risk price for the trade.
-- entry_invalidation_level and stop_loss are related but not mechanically identical. Keep the meaning of each field clear.
-- stop_loss must be derived independently from the provided execution context and current market structure as the live executable risk stop. Do not inherit it mechanically from stage1 failure_level or entry_invalidation_level.
+- entry_invalidation_level defines where the chosen tactical setup is no longer valid in market-structure terms. It is a structural judgment field, not the default placement rule for stop_loss.
+- stop_loss is the live executable risk stop used by the execution layer.
+- Choose stop_loss independently from the provided execution context and current market structure. Do not derive it mechanically from stage1 failure_level or from the nearest edge of entry_invalidation_level.
+- stop_loss may sit meaningfully beyond entry_invalidation_level when that is what the local structure, sweep risk, and normal retest behavior require for the setup to work.
 - Use stage1 failure_level to judge whether the broader path still deserves confirmation or reevaluation, but do not treat it as the tactical stop.
-- entry_note must make the distinction clear: explain why entry_invalidation_level is the tactical structure-failure zone and why stop_loss is the chosen executable risk stop.
+- entry_note must explain both fields separately: where the setup structurally fails, and why the chosen stop_loss is the correct executable risk stop.
 - Output only the single highest-quality entry plan you believe is valid right now.
 
 Output contract:
