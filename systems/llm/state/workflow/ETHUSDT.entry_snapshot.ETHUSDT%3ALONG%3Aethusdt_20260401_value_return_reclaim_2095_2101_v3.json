@@ -1,0 +1,45 @@
+{
+  "symbol": "ETHUSDT",
+  "context_key": "ETHUSDT:LONG:ethusdt_20260401_value_return_reclaim_2095_2101_v3",
+  "path_id": "ethusdt_20260401_value_return_reclaim_2095_2101_v3",
+  "side": "LONG",
+  "entry_profile": "reclaim_then_hold",
+  "intent_mode": "pullback",
+  "entry_activation_level": {
+    "low": 2100.73,
+    "high": 2101.15,
+    "timeframe": "15m",
+    "label": "Shelf-top reclaim trigger",
+    "reason": "Only activate after a pullback is re-accepted above the developing daily POC/reclaimed shelf top at 2100.73 and holds back above 2101.0 on 5m-15m structure."
+  },
+  "entry_zone": {
+    "low": 2100.75,
+    "high": 2101.35,
+    "timeframe": "15m-4h",
+    "label": "Reclaimed shelf retest pocket",
+    "reason": "Best tactical long location is the retest of the 2095.0-2100.73 reclaimed support shelf top, aligned with nearby 5m support prints around 2101.07 and the lower edge of current 15m value, without chasing into 2106.68-2110.0 supply."
+  },
+  "entry_invalidation_level": {
+    "low": 2098.95,
+    "high": 2099.55,
+    "timeframe": "15m",
+    "label": "Pullback-hold failure zone",
+    "reason": "Acceptance back below the 2100.0/2100.73 reclaim pocket and through the recent 2099.49 reaction low means this specific pullback-hold setup has structurally failed, even if the broader Stage1 thesis is not yet broken."
+  },
+  "max_drift_pct": 0.08,
+  "stop_loss": 2100.74,
+  "take_profit_1": 2108.34,
+  "take_profit_2": 2116.91,
+  "allowed_stop_loss_levels": [
+    2097.28,
+    2100.74
+  ],
+  "allowed_take_profit_levels": [
+    2108.34,
+    2116.91
+  ],
+  "tp1_realized": false,
+  "applied_driver_deterioration_signals": [],
+  "created_at": "2026-04-01T04:11:07.764932100Z",
+  "updated_at": "2026-04-01T04:22:07.402913830Z"
+}

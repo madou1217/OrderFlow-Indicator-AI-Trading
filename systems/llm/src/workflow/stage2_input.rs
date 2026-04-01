@@ -743,9 +743,70 @@ fn snapshot_matches_direction(snapshot: &EntrySnapshot, symbol: &str, direction:
     snapshot.symbol.eq_ignore_ascii_case(symbol) && snapshot.side.eq_ignore_ascii_case(direction)
 }
 
+fn live_exit_prices_for_position(
+    position: &crate::execution::binance::ActivePositionSnapshot,
+    open_orders: &[OpenOrderSnapshot],
+) -> (Option<f64>, Option<f64>) {
+    let direction = if position.position_amt >= 0.0 {
+        "LONG"
+    } else {
+        "SHORT"
+    };
+    let exit_side = if direction == "LONG" { "SELL" } else { "BUY" };
+    let is_take_profit = |price: f64| {
+        if direction == "LONG" {
+            price > position.entry_price
+        } else {
+            price < position.entry_price
+        }
+    };
+    let is_stop_loss = |price: f64| {
+        if direction == "LONG" {
+            price < position.entry_price
+        } else {
+            price > position.entry_price
+        }
+    };
+    let same_position_side = |order: &OpenOrderSnapshot| {
+        position.position_side.eq_ignore_ascii_case("BOTH")
+            || order.position_side.eq_ignore_ascii_case("BOTH")
+            || order.position_side.eq_ignore_ascii_case(&position.position_side)
+    };
+    let exit_prices = open_orders
+        .iter()
+        .filter(|order| {
+            (order.reduce_only || order.close_position)
+                && order.side.eq_ignore_ascii_case(exit_side)
+                && same_position_side(order)
+        })
+        .flat_map(|order| [order.price, order.stop_price])
+        .filter(|price| *price > 0.0)
+        .collect::<Vec<_>>();
+    let current_tp_price = exit_prices
+        .iter()
+        .copied()
+        .filter(|price| is_take_profit(*price))
+        .min_by(|left, right| {
+            (left - position.entry_price)
+                .abs()
+                .total_cmp(&(right - position.entry_price).abs())
+        });
+    let current_sl_price = exit_prices
+        .iter()
+        .copied()
+        .filter(|price| is_stop_loss(*price))
+        .min_by(|left, right| {
+            (left - position.entry_price)
+                .abs()
+                .total_cmp(&(right - position.entry_price).abs())
+        });
+    (current_tp_price, current_sl_price)
+}
+
 fn workflow_positions_for_active_position(
     symbol: &str,
     position: &crate::execution::binance::ActivePositionSnapshot,
+    open_orders: &[OpenOrderSnapshot],
     entry_snapshots: &HashMap<String, EntrySnapshot>,
 ) -> Vec<WorkflowPosition> {
     let direction = if position.position_amt >= 0.0 {
@@ -754,6 +815,8 @@ fn workflow_positions_for_active_position(
         "SHORT"
     }
     .to_string();
+    let (current_tp_price, current_sl_price) =
+        live_exit_prices_for_position(position, open_orders);
     let matching_snapshots = entry_snapshots
         .values()
         .filter(|snapshot| snapshot_matches_direction(snapshot, symbol, &direction))
@@ -769,8 +832,8 @@ fn workflow_positions_for_active_position(
             entry_price: position.entry_price,
             mark_price: position.mark_price,
             unrealized_pnl: position.unrealized_pnl,
-            current_tp_price: None,
-            current_sl_price: None,
+            current_tp_price,
+            current_sl_price,
             entry_snapshot: None,
         }];
     }
@@ -785,8 +848,8 @@ fn workflow_positions_for_active_position(
             entry_price: position.entry_price,
             mark_price: position.mark_price,
             unrealized_pnl: position.unrealized_pnl,
-            current_tp_price: Some(snapshot.take_profit_1),
-            current_sl_price: Some(snapshot.stop_loss),
+            current_tp_price,
+            current_sl_price,
             entry_snapshot: Some(snapshot),
         })
         .collect()
@@ -872,7 +935,12 @@ pub fn stage2b_active_positions_for_current_path(
         .active_positions
         .iter()
         .flat_map(|position| {
-            workflow_positions_for_active_position(&trading_state.symbol, position, entry_snapshots)
+            workflow_positions_for_active_position(
+                &trading_state.symbol,
+                position,
+                &trading_state.open_orders,
+                entry_snapshots,
+            )
         })
         .filter(|position| position.direction.eq_ignore_ascii_case(&current_path.side))
         .collect::<Vec<_>>();
@@ -1539,6 +1607,165 @@ mod tests {
                 .path_id,
             "path_previous"
         );
+    }
+
+    #[test]
+    fn stage2b_active_positions_use_live_exit_orders_for_current_tp_and_sl() {
+        let stage1_output = sample_stage1_output();
+        let trading_state = TradingStateSnapshot {
+            symbol: "TESTUSDT".to_string(),
+            has_active_context: true,
+            has_active_positions: true,
+            has_open_orders: true,
+            active_positions: vec![crate::execution::binance::ActivePositionSnapshot {
+                position_side: "BOTH".to_string(),
+                position_amt: 1.0,
+                entry_price: 101.0,
+                mark_price: 103.5,
+                unrealized_pnl: 2.5,
+                leverage: 3,
+            }],
+            open_orders: vec![
+                crate::execution::binance::OpenOrderSnapshot {
+                    order_id: 41,
+                    side: "SELL".to_string(),
+                    position_side: "BOTH".to_string(),
+                    order_type: "TAKE_PROFIT_MARKET".to_string(),
+                    status: "NEW".to_string(),
+                    orig_qty: 1.0,
+                    executed_qty: 0.0,
+                    price: 0.0,
+                    stop_price: 106.5,
+                    close_position: true,
+                    reduce_only: true,
+                    is_algo_order: true,
+                },
+                crate::execution::binance::OpenOrderSnapshot {
+                    order_id: 42,
+                    side: "SELL".to_string(),
+                    position_side: "BOTH".to_string(),
+                    order_type: "STOP_MARKET".to_string(),
+                    status: "NEW".to_string(),
+                    orig_qty: 1.0,
+                    executed_qty: 0.0,
+                    price: 0.0,
+                    stop_price: 97.5,
+                    close_position: true,
+                    reduce_only: true,
+                    is_algo_order: true,
+                },
+            ],
+            total_wallet_balance: 1000.0,
+            available_balance: 750.0,
+        };
+        let entry_snapshot = EntrySnapshot {
+            symbol: "TESTUSDT".to_string(),
+            context_key: "TESTUSDT:LONG:path_current".to_string(),
+            path_id: "path_current".to_string(),
+            side: "LONG".to_string(),
+            entry_profile: Some("pullback_acceptance".to_string()),
+            intent_mode: Some("pullback".to_string()),
+            entry_activation_level: None,
+            entry_zone: None,
+            entry_invalidation_level: None,
+            max_drift_pct: Some(0.2),
+            stop_loss: 96.0,
+            take_profit_1: 108.0,
+            take_profit_2: 111.0,
+            allowed_stop_loss_levels: vec![96.0],
+            allowed_take_profit_levels: vec![108.0, 111.0],
+            tp1_realized: false,
+            applied_driver_deterioration_signals: Vec::new(),
+            created_at: DateTime::parse_from_rfc3339("2026-04-01T01:00:00Z")
+                .expect("snapshot created")
+                .with_timezone(&Utc),
+            updated_at: DateTime::parse_from_rfc3339("2026-04-01T01:05:00Z")
+                .expect("snapshot updated")
+                .with_timezone(&Utc),
+        };
+        let entry_snapshots =
+            HashMap::from([(entry_snapshot.context_key.clone(), entry_snapshot.clone())]);
+
+        let positions =
+            stage2b_active_positions_for_current_path(&stage1_output, &trading_state, &entry_snapshots);
+
+        assert_eq!(positions.len(), 1);
+        assert_eq!(positions[0].context_key, entry_snapshot.context_key);
+        assert_eq!(positions[0].current_tp_price, Some(106.5));
+        assert_eq!(positions[0].current_sl_price, Some(97.5));
+        assert_eq!(
+            positions[0]
+                .entry_snapshot
+                .as_ref()
+                .expect("snapshot")
+                .take_profit_1,
+            108.0
+        );
+        assert_eq!(
+            positions[0]
+                .entry_snapshot
+                .as_ref()
+                .expect("snapshot")
+                .stop_loss,
+            96.0
+        );
+    }
+
+    #[test]
+    fn stage2b_active_positions_clear_current_tp_and_sl_when_live_exit_orders_are_missing() {
+        let stage1_output = sample_stage1_output();
+        let trading_state = TradingStateSnapshot {
+            symbol: "TESTUSDT".to_string(),
+            has_active_context: true,
+            has_active_positions: true,
+            has_open_orders: false,
+            active_positions: vec![crate::execution::binance::ActivePositionSnapshot {
+                position_side: "BOTH".to_string(),
+                position_amt: 1.0,
+                entry_price: 101.0,
+                mark_price: 103.5,
+                unrealized_pnl: 2.5,
+                leverage: 3,
+            }],
+            open_orders: Vec::new(),
+            total_wallet_balance: 1000.0,
+            available_balance: 750.0,
+        };
+        let entry_snapshot = EntrySnapshot {
+            symbol: "TESTUSDT".to_string(),
+            context_key: "TESTUSDT:LONG:path_current".to_string(),
+            path_id: "path_current".to_string(),
+            side: "LONG".to_string(),
+            entry_profile: Some("pullback_acceptance".to_string()),
+            intent_mode: Some("pullback".to_string()),
+            entry_activation_level: None,
+            entry_zone: None,
+            entry_invalidation_level: None,
+            max_drift_pct: Some(0.2),
+            stop_loss: 96.0,
+            take_profit_1: 108.0,
+            take_profit_2: 111.0,
+            allowed_stop_loss_levels: vec![96.0],
+            allowed_take_profit_levels: vec![108.0, 111.0],
+            tp1_realized: false,
+            applied_driver_deterioration_signals: Vec::new(),
+            created_at: DateTime::parse_from_rfc3339("2026-04-01T01:00:00Z")
+                .expect("snapshot created")
+                .with_timezone(&Utc),
+            updated_at: DateTime::parse_from_rfc3339("2026-04-01T01:05:00Z")
+                .expect("snapshot updated")
+                .with_timezone(&Utc),
+        };
+        let entry_snapshots =
+            HashMap::from([(entry_snapshot.context_key.clone(), entry_snapshot.clone())]);
+
+        let positions =
+            stage2b_active_positions_for_current_path(&stage1_output, &trading_state, &entry_snapshots);
+
+        assert_eq!(positions.len(), 1);
+        assert_eq!(positions[0].context_key, entry_snapshot.context_key);
+        assert_eq!(positions[0].current_tp_price, None);
+        assert_eq!(positions[0].current_sl_price, None);
     }
 
     #[test]

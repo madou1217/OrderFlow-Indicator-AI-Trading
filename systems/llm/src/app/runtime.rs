@@ -18,6 +18,7 @@ use chrono::{DateTime, Duration as ChronoDuration, NaiveDateTime, Timelike, Utc}
 use flate2::read::GzDecoder;
 use futures_util::StreamExt;
 use lapin::{
+    message::Delivery,
     options::{BasicAckOptions, BasicConsumeOptions, BasicQosOptions, QueuePurgeOptions},
     types::FieldTable,
 };
@@ -552,38 +553,8 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                 };
                 match delivery_result {
                     Ok(delivery) => {
-                        let content_encoding = delivery
-                            .properties
-                            .content_encoding()
-                            .as_ref()
-                            .map(|value| value.as_str().to_string());
-                        match decode_fast_market_envelope(&delivery.data, content_encoding.as_deref()) {
-                            Ok(envelope) => {
-                                if let Some(event) =
-                                    extract_fast_price_event(&envelope, &ctx.config.llm.symbol)
-                                {
-                                    record_fast_price_event_in_buffer(&event);
-                                    if let Err(err) =
-                                        handle_fast_market_event(&ctx, &mut fast_watcher_state, event)
-                                            .await
-                                    {
-                                        warn!(error = %err, "llm fast watcher event handling failed");
-                                    }
-                                }
-                            }
-                            Err(err) => {
-                                warn!(
-                                    error = %err,
-                                    payload_len = delivery.data.len(),
-                                    content_encoding = content_encoding.as_deref().unwrap_or("identity"),
-                                    "llm decode fast market event failed"
-                                );
-                            }
-                        }
-
-                        if let Err(err) = delivery.ack(BasicAckOptions::default()).await {
-                            warn!(error = %err, "llm fast ack failed");
-                        }
+                        process_fast_market_delivery(&ctx, &mut fast_watcher_state, delivery)
+                            .await;
                     }
                     Err(err) => {
                         error!(error = %err, "llm fast consumer stream error");
@@ -1443,35 +1414,21 @@ fn queue_latest_bundle_invoke(
         return;
     }
     *last_invoked_ts_bucket = Some(bundle.raw.ts_bucket);
-    let config = Arc::clone(&ctx.config);
-    let db_pool = ctx.db_pool.clone();
-    let http_client = ctx.http_client.clone();
-    let loopback_http_client = ctx.loopback_http_client.clone();
     let print_response = ctx.config.llm.print_response;
     let trigger = Arc::<str>::from(trigger.to_string());
+    let invoke_ctx = ctx.clone();
     tokio::spawn(async move {
-        invoke_bundle_models(
-            config,
-            db_pool,
-            http_client,
-            loopback_http_client,
-            print_response,
-            bundle,
-            trigger,
-        )
-        .await;
+        invoke_bundle_models(invoke_ctx, print_response, bundle, trigger).await;
     });
 }
 
 async fn invoke_bundle_models(
-    config: Arc<RootConfig>,
-    db_pool: PgPool,
-    http_client: Client,
-    loopback_http_client: Client,
+    ctx: AppContext,
     print_response: bool,
     bundle: LatestBundle,
     trigger: Arc<str>,
 ) {
+    let config = Arc::clone(&ctx.config);
     if !config.llm.workflow.enabled {
         debug!(
             symbol = %bundle.raw.symbol,
@@ -1482,10 +1439,7 @@ async fn invoke_bundle_models(
         return;
     }
     if let Err(err) = invoke_workflow_bundle_models(
-        Arc::clone(&config),
-        db_pool,
-        http_client,
-        loopback_http_client,
+        ctx,
         print_response,
         bundle,
         trigger,
@@ -1695,6 +1649,22 @@ fn buffered_fast_price_events_in_range(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default()
+}
+
+fn latest_buffered_fast_price_event_since(
+    symbol: &str,
+    start_inclusive: DateTime<Utc>,
+) -> Option<FastPriceEvent> {
+    fast_price_event_buffer()
+        .lock()
+        .ok()
+        .and_then(|guard| guard.get(&symbol.to_ascii_uppercase()).cloned())
+        .and_then(|queue| {
+            queue
+                .into_iter()
+                .filter(|event| event.event_ts >= start_inclusive)
+                .last()
+        })
 }
 
 fn fast_plan_version(
@@ -2273,14 +2243,6 @@ async fn process_fast_position_management_actions(
         else {
             continue;
         };
-        if current_path
-            .as_ref()
-            .is_some_and(|path| plan.path_id != path.id)
-        {
-            remove_position_management_plan(workflow_state, &plan_context_key);
-            state_dirty = true;
-            continue;
-        }
         let Some(action_index) = first_triggered_position_management_action_index(&plan, watch_facts)
         else {
             continue;
@@ -2294,6 +2256,47 @@ async fn process_fast_position_management_actions(
             &action.context_key,
             &action.path_id,
         ) else {
+            info!(
+                symbol = %symbol,
+                trigger = "watcher_fast_consumer",
+                context_key = %action.context_key,
+                path_id = %action.path_id,
+                action_type = %action.action_type,
+                trigger_price = watch_facts.current_price,
+                "workflow watcher position management action skipped because snapshot is missing"
+            );
+            append_workflow_journal_event(
+                "workflow_stage2b_management_skipped",
+                symbol,
+                event.event_ts,
+                json!({
+                    "trigger": "watcher_fast_consumer",
+                    "context_key": &action.context_key,
+                    "path_id": &action.path_id,
+                    "action": &action,
+                    "trigger_price": watch_facts.current_price,
+                    "price_source": event.source.as_str(),
+                    "routing_key": &event.routing_key,
+                    "reason": "snapshot_missing",
+                }),
+            );
+            if reconcile_missing_position_management_snapshot(
+                &ctx.http_client,
+                &ctx.config.api.binance,
+                &ctx.config.llm.execution,
+                symbol,
+                state_dir,
+                workflow_state,
+                entry_snapshots,
+                &action.context_key,
+                &action.path_id,
+                "watcher_fast_consumer",
+                event.event_ts,
+            )
+            .await?
+            {
+                state_dirty = true;
+            }
             continue;
         };
         info!(
@@ -3259,6 +3262,9 @@ fn snapshot_for_management_context(
     path_id: &str,
 ) -> Option<crate::workflow::schema::EntrySnapshot> {
     entry_snapshots.get(context_key).cloned().or_else(|| {
+        if path_id != current_path.id {
+            return None;
+        }
         build_fallback_entry_snapshot(
             symbol,
             context_key,
@@ -3463,11 +3469,11 @@ fn has_pending_order_management_actions(
 
 fn position_management_plan_for_context(
     plan: Option<crate::workflow::schema::PositionManagementPlan>,
-    path_id: &str,
+    expected_path_id: &str,
     context_key: &str,
 ) -> Option<crate::workflow::schema::PositionManagementPlan> {
     let mut plan = plan?;
-    if plan.path_id != path_id {
+    if plan.path_id != expected_path_id {
         return None;
     }
     plan.actions
@@ -3571,6 +3577,122 @@ fn remove_pending_order_management_plan(
     workflow_state
         .approved_pending_order_management_plans_updated_at
         .remove(context_key);
+}
+
+fn workflow_side_from_context_key(context_key: &str) -> Option<&'static str> {
+    let mut parts = context_key.split(':');
+    let _symbol = parts.next()?;
+    let side = parts.next()?;
+    if side.eq_ignore_ascii_case("LONG") {
+        Some("LONG")
+    } else if side.eq_ignore_ascii_case("SHORT") {
+        Some("SHORT")
+    } else if side.eq_ignore_ascii_case("BOTH") {
+        Some("BOTH")
+    } else {
+        None
+    }
+}
+
+async fn reconcile_missing_position_management_snapshot(
+    http_client: &Client,
+    api_config: &crate::app::config::BinanceApiConfig,
+    exec_config: &crate::app::config::LlmExecutionConfig,
+    symbol: &str,
+    state_dir: &str,
+    workflow_state: &mut crate::workflow::state::WorkflowState,
+    entry_snapshots: &mut HashMap<String, crate::workflow::schema::EntrySnapshot>,
+    context_key: &str,
+    path_id: &str,
+    trigger: &str,
+    ts_bucket: DateTime<Utc>,
+) -> Result<bool> {
+    let Some(side) = workflow_side_from_context_key(context_key) else {
+        append_workflow_journal_event(
+            "workflow_stage2b_management_skipped",
+            symbol,
+            ts_bucket,
+            json!({
+                "trigger": trigger,
+                "context_key": context_key,
+                "path_id": path_id,
+                "reason": "snapshot_missing_context_side_unknown",
+            }),
+        );
+        return Ok(false);
+    };
+
+    let refreshed_state = match fetch_symbol_trading_state(http_client, api_config, exec_config, symbol).await
+    {
+        Ok(state) => state,
+        Err(err) => {
+            append_workflow_journal_event(
+                "workflow_stage2b_management_skipped",
+                symbol,
+                ts_bucket,
+                json!({
+                    "trigger": trigger,
+                    "context_key": context_key,
+                    "path_id": path_id,
+                    "reason": "snapshot_missing_refresh_failed",
+                    "error": format!("{err:#}"),
+                }),
+            );
+            return Ok(false);
+        }
+    };
+
+    if has_active_position_for_side(&refreshed_state, side) {
+        append_workflow_journal_event(
+            "workflow_stage2b_management_skipped",
+            symbol,
+            ts_bucket,
+            json!({
+                "trigger": trigger,
+                "context_key": context_key,
+                "path_id": path_id,
+                "reason": "snapshot_missing_refresh_still_live",
+                "side": side,
+                "refreshed_active_position_count": refreshed_state.active_positions.len(),
+                "refreshed_open_order_count": refreshed_state.open_orders.len(),
+            }),
+        );
+        return Ok(false);
+    }
+
+    remove_position_management_plan(workflow_state, context_key);
+    if entry_snapshots.remove(context_key).is_some() {
+        crate::workflow::persistence::delete_entry_snapshot(state_dir, symbol, context_key)?;
+    }
+    if workflow_state.last_filled_context_key.as_deref() == Some(context_key) {
+        workflow_state.last_filled_context_key = None;
+    }
+    crate::workflow::persistence::save_workflow_state(state_dir, workflow_state)?;
+    info!(
+        symbol = %symbol,
+        trigger = trigger,
+        context_key = %context_key,
+        path_id = %path_id,
+        side = %side,
+        refreshed_active_position_count = refreshed_state.active_positions.len(),
+        refreshed_open_order_count = refreshed_state.open_orders.len(),
+        "workflow stage2b management plan removed after refreshing trading state because position is already flat"
+    );
+    append_workflow_journal_event(
+        "workflow_stage2b_management_plan_removed",
+        symbol,
+        ts_bucket,
+        json!({
+            "trigger": trigger,
+            "context_key": context_key,
+            "path_id": path_id,
+            "reason": "snapshot_missing_refresh_confirmed_flat",
+            "side": side,
+            "refreshed_active_position_count": refreshed_state.active_positions.len(),
+            "refreshed_open_order_count": refreshed_state.open_orders.len(),
+        }),
+    );
+    Ok(true)
 }
 
 fn upsert_position_management_plan(
@@ -3713,6 +3835,45 @@ fn select_entry_plan<'a>(
         plan: candidate,
         trigger_price: watch_price,
     })
+}
+
+async fn process_fast_market_delivery(
+    ctx: &AppContext,
+    fast_state: &mut Option<FastWatcherPlanState>,
+    delivery: Delivery,
+) -> bool {
+    let content_encoding = delivery
+        .properties
+        .content_encoding()
+        .as_ref()
+        .map(|value| value.as_str().to_string());
+    let mut processed_relevant_event = false;
+
+    match decode_fast_market_envelope(&delivery.data, content_encoding.as_deref()) {
+        Ok(envelope) => {
+            if let Some(event) = extract_fast_price_event(&envelope, &ctx.config.llm.symbol) {
+                processed_relevant_event = true;
+                record_fast_price_event_in_buffer(&event);
+                if let Err(err) = handle_fast_market_event(ctx, fast_state, event).await {
+                    warn!(error = %err, "llm fast watcher event handling failed");
+                }
+            }
+        }
+        Err(err) => {
+            warn!(
+                error = %err,
+                payload_len = delivery.data.len(),
+                content_encoding = content_encoding.as_deref().unwrap_or("identity"),
+                "llm decode fast market event failed"
+            );
+        }
+    }
+
+    if let Err(err) = delivery.ack(BasicAckOptions::default()).await {
+        warn!(error = %err, "llm fast ack failed");
+    }
+
+    processed_relevant_event
 }
 
 async fn handle_fast_market_event(
@@ -4598,14 +4759,15 @@ async fn maybe_refresh_stage1(
 }
 
 async fn invoke_workflow_bundle_models(
-    config: Arc<RootConfig>,
-    db_pool: PgPool,
-    http_client: Client,
-    loopback_http_client: Client,
+    ctx: AppContext,
     print_response: bool,
     bundle: LatestBundle,
     trigger: Arc<str>,
 ) -> Result<()> {
+    let config = Arc::clone(&ctx.config);
+    let db_pool = ctx.db_pool.clone();
+    let http_client = ctx.http_client.clone();
+    let loopback_http_client = ctx.loopback_http_client.clone();
     let symbol = bundle.raw.symbol.to_ascii_uppercase();
     let state_dir = config.llm.workflow.state_dir.clone();
     let retention_minutes = config.llm.temp_cache_retention_minutes();
@@ -4827,14 +4989,61 @@ async fn invoke_workflow_bundle_models(
                         &entry_snapshots,
                     );
                 let should_run_stage2a = dispatch_flags.should_run_stage2a;
+                let stage2b_dispatch_enabled = dispatch_flags.should_run_stage2b;
+                let stage2b_context_count = stage2b_contexts.len();
                 let should_run_stage2b =
-                    dispatch_flags.should_run_stage2b && !stage2b_contexts.is_empty();
+                    stage2b_dispatch_enabled && stage2b_context_count > 0;
                 let should_run_stage2c =
                     dispatch_flags.should_run_stage2c && !stage2c_contexts.is_empty();
                 let stage2c_exposure_state = stage2c_exposure_state_for_counts(
                     active_position_count,
                     live_entry_order_count,
                 );
+                if !should_run_stage2b {
+                    let stage2b_skip_reason =
+                        match (stage2b_dispatch_enabled, stage2b_context_count > 0) {
+                            (false, false) => "no_same_side_live_position_and_no_stage2b_context",
+                            (false, true) => "no_same_side_live_position",
+                            (true, false) => "no_stage2b_context",
+                            (true, true) => "not_skipped",
+                        };
+                    info!(
+                        symbol = %symbol,
+                        ts_bucket = %bundle.raw.ts_bucket,
+                        trigger = &*trigger,
+                        path_id = %current_path_id,
+                        path_side = %path_side,
+                        active_position_count,
+                        live_entry_order_count,
+                        stage2b_dispatch_enabled,
+                        stage2b_context_count,
+                        stage2b_context_keys = ?stage2b_contexts
+                            .iter()
+                            .map(|position| position.context_key.clone())
+                            .collect::<Vec<_>>(),
+                        skip_reason = stage2b_skip_reason,
+                        "workflow stage2b dispatch skipped"
+                    );
+                    append_workflow_journal_event(
+                        "workflow_stage2b_dispatch_skipped",
+                        &symbol,
+                        bundle.raw.ts_bucket,
+                        json!({
+                            "trigger": &*trigger,
+                            "path_id": current_path_id,
+                            "path_side": path_side,
+                            "active_position_count": active_position_count,
+                            "live_entry_order_count": live_entry_order_count,
+                            "dispatch_flag_should_run_stage2b": stage2b_dispatch_enabled,
+                            "stage2b_context_count": stage2b_context_count,
+                            "stage2b_context_keys": stage2b_contexts
+                                .iter()
+                                .map(|position| position.context_key.clone())
+                                .collect::<Vec<_>>(),
+                            "skip_reason": stage2b_skip_reason,
+                        }),
+                    );
+                }
 
                 if should_run_stage2a {
                     let prompt_input = crate::workflow::stage2_input::build_stage2a_prompt_input(
@@ -4985,6 +5194,70 @@ async fn invoke_workflow_bundle_models(
                                     "workflow tactical plan approved"
                                 );
                             }
+                            if let Some(replay_seed_event) =
+                                latest_buffered_fast_price_event_since(&symbol, bundle.raw.ts_bucket)
+                            {
+                                let mut approval_fast_state = None;
+                                info!(
+                                    symbol = %symbol,
+                                    trigger = &*trigger,
+                                    path_id = %current_path_id,
+                                    source_ts_bucket = %bundle.raw.ts_bucket,
+                                    replay_seed_event_ts = %replay_seed_event.event_ts,
+                                    replay_seed_price = replay_seed_event.price,
+                                    replay_seed_source = replay_seed_event.source.as_str(),
+                                    replay_seed_routing_key = %replay_seed_event.routing_key,
+                                    "workflow tactical plan approval replaying buffered fast market events immediately"
+                                );
+                                append_workflow_journal_event(
+                                    "workflow_tactical_plan_immediate_replay",
+                                    &symbol,
+                                    bundle.raw.ts_bucket,
+                                    json!({
+                                        "trigger": &*trigger,
+                                        "path_id": current_path_id,
+                                        "source_ts_bucket": bundle.raw.ts_bucket,
+                                        "replay_seed_event_ts": replay_seed_event.event_ts,
+                                        "replay_seed_price": replay_seed_event.price,
+                                        "replay_seed_source": replay_seed_event.source.as_str(),
+                                        "replay_seed_routing_key": &replay_seed_event.routing_key,
+                                    }),
+                                );
+                                if let Err(err) = handle_fast_market_event(
+                                    &ctx,
+                                    &mut approval_fast_state,
+                                    replay_seed_event,
+                                )
+                                .await
+                                {
+                                    warn!(
+                                        error = %err,
+                                        symbol = %symbol,
+                                        trigger = &*trigger,
+                                        source_ts_bucket = %bundle.raw.ts_bucket,
+                                        "workflow tactical plan approval immediate replay failed"
+                                    );
+                                }
+                            } else {
+                                info!(
+                                    symbol = %symbol,
+                                    trigger = &*trigger,
+                                    path_id = %current_path_id,
+                                    source_ts_bucket = %bundle.raw.ts_bucket,
+                                    "workflow tactical plan approval immediate replay skipped because fast buffer has no events since tactical plan source timestamp"
+                                );
+                                append_workflow_journal_event(
+                                    "workflow_tactical_plan_immediate_replay_skipped",
+                                    &symbol,
+                                    bundle.raw.ts_bucket,
+                                    json!({
+                                        "trigger": &*trigger,
+                                        "path_id": current_path_id,
+                                        "source_ts_bucket": bundle.raw.ts_bucket,
+                                        "reason": "no_buffered_fast_events_since_source_ts_bucket",
+                                    }),
+                                );
+                            }
                         }
                         other => return Err(anyhow!("unsupported stage2a decision {}", other)),
                     }
@@ -5010,12 +5283,17 @@ async fn invoke_workflow_bundle_models(
                 if should_run_stage2b {
                     let mut next_position_plans = BTreeMap::new();
                     for active_position in &stage2b_contexts {
+                        let active_position_path_id = active_position
+                            .entry_snapshot
+                            .as_ref()
+                            .map(|snapshot| snapshot.path_id.clone())
+                            .unwrap_or_else(|| current_path_id.clone());
                         let previous_management_plan = position_management_plan_for_context(
                             workflow_state
                                 .approved_position_management_plans
                                 .get(&active_position.context_key)
                                 .cloned(),
-                            &current_path_id,
+                            &active_position_path_id,
                             &active_position.context_key,
                         );
                         let prompt_input =
@@ -5043,6 +5321,7 @@ async fn invoke_workflow_bundle_models(
                             ts_bucket = %bundle.raw.ts_bucket,
                             trigger = &*trigger,
                             path_id = %current_path_id,
+                            position_path_id = %active_position_path_id,
                             context_key = %active_position.context_key,
                             exposure_state = %prompt_input.exposure_state,
                             had_previous_management_plan = previous_management_plan.is_some(),
@@ -5097,6 +5376,7 @@ async fn invoke_workflow_bundle_models(
                                 value,
                                 &stage1_output,
                                 &active_position.context_key,
+                                &active_position_path_id,
                             ) {
                                 Ok(parsed) => {
                                     selected_stage2b_model_names.insert(
@@ -5120,6 +5400,33 @@ async fn invoke_workflow_bundle_models(
                             }
                         }
                         if let Some(parsed) = stage2b_output_for_context {
+                            info!(
+                                symbol = %symbol,
+                                ts_bucket = %bundle.raw.ts_bucket,
+                                trigger = &*trigger,
+                                path_id = %parsed.position_management_plan.path_id,
+                                context_key = %active_position.context_key,
+                                action_count = parsed.position_management_plan.actions.len(),
+                                action_types = ?parsed
+                                    .position_management_plan
+                                    .actions
+                                    .iter()
+                                    .map(|action| action.action_type.clone())
+                                    .collect::<Vec<_>>(),
+                                "workflow stage2b management plan armed"
+                            );
+                            append_workflow_journal_event(
+                                "workflow_stage2b_management_plan_armed",
+                                &symbol,
+                                bundle.raw.ts_bucket,
+                                json!({
+                                    "trigger": &*trigger,
+                                    "context_key": active_position.context_key,
+                                    "path_id": parsed.position_management_plan.path_id,
+                                    "action_count": parsed.position_management_plan.actions.len(),
+                                    "actions": parsed.position_management_plan.actions,
+                                }),
+                            );
                             next_position_plans.insert(
                                 active_position.context_key.clone(),
                                 parsed.position_management_plan,
@@ -5129,6 +5436,44 @@ async fn invoke_workflow_bundle_models(
                     replace_position_management_plans(&mut workflow_state, next_position_plans);
                     crate::workflow::persistence::save_workflow_state(&state_dir, &workflow_state)?;
                 } else {
+                    if !workflow_state.approved_position_management_plans.is_empty() {
+                        info!(
+                            symbol = %symbol,
+                            ts_bucket = %bundle.raw.ts_bucket,
+                            trigger = &*trigger,
+                            path_id = %current_path_id,
+                            path_side = %path_side,
+                            active_position_count,
+                            live_entry_order_count,
+                            stage2b_dispatch_enabled,
+                            stage2b_context_count,
+                            cleared_context_keys = ?workflow_state
+                                .approved_position_management_plans
+                                .keys()
+                                .cloned()
+                                .collect::<Vec<_>>(),
+                            "workflow stage2b management plans cleared because dispatch is disabled"
+                        );
+                        append_workflow_journal_event(
+                            "workflow_stage2b_management_plans_cleared",
+                            &symbol,
+                            bundle.raw.ts_bucket,
+                            json!({
+                                "trigger": &*trigger,
+                                "path_id": current_path_id,
+                                "path_side": path_side,
+                                "active_position_count": active_position_count,
+                                "live_entry_order_count": live_entry_order_count,
+                                "dispatch_flag_should_run_stage2b": stage2b_dispatch_enabled,
+                                "stage2b_context_count": stage2b_context_count,
+                                "cleared_context_keys": workflow_state
+                                    .approved_position_management_plans
+                                    .keys()
+                                    .cloned()
+                                    .collect::<Vec<_>>(),
+                            }),
+                        );
+                    }
                     clear_position_management_plans(&mut workflow_state);
                 }
 
@@ -5329,10 +5674,6 @@ async fn invoke_workflow_bundle_models(
                 else {
                     continue;
                 };
-                if plan.path_id != current_path.id {
-                    remove_position_management_plan(&mut workflow_state, &plan_context_key);
-                    continue;
-                }
                 let Some(action_index) =
                     first_triggered_position_management_action_index(&plan, &watch_facts)
                 else {
@@ -5347,6 +5688,42 @@ async fn invoke_workflow_bundle_models(
                     &action.context_key,
                     &action.path_id,
                 ) else {
+                    info!(
+                        symbol = %symbol,
+                        trigger = &*trigger,
+                        context_key = %action.context_key,
+                        path_id = %action.path_id,
+                        action_type = %action.action_type,
+                        trigger_price = watch_facts.current_price,
+                        "workflow stage2b scheduled management action skipped because snapshot is missing"
+                    );
+                    append_workflow_journal_event(
+                        "workflow_stage2b_management_skipped",
+                        &symbol,
+                        bundle.raw.ts_bucket,
+                        json!({
+                            "trigger": &*trigger,
+                            "context_key": &action.context_key,
+                            "path_id": &action.path_id,
+                            "action": &action,
+                            "trigger_price": watch_facts.current_price,
+                            "reason": "snapshot_missing",
+                        }),
+                    );
+                    let _ = reconcile_missing_position_management_snapshot(
+                        &http_client,
+                        &config.api.binance,
+                        &config.llm.execution,
+                        &symbol,
+                        &state_dir,
+                        &mut workflow_state,
+                        &mut entry_snapshots,
+                        &action.context_key,
+                        &action.path_id,
+                        &trigger,
+                        bundle.raw.ts_bucket,
+                    )
+                    .await?;
                     continue;
                 };
                 match action.action_type.as_str() {
@@ -7767,6 +8144,68 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_for_management_context_does_not_fallback_across_path_switches() {
+        let stage1_output = sample_stage1_output();
+        let current_path = stage1_output.current_path.as_ref().expect("path");
+        let workflow_state = WorkflowState {
+            symbol: "ETHUSDT".to_string(),
+            approved_tactical_plan: Some(sample_tactical_plan()),
+            ..WorkflowState::default()
+        };
+
+        let snapshot = snapshot_for_management_context(
+            "ETHUSDT",
+            current_path,
+            &workflow_state,
+            &HashMap::new(),
+            "ETHUSDT:LONG:legacy_path",
+            "legacy_path",
+        );
+
+        assert!(snapshot.is_none());
+    }
+
+    #[test]
+    fn position_management_plan_for_context_accepts_matching_legacy_path() {
+        let plan = PositionManagementPlan {
+            path_id: "legacy_path".to_string(),
+            exposure_state: "in_position".to_string(),
+            path_live_assessment: "degraded".to_string(),
+            path_assessment_reason: Some("legacy context still active".to_string()),
+            actions: vec![PositionManagementAction {
+                action_type: "reduce".to_string(),
+                context_key: "ctx_legacy".to_string(),
+                path_id: "legacy_path".to_string(),
+                trigger_condition: Some(PriceTriggerCondition {
+                    trigger_type: "price_below".to_string(),
+                    trigger_price: 99.0,
+                }),
+                execution_price: Some(98.8),
+                add_ratio: None,
+                reuse_current_entry_template: None,
+                reduce_ratio: Some(0.5),
+                new_stop_loss: None,
+                reuse_current_bracket_template: None,
+                take_profit_1: None,
+                take_profit_2: None,
+                reason: "legacy de-risk".to_string(),
+            }],
+            management_note: "legacy plan".to_string(),
+        };
+
+        let filtered = position_management_plan_for_context(
+            Some(plan),
+            "legacy_path",
+            "ctx_legacy",
+        )
+        .expect("matching legacy path plan");
+
+        assert_eq!(filtered.path_id, "legacy_path");
+        assert_eq!(filtered.actions.len(), 1);
+        assert_eq!(filtered.actions[0].context_key, "ctx_legacy");
+    }
+
+    #[test]
     fn stage2c_replace_execution_intent_reuses_entry_template_and_current_bracket() {
         let stage1_output = sample_stage1_output();
         let current_path = stage1_output.current_path.as_ref().expect("path");
@@ -8035,6 +8474,26 @@ mod tests {
         assert_eq!(replay.len(), 2);
         assert_eq!(replay[0].price, 100.1);
         assert_eq!(replay[1].price, 100.2);
+        clear_fast_price_event_buffer_for_symbol("ETHUSDT");
+    }
+
+    #[test]
+    fn latest_buffered_fast_price_event_since_selects_newest_event_after_source_ts() {
+        clear_fast_price_event_buffer_for_symbol("ETHUSDT");
+        record_fast_price_event_in_buffer(&sample_fast_price_event("2026-03-30T09:34:59Z", 100.0));
+        record_fast_price_event_in_buffer(&sample_fast_price_event("2026-03-30T09:35:00Z", 100.1));
+        record_fast_price_event_in_buffer(&sample_fast_price_event("2026-03-30T09:35:02Z", 100.3));
+
+        let latest = latest_buffered_fast_price_event_since(
+            "ETHUSDT",
+            DateTime::parse_from_rfc3339("2026-03-30T09:35:00Z")
+                .expect("source ts")
+                .with_timezone(&Utc),
+        )
+        .expect("latest replay seed");
+
+        assert_eq!(latest.event_ts, sample_fast_price_event("2026-03-30T09:35:02Z", 100.3).event_ts);
+        assert_eq!(latest.price, 100.3);
         clear_fast_price_event_buffer_for_symbol("ETHUSDT");
     }
 

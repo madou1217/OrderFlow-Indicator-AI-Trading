@@ -863,14 +863,15 @@ fn validate_position_management_plan(
     plan: &PositionManagementPlan,
     stage1_output: &Stage1Output,
     expected_context_key: &str,
+    expected_path_id: &str,
 ) -> Result<()> {
-    let current_path = stage1_output
+    stage1_output
         .current_path
         .as_ref()
         .ok_or_else(|| anyhow!("Stage2B requires Stage1 current_path"))?;
-    if plan.path_id != current_path.id {
+    if plan.path_id != expected_path_id {
         return Err(anyhow!(
-            "position_management_plan.path_id must match Stage1 current_path.id"
+            "position_management_plan.path_id must match the current Stage2B context path_id"
         ));
     }
     if plan.exposure_state != "in_position" {
@@ -908,6 +909,7 @@ pub fn parse_stage2b_output(
     value: Value,
     stage1_output: &Stage1Output,
     expected_context_key: &str,
+    expected_path_id: &str,
 ) -> Result<Stage2BOutput> {
     let output: Stage2BOutput = serde_json::from_value(value)?;
     if output.stage2b_decision != "MANAGE_POSITION" {
@@ -917,6 +919,7 @@ pub fn parse_stage2b_output(
         &output.position_management_plan,
         stage1_output,
         expected_context_key,
+        expected_path_id,
     )?;
     Ok(output)
 }
@@ -1528,8 +1531,48 @@ mod tests {
                 "management_note": "no incremental changes"
             }
         });
-        let parsed = parse_stage2b_output(value, &stage1_output, "ctx_1").expect("parse");
+        let parsed = parse_stage2b_output(value, &stage1_output, "ctx_1", "path_1").expect("parse");
         assert_eq!(parsed.stage2b_decision, "MANAGE_POSITION");
+    }
+
+    #[test]
+    fn stage2b_parser_allows_management_for_live_context_with_legacy_path_id() {
+        let stage1_output = sample_stage1_output();
+        let value = json!({
+            "stage2b_decision": "MANAGE_POSITION",
+            "position_management_plan": {
+                "path_id": "legacy_path",
+                "exposure_state": "in_position",
+                "path_live_assessment": "invalidated",
+                "path_assessment_reason": "legacy position still needs to be flattened",
+                "actions": [{
+                    "action_type": "exit_full",
+                    "context_key": "ctx_1",
+                    "path_id": "legacy_path",
+                    "trigger_condition": {
+                        "trigger_type": "price_below",
+                        "trigger_price": 1990.0
+                    },
+                    "execution_price": 1989.5,
+                    "add_ratio": null,
+                    "reuse_current_entry_template": null,
+                    "reduce_ratio": null,
+                    "new_stop_loss": null,
+                    "reuse_current_bracket_template": null,
+                    "take_profit_1": null,
+                    "take_profit_2": null,
+                    "reason": "flatten the old path if support fails"
+                }],
+                "management_note": "manage the live legacy position"
+            }
+        });
+
+        let parsed =
+            parse_stage2b_output(value, &stage1_output, "ctx_1", "legacy_path").expect("parse");
+        assert_eq!(
+            parsed.position_management_plan.path_id,
+            "legacy_path"
+        );
     }
 
     #[test]
@@ -1563,7 +1606,8 @@ mod tests {
                 "management_note": "bad add"
             }
         });
-        let err = parse_stage2b_output(value, &stage1_output, "ctx_1").expect_err("should fail");
+        let err =
+            parse_stage2b_output(value, &stage1_output, "ctx_1", "path_1").expect_err("should fail");
         assert!(err
             .to_string()
             .contains("position_management_plan.actions[].take_profit_1 must be null for add"));
@@ -1601,7 +1645,8 @@ mod tests {
             }
         });
 
-        let err = parse_stage2b_output(value, &stage1_output, "ctx_1").expect_err("should fail");
+        let err =
+            parse_stage2b_output(value, &stage1_output, "ctx_1", "path_1").expect_err("should fail");
         assert!(err.to_string().contains("reduce requires execution_price"));
     }
 
@@ -1724,7 +1769,8 @@ mod tests {
             }
         });
 
-        let err = parse_stage2b_output(value, &stage1_output, "ctx_1").expect_err("should fail");
+        let err =
+            parse_stage2b_output(value, &stage1_output, "ctx_1", "path_1").expect_err("should fail");
         assert!(err
             .to_string()
             .contains("position_management_plan.actions[].context_key must match the current Stage2B context_key"));
