@@ -29,7 +29,7 @@ Entry design rules:
 - entry_invalidation_level is the tactical structure invalidation zone for the setup. It says where the chosen setup is no longer valid in market-structure terms.
 - stop_loss is the executable stop used by the execution layer. It is the actual live risk price for the trade.
 - entry_invalidation_level and stop_loss are related but not mechanically identical. Keep the meaning of each field clear.
-- stop_loss must be chosen independently as the live executable risk stop. It may differ from entry_invalidation_level if that is what the 15m structure and execution quality support.
+- stop_loss must be derived independently from the provided execution context and current market structure as the live executable risk stop. Do not inherit it mechanically from stage1 failure_level or entry_invalidation_level.
 - Use stage1 failure_level to judge whether the broader path still deserves confirmation or reevaluation, but do not treat it as the tactical stop.
 - entry_note must make the distinction clear: explain why entry_invalidation_level is the tactical structure-failure zone and why stop_loss is the chosen executable risk stop.
 - Output only the single highest-quality entry plan you believe is valid right now.

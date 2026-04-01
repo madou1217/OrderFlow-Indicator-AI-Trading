@@ -15,6 +15,10 @@ pub struct WorkflowState {
     #[serde(default)]
     pub last_stage1_ts: Option<DateTime<Utc>>,
     #[serde(default)]
+    pub last_stage1_source_ts_bucket: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub last_stage1_refresh_reason: Option<String>,
+    #[serde(default)]
     pub approved_tactical_plan: Option<TacticalEntryPlan>,
     #[serde(default)]
     pub approved_tactical_plan_updated_at: Option<DateTime<Utc>>,

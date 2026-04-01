@@ -1463,7 +1463,49 @@ fn workflow_stage1_refresh_reason(
     if minute == 0 && config.llm.workflow.stage1_refresh_hours.contains(&hour) {
         return Some("scheduled_2h".to_string());
     }
+    if stage1_no_edge_retry_due(config, bundle, workflow_state, stage1_output) {
+        return Some("scheduled_no_edge_retry".to_string());
+    }
     None
+}
+
+fn stage1_no_edge_retry_due(
+    config: &RootConfig,
+    bundle: &LatestBundle,
+    workflow_state: &crate::workflow::state::WorkflowState,
+    stage1_output: Option<&crate::workflow::schema::Stage1Output>,
+) -> bool {
+    let Some(stage1_output) = stage1_output else {
+        return false;
+    };
+    if stage1_output.monitoring_status != "no_edge" {
+        return false;
+    }
+    let retry_minutes = &config.llm.workflow.stage1_no_edge_retry_minutes;
+    if retry_minutes.is_empty() {
+        return false;
+    }
+    let current_ts_bucket = bundle.raw.ts_bucket;
+    let current_minute = current_ts_bucket.minute() as u8;
+    if !retry_minutes.contains(&current_minute) {
+        return false;
+    }
+    if workflow_state.last_stage1_refresh_reason.as_deref() != Some("scheduled_2h") {
+        return false;
+    }
+    let Some(last_source_ts_bucket) = workflow_state.last_stage1_source_ts_bucket else {
+        return false;
+    };
+    if last_source_ts_bucket >= current_ts_bucket {
+        return false;
+    }
+    if last_source_ts_bucket.date_naive() != current_ts_bucket.date_naive()
+        || last_source_ts_bucket.hour() != current_ts_bucket.hour()
+        || last_source_ts_bucket.minute() != 0
+    {
+        return false;
+    }
+    true
 }
 
 fn consume_pending_stage1_refresh_reason(
@@ -4627,6 +4669,8 @@ async fn maybe_refresh_stage1(
         .map(|path| path.tracked_zones.clone())
         .unwrap_or_default();
     workflow_state.last_stage1_ts = Some(parsed_stage1.meta.stage1_ts);
+    workflow_state.last_stage1_source_ts_bucket = Some(bundle.raw.ts_bucket);
+    workflow_state.last_stage1_refresh_reason = Some(refresh_reason.clone());
     workflow_state.pending_stage1_refresh_reason = None;
     clear_approved_tactical_plan(workflow_state);
     crate::workflow::persistence::save_stage1_output(state_dir, symbol, &parsed_stage1)?;
@@ -7709,6 +7753,95 @@ mod tests {
             )
             .as_deref(),
             Some("scheduled_2h")
+        );
+    }
+
+    #[test]
+    fn workflow_stage1_refresh_reason_retries_no_edge_at_configured_half_hour() {
+        let config = workflow_test_config();
+        let symbol = "ETHUSDT_NO_EDGE_RETRY";
+        reset_startup_stage1_refresh_for_symbol(symbol);
+        mark_startup_stage1_refresh_consumed(symbol);
+        let ts_bucket = DateTime::parse_from_rfc3339("2026-03-28T04:30:00Z")
+            .expect("ts")
+            .with_timezone(&Utc);
+        let bundle = LatestBundle {
+            raw: MinuteBundleEnvelope {
+                msg_type: "bundle".to_string(),
+                routing_key: "test.route".to_string(),
+                symbol: symbol.to_string(),
+                ts_bucket,
+                window_code: "15m".to_string(),
+                indicator_count: 0,
+                published_at: None,
+                indicators: json!({}),
+            },
+            indicators: json!({}),
+            missing_indicator_codes: vec![],
+            received_at: ts_bucket,
+        };
+        let state = WorkflowState {
+            symbol: symbol.to_string(),
+            pending_stage1_refresh_reason: None,
+            last_stage1_ts: Some(ts_bucket - ChronoDuration::minutes(30)),
+            last_stage1_source_ts_bucket: Some(ts_bucket - ChronoDuration::minutes(30)),
+            last_stage1_refresh_reason: Some("scheduled_2h".to_string()),
+            ..WorkflowState::default()
+        };
+        let mut stage1_output = sample_stage1_output();
+        stage1_output.monitoring_status = "no_edge".to_string();
+        stage1_output.no_trade_reason = Some("path_not_actionable".to_string());
+        stage1_output.current_script = None;
+        stage1_output.current_path = None;
+
+        assert_eq!(
+            workflow_stage1_refresh_reason(&config, &bundle, &state, Some(&stage1_output))
+                .as_deref(),
+            Some("scheduled_no_edge_retry")
+        );
+    }
+
+    #[test]
+    fn workflow_stage1_refresh_reason_does_not_retry_no_edge_after_non_scheduled_refresh() {
+        let config = workflow_test_config();
+        let symbol = "ETHUSDT_NO_EDGE_NO_RETRY";
+        reset_startup_stage1_refresh_for_symbol(symbol);
+        mark_startup_stage1_refresh_consumed(symbol);
+        let ts_bucket = DateTime::parse_from_rfc3339("2026-03-28T04:30:00Z")
+            .expect("ts")
+            .with_timezone(&Utc);
+        let bundle = LatestBundle {
+            raw: MinuteBundleEnvelope {
+                msg_type: "bundle".to_string(),
+                routing_key: "test.route".to_string(),
+                symbol: symbol.to_string(),
+                ts_bucket,
+                window_code: "15m".to_string(),
+                indicator_count: 0,
+                published_at: None,
+                indicators: json!({}),
+            },
+            indicators: json!({}),
+            missing_indicator_codes: vec![],
+            received_at: ts_bucket,
+        };
+        let state = WorkflowState {
+            symbol: symbol.to_string(),
+            pending_stage1_refresh_reason: None,
+            last_stage1_ts: Some(ts_bucket - ChronoDuration::minutes(10)),
+            last_stage1_source_ts_bucket: Some(ts_bucket - ChronoDuration::minutes(10)),
+            last_stage1_refresh_reason: Some("thesis_invalidated".to_string()),
+            ..WorkflowState::default()
+        };
+        let mut stage1_output = sample_stage1_output();
+        stage1_output.monitoring_status = "no_edge".to_string();
+        stage1_output.no_trade_reason = Some("path_not_actionable".to_string());
+        stage1_output.current_script = None;
+        stage1_output.current_path = None;
+
+        assert!(
+            workflow_stage1_refresh_reason(&config, &bundle, &state, Some(&stage1_output))
+                .is_none()
         );
     }
 
