@@ -1,9 +1,9 @@
 use crate::execution::binance::{OpenOrderSnapshot, TradingStateSnapshot};
 use crate::llm::input::ModelInvocationInput;
 use crate::workflow::schema::{
-    EntrySnapshot, PendingOrderManagementPlan, PositionManagementPlan, PostFillBracketTemplate,
-    Stage1Output, Stage2APromptInput, Stage2BPromptInput, Stage2CPromptInput,
-    StrategicIndicatorSummary, WorkflowAccountContext, WorkflowPendingOrder, WorkflowPosition,
+    EntrySnapshot, PostFillBracketTemplate, Stage1Output, Stage2APromptInput, Stage2BPromptInput,
+    Stage2CPromptInput, StrategicIndicatorSummary, WorkflowAccountContext, WorkflowPendingOrder,
+    WorkflowPosition,
 };
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde_json::{json, Map, Value};
@@ -1016,7 +1016,6 @@ pub fn build_stage2b_prompt_input(
     summary: &StrategicIndicatorSummary,
     stage1_output: &Stage1Output,
     active_position: WorkflowPosition,
-    previous_management_plan: Option<PositionManagementPlan>,
     trading_state: &TradingStateSnapshot,
 ) -> Stage2BPromptInput {
     Stage2BPromptInput {
@@ -1033,7 +1032,6 @@ pub fn build_stage2b_prompt_input(
         driver_guardrail_snapshot: build_driver_guardrail_snapshot(summary),
         options_guardrail_snapshot: build_options_guardrail_snapshot(summary, stage1_output),
         stage1_output: stage1_output.clone(),
-        previous_management_plan,
         account: build_account_context(trading_state),
     }
 }
@@ -1044,7 +1042,6 @@ pub fn build_stage2c_prompt_input(
     stage1_output: &Stage1Output,
     exposure_state: &str,
     active_order: WorkflowPendingOrder,
-    previous_pending_order_management_plan: Option<PendingOrderManagementPlan>,
     trading_state: &TradingStateSnapshot,
 ) -> Stage2CPromptInput {
     Stage2CPromptInput {
@@ -1061,7 +1058,6 @@ pub fn build_stage2c_prompt_input(
         driver_guardrail_snapshot: build_driver_guardrail_snapshot(summary),
         options_guardrail_snapshot: build_options_guardrail_snapshot(summary, stage1_output),
         stage1_output: stage1_output.clone(),
-        previous_pending_order_management_plan,
         account: build_account_context(trading_state),
     }
 }
@@ -1077,9 +1073,9 @@ mod tests {
     use crate::llm::input::ModelInvocationInput;
     use crate::workflow::code_layer::build_indicator_summary;
     use crate::workflow::schema::{
-        CurrentPath, EntrySnapshot, MapSummary, OpportunityAssessment, PendingOrderManagementPlan,
-        PositionManagementPlan, PriceZone, ReevaluationTrigger, Stage1Meta, Stage1Output,
-        TrackedZone, WorkflowPendingOrder, WorkflowPosition,
+        CurrentPath, EntrySnapshot, MapSummary, OpportunityAssessment, PriceZone,
+        ReevaluationTrigger, Stage1Meta, Stage1Output, TrackedZone, WorkflowPendingOrder,
+        WorkflowPosition,
     };
     use chrono::{DateTime, Utc};
     use serde_json::json;
@@ -1859,19 +1855,11 @@ mod tests {
             &summary,
             &stage1_output,
             sample_stage2b_position(),
-            Some(PositionManagementPlan {
-                path_id: "path_long".to_string(),
-                exposure_state: "in_position".to_string(),
-                path_live_assessment: "live".to_string(),
-                path_assessment_reason: Some("carry forward".to_string()),
-                actions: Vec::new(),
-                management_note: "hold".to_string(),
-            }),
             &trading_state,
         );
         let stage2b_encoded = serde_json::to_value(&stage2b_prompt).expect("encode stage2b");
         assert!(stage2b_encoded.get("active_positions").is_some());
-        assert!(stage2b_encoded.get("previous_management_plan").is_some());
+        assert!(stage2b_encoded.get("previous_management_plan").is_none());
         assert!(stage2b_encoded.get("strategic_context_frozen").is_some());
         assert!(stage2b_encoded.get("entry_location_context_15m").is_some());
         assert!(stage2b_encoded
@@ -1890,21 +1878,13 @@ mod tests {
             &stage1_output,
             "pending_entry_only",
             sample_stage2c_order(),
-            Some(PendingOrderManagementPlan {
-                path_id: "path_long".to_string(),
-                exposure_state: "pending_entry_only".to_string(),
-                path_live_assessment: "live".to_string(),
-                path_assessment_reason: Some("carry forward".to_string()),
-                actions: Vec::new(),
-                management_note: "keep".to_string(),
-            }),
             &trading_state,
         );
         let stage2c_encoded = serde_json::to_value(&stage2c_prompt).expect("encode stage2c");
         assert!(stage2c_encoded.get("active_orders").is_some());
         assert!(stage2c_encoded
             .get("previous_pending_order_management_plan")
-            .is_some());
+            .is_none());
         assert!(stage2c_encoded.get("strategic_context_frozen").is_some());
         assert!(stage2c_encoded.get("entry_location_context_15m").is_some());
         assert!(stage2c_encoded

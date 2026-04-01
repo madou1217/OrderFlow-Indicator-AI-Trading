@@ -572,8 +572,6 @@ pub struct Stage2BPromptInput {
     #[serde(default)]
     pub options_guardrail_snapshot: Option<Value>,
     pub stage1_output: Stage1Output,
-    #[serde(default)]
-    pub previous_management_plan: Option<PositionManagementPlan>,
     pub account: WorkflowAccountContext,
 }
 
@@ -592,8 +590,6 @@ pub struct Stage2CPromptInput {
     #[serde(default)]
     pub options_guardrail_snapshot: Option<Value>,
     pub stage1_output: Stage1Output,
-    #[serde(default)]
-    pub previous_pending_order_management_plan: Option<PendingOrderManagementPlan>,
     pub account: WorkflowAccountContext,
 }
 

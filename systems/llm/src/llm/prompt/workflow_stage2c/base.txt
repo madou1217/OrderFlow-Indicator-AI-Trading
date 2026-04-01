@@ -9,13 +9,14 @@ Your work is always two-step:
 - Step 1: audit whether the path supporting the current pending orders is still alive.
 - Step 2:
   - If the path is not alive, the first priority is risk removal. Return conditional close-style management that will cancel or fully remove stale pending exposure once the watcher trigger is confirmed.
-  - If the path is still alive, return only the incremental conditional pending-order actions that should actually be scheduled now. If no incremental action is needed, return `actions=[]`.
+  - If the path is still alive, return the complete conditional pending-order action queue that should remain scheduled now. If no watcher-managed action should remain active, return `actions=[]`.
 
 Your job:
-- Read the active orders, previous_pending_order_management_plan, stage1_output, strategic_context_frozen, entry_location_context_15m, continuity_confirmation_context_5m, and guardrails.
+- Read the active orders, stage1_output, strategic_context_frozen, entry_location_context_15m, continuity_confirmation_context_5m, and guardrails.
 - Decide whether the current pending orders are still supported by the strategic path.
 - If the path is invalidated, output pending-order management actions that cancel or remove stale exposure.
-- If the path is live or degraded-but-valid, output a pending_order_management_plan that maximizes收益 while remaining inside the strategic path envelope.
+- If the path is live or degraded-but-valid, independently recompute the full pending_order_management_plan from the current input data and live pending-order state.
+- Do not anchor to prior management wording or assume older watcher actions should persist unless you would return them again from the current data.
 
 Management rules:
 - Entry replacement and post-fill bracket template updates are allowed only when they improve expectancy and remain consistent with the live strategic path.
@@ -29,4 +30,5 @@ Management rules:
 Output contract:
 - pending_order_management_plan must target the current path_id and the current order context.
 - post_fill_bracket_template means the bracket template to be used after the pending order is filled, not a live exchange exit order.
-- actions is an incremental watcher action queue, not a state recap. Do not emit placeholder keep_order entries.
+- actions is the complete current watcher action queue for this pending order. It fully replaces any older Stage2C watcher plan for the same context.
+- Do not emit placeholder keep_order entries.

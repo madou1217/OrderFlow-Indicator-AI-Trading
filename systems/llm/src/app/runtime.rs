@@ -3703,42 +3703,6 @@ fn has_pending_order_management_actions(
         .any(|action| action.action_type != "keep_order")
 }
 
-fn position_management_plan_for_context(
-    plan: Option<crate::workflow::schema::PositionManagementPlan>,
-    expected_path_id: &str,
-    context_key: &str,
-) -> Option<crate::workflow::schema::PositionManagementPlan> {
-    let mut plan = plan?;
-    if plan.path_id != expected_path_id {
-        return None;
-    }
-    plan.actions
-        .retain(|action| action.context_key == context_key && action.action_type != "hold");
-    if !has_pending_position_management_actions(&plan) {
-        None
-    } else {
-        Some(plan)
-    }
-}
-
-fn pending_order_management_plan_for_context(
-    plan: Option<crate::workflow::schema::PendingOrderManagementPlan>,
-    path_id: &str,
-    context_key: &str,
-) -> Option<crate::workflow::schema::PendingOrderManagementPlan> {
-    let mut plan = plan?;
-    if plan.path_id != path_id {
-        return None;
-    }
-    plan.actions
-        .retain(|action| action.context_key == context_key && action.action_type != "keep_order");
-    if !has_pending_order_management_actions(&plan) {
-        None
-    } else {
-        Some(plan)
-    }
-}
-
 fn clear_position_management_plans(workflow_state: &mut crate::workflow::state::WorkflowState) {
     workflow_state.approved_position_management_plans.clear();
     workflow_state
@@ -5129,21 +5093,12 @@ async fn invoke_workflow_bundle_models(
                             .as_ref()
                             .map(|snapshot| snapshot.path_id.clone())
                             .unwrap_or_else(|| current_path_id.clone());
-                        let previous_management_plan = position_management_plan_for_context(
-                            workflow_state
-                                .approved_position_management_plans
-                                .get(&active_position.context_key)
-                                .cloned(),
-                            &active_position_path_id,
-                            &active_position.context_key,
-                        );
                         let prompt_input =
                             crate::workflow::stage2_input::build_stage2b_prompt_input(
                                 &input,
                                 &indicator_summary,
                                 &stage1_output,
                                 active_position.clone(),
-                                previous_management_plan.clone(),
                                 &trading_state,
                             );
                         let prompt_value = serde_json::to_value(&prompt_input)
@@ -5165,7 +5120,6 @@ async fn invoke_workflow_bundle_models(
                             position_path_id = %active_position_path_id,
                             context_key = %active_position.context_key,
                             exposure_state = %prompt_input.exposure_state,
-                            had_previous_management_plan = previous_management_plan.is_some(),
                             "invoking workflow stage2b models"
                         );
                         let mut stage2b_output_for_context: Option<
@@ -5319,15 +5273,6 @@ async fn invoke_workflow_bundle_models(
                     let expected_stage2c_exposure_state = stage2c_exposure_state
                         .expect("Stage2C exposure state must exist when Stage2C is enabled");
                     for active_order in &stage2c_contexts {
-                        let previous_pending_order_management_plan =
-                            pending_order_management_plan_for_context(
-                                workflow_state
-                                    .approved_pending_order_management_plans
-                                    .get(&active_order.context_key)
-                                    .cloned(),
-                                &current_path_id,
-                                &active_order.context_key,
-                            );
                         let prompt_input =
                             crate::workflow::stage2_input::build_stage2c_prompt_input(
                                 &input,
@@ -5335,7 +5280,6 @@ async fn invoke_workflow_bundle_models(
                                 &stage1_output,
                                 expected_stage2c_exposure_state,
                                 active_order.clone(),
-                                previous_pending_order_management_plan.clone(),
                                 &trading_state,
                             );
                         let prompt_value = serde_json::to_value(&prompt_input)
@@ -5357,8 +5301,6 @@ async fn invoke_workflow_bundle_models(
                             context_key = %active_order.context_key,
                             order_id = active_order.order_id,
                             exposure_state = %prompt_input.exposure_state,
-                            had_previous_pending_order_management_plan =
-                                previous_pending_order_management_plan.is_some(),
                             "invoking workflow stage2c models"
                         );
                         let mut stage2c_output_for_context: Option<
@@ -6915,43 +6857,6 @@ mod tests {
         );
 
         assert!(snapshot.is_none());
-    }
-
-    #[test]
-    fn position_management_plan_for_context_accepts_matching_legacy_path() {
-        let plan = PositionManagementPlan {
-            path_id: "legacy_path".to_string(),
-            exposure_state: "in_position".to_string(),
-            path_live_assessment: "degraded".to_string(),
-            path_assessment_reason: Some("legacy context still active".to_string()),
-            actions: vec![PositionManagementAction {
-                action_type: "reduce".to_string(),
-                context_key: "ctx_legacy".to_string(),
-                path_id: "legacy_path".to_string(),
-                trigger_condition: Some(PriceTriggerCondition {
-                    trigger_type: "price_below".to_string(),
-                    trigger_price: 99.0,
-                }),
-                execution_price: Some(98.8),
-                add_ratio: None,
-                reuse_current_entry_template: None,
-                reduce_ratio: Some(0.5),
-                new_stop_loss: None,
-                reuse_current_bracket_template: None,
-                take_profit_1: None,
-                take_profit_2: None,
-                reason: "legacy de-risk".to_string(),
-            }],
-            management_note: "legacy plan".to_string(),
-        };
-
-        let filtered =
-            position_management_plan_for_context(Some(plan), "legacy_path", "ctx_legacy")
-                .expect("matching legacy path plan");
-
-        assert_eq!(filtered.path_id, "legacy_path");
-        assert_eq!(filtered.actions.len(), 1);
-        assert_eq!(filtered.actions[0].context_key, "ctx_legacy");
     }
 
     #[test]
