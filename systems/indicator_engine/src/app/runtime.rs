@@ -69,6 +69,18 @@ const LIVE_CANONICAL_TAIL_RECONCILE_INTERVAL_SECS: u64 = 24 * 60;
 const LIVE_CANONICAL_TAIL_RECONCILE_LOOKBACK_MINUTES: i64 = 31;
 const CANONICAL_REPLAY_FETCH_WINDOW_MINUTES: i64 = 360;
 const STARTUP_BACKFILL_YIELD_EVERY_MINUTES: usize = 64;
+const STARTUP_BACKFILL_PROGRESS_LOG_INTERVAL_SECS: u64 = 15;
+const MAX_CONSECUTIVE_NULL_PRICE_MINUTES_IN_SNAPSHOT: usize = 60;
+const MIN_RECENT_BARS_AFTER_NULL_RUN_IN_SNAPSHOT: usize = 1440;
+
+enum SnapshotLoadOutcome {
+    Fresh(StateSnapshot),
+    StaleRecoverySeed {
+        snap: StateSnapshot,
+        age_hours: i64,
+    },
+    Rejected,
+}
 
 async fn build_publish_db_pool(config: &Arc<RootConfig>) -> Result<PgPool> {
     let mut publish_cfg = (**config).clone();
@@ -633,7 +645,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
             .replace("{symbol}", &ctx.config.indicator.symbol);
         let snap = state_store.extract_snapshot();
         let history_len = snap.history_futures.len();
-        if !snapshot_path.is_empty() && snapshot_has_required_history(&snap) {
+        if !snapshot_path.is_empty() && snapshot_is_reusable_recovery_seed(&snap) {
             info!(
                 history_bars = history_len,
                 "Saving state snapshot before exit (mid-backfill)..."
@@ -648,7 +660,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
             info!(
                 history_bars = history_len,
                 effective_history_floor_ts = ?snap.effective_history_floor_ts,
-                "Skipping snapshot save — state does not yet cover a reusable restart window"
+                "Skipping snapshot save — state does not yet cover a reusable restart seed"
             );
         }
         heartbeat_handle.abort();
@@ -1211,15 +1223,25 @@ pub async fn run(ctx: AppContext) -> Result<()> {
         if !snapshot_path.is_empty() {
             info!("Saving state snapshot before exit...");
             let snap = state_store.extract_snapshot();
-            match save_state_snapshot(&snap, &snapshot_path).await {
-                Ok(()) => info!(
-                    path = %snapshot_path,
+            if snapshot_is_reusable_recovery_seed(&snap) {
+                match save_state_snapshot(&snap, &snapshot_path).await {
+                    Ok(()) => info!(
+                        path = %snapshot_path,
+                        futures_bars = snap.history_futures.len(),
+                        spot_bars = snap.history_spot.len(),
+                        last_ts = %snap.last_finalized_ts,
+                        "State snapshot saved successfully"
+                    ),
+                    Err(e) => warn!(error = %e, "Failed to save state snapshot"),
+                }
+            } else {
+                info!(
                     futures_bars = snap.history_futures.len(),
                     spot_bars = snap.history_spot.len(),
                     last_ts = %snap.last_finalized_ts,
-                    "State snapshot saved successfully"
-                ),
-                Err(e) => warn!(error = %e, "Failed to save state snapshot"),
+                    effective_history_floor_ts = ?snap.effective_history_floor_ts,
+                    "Skipping snapshot save — state does not meet restart reuse requirements"
+                );
             }
         }
 
@@ -1281,15 +1303,25 @@ pub async fn run(ctx: AppContext) -> Result<()> {
     if !snapshot_path.is_empty() {
         info!("Saving state snapshot before exit...");
         let snap = state_store.extract_snapshot();
-        match save_state_snapshot(&snap, &snapshot_path).await {
-            Ok(()) => info!(
-                path = %snapshot_path,
+        if snapshot_is_reusable_recovery_seed(&snap) {
+            match save_state_snapshot(&snap, &snapshot_path).await {
+                Ok(()) => info!(
+                    path = %snapshot_path,
+                    futures_bars = snap.history_futures.len(),
+                    spot_bars = snap.history_spot.len(),
+                    last_ts = %snap.last_finalized_ts,
+                    "State snapshot saved successfully"
+                ),
+                Err(e) => warn!(error = %e, "Failed to save state snapshot"),
+            }
+        } else {
+            info!(
                 futures_bars = snap.history_futures.len(),
                 spot_bars = snap.history_spot.len(),
                 last_ts = %snap.last_finalized_ts,
-                "State snapshot saved successfully"
-            ),
-            Err(e) => warn!(error = %e, "Failed to save state snapshot"),
+                effective_history_floor_ts = ?snap.effective_history_floor_ts,
+                "Skipping snapshot save — state does not meet restart reuse requirements"
+            );
         }
     }
 
@@ -1624,19 +1656,25 @@ fn format_stale_msg_type_distribution(counter: &HashMap<String, u64>) -> String 
         .join(",")
 }
 
-fn try_load_state_snapshot(path: &str, symbol: &str, max_age_hours: u64) -> Option<StateSnapshot> {
+fn try_load_state_snapshot(
+    path: &str,
+    symbol: &str,
+    max_age_hours: u64,
+) -> SnapshotLoadOutcome {
     use flate2::read::GzDecoder;
     use std::fs::File;
 
-    const MAX_CONSECUTIVE_NULL_PRICE_MINUTES_IN_SNAPSHOT: usize = 60;
-    const MIN_RECENT_BARS_AFTER_NULL_RUN_IN_SNAPSHOT: usize = 1440;
-
     if path.is_empty() {
-        return None;
+        return SnapshotLoadOutcome::Rejected;
     }
-    let file = File::open(path).ok()?;
+    let Ok(file) = File::open(path) else {
+        return SnapshotLoadOutcome::Rejected;
+    };
     let gz = GzDecoder::new(file);
-    let snap: StateSnapshot = serde_json::from_reader(gz).ok()?;
+    let snap: StateSnapshot = match serde_json::from_reader(gz) {
+        Ok(snap) => snap,
+        Err(_) => return SnapshotLoadOutcome::Rejected,
+    };
     // Version check
     if snap.version != STATE_SNAPSHOT_VERSION {
         warn!(
@@ -1644,28 +1682,19 @@ fn try_load_state_snapshot(path: &str, symbol: &str, max_age_hours: u64) -> Opti
             expected = STATE_SNAPSHOT_VERSION,
             "State snapshot version mismatch, ignoring"
         );
-        return None;
+        return SnapshotLoadOutcome::Rejected;
     }
     // Symbol check
     if snap.symbol != symbol {
         warn!(snap_symbol = %snap.symbol, "State snapshot symbol mismatch, ignoring");
-        return None;
-    }
-    // Age check
-    let age = Utc::now() - snap.saved_at;
-    if age > chrono::Duration::hours(max_age_hours as i64) {
-        warn!(
-            age_hours = age.num_hours(),
-            max_age_hours, "State snapshot too old, ignoring"
-        );
-        return None;
+        return SnapshotLoadOutcome::Rejected;
     }
     if !snapshot_has_required_history(&snap) {
-        return None;
+        return SnapshotLoadOutcome::Rejected;
     }
     if !minute_history_is_strictly_contiguous(&snap.history_futures, snap.last_finalized_ts) {
         warn!("State snapshot futures history is not a strict contiguous minute series, ignoring");
-        return None;
+        return SnapshotLoadOutcome::Rejected;
     }
     if let Some((start, end, len)) = find_long_null_price_run(
         &snap.history_futures,
@@ -1684,7 +1713,7 @@ fn try_load_state_snapshot(path: &str, symbol: &str, max_age_hours: u64) -> Opti
                 min_recent_bars_after_run = MIN_RECENT_BARS_AFTER_NULL_RUN_IN_SNAPSHOT,
                 "State snapshot futures history contains recent long null-price run, ignoring"
             );
-            return None;
+            return SnapshotLoadOutcome::Rejected;
         }
         info!(
             run_start = %start,
@@ -1698,7 +1727,7 @@ fn try_load_state_snapshot(path: &str, symbol: &str, max_age_hours: u64) -> Opti
         && !minute_history_is_strictly_contiguous(&snap.history_spot, snap.last_finalized_ts)
     {
         warn!("State snapshot spot history is not a strict contiguous minute series, ignoring");
-        return None;
+        return SnapshotLoadOutcome::Rejected;
     }
     if let Some((start, end, len)) = find_long_null_price_run(
         &snap.history_spot,
@@ -1717,7 +1746,7 @@ fn try_load_state_snapshot(path: &str, symbol: &str, max_age_hours: u64) -> Opti
                 min_recent_bars_after_run = MIN_RECENT_BARS_AFTER_NULL_RUN_IN_SNAPSHOT,
                 "State snapshot spot history contains recent long null-price run, ignoring"
             );
-            return None;
+            return SnapshotLoadOutcome::Rejected;
         }
         info!(
             run_start = %start,
@@ -1727,7 +1756,20 @@ fn try_load_state_snapshot(path: &str, symbol: &str, max_age_hours: u64) -> Opti
             "State snapshot spot history contains only historical long null-price run, accepting snapshot"
         );
     }
-    Some(snap)
+    let age = Utc::now().signed_duration_since(snap.saved_at);
+    if age > chrono::Duration::hours(max_age_hours as i64) {
+        warn!(
+            age_hours = age.num_hours(),
+            max_age_hours,
+            "State snapshot too old for fast restart; using it only as a recovery seed"
+        );
+        SnapshotLoadOutcome::StaleRecoverySeed {
+            snap,
+            age_hours: age.num_hours(),
+        }
+    } else {
+        SnapshotLoadOutcome::Fresh(snap)
+    }
 }
 
 fn minute_history_is_strictly_contiguous(
@@ -1871,6 +1913,61 @@ fn snapshot_history_covers_required_window(
 ) -> bool {
     snapshot_history_reaches_required_start(history, required_start_ts)
         && minute_history_is_strictly_contiguous(history, last_finalized_ts)
+}
+
+fn minimum_startup_recovery_history_floor(to_ts: DateTime<Utc>) -> DateTime<Utc> {
+    to_ts - ChronoDuration::minutes(MIN_REUSABLE_SNAPSHOT_HISTORY_MINUTES)
+}
+
+fn expand_startup_backfill_to_minimum_recovery_window(
+    from_ts: DateTime<Utc>,
+    to_ts: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    let minimum_recovery_floor = minimum_startup_recovery_history_floor(to_ts);
+    if from_ts > minimum_recovery_floor {
+        Some(minimum_recovery_floor)
+    } else {
+        None
+    }
+}
+
+fn snapshot_is_reusable_recovery_seed(snap: &StateSnapshot) -> bool {
+    if !snapshot_has_required_history(snap) {
+        return false;
+    }
+    if !minute_history_is_strictly_contiguous(&snap.history_futures, snap.last_finalized_ts) {
+        return false;
+    }
+    if let Some((_, end, _)) = find_long_null_price_run(
+        &snap.history_futures,
+        MAX_CONSECUTIVE_NULL_PRICE_MINUTES_IN_SNAPSHOT,
+    ) {
+        if snapshot_null_price_run_reaches_recent_tail(
+            snap.last_finalized_ts,
+            end,
+            MIN_RECENT_BARS_AFTER_NULL_RUN_IN_SNAPSHOT,
+        ) {
+            return false;
+        }
+    }
+    if !snap.history_spot.is_empty()
+        && !minute_history_is_strictly_contiguous(&snap.history_spot, snap.last_finalized_ts)
+    {
+        return false;
+    }
+    if let Some((_, end, _)) = find_long_null_price_run(
+        &snap.history_spot,
+        MAX_CONSECUTIVE_NULL_PRICE_MINUTES_IN_SNAPSHOT,
+    ) {
+        if snapshot_null_price_run_reaches_recent_tail(
+            snap.last_finalized_ts,
+            end,
+            MIN_RECENT_BARS_AFTER_NULL_RUN_IN_SNAPSHOT,
+        ) {
+            return false;
+        }
+    }
+    true
 }
 
 async fn save_state_snapshot(snap: &StateSnapshot, path: &str) -> anyhow::Result<()> {
@@ -3978,49 +4075,68 @@ async fn run_startup_backfill(
         .replace("{symbol}", &ctx.config.indicator.symbol);
     let mut snapshot_was_loaded = false;
     if !snapshot_file_path.is_empty() {
-        if let Some(snap) = try_load_state_snapshot(
+        match try_load_state_snapshot(
             &snapshot_file_path,
             &ctx.config.indicator.symbol,
             ctx.config.indicator.snapshot_max_age_hours,
         ) {
-            let snap_ts = snap.last_finalized_ts;
-            state_store.restore_from_snapshot(snap);
-            snapshot_was_loaded = true;
-            let snap_overlap_from_ts =
-                floor_minute(snap_ts - ChronoDuration::minutes(STARTUP_BACKFILL_OVERLAP_MINUTES));
-            from_ts = from_ts.min(snap_overlap_from_ts);
-            info!(
-                snap_ts = %snap_ts,
-                overlap_from_ts = %snap_overlap_from_ts,
-                effective_from_ts = %from_ts,
-                "State snapshot loaded successfully, running overlap repair backfill"
-            );
-        } else {
-            info!("No valid state snapshot found, running full backfill");
-            let strict_history_floor_minutes = HISTORY_LIMIT_MINUTES as i64;
-            let strict_history_floor =
-                to_ts - ChronoDuration::minutes(strict_history_floor_minutes);
-            if from_ts > strict_history_floor {
-                info!(
-                    original_from_ts = %from_ts,
-                    strict_history_floor = %strict_history_floor,
-                    history_limit_minutes = strict_history_floor_minutes,
-                    "startup historical backfill expanded to rebuild full in-memory retention"
+            SnapshotLoadOutcome::Fresh(snap) => {
+                let snap_ts = snap.last_finalized_ts;
+                state_store.restore_from_snapshot(snap);
+                snapshot_was_loaded = true;
+                let snap_overlap_from_ts = floor_minute(
+                    snap_ts - ChronoDuration::minutes(STARTUP_BACKFILL_OVERLAP_MINUTES),
                 );
-                from_ts = strict_history_floor;
+                from_ts = from_ts.min(snap_overlap_from_ts);
+                info!(
+                    snap_ts = %snap_ts,
+                    overlap_from_ts = %snap_overlap_from_ts,
+                    effective_from_ts = %from_ts,
+                    "State snapshot loaded successfully, running overlap repair backfill"
+                );
+            }
+            SnapshotLoadOutcome::StaleRecoverySeed { snap, age_hours } => {
+                let snap_ts = snap.last_finalized_ts;
+                state_store.restore_from_snapshot(snap);
+                snapshot_was_loaded = true;
+                let snap_overlap_from_ts = floor_minute(
+                    snap_ts - ChronoDuration::minutes(STARTUP_BACKFILL_OVERLAP_MINUTES),
+                );
+                from_ts = from_ts.min(snap_overlap_from_ts);
+                info!(
+                    snap_ts = %snap_ts,
+                    age_hours,
+                    overlap_from_ts = %snap_overlap_from_ts,
+                    effective_from_ts = %from_ts,
+                    "State snapshot exceeded age limit but passed structural checks; using it as a recovery seed"
+                );
+            }
+            SnapshotLoadOutcome::Rejected => {
+                info!("No reusable state snapshot found, rebuilding only the minimum reusable warm-history window");
+                if let Some(minimum_recovery_floor) =
+                    expand_startup_backfill_to_minimum_recovery_window(from_ts, to_ts)
+                {
+                    info!(
+                        original_from_ts = %from_ts,
+                        minimum_recovery_floor = %minimum_recovery_floor,
+                        minimum_recovery_history_minutes = MIN_REUSABLE_SNAPSHOT_HISTORY_MINUTES,
+                        "startup historical backfill expanded to rebuild minimum reusable restart history"
+                    );
+                    from_ts = minimum_recovery_floor;
+                }
             }
         }
     } else {
-        let strict_history_floor_minutes = HISTORY_LIMIT_MINUTES as i64;
-        let strict_history_floor = to_ts - ChronoDuration::minutes(strict_history_floor_minutes);
-        if from_ts > strict_history_floor {
+        if let Some(minimum_recovery_floor) =
+            expand_startup_backfill_to_minimum_recovery_window(from_ts, to_ts)
+        {
             info!(
                 original_from_ts = %from_ts,
-                strict_history_floor = %strict_history_floor,
-                history_limit_minutes = strict_history_floor_minutes,
-                "startup historical backfill expanded to rebuild full in-memory retention"
+                minimum_recovery_floor = %minimum_recovery_floor,
+                minimum_recovery_history_minutes = MIN_REUSABLE_SNAPSHOT_HISTORY_MINUTES,
+                "startup historical backfill expanded to rebuild minimum reusable restart history"
             );
-            from_ts = strict_history_floor;
+            from_ts = minimum_recovery_floor;
         }
     }
     // Startup replay is bucket-based for canonical 1m rows. Floor the lower bound so
@@ -4061,11 +4177,30 @@ async fn run_startup_backfill(
     );
 
     let mut total_rows = 0_u64;
+    let total_minutes = (to_ts - from_ts).num_minutes().max(0);
+    let total_windows = if total_minutes == 0 {
+        0
+    } else {
+        ((total_minutes + CANONICAL_REPLAY_FETCH_WINDOW_MINUTES - 1)
+            / CANONICAL_REPLAY_FETCH_WINDOW_MINUTES) as usize
+    };
     let mut window_from_ts = from_ts;
+    let startup_backfill_started_at = Instant::now();
+    let mut last_progress_log_at = Instant::now();
+    let mut completed_windows = 0usize;
     while window_from_ts < to_ts {
         let window_to_ts = (window_from_ts
             + ChronoDuration::minutes(CANONICAL_REPLAY_FETCH_WINDOW_MINUTES))
         .min(to_ts);
+        let window_started_at = Instant::now();
+        info!(
+            window_index = completed_windows + 1,
+            windows_total = total_windows,
+            window_from_ts = %window_from_ts,
+            window_to_ts = %window_to_ts,
+            elapsed_secs = startup_backfill_started_at.elapsed().as_secs(),
+            "startup backfill replay ingest window begin"
+        );
         let rows = fetch_backfill_window(
             &ctx.db_pool,
             window_from_ts,
@@ -4074,6 +4209,8 @@ async fn run_startup_backfill(
             STARTUP_BACKFILL_MARKET,
         )
         .await?;
+        let window_rows_total = rows.len() as u64;
+        let mut window_rows_processed = 0_u64;
 
         for row in rows {
             match replay_row_to_engine_event(row) {
@@ -4081,13 +4218,76 @@ async fn run_startup_backfill(
                     metrics.inc_processed(event.event_ts.timestamp_millis());
                     state_store.ingest(event);
                     total_rows += 1;
+                    window_rows_processed += 1;
                 }
                 Err(err) => {
                     warn!(error = %err, "decode startup backfill row failed");
                 }
             }
+
+            if last_progress_log_at.elapsed()
+                >= Duration::from_secs(STARTUP_BACKFILL_PROGRESS_LOG_INTERVAL_SECS)
+            {
+                let completed_minutes = (window_to_ts - from_ts).num_minutes().max(0);
+                let progress_pct = if total_minutes > 0 {
+                    (completed_minutes as f64 / total_minutes as f64) * 100.0
+                } else {
+                    100.0
+                };
+                info!(
+                    window_index = completed_windows + 1,
+                    windows_total = total_windows,
+                    window_from_ts = %window_from_ts,
+                    window_to_ts = %window_to_ts,
+                    window_rows_processed,
+                    window_rows_total,
+                    total_rows,
+                    completed_minutes,
+                    total_minutes,
+                    progress_pct = format_args!("{progress_pct:.1}"),
+                    elapsed_secs = startup_backfill_started_at.elapsed().as_secs(),
+                    "startup backfill replay ingest progress"
+                );
+                last_progress_log_at = Instant::now();
+            }
         }
 
+        completed_windows += 1;
+        let completed_minutes = (window_to_ts - from_ts).num_minutes().max(0);
+        let progress_pct = if total_minutes > 0 {
+            (completed_minutes as f64 / total_minutes as f64) * 100.0
+        } else {
+            100.0
+        };
+        let window_elapsed = window_started_at.elapsed();
+        let window_elapsed_secs = window_elapsed.as_secs_f64();
+        let window_minutes = (window_to_ts - window_from_ts).num_minutes().max(0) as f64;
+        let rows_per_sec = if window_elapsed_secs > 0.0 {
+            window_rows_total as f64 / window_elapsed_secs
+        } else {
+            0.0
+        };
+        let minutes_per_sec = if window_elapsed_secs > 0.0 {
+            window_minutes / window_elapsed_secs
+        } else {
+            0.0
+        };
+        info!(
+            window_index = completed_windows,
+            windows_total = total_windows,
+            window_from_ts = %window_from_ts,
+            window_to_ts = %window_to_ts,
+            window_rows_total,
+            total_rows,
+            completed_minutes,
+            total_minutes,
+            progress_pct = format_args!("{progress_pct:.1}"),
+            window_elapsed_ms = window_elapsed.as_millis(),
+            rows_per_sec = format_args!("{rows_per_sec:.1}"),
+            minutes_per_sec = format_args!("{minutes_per_sec:.3}"),
+            elapsed_secs = startup_backfill_started_at.elapsed().as_secs(),
+            "startup backfill replay ingest window complete"
+        );
         window_from_ts = window_to_ts;
     }
 
@@ -5814,15 +6014,17 @@ async fn export_snapshots(
 mod tests {
     use super::{
         allow_live_tail_reconcile, allow_oi_ratio_patch_processing, build_backfill_sql,
-        find_long_null_price_run, handle_ingest_event,
+        expand_startup_backfill_to_minimum_recovery_window, find_long_null_price_run,
+        handle_ingest_event,
         hydrate_futures_orderbook_heatmaps_for_range_with_fetch, live_tail_reconcile_start_ts,
         minute_exclusive_upper_bound, minute_history_is_strictly_contiguous,
-        replay_heatmap_hydration_batch_end, shutdown_ready_through_candidate,
-        snapshot_has_required_history, snapshot_null_price_run_reaches_recent_tail,
-        LiveCanonicalRepairController, FUNDING_BACKFILL_WINDOW_SQL, LIQ_BACKFILL_WINDOW_SQL,
-        LIVE_CANONICAL_TAIL_RECONCILE_LOOKBACK_MINUTES, MIN_REUSABLE_SNAPSHOT_HISTORY_MINUTES,
-        ORDERBOOK_BACKFILL_WINDOW_SQL_SCALAR, ORDERBOOK_BACKFILL_WINDOW_SQL_WITH_HEATMAP,
-        TRADE_BACKFILL_WINDOW_SQL,
+        minimum_startup_recovery_history_floor, replay_heatmap_hydration_batch_end,
+        save_state_snapshot, shutdown_ready_through_candidate, snapshot_has_required_history,
+        snapshot_null_price_run_reaches_recent_tail, try_load_state_snapshot,
+        LiveCanonicalRepairController, SnapshotLoadOutcome, FUNDING_BACKFILL_WINDOW_SQL,
+        LIQ_BACKFILL_WINDOW_SQL, LIVE_CANONICAL_TAIL_RECONCILE_LOOKBACK_MINUTES,
+        MIN_REUSABLE_SNAPSHOT_HISTORY_MINUTES, ORDERBOOK_BACKFILL_WINDOW_SQL_SCALAR,
+        ORDERBOOK_BACKFILL_WINDOW_SQL_WITH_HEATMAP, TRADE_BACKFILL_WINDOW_SQL,
     };
     use crate::ingest::decoder::{
         AggHeatmapLevel, AggOrderbook1mEvent, EngineEvent, MarketKind, MdData, TradeEvent,
@@ -6330,6 +6532,60 @@ mod tests {
         let snap = snapshot_fixture(last_finalized_ts, history.clone(), history, None);
 
         assert!(!snapshot_has_required_history(&snap));
+    }
+
+    #[test]
+    fn startup_missing_snapshot_fallback_uses_minimum_reusable_history_window() {
+        let to_ts = Utc.with_ymd_and_hms(2026, 3, 31, 21, 53, 0).single().unwrap();
+        let recent_from_ts = to_ts - ChronoDuration::minutes(30);
+        let expanded = expand_startup_backfill_to_minimum_recovery_window(recent_from_ts, to_ts)
+            .expect("expected expansion to reusable floor");
+        assert_eq!(expanded, minimum_startup_recovery_history_floor(to_ts));
+        assert_eq!(
+            expanded,
+            to_ts - ChronoDuration::minutes(MIN_REUSABLE_SNAPSHOT_HISTORY_MINUTES)
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_snapshot_is_accepted_as_recovery_seed() {
+        let last_finalized_ts = Utc::now() - ChronoDuration::hours(30);
+        let required_minutes = MIN_REUSABLE_SNAPSHOT_HISTORY_MINUTES - 1;
+        let history_start_ts = last_finalized_ts - ChronoDuration::minutes(required_minutes);
+        let history = (0..=required_minutes)
+            .map(|offset| {
+                priced_history_row(history_start_ts + ChronoDuration::minutes(offset), 2000.0)
+            })
+            .collect::<Vec<_>>();
+        let snap = snapshot_fixture(
+            last_finalized_ts,
+            history.clone(),
+            history,
+            Some(history_start_ts),
+        );
+        let temp_path = std::env::temp_dir().join(format!(
+            "indicator_engine_snapshot_recovery_seed_{}.json.gz",
+            Uuid::new_v4()
+        ));
+        save_state_snapshot(&snap, temp_path.to_str().unwrap())
+            .await
+            .expect("save stale snapshot");
+
+        let outcome = try_load_state_snapshot(temp_path.to_str().unwrap(), "TESTUSDT", 24);
+        let _ = std::fs::remove_file(&temp_path);
+
+        match outcome {
+            SnapshotLoadOutcome::StaleRecoverySeed {
+                snap: loaded,
+                age_hours,
+            } => {
+                assert!(age_hours >= 24);
+                assert_eq!(loaded.last_finalized_ts, snap.last_finalized_ts);
+                assert_eq!(loaded.history_futures.len(), snap.history_futures.len());
+            }
+            SnapshotLoadOutcome::Fresh(_) => panic!("expected stale recovery seed, got fresh"),
+            SnapshotLoadOutcome::Rejected => panic!("expected stale recovery seed, got rejected"),
+        }
     }
 
     #[test]
