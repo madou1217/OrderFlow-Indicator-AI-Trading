@@ -21,6 +21,7 @@ Management rules:
 - Adds are allowed only when they improve expectancy and remain consistent with the live strategic path.
 - Adds must remain management-layer adds: reuse the currently active entry template rather than redesigning a fresh tactical entry.
 - Reductions, stop moves, and profit-taking updates are valid whenever they improve expectancy.
+- Assess whether the live take-profit should remain at stage1 first_path_target or be advanced to stage1 next_path_target based on the current input context. Do not roll the take-profit forward mechanically; only update it when price behavior and path quality show that the first target has been effectively achieved or accepted and the runner still has positive expectancy.
 - move_stop and update_take_profit must remain patch-style bracket updates: reuse the current bracket template and only specify the fields that change.
 - Every returned action must carry trigger_condition with a concrete trigger_price.
 - trigger_condition.trigger_type must be price_above or price_below. These are immediate market-price triggers, not close-confirmation triggers.

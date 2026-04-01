@@ -42,8 +42,12 @@ pub fn snapshot_from_execution_intent(
         allowed_take_profit_levels: dedup_levels([
             intent.take_profit_1,
             intent.take_profit_2,
-            current_path.first_path_target.midpoint(),
-            current_path.next_path_target.midpoint(),
+            current_path
+                .first_path_target
+                .directional_target(&intent.side),
+            current_path
+                .next_path_target
+                .directional_target(&intent.side),
         ]),
         tp1_realized: false,
         applied_driver_deterioration_signals: Vec::new(),
@@ -146,5 +150,82 @@ mod tests {
         let snapshot = snapshot_from_execution_intent("ETHUSDT", &intent, &path, Utc::now());
         assert_eq!(snapshot.allowed_stop_loss_levels, vec![99.0]);
         assert_eq!(snapshot.allowed_take_profit_levels, vec![103.0, 105.0]);
+    }
+
+    #[test]
+    fn snapshot_uses_directional_target_edges_for_allowed_take_profit_levels() {
+        let intent = ExecutionIntent {
+            side: "SHORT".to_string(),
+            entry_profile: Some("reclaim_then_hold".to_string()),
+            intent_mode: "immediate".to_string(),
+            entry_activation_level: None,
+            entry_zone: PriceZone {
+                low: 100.0,
+                high: 101.0,
+                timeframe: None,
+                label: None,
+                reason: None,
+            },
+            entry_invalidation_level: None,
+            trigger_price: Some(100.5),
+            stop_loss: 102.0,
+            take_profit_1: 97.0,
+            take_profit_2: 94.0,
+            ttl_minutes: 15,
+            max_drift_pct: 0.2,
+            path_id: "path_a".to_string(),
+            entry_snapshot: EntrySnapshotRef {
+                context_key: "ETHUSDT:SHORT".to_string(),
+                path_id: "path_a".to_string(),
+            },
+            reason: None,
+            quantity_override: None,
+        };
+        let path = CurrentPath {
+            id: "path_a".to_string(),
+            side: "SHORT".to_string(),
+            thesis: "continuation".to_string(),
+            risk_grade: "aligned_trend".to_string(),
+            activation_anchor_id: None,
+            strategic_activation_level: PriceZone {
+                low: 100.0,
+                high: 101.0,
+                timeframe: None,
+                label: None,
+                reason: None,
+            },
+            first_path_target_anchor_id: None,
+            first_path_target: PriceZone {
+                low: 97.0,
+                high: 98.0,
+                timeframe: None,
+                label: None,
+                reason: None,
+            },
+            next_path_target_anchor_id: None,
+            next_path_target: PriceZone {
+                low: 94.0,
+                high: 95.0,
+                timeframe: None,
+                label: None,
+                reason: None,
+            },
+            failure_anchor_id: None,
+            failure_level: PriceZone {
+                low: 102.0,
+                high: 103.0,
+                timeframe: None,
+                label: None,
+                reason: None,
+            },
+            failure_switch: Some("alt".to_string()),
+            setup_type: "A_continuation".to_string(),
+            reevaluation_trigger: ReevaluationTrigger::default(),
+            tracked_zones: vec![],
+        };
+
+        let snapshot = snapshot_from_execution_intent("ETHUSDT", &intent, &path, Utc::now());
+
+        assert_eq!(snapshot.allowed_take_profit_levels, vec![97.0, 94.0]);
     }
 }

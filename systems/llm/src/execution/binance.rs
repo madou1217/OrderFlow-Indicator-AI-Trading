@@ -1294,14 +1294,9 @@ pub async fn execute_workflow_execution_intent(
     let position_side = resolve_position_side(exec_config, decision);
     let entry_plan = workflow_entry_plan_from_intent(intent)?;
     let entry_price = entry_plan.requested_entry_price;
-    // v2.0.0: TP1/TP2 are managed by the code-side management engine.
-    // The exchange-side full-position take-profit stays on the outer target so
-    // TP1 can be handled as a deterministic partial-management event.
-    let take_profit = if (intent.take_profit_2 - intent.take_profit_1).abs() > f64::EPSILON {
-        intent.take_profit_2
-    } else {
-        intent.take_profit_1
-    };
+    // Initial exchange-side take-profit starts at TP1. Stage2B can later roll it
+    // forward to TP2 when management conditions are met.
+    let take_profit = exchange_take_profit_from_intent(intent);
     let stop_loss = intent.stop_loss;
     let book_ticker = fetch_book_ticker(http_client, api_config, symbol).await?;
     let best_bid_price = parse_book_ticker_price(&book_ticker.bid_price, entry_price);
@@ -2457,6 +2452,10 @@ fn build_trade_blocked_by_current_price_beyond_stop_loss(
         best_bid_price,
         best_ask_price,
     })
+}
+
+fn exchange_take_profit_from_intent(intent: &AdaptedExecutionIntent) -> f64 {
+    intent.take_profit_1
 }
 
 fn compute_execution_rr(
@@ -4120,6 +4119,12 @@ mod tests {
         ))
         .expect("breakout short");
         assert_eq!(breakout_short.requested_entry_price, 100.0);
+    }
+
+    #[test]
+    fn exchange_take_profit_from_intent_starts_at_tp1() {
+        let intent = sample_workflow_execution_intent("LONG", "pullback", Some(101.5));
+        assert_eq!(exchange_take_profit_from_intent(&intent), 106.0);
     }
 
     #[test]

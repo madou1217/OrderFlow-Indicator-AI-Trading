@@ -23,6 +23,14 @@ impl PriceZone {
     pub fn midpoint(&self) -> f64 {
         (self.low + self.high) / 2.0
     }
+
+    pub fn directional_target(&self, side: &str) -> f64 {
+        if side.eq_ignore_ascii_case("SHORT") {
+            self.low
+        } else {
+            self.high
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

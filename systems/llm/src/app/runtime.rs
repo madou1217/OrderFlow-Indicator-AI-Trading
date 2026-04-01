@@ -3396,10 +3396,14 @@ fn execution_intent_from_entry_plan(
 ) -> crate::workflow::schema::ExecutionIntent {
     let take_profit_1 = bracket_override
         .map(|item| item.take_profit_1)
-        .unwrap_or_else(|| current_path.first_path_target.midpoint());
+        .unwrap_or_else(|| {
+            current_path
+                .first_path_target
+                .directional_target(&plan.side)
+        });
     let take_profit_2 = bracket_override
         .map(|item| item.take_profit_2)
-        .unwrap_or_else(|| current_path.next_path_target.midpoint());
+        .unwrap_or_else(|| current_path.next_path_target.directional_target(&plan.side));
     let stop_loss = bracket_override
         .map(|item| item.stop_loss)
         .unwrap_or(plan.stop_loss);
@@ -3464,10 +3468,18 @@ fn build_fallback_entry_snapshot(
         stop_loss,
         take_profit_1: bracket_override
             .map(|item| item.take_profit_1)
-            .unwrap_or_else(|| current_path.first_path_target.midpoint()),
+            .unwrap_or_else(|| {
+                current_path
+                    .first_path_target
+                    .directional_target(&current_path.side)
+            }),
         take_profit_2: bracket_override
             .map(|item| item.take_profit_2)
-            .unwrap_or_else(|| current_path.next_path_target.midpoint()),
+            .unwrap_or_else(|| {
+                current_path
+                    .next_path_target
+                    .directional_target(&current_path.side)
+            }),
         allowed_stop_loss_levels: vec![],
         allowed_take_profit_levels: vec![],
         tp1_realized: false,
@@ -6659,6 +6671,72 @@ mod tests {
     }
 
     #[test]
+    fn execution_intent_from_entry_plan_uses_directional_target_edges() {
+        let current_path = CurrentPath {
+            id: "path_a".to_string(),
+            side: "LONG".to_string(),
+            thesis: "continuation".to_string(),
+            risk_grade: "aligned_trend".to_string(),
+            activation_anchor_id: None,
+            strategic_activation_level: sample_price_zone(100.0, 101.0, "4h"),
+            first_path_target_anchor_id: None,
+            first_path_target: sample_price_zone(104.0, 106.0, "4h"),
+            next_path_target_anchor_id: None,
+            next_path_target: sample_price_zone(109.0, 112.0, "1d"),
+            failure_anchor_id: None,
+            failure_level: sample_price_zone(98.0, 99.0, "4h"),
+            failure_switch: Some("alt".to_string()),
+            setup_type: "A_continuation".to_string(),
+            reevaluation_trigger: ReevaluationTrigger::default(),
+            tracked_zones: vec![],
+        };
+        let long_plan = crate::workflow::schema::EntryPlan {
+            side: "LONG".to_string(),
+            entry_profile: "reclaim_then_hold".to_string(),
+            intent_mode: "pullback".to_string(),
+            entry_activation_level: sample_price_zone(100.0, 101.0, "15m"),
+            entry_zone: sample_price_zone(100.5, 101.5, "15m"),
+            entry_invalidation_level: sample_price_zone(98.0, 99.0, "15m"),
+            stop_loss: 97.5,
+            max_drift_pct: 0.2,
+            entry_note: "entry".to_string(),
+        };
+        let short_plan = crate::workflow::schema::EntryPlan {
+            side: "SHORT".to_string(),
+            ..long_plan.clone()
+        };
+
+        let long_intent = execution_intent_from_entry_plan(
+            "ETHUSDT",
+            "path_a",
+            &long_plan,
+            &current_path,
+            None,
+            101.2,
+            15,
+            None,
+        );
+        let short_intent = execution_intent_from_entry_plan(
+            "ETHUSDT",
+            "path_a",
+            &short_plan,
+            &CurrentPath {
+                side: "SHORT".to_string(),
+                ..current_path.clone()
+            },
+            None,
+            100.8,
+            15,
+            None,
+        );
+
+        assert_eq!(long_intent.take_profit_1, 106.0);
+        assert_eq!(long_intent.take_profit_2, 112.0);
+        assert_eq!(short_intent.take_profit_1, 104.0);
+        assert_eq!(short_intent.take_profit_2, 109.0);
+    }
+
+    #[test]
     fn maybe_record_stopout_and_cleanup_removes_snapshot_after_stop_is_hit() {
         let tactical_plan = sample_tactical_plan();
         let mut workflow_state = WorkflowState {
@@ -8428,6 +8506,79 @@ mod tests {
         assert_eq!(signal.take_profit_2, Some(2080.0));
         assert_eq!(signal.stop_loss, Some(1980.0));
         assert_eq!(signal.risk_reward_ratio, Some(2.0));
+    }
+
+    #[test]
+    fn build_execution_trade_signal_keeps_tp1_tp2_gradient_from_execution_and_intent() {
+        let ts_bucket = DateTime::parse_from_rfc3339("2026-03-28T05:15:00Z")
+            .expect("ts")
+            .with_timezone(&Utc);
+        let intent = crate::workflow::schema::ExecutionIntent {
+            side: "LONG".to_string(),
+            entry_profile: Some("reclaim_then_hold".to_string()),
+            intent_mode: "pullback".to_string(),
+            entry_activation_level: Some(crate::workflow::schema::PriceZone {
+                low: 2129.0,
+                high: 2130.0,
+                timeframe: None,
+                label: None,
+                reason: None,
+            }),
+            entry_zone: crate::workflow::schema::PriceZone {
+                low: 2131.0,
+                high: 2132.0,
+                timeframe: None,
+                label: None,
+                reason: None,
+            },
+            entry_invalidation_level: Some(crate::workflow::schema::PriceZone {
+                low: 2128.0,
+                high: 2129.0,
+                timeframe: None,
+                label: None,
+                reason: None,
+            }),
+            trigger_price: Some(2131.5),
+            stop_loss: 2128.78,
+            take_profit_1: 2140.08,
+            take_profit_2: 2157.99,
+            ttl_minutes: 15,
+            max_drift_pct: 0.12,
+            path_id: "path_a".to_string(),
+            entry_snapshot: crate::workflow::schema::EntrySnapshotRef {
+                context_key: "ETHUSDT:LONG:path_a".to_string(),
+                path_id: "path_a".to_string(),
+            },
+            reason: Some("driver aligned".to_string()),
+            quantity_override: None,
+        };
+        let report = ExecutionReport {
+            decision: "LONG",
+            quantity: "0.047".to_string(),
+            leverage: 4,
+            position_side: "LONG",
+            dry_run: false,
+            maker_entry_price: 2131.73,
+            actual_take_profit: 2140.08,
+            actual_stop_loss: 2128.78,
+            actual_risk_reward_ratio: 2.84,
+        };
+        let trading_state = sample_flat_trading_state();
+
+        let signal = build_execution_trade_signal(
+            ts_bucket,
+            "watcher_fast_consumer",
+            "ETHUSDT",
+            "workflow_watcher_fast",
+            &trading_state,
+            &intent,
+            Some(&report),
+            Some("path confirmed"),
+        );
+
+        assert_eq!(signal.take_profit_1, Some(2140.08));
+        assert_eq!(signal.take_profit_2, Some(2157.99));
+        assert_eq!(signal.risk_reward_ratio, Some(2.84));
     }
 
     #[test]
