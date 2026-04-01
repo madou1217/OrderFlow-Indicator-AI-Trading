@@ -1733,6 +1733,18 @@ fn favorable_beyond_zone(
     }
 }
 
+fn pullback_dispatch_price_ok(plan: &crate::workflow::schema::EntryPlan, price: f64) -> bool {
+    match plan.side.as_str() {
+        // Pullback entries post a passive order back into the entry_zone, so
+        // dispatch is still valid while price is inside the zone or trading on
+        // the favorable side above it. Once price trades through the far side
+        // of the zone, the pullback is no longer clean enough to arm.
+        "LONG" => price >= plan.entry_zone.low,
+        "SHORT" => price <= plan.entry_zone.high,
+        _ => false,
+    }
+}
+
 fn inside_or_beyond_activation(plan: &crate::workflow::schema::EntryPlan, price: f64) -> bool {
     plan.entry_activation_level.contains(price)
         || favorable_beyond_zone(&plan.side, price, &plan.entry_activation_level)
@@ -1824,9 +1836,7 @@ fn fast_watcher_entry_ready(
             if state.activation_seen_at.is_some() && breakout_crossed(plan, event.price) {
                 state.advanced_beyond_entry_after_activation = true;
             }
-            state.activation_seen_at.is_some()
-                && state.advanced_beyond_entry_after_activation
-                && plan.entry_zone.contains(event.price)
+            state.activation_seen_at.is_some() && pullback_dispatch_price_ok(plan, event.price)
         }
         "breakout" => {
             if !breakout_crossed(plan, event.price) {
@@ -4472,6 +4482,9 @@ fn watcher_entry_ready(
     };
     if !all_required_predicates(&intent_rule.required_predicates, plan, facts, watcher_cfg) {
         return false;
+    }
+    if plan.intent_mode == "pullback" {
+        return pullback_dispatch_price_ok(plan, facts.current_price);
     }
     if intent_rule.require_price_inside_entry_zone && !plan.entry_zone.contains(facts.current_price)
     {
@@ -8369,7 +8382,7 @@ mod tests {
     }
 
     #[test]
-    fn fast_watcher_pullback_requires_activation_then_reentry() {
+    fn fast_watcher_pullback_arms_after_activation() {
         let watcher_cfg = sample_fast_watcher_config();
         let plan = sample_fast_entry_plan("pullback", "pullback_acceptance");
         let mut state = FastWatcherPlanState::default();
@@ -8377,19 +8390,13 @@ mod tests {
         assert!(!fast_watcher_entry_ready(
             &mut state,
             &plan,
-            &sample_fast_price_event("2026-03-30T09:35:00Z", 100.4),
-            &watcher_cfg,
-        ));
-        assert!(!fast_watcher_entry_ready(
-            &mut state,
-            &plan,
-            &sample_fast_price_event("2026-03-30T09:35:01Z", 101.1),
+            &sample_fast_price_event("2026-03-30T09:35:00Z", 99.8),
             &watcher_cfg,
         ));
         assert!(fast_watcher_entry_ready(
             &mut state,
             &plan,
-            &sample_fast_price_event("2026-03-30T09:35:02Z", 100.8),
+            &sample_fast_price_event("2026-03-30T09:35:01Z", 101.1),
             &watcher_cfg,
         ));
     }
@@ -9473,6 +9480,80 @@ mod tests {
             ],
         };
         assert!(watcher_entry_ready(&plan, &confirmed_facts, &watcher_cfg));
+    }
+
+    #[test]
+    fn watcher_pullback_can_dispatch_above_entry_zone_once_confirmation_is_done() {
+        let watcher_cfg = workflow_test_config().llm.workflow.watcher;
+        let plan = crate::workflow::schema::EntryPlan {
+            side: "LONG".to_string(),
+            entry_profile: "reclaim_then_hold".to_string(),
+            intent_mode: "pullback".to_string(),
+            entry_activation_level: crate::workflow::schema::PriceZone {
+                low: 100.0,
+                high: 101.0,
+                timeframe: None,
+                label: None,
+                reason: None,
+            },
+            entry_zone: crate::workflow::schema::PriceZone {
+                low: 100.0,
+                high: 101.0,
+                timeframe: None,
+                label: None,
+                reason: None,
+            },
+            entry_invalidation_level: crate::workflow::schema::PriceZone {
+                low: 98.0,
+                high: 99.0,
+                timeframe: None,
+                label: None,
+                reason: None,
+            },
+            stop_loss: 98.8,
+            take_profit_1: 104.0,
+            take_profit_2: 106.0,
+            ttl_minutes: 15,
+            max_drift_pct: 0.2,
+            entry_snapshot: crate::workflow::schema::TacticalEntrySnapshot {
+                context_key: "ETHUSDT:LONG:path_a:primary".to_string(),
+                path_id: "path_a".to_string(),
+                plan_role: "primary".to_string(),
+            },
+            entry_note: String::new(),
+        };
+
+        let confirmed_above_zone = WatcherPriceFacts {
+            current_price: 101.4,
+            recent_bars: vec![
+                WatcherBar {
+                    close: 101.15,
+                    high: 101.2,
+                    low: 100.95,
+                },
+                WatcherBar {
+                    close: 101.25,
+                    high: 101.3,
+                    low: 101.0,
+                },
+                WatcherBar {
+                    close: 101.35,
+                    high: 101.4,
+                    low: 101.05,
+                },
+            ],
+        };
+        assert!(watcher_entry_ready(
+            &plan,
+            &confirmed_above_zone,
+            &watcher_cfg,
+        ));
+
+        let through_zone = WatcherPriceFacts {
+            current_price: 99.8,
+            recent_bars: confirmed_above_zone.recent_bars.clone(),
+        };
+        assert!(!watcher_entry_ready(&plan, &through_zone, &watcher_cfg));
     }
 
     #[test]

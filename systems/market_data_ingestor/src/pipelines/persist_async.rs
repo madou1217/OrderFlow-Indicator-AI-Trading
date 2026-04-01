@@ -2968,8 +2968,16 @@ where
     events
         .into_iter()
         .filter(|event| {
+            // Fast watcher consumers bind directly to these raw/fast market keys
+            // on x.md.live. Keep them on the publish path even though they are not
+            // minute aggregates, otherwise the watcher queue never receives any
+            // input and llm-side fast replay buffers stay empty.
             matches!(
                 event.msg_type.as_str(),
+                "md.kline"
+                    | "md.mark_price"
+                    | "md.agg.trade.1s"
+                    |
                 "md.open_interest_current"
                     | "md.open_interest_hist_5m"
                     | "md.long_short_ratio_5m"
@@ -3656,6 +3664,50 @@ mod tests {
         let publish_passthrough = collect_publish_passthrough_events([&options]);
         assert_eq!(publish_passthrough.len(), 1);
         assert_eq!(publish_passthrough[0].msg_type, "md.option_mark_greeks_5m");
+    }
+
+    #[test]
+    fn publish_path_preserves_fast_watcher_inputs() {
+        let ts = Utc.with_ymd_and_hms(2026, 3, 27, 5, 0, 0).single().unwrap();
+        let kline = NormalizedMdEvent {
+            msg_type: "md.kline".to_string(),
+            market: "futures".to_string(),
+            symbol: "ETHUSDT".to_string(),
+            source_kind: "ws".to_string(),
+            backfill_in_progress: false,
+            routing_key: "md.futures.kline.1m.ethusdt".to_string(),
+            stream_name: "ethusdt@kline_1m".to_string(),
+            event_ts: ts,
+            data: json!({}),
+        };
+        let mark = NormalizedMdEvent {
+            msg_type: "md.mark_price".to_string(),
+            market: "futures".to_string(),
+            symbol: "ETHUSDT".to_string(),
+            source_kind: "ws".to_string(),
+            backfill_in_progress: false,
+            routing_key: "md.futures.mark_price.ethusdt".to_string(),
+            stream_name: "ethusdt@markPrice".to_string(),
+            event_ts: ts,
+            data: json!({}),
+        };
+        let trade_1s = NormalizedMdEvent {
+            msg_type: "md.agg.trade.1s".to_string(),
+            market: "futures".to_string(),
+            symbol: "ETHUSDT".to_string(),
+            source_kind: "ws".to_string(),
+            backfill_in_progress: false,
+            routing_key: "md.agg.futures.trade.1s.ethusdt".to_string(),
+            stream_name: "agg.trade.1s".to_string(),
+            event_ts: ts,
+            data: json!({}),
+        };
+
+        let publish_passthrough = collect_publish_passthrough_events([&kline, &mark, &trade_1s]);
+        assert_eq!(publish_passthrough.len(), 3);
+        assert_eq!(publish_passthrough[0].msg_type, "md.kline");
+        assert_eq!(publish_passthrough[1].msg_type, "md.mark_price");
+        assert_eq!(publish_passthrough[2].msg_type, "md.agg.trade.1s");
     }
 
     #[test]

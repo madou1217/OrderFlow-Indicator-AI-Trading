@@ -1072,8 +1072,8 @@ fn default_immediate_intent_rule() -> IntentModeRuleConfig {
 fn default_pullback_intent_rule() -> IntentModeRuleConfig {
     IntentModeRuleConfig {
         required_predicates: Vec::new(),
-        require_price_inside_entry_zone: true,
-        disallow_breakout_chase: true,
+        require_price_inside_entry_zone: false,
+        disallow_breakout_chase: false,
     }
 }
 
