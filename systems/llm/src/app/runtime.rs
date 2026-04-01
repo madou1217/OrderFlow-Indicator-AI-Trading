@@ -1937,6 +1937,7 @@ async fn process_fast_market_event_for_plan(
     fast_plan_state: &mut FastWatcherPlanState,
     context_key: &str,
     entry_snapshots: &mut HashMap<String, crate::workflow::schema::EntrySnapshot>,
+    trading_state: &TradingStateSnapshot,
     event: &FastPriceEvent,
 ) -> Result<()> {
     if entry_snapshots.contains_key(context_key) {
@@ -1995,18 +1996,11 @@ async fn process_fast_market_event_for_plan(
         fast_plan_state.ready_logged = true;
     }
 
-    let trading_state = fetch_symbol_trading_state_for_fast_path(
-        &ctx.http_client,
-        &ctx.config.api.binance,
-        &ctx.config.llm.execution,
-        symbol,
-    )
-    .await?;
     if let Some(reason) = fast_entry_selection_block_reason(
         symbol,
         tactical_plan,
         workflow_state,
-        &trading_state,
+        trading_state,
         entry_snapshots,
         ctx.config.llm.workflow.watcher.max_filled_stopout_attempts,
     ) {
@@ -2044,7 +2038,7 @@ async fn process_fast_market_event_for_plan(
         symbol,
         tactical_plan,
         workflow_state,
-        &trading_state,
+        trading_state,
         entry_snapshots,
         event.price,
         entry_ready,
@@ -2162,7 +2156,7 @@ async fn process_fast_market_event_for_plan(
                     "watcher_fast_consumer",
                     symbol,
                     "workflow_watcher_fast",
-                    &trading_state,
+                    trading_state,
                     &intent,
                     Some(&report),
                     intent.reason.as_deref(),
@@ -2230,6 +2224,937 @@ async fn process_fast_market_event_for_plan(
     }
 
     Ok(())
+}
+
+fn fast_management_snapshot_for_context(
+    symbol: &str,
+    current_path: Option<&crate::workflow::schema::CurrentPath>,
+    workflow_state: &crate::workflow::state::WorkflowState,
+    entry_snapshots: &HashMap<String, crate::workflow::schema::EntrySnapshot>,
+    context_key: &str,
+    path_id: &str,
+) -> Option<crate::workflow::schema::EntrySnapshot> {
+    entry_snapshots.get(context_key).cloned().or_else(|| {
+        current_path.and_then(|path| {
+            snapshot_for_management_context(
+                symbol,
+                path,
+                workflow_state,
+                entry_snapshots,
+                context_key,
+                path_id,
+            )
+        })
+    })
+}
+
+async fn process_fast_position_management_actions(
+    ctx: &AppContext,
+    workflow_state: &mut crate::workflow::state::WorkflowState,
+    current_path: Option<&crate::workflow::schema::CurrentPath>,
+    symbol: &str,
+    state_dir: &str,
+    entry_snapshots: &mut HashMap<String, crate::workflow::schema::EntrySnapshot>,
+    trading_state: &TradingStateSnapshot,
+    watch_facts: &WatcherPriceFacts,
+    event: &FastPriceEvent,
+) -> Result<bool> {
+    let mut state_dirty = false;
+    let plan_context_keys = workflow_state
+        .approved_position_management_plans
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    for plan_context_key in plan_context_keys {
+        let Some(plan) = workflow_state
+            .approved_position_management_plans
+            .get(&plan_context_key)
+            .cloned()
+        else {
+            continue;
+        };
+        if current_path
+            .as_ref()
+            .is_some_and(|path| plan.path_id != path.id)
+        {
+            remove_position_management_plan(workflow_state, &plan_context_key);
+            state_dirty = true;
+            continue;
+        }
+        let Some(action_index) = first_triggered_position_management_action_index(&plan, watch_facts)
+        else {
+            continue;
+        };
+        let action = plan.actions[action_index].clone();
+        let Some(snapshot) = fast_management_snapshot_for_context(
+            symbol,
+            current_path,
+            workflow_state,
+            entry_snapshots,
+            &action.context_key,
+            &action.path_id,
+        ) else {
+            continue;
+        };
+        info!(
+            symbol = %symbol,
+            trigger = "watcher_fast_consumer",
+            path_id = %action.path_id,
+            context_key = %action.context_key,
+            action_type = %action.action_type,
+            trigger_price = watch_facts.current_price,
+            execution_price = ?action.execution_price,
+            price_source = event.source.as_str(),
+            routing_key = %event.routing_key,
+            "workflow watcher position management action ready"
+        );
+        append_workflow_journal_event(
+            "workflow_stage2b_management_ready",
+            symbol,
+            event.event_ts,
+            json!({
+                "trigger": "watcher_fast_consumer",
+                "context_key": &action.context_key,
+                "path_id": &action.path_id,
+                "action": &action,
+                "trigger_price": watch_facts.current_price,
+                "price_source": event.source.as_str(),
+                "routing_key": &event.routing_key,
+            }),
+        );
+        match action.action_type.as_str() {
+            "add" => {
+                let Some(current_path) = current_path else {
+                    append_workflow_journal_event(
+                        "workflow_stage2b_add_execution_error",
+                        symbol,
+                        event.event_ts,
+                        json!({
+                            "trigger": "watcher_fast_consumer",
+                            "action": &action,
+                            "error": "missing active current_path for add execution",
+                        }),
+                    );
+                    if state_dirty {
+                        crate::workflow::persistence::save_workflow_state(
+                            state_dir,
+                            workflow_state,
+                        )?;
+                    }
+                    return Ok(true);
+                };
+                let fallback_plan = matching_tactical_entry_plan(workflow_state, &action.path_id);
+                match (
+                    entry_plan_from_snapshot_template(&snapshot, fallback_plan),
+                    find_active_position_for_side(trading_state, &snapshot.side),
+                ) {
+                    (Ok(entry_template), Some(active_position)) => {
+                        let bracket_template = crate::workflow::schema::PostFillBracketTemplate {
+                            take_profit_1: snapshot.take_profit_1,
+                            take_profit_2: snapshot.take_profit_2,
+                            stop_loss: snapshot.stop_loss,
+                        };
+                        let mut intent = execution_intent_from_entry_plan(
+                            symbol,
+                            &action.path_id,
+                            &entry_template,
+                            current_path,
+                            Some(&bracket_template),
+                            watch_facts.current_price,
+                            ctx.config.llm.workflow.watcher.entry_ttl_minutes,
+                            action
+                                .add_ratio
+                                .map(|ratio| active_position.position_amt.abs() * ratio),
+                        );
+                        intent.reason = Some(action.reason.clone());
+                        match adapt_execution_intent(&intent) {
+                            Ok(adapted_intent) => {
+                                match execute_workflow_execution_intent(
+                                    &ctx.http_client,
+                                    &ctx.config.api.binance,
+                                    &ctx.config.llm.execution,
+                                    symbol,
+                                    &adapted_intent,
+                                )
+                                .await
+                                {
+                                    Ok(report) => {
+                                        append_workflow_journal_event(
+                                            "workflow_stage2b_add_execution_report",
+                                            symbol,
+                                            event.event_ts,
+                                            json!({
+                                                "trigger": "watcher_fast_consumer",
+                                                "action": &action,
+                                                "trigger_price": watch_facts.current_price,
+                                                "price_source": event.source.as_str(),
+                                                "routing_key": &event.routing_key,
+                                                "report": {
+                                                    "decision": report.decision,
+                                                    "quantity": report.quantity,
+                                                    "leverage": report.leverage,
+                                                    "position_side": report.position_side,
+                                                    "maker_entry_price": report.maker_entry_price,
+                                                    "take_profit": report.actual_take_profit,
+                                                    "stop_loss": report.actual_stop_loss,
+                                                    "risk_reward_ratio": report.actual_risk_reward_ratio,
+                                                    "dry_run": report.dry_run,
+                                                },
+                                            }),
+                                        );
+                                        if !report.dry_run {
+                                            let mut next_snapshot = snapshot.clone();
+                                            next_snapshot.updated_at = Utc::now();
+                                            crate::workflow::persistence::save_entry_snapshot(
+                                                state_dir,
+                                                &next_snapshot,
+                                            )?;
+                                            entry_snapshots.insert(
+                                                next_snapshot.context_key.clone(),
+                                                next_snapshot,
+                                            );
+                                            workflow_state.last_filled_context_key =
+                                                Some(snapshot.context_key.clone());
+                                            if let Some(next_plan) =
+                                                remove_position_management_action(&plan, action_index)
+                                            {
+                                                upsert_position_management_plan(
+                                                    workflow_state,
+                                                    &plan_context_key,
+                                                    next_plan,
+                                                );
+                                            } else {
+                                                remove_position_management_plan(
+                                                    workflow_state,
+                                                    &plan_context_key,
+                                                );
+                                            }
+                                            state_dirty = true;
+                                        }
+                                    }
+                                    Err(err) => {
+                                        append_workflow_journal_event(
+                                            "workflow_stage2b_add_execution_error",
+                                            symbol,
+                                            event.event_ts,
+                                            json!({
+                                                "trigger": "watcher_fast_consumer",
+                                                "action": &action,
+                                                "trigger_price": watch_facts.current_price,
+                                                "price_source": event.source.as_str(),
+                                                "routing_key": &event.routing_key,
+                                                "error": format!("{err:#}"),
+                                            }),
+                                        );
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                append_workflow_journal_event(
+                                    "workflow_stage2b_add_execution_error",
+                                    symbol,
+                                    event.event_ts,
+                                    json!({
+                                        "trigger": "watcher_fast_consumer",
+                                        "action": &action,
+                                        "trigger_price": watch_facts.current_price,
+                                        "price_source": event.source.as_str(),
+                                        "routing_key": &event.routing_key,
+                                        "error": format!("{err:#}"),
+                                        "phase": "intent_adapter",
+                                    }),
+                                );
+                            }
+                        }
+                    }
+                    (Err(err), _) => {
+                        append_workflow_journal_event(
+                            "workflow_stage2b_add_execution_error",
+                            symbol,
+                            event.event_ts,
+                            json!({
+                                "trigger": "watcher_fast_consumer",
+                                "action": &action,
+                                "trigger_price": watch_facts.current_price,
+                                "price_source": event.source.as_str(),
+                                "routing_key": &event.routing_key,
+                                "error": format!("{err:#}"),
+                                "phase": "entry_template",
+                            }),
+                        );
+                    }
+                    (_, None) => {
+                        append_workflow_journal_event(
+                            "workflow_stage2b_add_execution_error",
+                            symbol,
+                            event.event_ts,
+                            json!({
+                                "trigger": "watcher_fast_consumer",
+                                "action": &action,
+                                "trigger_price": watch_facts.current_price,
+                                "price_source": event.source.as_str(),
+                                "routing_key": &event.routing_key,
+                                "error": "no active position available for add execution",
+                            }),
+                        );
+                    }
+                }
+            }
+            "reduce" | "exit_full" | "move_stop" | "update_take_profit" => {
+                match management_action_from_position_management_action(&action).and_then(
+                    |management_action| {
+                        let adapted = adapt_management_action(&management_action, &snapshot)?;
+                        Ok((management_action, adapted))
+                    },
+                ) {
+                    Ok((management_action, adapted_action)) => {
+                        match execute_workflow_management_action(
+                            &ctx.http_client,
+                            &ctx.config.api.binance,
+                            &ctx.config.llm.execution,
+                            symbol,
+                            &snapshot,
+                            &adapted_action,
+                        )
+                        .await
+                        {
+                            Ok(report) => {
+                                append_workflow_journal_event(
+                                    "workflow_stage2b_management_execution_report",
+                                    symbol,
+                                    event.event_ts,
+                                    json!({
+                                        "trigger": "watcher_fast_consumer",
+                                        "action": &action,
+                                        "trigger_price": watch_facts.current_price,
+                                        "price_source": event.source.as_str(),
+                                        "routing_key": &event.routing_key,
+                                        "report": {
+                                            "action": report.action,
+                                            "dry_run": report.dry_run,
+                                            "position_count": report.position_count,
+                                            "open_order_count": report.open_order_count,
+                                            "canceled_open_orders": report.canceled_open_orders,
+                                            "reduce_order_ids": report.reduce_order_ids,
+                                            "close_order_ids": report.close_order_ids,
+                                            "modify_take_profit_order_ids": report.modify_take_profit_order_ids,
+                                            "modify_stop_loss_order_ids": report.modify_stop_loss_order_ids,
+                                            "realized_pnl_usdt": report.realized_pnl_usdt,
+                                        },
+                                    }),
+                                );
+                                if !report.dry_run {
+                                    match action.action_type.as_str() {
+                                        "exit_full" => {
+                                            entry_snapshots.remove(&snapshot.context_key);
+                                            crate::workflow::persistence::delete_entry_snapshot(
+                                                state_dir,
+                                                symbol,
+                                                &snapshot.context_key,
+                                            )?;
+                                            clear_approved_tactical_plan(workflow_state);
+                                            remove_position_management_plan(
+                                                workflow_state,
+                                                &plan_context_key,
+                                            );
+                                        }
+                                        "move_stop" => {
+                                            let next_snapshot = patch_entry_snapshot_levels(
+                                                &snapshot,
+                                                action.new_stop_loss,
+                                                None,
+                                                None,
+                                            );
+                                            crate::workflow::persistence::save_entry_snapshot(
+                                                state_dir,
+                                                &next_snapshot,
+                                            )?;
+                                            entry_snapshots.insert(
+                                                next_snapshot.context_key.clone(),
+                                                next_snapshot,
+                                            );
+                                            if let Some(next_plan) =
+                                                remove_position_management_action(&plan, action_index)
+                                            {
+                                                upsert_position_management_plan(
+                                                    workflow_state,
+                                                    &plan_context_key,
+                                                    next_plan,
+                                                );
+                                            } else {
+                                                remove_position_management_plan(
+                                                    workflow_state,
+                                                    &plan_context_key,
+                                                );
+                                            }
+                                        }
+                                        "update_take_profit" => {
+                                            let next_snapshot = patch_entry_snapshot_levels(
+                                                &snapshot,
+                                                None,
+                                                action.take_profit_1,
+                                                action.take_profit_2,
+                                            );
+                                            crate::workflow::persistence::save_entry_snapshot(
+                                                state_dir,
+                                                &next_snapshot,
+                                            )?;
+                                            entry_snapshots.insert(
+                                                next_snapshot.context_key.clone(),
+                                                next_snapshot,
+                                            );
+                                            if let Some(next_plan) =
+                                                remove_position_management_action(&plan, action_index)
+                                            {
+                                                upsert_position_management_plan(
+                                                    workflow_state,
+                                                    &plan_context_key,
+                                                    next_plan,
+                                                );
+                                            } else {
+                                                remove_position_management_plan(
+                                                    workflow_state,
+                                                    &plan_context_key,
+                                                );
+                                            }
+                                        }
+                                        _ => {
+                                            let mut next_snapshot = snapshot.clone();
+                                            next_snapshot.updated_at = Utc::now();
+                                            crate::workflow::persistence::save_entry_snapshot(
+                                                state_dir,
+                                                &next_snapshot,
+                                            )?;
+                                            entry_snapshots.insert(
+                                                next_snapshot.context_key.clone(),
+                                                next_snapshot,
+                                            );
+                                            if let Some(next_plan) =
+                                                remove_position_management_action(&plan, action_index)
+                                            {
+                                                upsert_position_management_plan(
+                                                    workflow_state,
+                                                    &plan_context_key,
+                                                    next_plan,
+                                                );
+                                            } else {
+                                                remove_position_management_plan(
+                                                    workflow_state,
+                                                    &plan_context_key,
+                                                );
+                                            }
+                                        }
+                                    }
+                                    state_dirty = true;
+                                }
+                                let _ = management_action;
+                            }
+                            Err(err) => {
+                                append_workflow_journal_event(
+                                    "workflow_stage2b_management_execution_error",
+                                    symbol,
+                                    event.event_ts,
+                                    json!({
+                                        "trigger": "watcher_fast_consumer",
+                                        "action": &action,
+                                        "trigger_price": watch_facts.current_price,
+                                        "price_source": event.source.as_str(),
+                                        "routing_key": &event.routing_key,
+                                        "error": format!("{err:#}"),
+                                    }),
+                                );
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        append_workflow_journal_event(
+                            "workflow_stage2b_management_execution_error",
+                            symbol,
+                            event.event_ts,
+                            json!({
+                                "trigger": "watcher_fast_consumer",
+                                "action": &action,
+                                "trigger_price": watch_facts.current_price,
+                                "price_source": event.source.as_str(),
+                                "routing_key": &event.routing_key,
+                                "error": format!("{err:#}"),
+                                "phase": "adapter",
+                            }),
+                        );
+                    }
+                }
+            }
+            other => {
+                append_workflow_journal_event(
+                    "workflow_stage2b_management_execution_error",
+                    symbol,
+                    event.event_ts,
+                    json!({
+                        "trigger": "watcher_fast_consumer",
+                        "action": &action,
+                        "trigger_price": watch_facts.current_price,
+                        "price_source": event.source.as_str(),
+                        "routing_key": &event.routing_key,
+                        "error": format!("unsupported stage2b watcher action {}", other),
+                    }),
+                );
+            }
+        }
+
+        if state_dirty {
+            crate::workflow::persistence::save_workflow_state(state_dir, workflow_state)?;
+        }
+        return Ok(true);
+    }
+
+    if state_dirty {
+        crate::workflow::persistence::save_workflow_state(state_dir, workflow_state)?;
+    }
+    Ok(false)
+}
+
+async fn process_fast_pending_order_management_actions(
+    ctx: &AppContext,
+    workflow_state: &mut crate::workflow::state::WorkflowState,
+    current_path: Option<&crate::workflow::schema::CurrentPath>,
+    symbol: &str,
+    state_dir: &str,
+    entry_snapshots: &mut HashMap<String, crate::workflow::schema::EntrySnapshot>,
+    trading_state: &TradingStateSnapshot,
+    watch_facts: &WatcherPriceFacts,
+    event: &FastPriceEvent,
+) -> Result<bool> {
+    let mut state_dirty = false;
+    let plan_context_keys = workflow_state
+        .approved_pending_order_management_plans
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    for plan_context_key in plan_context_keys {
+        let Some(plan) = workflow_state
+            .approved_pending_order_management_plans
+            .get(&plan_context_key)
+            .cloned()
+        else {
+            continue;
+        };
+        if current_path
+            .as_ref()
+            .is_some_and(|path| plan.path_id != path.id)
+        {
+            remove_pending_order_management_plan(workflow_state, &plan_context_key);
+            state_dirty = true;
+            continue;
+        }
+        let Some(action_index) = first_triggered_pending_order_action_index(&plan, watch_facts)
+        else {
+            continue;
+        };
+        let action = plan.actions[action_index].clone();
+        let Some(snapshot) = fast_management_snapshot_for_context(
+            symbol,
+            current_path,
+            workflow_state,
+            entry_snapshots,
+            &action.context_key,
+            &action.path_id,
+        ) else {
+            continue;
+        };
+        let has_live_position = has_active_position_for_side(trading_state, &snapshot.side);
+        info!(
+            symbol = %symbol,
+            trigger = "watcher_fast_consumer",
+            path_id = %action.path_id,
+            context_key = %action.context_key,
+            action_type = %action.action_type,
+            trigger_price = watch_facts.current_price,
+            execution_price = ?action.execution_price,
+            price_source = event.source.as_str(),
+            routing_key = %event.routing_key,
+            "workflow watcher pending-order management action ready"
+        );
+        append_workflow_journal_event(
+            "workflow_stage2c_pending_order_ready",
+            symbol,
+            event.event_ts,
+            json!({
+                "trigger": "watcher_fast_consumer",
+                "context_key": &action.context_key,
+                "path_id": &action.path_id,
+                "action": &action,
+                "trigger_price": watch_facts.current_price,
+                "price_source": event.source.as_str(),
+                "routing_key": &event.routing_key,
+            }),
+        );
+        match action.action_type.as_str() {
+            "cancel_pending_order" => {
+                match cancel_workflow_pending_entry_orders(
+                    &ctx.http_client,
+                    &ctx.config.api.binance,
+                    &ctx.config.llm.execution,
+                    symbol,
+                    &snapshot.side,
+                )
+                .await
+                {
+                    Ok(canceled_order_ids) => {
+                        append_workflow_journal_event(
+                            "workflow_stage2c_pending_order_execution_report",
+                            symbol,
+                            event.event_ts,
+                            json!({
+                                "trigger": "watcher_fast_consumer",
+                                "action": &action,
+                                "trigger_price": watch_facts.current_price,
+                                "price_source": event.source.as_str(),
+                                "routing_key": &event.routing_key,
+                                "canceled_order_ids": canceled_order_ids,
+                                "dry_run": ctx.config.llm.execution.dry_run,
+                            }),
+                        );
+                        if !ctx.config.llm.execution.dry_run {
+                            if !has_live_position {
+                                entry_snapshots.remove(&snapshot.context_key);
+                                crate::workflow::persistence::delete_entry_snapshot(
+                                    state_dir,
+                                    symbol,
+                                    &snapshot.context_key,
+                                )?;
+                                if workflow_state.last_filled_context_key.as_deref()
+                                    == Some(snapshot.context_key.as_str())
+                                {
+                                    workflow_state.last_filled_context_key = None;
+                                }
+                            }
+                            if workflow_state
+                                .approved_tactical_plan
+                                .as_ref()
+                                .is_some_and(|item| item.path_id == action.path_id)
+                            {
+                                clear_approved_tactical_plan(workflow_state);
+                            }
+                            workflow_state.pending_entry_bracket_template_override = None;
+                            if let Some(next_plan) =
+                                remove_pending_order_management_action(&plan, action_index)
+                            {
+                                upsert_pending_order_management_plan(
+                                    workflow_state,
+                                    &plan_context_key,
+                                    next_plan,
+                                );
+                            } else {
+                                remove_pending_order_management_plan(
+                                    workflow_state,
+                                    &plan_context_key,
+                                );
+                            }
+                            state_dirty = true;
+                        }
+                    }
+                    Err(err) => {
+                        append_workflow_journal_event(
+                            "workflow_stage2c_pending_order_execution_error",
+                            symbol,
+                            event.event_ts,
+                            json!({
+                                "trigger": "watcher_fast_consumer",
+                                "action": &action,
+                                "trigger_price": watch_facts.current_price,
+                                "price_source": event.source.as_str(),
+                                "routing_key": &event.routing_key,
+                                "error": format!("{err:#}"),
+                            }),
+                        );
+                    }
+                }
+            }
+            "replace_entry" => {
+                let Some(current_path) = current_path else {
+                    append_workflow_journal_event(
+                        "workflow_stage2c_pending_order_execution_error",
+                        symbol,
+                        event.event_ts,
+                        json!({
+                            "trigger": "watcher_fast_consumer",
+                            "action": &action,
+                            "trigger_price": watch_facts.current_price,
+                            "price_source": event.source.as_str(),
+                            "routing_key": &event.routing_key,
+                            "error": "missing active current_path for replace_entry execution",
+                        }),
+                    );
+                    if state_dirty {
+                        crate::workflow::persistence::save_workflow_state(
+                            state_dir,
+                            workflow_state,
+                        )?;
+                    }
+                    return Ok(true);
+                };
+                match build_stage2c_replace_execution_intent(
+                    symbol,
+                    current_path,
+                    workflow_state,
+                    &snapshot,
+                    &action,
+                    watch_facts.current_price,
+                    ctx.config.llm.workflow.watcher.entry_ttl_minutes,
+                ) {
+                    Ok((next_tactical_plan, bracket_template, intent)) => {
+                        match adapt_execution_intent(&intent) {
+                            Ok(adapted_intent) => {
+                                match cancel_workflow_pending_entry_orders(
+                                    &ctx.http_client,
+                                    &ctx.config.api.binance,
+                                    &ctx.config.llm.execution,
+                                    symbol,
+                                    &snapshot.side,
+                                )
+                                .await
+                                {
+                                    Ok(canceled_order_ids) => {
+                                        append_workflow_journal_event(
+                                            "workflow_stage2c_pending_order_execution_report",
+                                            symbol,
+                                            event.event_ts,
+                                            json!({
+                                                "trigger": "watcher_fast_consumer",
+                                                "action": &action,
+                                                "trigger_price": watch_facts.current_price,
+                                                "price_source": event.source.as_str(),
+                                                "routing_key": &event.routing_key,
+                                                "canceled_order_ids": canceled_order_ids,
+                                                "dry_run": ctx.config.llm.execution.dry_run,
+                                            }),
+                                        );
+                                        match execute_workflow_execution_intent(
+                                            &ctx.http_client,
+                                            &ctx.config.api.binance,
+                                            &ctx.config.llm.execution,
+                                            symbol,
+                                            &adapted_intent,
+                                        )
+                                        .await
+                                        {
+                                            Ok(report) => {
+                                                append_workflow_journal_event(
+                                                    "workflow_stage2c_replace_execution_report",
+                                                    symbol,
+                                                    event.event_ts,
+                                                    json!({
+                                                        "trigger": "watcher_fast_consumer",
+                                                        "action": &action,
+                                                        "trigger_price": watch_facts.current_price,
+                                                        "price_source": event.source.as_str(),
+                                                        "routing_key": &event.routing_key,
+                                                        "report": {
+                                                            "decision": report.decision,
+                                                            "quantity": report.quantity,
+                                                            "leverage": report.leverage,
+                                                            "position_side": report.position_side,
+                                                            "maker_entry_price": report.maker_entry_price,
+                                                            "take_profit": report.actual_take_profit,
+                                                            "stop_loss": report.actual_stop_loss,
+                                                            "risk_reward_ratio": report.actual_risk_reward_ratio,
+                                                            "dry_run": report.dry_run,
+                                                        },
+                                                    }),
+                                                );
+                                                if !report.dry_run {
+                                                    workflow_state.approved_tactical_plan =
+                                                        Some(next_tactical_plan);
+                                                    workflow_state.approved_tactical_plan_updated_at =
+                                                        Some(Utc::now());
+                                                    workflow_state.approved_tactical_plan_source_ts_bucket =
+                                                        Some(event.event_ts);
+                                                    workflow_state.pending_entry_bracket_template_override =
+                                                        Some(bracket_template);
+                                                    let next_snapshot =
+                                                        crate::workflow::management::snapshot_from_execution_intent(
+                                                            symbol,
+                                                            &intent,
+                                                            current_path,
+                                                            Utc::now(),
+                                                        );
+                                                    crate::workflow::persistence::save_entry_snapshot(
+                                                        state_dir,
+                                                        &next_snapshot,
+                                                    )?;
+                                                    entry_snapshots.insert(
+                                                        next_snapshot.context_key.clone(),
+                                                        next_snapshot,
+                                                    );
+                                                    workflow_state.last_filled_context_key =
+                                                        Some(intent.entry_snapshot.context_key.clone());
+                                                    if let Some(next_plan) =
+                                                        remove_pending_order_management_action(
+                                                            &plan,
+                                                            action_index,
+                                                        )
+                                                    {
+                                                        upsert_pending_order_management_plan(
+                                                            workflow_state,
+                                                            &plan_context_key,
+                                                            next_plan,
+                                                        );
+                                                    } else {
+                                                        remove_pending_order_management_plan(
+                                                            workflow_state,
+                                                            &plan_context_key,
+                                                        );
+                                                    }
+                                                    state_dirty = true;
+                                                }
+                                            }
+                                            Err(err) => {
+                                                append_workflow_journal_event(
+                                                    "workflow_stage2c_pending_order_execution_error",
+                                                    symbol,
+                                                    event.event_ts,
+                                                    json!({
+                                                        "trigger": "watcher_fast_consumer",
+                                                        "action": &action,
+                                                        "trigger_price": watch_facts.current_price,
+                                                        "price_source": event.source.as_str(),
+                                                        "routing_key": &event.routing_key,
+                                                        "error": format!("{err:#}"),
+                                                        "phase": "replace_execution",
+                                                    }),
+                                                );
+                                            }
+                                        }
+                                    }
+                                    Err(err) => {
+                                        append_workflow_journal_event(
+                                            "workflow_stage2c_pending_order_execution_error",
+                                            symbol,
+                                            event.event_ts,
+                                            json!({
+                                                "trigger": "watcher_fast_consumer",
+                                                "action": &action,
+                                                "trigger_price": watch_facts.current_price,
+                                                "price_source": event.source.as_str(),
+                                                "routing_key": &event.routing_key,
+                                                "error": format!("{err:#}"),
+                                            }),
+                                        );
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                append_workflow_journal_event(
+                                    "workflow_stage2c_pending_order_execution_error",
+                                    symbol,
+                                    event.event_ts,
+                                    json!({
+                                        "trigger": "watcher_fast_consumer",
+                                        "action": &action,
+                                        "trigger_price": watch_facts.current_price,
+                                        "price_source": event.source.as_str(),
+                                        "routing_key": &event.routing_key,
+                                        "error": format!("{err:#}"),
+                                        "phase": "intent_adapter",
+                                    }),
+                                );
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        append_workflow_journal_event(
+                            "workflow_stage2c_pending_order_execution_error",
+                            symbol,
+                            event.event_ts,
+                            json!({
+                                "trigger": "watcher_fast_consumer",
+                                "action": &action,
+                                "trigger_price": watch_facts.current_price,
+                                "price_source": event.source.as_str(),
+                                "routing_key": &event.routing_key,
+                                "error": format!("{err:#}"),
+                                "phase": "replace_template",
+                            }),
+                        );
+                    }
+                }
+            }
+            "update_post_fill_bracket_template" => {
+                append_workflow_journal_event(
+                    "workflow_stage2c_pending_order_execution_report",
+                    symbol,
+                    event.event_ts,
+                    json!({
+                        "trigger": "watcher_fast_consumer",
+                        "action": &action,
+                        "trigger_price": watch_facts.current_price,
+                        "price_source": event.source.as_str(),
+                        "routing_key": &event.routing_key,
+                        "dry_run": ctx.config.llm.execution.dry_run,
+                    }),
+                );
+                if !ctx.config.llm.execution.dry_run {
+                    if let Some(template) = action.post_fill_bracket_template.clone() {
+                        workflow_state.pending_entry_bracket_template_override =
+                            Some(template.clone());
+                        if !has_live_position {
+                            let next_snapshot = patch_entry_snapshot_levels(
+                                &snapshot,
+                                Some(template.stop_loss),
+                                Some(template.take_profit_1),
+                                Some(template.take_profit_2),
+                            );
+                            crate::workflow::persistence::save_entry_snapshot(
+                                state_dir,
+                                &next_snapshot,
+                            )?;
+                            entry_snapshots.insert(
+                                next_snapshot.context_key.clone(),
+                                next_snapshot,
+                            );
+                        }
+                    }
+                    if let Some(next_plan) =
+                        remove_pending_order_management_action(&plan, action_index)
+                    {
+                        upsert_pending_order_management_plan(
+                            workflow_state,
+                            &plan_context_key,
+                            next_plan,
+                        );
+                    } else {
+                        remove_pending_order_management_plan(workflow_state, &plan_context_key);
+                    }
+                    state_dirty = true;
+                }
+            }
+            other => {
+                append_workflow_journal_event(
+                    "workflow_stage2c_pending_order_execution_error",
+                    symbol,
+                    event.event_ts,
+                    json!({
+                        "trigger": "watcher_fast_consumer",
+                        "action": &action,
+                        "trigger_price": watch_facts.current_price,
+                        "price_source": event.source.as_str(),
+                        "routing_key": &event.routing_key,
+                        "error": format!("unsupported stage2c watcher action {}", other),
+                    }),
+                );
+            }
+        }
+
+        if state_dirty {
+            crate::workflow::persistence::save_workflow_state(state_dir, workflow_state)?;
+        }
+        return Ok(true);
+    }
+
+    if state_dirty {
+        crate::workflow::persistence::save_workflow_state(state_dir, workflow_state)?;
+    }
+    Ok(false)
 }
 
 fn execution_intent_from_entry_plan(
@@ -2802,25 +3727,86 @@ async fn handle_fast_market_event(
             .unwrap_or_else(|| default_workflow_state(&symbol));
     workflow_state.symbol = symbol.clone();
 
-    let Some(stage1_output) =
-        crate::workflow::persistence::load_stage1_output(&state_dir, &symbol)?
-    else {
-        *fast_state = None;
-        return Ok(());
-    };
-    if stage1_output.monitoring_status != "active" {
-        *fast_state = None;
+    let stage1_output = crate::workflow::persistence::load_stage1_output(&state_dir, &symbol)?;
+    let active_current_path = stage1_output
+        .as_ref()
+        .filter(|stage1| stage1.monitoring_status == "active")
+        .and_then(|stage1| stage1.current_path.as_ref())
+        .cloned();
+
+    let mut entry_snapshots =
+        crate::workflow::persistence::load_entry_snapshots_for_symbol(&state_dir, &symbol)?
+            .into_iter()
+            .map(|snapshot| (snapshot.context_key.clone(), snapshot))
+            .collect::<HashMap<_, _>>();
+
+    let trading_state = fetch_symbol_trading_state_for_fast_path(
+        &ctx.http_client,
+        &ctx.config.api.binance,
+        &ctx.config.llm.execution,
+        &symbol,
+    )
+    .await
+    .unwrap_or_else(|err| {
+        warn!(
+            symbol = %symbol,
+            trigger = "watcher_fast_consumer",
+            error = %err,
+            "workflow watcher failed to load fast trading state"
+        );
+        TradingStateSnapshot {
+            symbol: symbol.clone(),
+            has_active_context: false,
+            has_active_positions: false,
+            has_open_orders: false,
+            active_positions: Vec::new(),
+            open_orders: Vec::new(),
+            total_wallet_balance: 0.0,
+            available_balance: 0.0,
+        }
+    });
+    let watch_facts = fast_watcher_price_facts(event.price);
+
+    if process_fast_position_management_actions(
+        ctx,
+        &mut workflow_state,
+        active_current_path.as_ref(),
+        &symbol,
+        &state_dir,
+        &mut entry_snapshots,
+        &trading_state,
+        &watch_facts,
+        &event,
+    )
+    .await?
+    {
         return Ok(());
     }
-    let Some(current_path) = stage1_output.current_path.as_ref() else {
-        *fast_state = None;
+
+    if process_fast_pending_order_management_actions(
+        ctx,
+        &mut workflow_state,
+        active_current_path.as_ref(),
+        &symbol,
+        &state_dir,
+        &mut entry_snapshots,
+        &trading_state,
+        &watch_facts,
+        &event,
+    )
+    .await?
+    {
         return Ok(());
-    };
-    let current_path = current_path.clone();
+    }
+
     if workflow_state.pending_stage1_refresh_reason.is_some() {
         *fast_state = None;
         return Ok(());
     }
+    let Some(current_path) = active_current_path.as_ref() else {
+        *fast_state = None;
+        return Ok(());
+    };
     let Some(tactical_plan) = workflow_state.approved_tactical_plan.as_ref() else {
         *fast_state = None;
         return Ok(());
@@ -2886,11 +3872,6 @@ async fn handle_fast_market_event(
         );
     }
 
-    let mut entry_snapshots =
-        crate::workflow::persistence::load_entry_snapshots_for_symbol(&state_dir, &symbol)?
-            .into_iter()
-            .map(|snapshot| (snapshot.context_key.clone(), snapshot))
-            .collect::<HashMap<_, _>>();
     if entry_snapshots.contains_key(&context_key) {
         fast_plan_state.fired = true;
         return Ok(());
@@ -2932,13 +3913,14 @@ async fn handle_fast_market_event(
                 process_fast_market_event_for_plan(
                     ctx,
                     &mut workflow_state,
-                    &current_path,
+                    current_path,
                     &tactical_plan,
                     &symbol,
                     &state_dir,
                     fast_plan_state,
                     &context_key,
                     &mut entry_snapshots,
+                    &trading_state,
                     &replay_event,
                 )
                 .await?;
@@ -2973,13 +3955,14 @@ async fn handle_fast_market_event(
     process_fast_market_event_for_plan(
         ctx,
         &mut workflow_state,
-        &current_path,
+        current_path,
         &tactical_plan,
         &symbol,
         &state_dir,
         fast_plan_state,
         &context_key,
         &mut entry_snapshots,
+        &trading_state,
         &event,
     )
     .await
@@ -3033,6 +4016,13 @@ fn build_watcher_price_facts(indicators: &Value, fallback_price: f64) -> Watcher
             .map(|bar| bar.close)
             .unwrap_or(fallback_price),
         recent_bars: closed_bars,
+    }
+}
+
+fn fast_watcher_price_facts(current_price: f64) -> WatcherPriceFacts {
+    WatcherPriceFacts {
+        current_price,
+        recent_bars: Vec::new(),
     }
 }
 
@@ -6477,6 +7467,41 @@ mod tests {
     }
 
     #[test]
+    fn first_triggered_position_management_action_matches_fast_price_rule_without_recent_bars() {
+        let facts = fast_watcher_price_facts(102.0);
+        let plan = PositionManagementPlan {
+            path_id: "path_a".to_string(),
+            exposure_state: "in_position".to_string(),
+            path_live_assessment: "live".to_string(),
+            path_assessment_reason: None,
+            actions: vec![PositionManagementAction {
+                action_type: "reduce".to_string(),
+                context_key: "ETHUSDT:LONG:path_a".to_string(),
+                path_id: "path_a".to_string(),
+                trigger_condition: Some(PriceTriggerCondition {
+                    trigger_type: "price_below".to_string(),
+                    trigger_price: 103.0,
+                }),
+                execution_price: Some(101.5),
+                add_ratio: None,
+                reuse_current_entry_template: None,
+                reduce_ratio: Some(0.5),
+                new_stop_loss: None,
+                reuse_current_bracket_template: None,
+                take_profit_1: None,
+                take_profit_2: None,
+                reason: "de-risk".to_string(),
+            }],
+            management_note: "note".to_string(),
+        };
+
+        assert_eq!(
+            first_triggered_position_management_action_index(&plan, &facts),
+            Some(0)
+        );
+    }
+
+    #[test]
     fn first_triggered_pending_order_action_matches_immediate_price_rule() {
         let facts = WatcherPriceFacts {
             current_price: 99.0,
@@ -6498,6 +7523,39 @@ mod tests {
                 },
             ],
         };
+        let plan = PendingOrderManagementPlan {
+            path_id: "path_a".to_string(),
+            exposure_state: "flat_with_live_entry_orders".to_string(),
+            path_live_assessment: "degraded".to_string(),
+            path_assessment_reason: None,
+            actions: vec![PendingOrderManagementAction {
+                action_type: "cancel_pending_order".to_string(),
+                context_key: "ETHUSDT:LONG:path_a".to_string(),
+                path_id: "path_a".to_string(),
+                trigger_condition: Some(PriceTriggerCondition {
+                    trigger_type: "price_below".to_string(),
+                    trigger_price: 100.0,
+                }),
+                execution_price: None,
+                replacement_entry_zone: None,
+                replacement_entry_invalidation_level: None,
+                replacement_stop_loss: None,
+                reuse_current_entry_template: None,
+                post_fill_bracket_template: None,
+                reason: "cancel".to_string(),
+            }],
+            management_note: "note".to_string(),
+        };
+
+        assert_eq!(
+            first_triggered_pending_order_action_index(&plan, &facts),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn first_triggered_pending_order_action_matches_fast_price_rule_without_recent_bars() {
+        let facts = fast_watcher_price_facts(99.0);
         let plan = PendingOrderManagementPlan {
             path_id: "path_a".to_string(),
             exposure_state: "flat_with_live_entry_orders".to_string(),

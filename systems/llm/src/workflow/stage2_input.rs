@@ -792,6 +792,20 @@ fn workflow_positions_for_active_position(
         .collect()
 }
 
+fn workflow_position_relevance_key(position: &WorkflowPosition) -> (u8, i64, i64) {
+    position
+        .entry_snapshot
+        .as_ref()
+        .map(|snapshot| {
+            (
+                1,
+                snapshot.updated_at.timestamp_millis(),
+                snapshot.created_at.timestamp_millis(),
+            )
+        })
+        .unwrap_or((0, i64::MIN, i64::MIN))
+}
+
 fn order_direction(order: &OpenOrderSnapshot) -> Option<&'static str> {
     if order.reduce_only || order.close_position {
         return None;
@@ -854,13 +868,17 @@ pub fn stage2b_active_positions_for_current_path(
     let Some(current_path) = stage1_output.current_path.as_ref() else {
         return Vec::new();
     };
-    trading_state
+    let same_side_positions = trading_state
         .active_positions
         .iter()
         .flat_map(|position| {
             workflow_positions_for_active_position(&trading_state.symbol, position, entry_snapshots)
         })
         .filter(|position| position.direction.eq_ignore_ascii_case(&current_path.side))
+        .collect::<Vec<_>>();
+
+    let current_path_positions = same_side_positions
+        .iter()
         .filter(|position| {
             position
                 .entry_snapshot
@@ -868,6 +886,16 @@ pub fn stage2b_active_positions_for_current_path(
                 .map(|snapshot| snapshot.path_id == current_path.id)
                 .unwrap_or(true)
         })
+        .cloned()
+        .collect::<Vec<_>>();
+    if !current_path_positions.is_empty() {
+        return current_path_positions;
+    }
+
+    same_side_positions
+        .into_iter()
+        .max_by_key(workflow_position_relevance_key)
+        .into_iter()
         .collect()
 }
 
@@ -975,19 +1003,20 @@ pub fn build_stage2c_prompt_input(
 mod tests {
     use super::{
         aggregate_kline_history_5m, build_stage2a_prompt_input, build_stage2b_prompt_input,
-        build_stage2c_prompt_input,
+        build_stage2c_prompt_input, stage2b_active_positions_for_current_path,
     };
     use crate::execution::binance::TradingStateSnapshot;
     use crate::llm::input::ManagementSnapshotForLlm;
     use crate::llm::input::ModelInvocationInput;
     use crate::workflow::code_layer::build_indicator_summary;
     use crate::workflow::schema::{
-        CurrentPath, MapSummary, OpportunityAssessment, PendingOrderManagementPlan,
+        CurrentPath, EntrySnapshot, MapSummary, OpportunityAssessment, PendingOrderManagementPlan,
         PositionManagementPlan, PriceZone, ReevaluationTrigger, Stage1Meta, Stage1Output,
         TrackedZone, WorkflowPendingOrder, WorkflowPosition,
     };
     use chrono::{DateTime, Utc};
     use serde_json::json;
+    use std::collections::HashMap;
 
     #[test]
     fn aggregate_kline_history_5m_builds_complete_bars_from_1m() {
@@ -1420,6 +1449,96 @@ mod tests {
             post_fill_bracket_template: None,
             entry_snapshot: None,
         }
+    }
+
+    #[test]
+    fn stage2b_active_positions_fall_back_to_latest_same_side_snapshot_when_path_switched() {
+        let stage1_output = sample_stage1_output();
+        let trading_state = TradingStateSnapshot {
+            symbol: "TESTUSDT".to_string(),
+            has_active_context: true,
+            has_active_positions: true,
+            has_open_orders: false,
+            active_positions: vec![crate::execution::binance::ActivePositionSnapshot {
+                position_side: "LONG".to_string(),
+                position_amt: 1.0,
+                entry_price: 101.0,
+                mark_price: 103.5,
+                unrealized_pnl: 2.5,
+                leverage: 3,
+            }],
+            open_orders: Vec::new(),
+            total_wallet_balance: 1000.0,
+            available_balance: 750.0,
+        };
+        let older_snapshot = EntrySnapshot {
+            symbol: "TESTUSDT".to_string(),
+            context_key: "TESTUSDT:LONG:path_older".to_string(),
+            path_id: "path_older".to_string(),
+            side: "LONG".to_string(),
+            entry_profile: Some("pullback_acceptance".to_string()),
+            intent_mode: Some("pullback".to_string()),
+            entry_activation_level: None,
+            entry_zone: None,
+            entry_invalidation_level: None,
+            max_drift_pct: Some(0.2),
+            stop_loss: 96.0,
+            take_profit_1: 106.0,
+            take_profit_2: 109.0,
+            allowed_stop_loss_levels: vec![96.0],
+            allowed_take_profit_levels: vec![106.0, 109.0],
+            tp1_realized: false,
+            applied_driver_deterioration_signals: Vec::new(),
+            created_at: DateTime::parse_from_rfc3339("2026-03-30T05:00:00Z")
+                .expect("older created")
+                .with_timezone(&Utc),
+            updated_at: DateTime::parse_from_rfc3339("2026-03-30T05:10:00Z")
+                .expect("older updated")
+                .with_timezone(&Utc),
+        };
+        let newer_snapshot = EntrySnapshot {
+            symbol: "TESTUSDT".to_string(),
+            context_key: "TESTUSDT:LONG:path_previous".to_string(),
+            path_id: "path_previous".to_string(),
+            side: "LONG".to_string(),
+            entry_profile: Some("pullback_acceptance".to_string()),
+            intent_mode: Some("pullback".to_string()),
+            entry_activation_level: None,
+            entry_zone: None,
+            entry_invalidation_level: None,
+            max_drift_pct: Some(0.2),
+            stop_loss: 97.0,
+            take_profit_1: 107.0,
+            take_profit_2: 110.0,
+            allowed_stop_loss_levels: vec![97.0],
+            allowed_take_profit_levels: vec![107.0, 110.0],
+            tp1_realized: false,
+            applied_driver_deterioration_signals: Vec::new(),
+            created_at: DateTime::parse_from_rfc3339("2026-03-31T05:00:00Z")
+                .expect("newer created")
+                .with_timezone(&Utc),
+            updated_at: DateTime::parse_from_rfc3339("2026-03-31T05:10:00Z")
+                .expect("newer updated")
+                .with_timezone(&Utc),
+        };
+        let entry_snapshots = HashMap::from([
+            (older_snapshot.context_key.clone(), older_snapshot),
+            (newer_snapshot.context_key.clone(), newer_snapshot),
+        ]);
+
+        let positions =
+            stage2b_active_positions_for_current_path(&stage1_output, &trading_state, &entry_snapshots);
+
+        assert_eq!(positions.len(), 1);
+        assert_eq!(positions[0].context_key, "TESTUSDT:LONG:path_previous");
+        assert_eq!(
+            positions[0]
+                .entry_snapshot
+                .as_ref()
+                .expect("fallback snapshot")
+                .path_id,
+            "path_previous"
+        );
     }
 
     #[test]

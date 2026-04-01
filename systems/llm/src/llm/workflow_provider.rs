@@ -679,26 +679,34 @@ fn selected_models(config: &RootConfig) -> Vec<LlmModelConfig> {
 
 const STAGE2_RETRY_DELAY: Duration = Duration::from_millis(250);
 
-fn should_retry_workflow_stage_once(
-    stage: WorkflowPromptStage,
-    model: &LlmModelConfig,
-    error: Option<&str>,
-) -> bool {
-    if stage == WorkflowPromptStage::Stage1 || !model.provider.eq_ignore_ascii_case("custom_llm") {
-        return false;
-    }
-    let Some(error) = error else {
-        return false;
-    };
+fn is_retryable_transient_provider_error(error: &str) -> bool {
     let normalized = error.to_ascii_lowercase();
-    normalized.contains("invalid schema for response_format")
-        || normalized.contains("call workflow custom_llm api")
-        || normalized.contains("status=408")
+    normalized.contains("status=408")
         || normalized.contains("status=429")
         || normalized.contains("status=500")
         || normalized.contains("status=502")
         || normalized.contains("status=503")
         || normalized.contains("status=504")
+        || normalized.contains("bad gateway")
+}
+
+fn should_retry_workflow_stage_once(
+    stage: WorkflowPromptStage,
+    model: &LlmModelConfig,
+    error: Option<&str>,
+) -> bool {
+    let Some(error) = error else {
+        return false;
+    };
+    if is_retryable_transient_provider_error(error) {
+        return true;
+    }
+    if stage == WorkflowPromptStage::Stage1 || !model.provider.eq_ignore_ascii_case("custom_llm") {
+        return false;
+    }
+    let normalized = error.to_ascii_lowercase();
+    normalized.contains("invalid schema for response_format")
+        || normalized.contains("call workflow custom_llm api")
 }
 
 async fn invoke_provider_stage_once(
@@ -1101,7 +1109,28 @@ mod tests {
     }
 
     #[test]
-    fn retry_policy_retries_non_stage1_custom_llm_errors_once() {
+    fn retry_policy_retries_transient_http_errors_once_even_for_stage1() {
+        let custom_llm = LlmModelConfig {
+            name: "custom_llm_default".to_string(),
+            provider: "custom_llm".to_string(),
+            model: "gpt-5.4-xhigh".to_string(),
+            use_openrouter: None,
+            enabled: true,
+            temperature: 0.1,
+            max_tokens: 1200,
+            stage1_reasoning: None,
+            stage2_reasoning: None,
+            reasoning: None,
+        };
+        assert!(should_retry_workflow_stage_once(
+            WorkflowPromptStage::Stage1,
+            &custom_llm,
+            Some("workflow custom_llm status=502 Bad Gateway body={\"error\":{\"message\":\"server_error\"}}"),
+        ));
+    }
+
+    #[test]
+    fn retry_policy_keeps_non_stage1_custom_llm_schema_retry() {
         let custom_llm = LlmModelConfig {
             name: "custom_llm_default".to_string(),
             provider: "custom_llm".to_string(),
