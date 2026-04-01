@@ -770,7 +770,9 @@ fn live_exit_prices_for_position(
     let same_position_side = |order: &OpenOrderSnapshot| {
         position.position_side.eq_ignore_ascii_case("BOTH")
             || order.position_side.eq_ignore_ascii_case("BOTH")
-            || order.position_side.eq_ignore_ascii_case(&position.position_side)
+            || order
+                .position_side
+                .eq_ignore_ascii_case(&position.position_side)
     };
     let exit_prices = open_orders
         .iter()
@@ -815,8 +817,7 @@ fn workflow_positions_for_active_position(
         "SHORT"
     }
     .to_string();
-    let (current_tp_price, current_sl_price) =
-        live_exit_prices_for_position(position, open_orders);
+    let (current_tp_price, current_sl_price) = live_exit_prices_for_position(position, open_orders);
     let matching_snapshots = entry_snapshots
         .values()
         .filter(|snapshot| snapshot_matches_direction(snapshot, symbol, &direction))
@@ -996,7 +997,6 @@ pub fn build_stage2a_prompt_input(
     input: &ModelInvocationInput,
     summary: &StrategicIndicatorSummary,
     stage1_output: &Stage1Output,
-    trading_state: &TradingStateSnapshot,
 ) -> Stage2APromptInput {
     Stage2APromptInput {
         task: "Review the current strategic path and design the tactical entry from the dedicated Stage2 context"
@@ -1008,7 +1008,6 @@ pub fn build_stage2a_prompt_input(
         driver_guardrail_snapshot: build_driver_guardrail_snapshot(summary),
         options_guardrail_snapshot: build_options_guardrail_snapshot(summary, stage1_output),
         stage1_output: stage1_output.clone(),
-        account: build_account_context(trading_state),
     }
 }
 
@@ -1594,8 +1593,11 @@ mod tests {
             (newer_snapshot.context_key.clone(), newer_snapshot),
         ]);
 
-        let positions =
-            stage2b_active_positions_for_current_path(&stage1_output, &trading_state, &entry_snapshots);
+        let positions = stage2b_active_positions_for_current_path(
+            &stage1_output,
+            &trading_state,
+            &entry_snapshots,
+        );
 
         assert_eq!(positions.len(), 1);
         assert_eq!(positions[0].context_key, "TESTUSDT:LONG:path_previous");
@@ -1686,8 +1688,11 @@ mod tests {
         let entry_snapshots =
             HashMap::from([(entry_snapshot.context_key.clone(), entry_snapshot.clone())]);
 
-        let positions =
-            stage2b_active_positions_for_current_path(&stage1_output, &trading_state, &entry_snapshots);
+        let positions = stage2b_active_positions_for_current_path(
+            &stage1_output,
+            &trading_state,
+            &entry_snapshots,
+        );
 
         assert_eq!(positions.len(), 1);
         assert_eq!(positions[0].context_key, entry_snapshot.context_key);
@@ -1759,8 +1764,11 @@ mod tests {
         let entry_snapshots =
             HashMap::from([(entry_snapshot.context_key.clone(), entry_snapshot.clone())]);
 
-        let positions =
-            stage2b_active_positions_for_current_path(&stage1_output, &trading_state, &entry_snapshots);
+        let positions = stage2b_active_positions_for_current_path(
+            &stage1_output,
+            &trading_state,
+            &entry_snapshots,
+        );
 
         assert_eq!(positions.len(), 1);
         assert_eq!(positions[0].context_key, entry_snapshot.context_key);
@@ -1779,8 +1787,7 @@ mod tests {
             .tracked_zones
             .clone();
         let summary = build_indicator_summary(&input, &tracked_zones).expect("indicator summary");
-        let prompt =
-            build_stage2a_prompt_input(&input, &summary, &stage1_output, &sample_trading_state());
+        let prompt = build_stage2a_prompt_input(&input, &summary, &stage1_output);
         let encoded = serde_json::to_value(&prompt).expect("encode prompt");
 
         for key in [
@@ -1788,10 +1795,13 @@ mod tests {
             "entry_location_context_15m",
             "continuity_confirmation_context_5m",
             "stage1_output",
-            "account",
         ] {
             assert!(encoded.get(key).is_some(), "missing key {key}");
         }
+        assert!(
+            encoded.get("account").is_none(),
+            "legacy key leaked: account"
+        );
         for legacy_key in [
             "latest_15m_trigger_facts",
             "path_runtime_state",

@@ -442,8 +442,6 @@ pub struct LlmConfig {
     pub bundle_stale_secs: u64,
     #[serde(default = "default_bundle_consume_stale_secs")]
     pub bundle_consume_stale_secs: u64,
-    #[serde(default = "default_bundle_execution_stale_secs")]
-    pub bundle_execution_stale_secs: u64,
     #[serde(default)]
     pub temp_cache_retention_hours: Option<u64>,
     #[serde(default, rename = "temp_cache_retention_minutes")]
@@ -477,7 +475,6 @@ impl Default for LlmConfig {
             bundle_settle_ms: default_bundle_settle_ms(),
             bundle_stale_secs: default_bundle_stale_secs(),
             bundle_consume_stale_secs: default_bundle_consume_stale_secs(),
-            bundle_execution_stale_secs: default_bundle_execution_stale_secs(),
             temp_cache_retention_hours: Some(default_temp_cache_retention_hours()),
             temp_cache_retention_minutes_legacy: None,
             print_response: default_print_response(),
@@ -597,8 +594,6 @@ impl Default for WorkflowLimitsConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct WorkflowWatcherConfig {
-    #[serde(default = "default_watcher_evaluate_on")]
-    pub evaluate_on: String,
     #[serde(default = "default_watcher_entry_attempt_window")]
     pub entry_attempt_window: String,
     #[serde(default = "default_watcher_entry_ttl_minutes")]
@@ -618,7 +613,6 @@ pub struct WorkflowWatcherConfig {
 impl Default for WorkflowWatcherConfig {
     fn default() -> Self {
         Self {
-            evaluate_on: default_watcher_evaluate_on(),
             entry_attempt_window: default_watcher_entry_attempt_window(),
             entry_ttl_minutes: default_watcher_entry_ttl_minutes(),
             max_filled_stopout_attempts: default_watcher_max_filled_stopout_attempts(),
@@ -632,10 +626,6 @@ impl Default for WorkflowWatcherConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct WorkflowWatcherPricePredicatesConfig {
-    #[serde(default)]
-    pub price_above_on_close: ClosePredicateConfig,
-    #[serde(default)]
-    pub price_below_on_close: ClosePredicateConfig,
     #[serde(default)]
     pub entry_reclaim_confirmed: EntryReclaimPredicateConfig,
     #[serde(default)]
@@ -651,30 +641,11 @@ pub struct WorkflowWatcherPricePredicatesConfig {
 impl Default for WorkflowWatcherPricePredicatesConfig {
     fn default() -> Self {
         Self {
-            price_above_on_close: ClosePredicateConfig::default(),
-            price_below_on_close: ClosePredicateConfig::default(),
             entry_reclaim_confirmed: EntryReclaimPredicateConfig::default(),
             entry_hold_confirmed: EntryHoldPredicateConfig::default(),
             breakout_confirmed: BreakoutPredicateConfig::default(),
             pullback_acceptance_confirmed: PullbackAcceptancePredicateConfig::default(),
             failed_auction_reentry_confirmed: FailedAuctionReentryPredicateConfig::default(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct ClosePredicateConfig {
-    #[serde(default = "default_watcher_confirm_bars")]
-    pub confirm_bars: u8,
-    #[serde(default)]
-    pub min_close_bps: f64,
-}
-
-impl Default for ClosePredicateConfig {
-    fn default() -> Self {
-        Self {
-            confirm_bars: default_watcher_confirm_bars(),
-            min_close_bps: default_watcher_min_close_bps(),
         }
     }
 }
@@ -960,10 +931,6 @@ fn default_bundle_consume_stale_secs() -> u64 {
     300
 }
 
-fn default_bundle_execution_stale_secs() -> u64 {
-    300
-}
-
 fn default_workflow_stage1_refresh_hours() -> Vec<u8> {
     vec![0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22]
 }
@@ -992,10 +959,6 @@ fn default_workflow_max_live_entry_orders_per_direction() -> usize {
     1
 }
 
-fn default_watcher_evaluate_on() -> String {
-    "fast_price".to_string()
-}
-
 fn default_watcher_entry_attempt_window() -> String {
     "same_15m_window".to_string()
 }
@@ -1014,10 +977,6 @@ fn default_watcher_count_unfilled_attempts() -> bool {
 
 fn default_watcher_confirm_bars() -> u8 {
     3
-}
-
-fn default_watcher_min_close_bps() -> f64 {
-    3.0
 }
 
 fn default_watcher_retest_tolerance_bps() -> f64 {
@@ -1139,8 +1098,6 @@ fn validate_schedule_minutes(minutes: &[u8], field_name: &str) -> Result<()> {
 
 fn validate_required_predicates(predicates: &[String], field_name: &str) -> Result<()> {
     const ALLOWED: &[&str] = &[
-        "price_above_on_close",
-        "price_below_on_close",
         "entry_reclaim_confirmed",
         "entry_hold_confirmed",
         "breakout_confirmed",
@@ -1160,11 +1117,6 @@ fn validate_required_predicates(predicates: &[String], field_name: &str) -> Resu
 }
 
 fn validate_workflow_watcher_config(cfg: &WorkflowWatcherConfig) -> Result<()> {
-    if !matches!(cfg.evaluate_on.trim(), "1m_close" | "fast_price") {
-        return Err(anyhow!(
-            "llm.workflow.watcher.evaluate_on must be one of: 1m_close, fast_price"
-        ));
-    }
     if cfg.entry_attempt_window.trim() != "same_15m_window" {
         return Err(anyhow!(
             "llm.workflow.watcher.entry_attempt_window must be same_15m_window"
@@ -1185,9 +1137,7 @@ fn validate_workflow_watcher_config(cfg: &WorkflowWatcherConfig) -> Result<()> {
             "llm.workflow.watcher.count_unfilled_attempts=true is not supported yet"
         ));
     }
-    if cfg.price_predicates.price_above_on_close.confirm_bars == 0
-        || cfg.price_predicates.price_below_on_close.confirm_bars == 0
-        || cfg.price_predicates.entry_reclaim_confirmed.confirm_bars == 0
+    if cfg.price_predicates.entry_reclaim_confirmed.confirm_bars == 0
         || cfg.price_predicates.entry_hold_confirmed.hold_bars == 0
         || cfg.price_predicates.breakout_confirmed.confirm_bars == 0
         || cfg
@@ -1203,13 +1153,6 @@ fn validate_workflow_watcher_config(cfg: &WorkflowWatcherConfig) -> Result<()> {
     {
         return Err(anyhow!(
             "llm.workflow.watcher predicate confirm bars must be > 0"
-        ));
-    }
-    if cfg.price_predicates.price_above_on_close.min_close_bps < 0.0
-        || cfg.price_predicates.price_below_on_close.min_close_bps < 0.0
-    {
-        return Err(anyhow!(
-            "llm.workflow.watcher price_above_on_close/price_below_on_close min_close_bps must be >= 0"
         ));
     }
     if cfg.price_predicates.breakout_confirmed.min_break_bps <= 0.0 {
@@ -1440,19 +1383,10 @@ mod tests {
     #[test]
     fn default_workflow_watcher_config_is_stricter_and_valid() {
         let watcher = WorkflowWatcherConfig::default();
-        assert_eq!(watcher.evaluate_on, "fast_price");
         assert_eq!(watcher.entry_attempt_window, "same_15m_window");
         assert_eq!(watcher.entry_ttl_minutes, 15);
         assert_eq!(watcher.max_filled_stopout_attempts, 2);
         assert!(!watcher.count_unfilled_attempts);
-        assert_eq!(
-            watcher.price_predicates.price_above_on_close.confirm_bars,
-            3
-        );
-        assert!(
-            (watcher.price_predicates.price_above_on_close.min_close_bps - 3.0).abs()
-                < f64::EPSILON
-        );
         assert_eq!(watcher.price_predicates.breakout_confirmed.confirm_bars, 3);
         assert!(
             (watcher.price_predicates.breakout_confirmed.min_break_bps - 8.0).abs() < f64::EPSILON

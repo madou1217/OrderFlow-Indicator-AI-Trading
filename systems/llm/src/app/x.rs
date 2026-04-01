@@ -1,5 +1,5 @@
 use crate::app::config::XApiConfig;
-use crate::app::telegram::TradeSignalNotification;
+use crate::app::telegram::{format_trade_signal_message, TradeSignalNotification};
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use chrono::Utc;
@@ -221,40 +221,5 @@ fn oauth_percent_encode(input: &str) -> String {
 }
 
 fn build_trade_signal_message(signal: &TradeSignalNotification) -> String {
-    let mut parts = vec![
-        signal.decision.clone(),
-        signal.symbol.clone(),
-        format!("entry {}", format_opt_price(signal.entry_price)),
-        format!("sl {}", format_opt_price(signal.stop_loss)),
-        format!("tp1 {}", format_opt_price(signal.take_profit_1)),
-    ];
-    if signal.take_profit_2.is_some() {
-        parts.push(format!("tp2 {}", format_opt_price(signal.take_profit_2)));
-    }
-    if let Some(context_key) = signal.context_key.as_deref() {
-        parts.push(format!("ctx {}", context_key));
-    }
-    parts.push(format!("t {}", signal.ts_bucket.format("%H:%M UTC")));
-    let mut text = parts.join(" | ");
-    let reason = single_line_text(&signal.reason, 60);
-    if !reason.is_empty() {
-        text.push_str(" | ");
-        text.push_str(&reason);
-    }
-    text
-}
-
-fn single_line_text(input: &str, max_len: usize) -> String {
-    let mut output = input.split_whitespace().collect::<Vec<_>>().join(" ");
-    if output.len() > max_len {
-        output.truncate(max_len);
-        output.push_str("...");
-    }
-    output
-}
-
-fn format_opt_price(value: Option<f64>) -> String {
-    value
-        .map(|v| v.to_string())
-        .unwrap_or_else(|| "-".to_string())
+    format_trade_signal_message(signal)
 }

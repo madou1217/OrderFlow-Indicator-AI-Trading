@@ -1,0 +1,44 @@
+{
+  "symbol": "ETHUSDT",
+  "context_key": "ETHUSDT:SHORT:ethusdt_20260401_value_return_2127_2134_v1",
+  "path_id": "ethusdt_20260401_value_return_2127_2134_v1",
+  "side": "SHORT",
+  "entry_profile": "pullback_acceptance",
+  "intent_mode": "pullback",
+  "entry_activation_level": {
+    "low": 2134.07,
+    "high": 2135.42,
+    "timeframe": "15m-4h",
+    "label": "upper-band retest trigger",
+    "reason": "The strategic short is still alive, but current price is already pressing the lower half of local 15m value. A bounce back into the top of the accepted failure band and underside of 15m value offers better location than chasing near 2130 support."
+  },
+  "entry_zone": {
+    "low": 2134.4,
+    "high": 2136.33,
+    "timeframe": "15m-4h",
+    "label": "sell rejection pocket",
+    "reason": "This zone aligns the failure-band top, 15m VAH, 15m RVWAP +1/+2, and the densest recent sell-stack footprint overhead, making it the highest-quality short re-entry area."
+  },
+  "entry_invalidation_level": {
+    "low": 2136.33,
+    "high": 2137.52,
+    "timeframe": "15m-4h",
+    "label": "pullback rejection failure",
+    "reason": "Acceptance above RVWAP +2 and the upper sell-stack cluster would mean the chosen pullback-rejection structure failed and that squeeze risk is increasing toward the broader 2140+ reclaim shelf."
+  },
+  "max_drift_pct": 0.18,
+  "stop_loss": 2138.88,
+  "take_profit_1": 2120.18,
+  "take_profit_2": 2109.71,
+  "allowed_stop_loss_levels": [
+    2138.88
+  ],
+  "allowed_take_profit_levels": [
+    2120.18,
+    2109.71
+  ],
+  "tp1_realized": false,
+  "applied_driver_deterioration_signals": [],
+  "created_at": "2026-04-01T08:13:46.232610212Z",
+  "updated_at": "2026-04-01T08:13:46.232610212Z"
+}

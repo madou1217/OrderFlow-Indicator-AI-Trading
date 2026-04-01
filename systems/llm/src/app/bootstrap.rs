@@ -13,6 +13,7 @@ use tracing::{debug, info};
 use uuid::Uuid;
 
 const CONFIG_PATH: &str = "config/config.yaml";
+const WATCHER_FAST_QUEUE_TTL_MS: u32 = 15 * 60 * 1000;
 
 #[derive(Clone)]
 pub struct AppContext {
@@ -368,7 +369,7 @@ fn watcher_fast_queue_config(
                 routing_key: format!("md.futures.kline.1m.{}", symbol_lower),
             },
         ],
-        message_ttl_ms: Some(60_000),
+        message_ttl_ms: Some(WATCHER_FAST_QUEUE_TTL_MS),
         max_length: Some(4_096),
         max_length_bytes: None,
     }
@@ -418,4 +419,76 @@ fn resolve_effective_models_summary(config: &RootConfig) -> String {
     }
 
     "-".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::watcher_fast_queue_config;
+    use crate::app::config::{MqBinding, MqConfig, MqExchangeConfig, MqExchanges, MqQueueConfig};
+    use std::collections::HashMap;
+
+    #[test]
+    fn watcher_fast_queue_uses_fifteen_minute_ttl_and_fast_bindings() {
+        let mq = MqConfig {
+            host: "localhost".to_string(),
+            port: 5672,
+            vhost: "/".to_string(),
+            user: "guest".to_string(),
+            password_env: "RABBITMQ_PASSWORD".to_string(),
+            heartbeat_secs: None,
+            connection_timeout_secs: None,
+            exchanges: MqExchanges {
+                md_live: MqExchangeConfig {
+                    name: "x.md.live".to_string(),
+                    kind: "topic".to_string(),
+                    durable: true,
+                },
+                md_replay: MqExchangeConfig {
+                    name: "x.md.replay".to_string(),
+                    kind: "topic".to_string(),
+                    durable: true,
+                },
+                ind: MqExchangeConfig {
+                    name: "x.ind".to_string(),
+                    kind: "topic".to_string(),
+                    durable: true,
+                },
+                dlx: MqExchangeConfig {
+                    name: "x.dlx".to_string(),
+                    kind: "topic".to_string(),
+                    durable: true,
+                },
+            },
+            queues: HashMap::new(),
+        };
+        let base_queue_cfg = MqQueueConfig {
+            name: "q.llm.ind.minute".to_string(),
+            bind: vec![MqBinding {
+                exchange: "x.ind".to_string(),
+                routing_key: "bundle.1m.*".to_string(),
+            }],
+            message_ttl_ms: None,
+            max_length: None,
+            max_length_bytes: None,
+        };
+
+        let fast_queue_cfg = watcher_fast_queue_config(&mq, &base_queue_cfg, "ETHUSDT");
+
+        assert_eq!(fast_queue_cfg.name, "q.llm.ind.minute.watcher_fast.ethusdt");
+        assert_eq!(fast_queue_cfg.message_ttl_ms, Some(900_000));
+        assert_eq!(fast_queue_cfg.max_length, Some(4_096));
+        assert_eq!(fast_queue_cfg.bind.len(), 3);
+        assert_eq!(
+            fast_queue_cfg
+                .bind
+                .iter()
+                .map(|binding| binding.routing_key.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "md.futures.mark_price.ethusdt",
+                "md.agg.futures.trade.1s.ethusdt",
+                "md.futures.kline.1m.ethusdt",
+            ]
+        );
+    }
 }

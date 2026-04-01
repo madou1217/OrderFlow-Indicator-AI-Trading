@@ -56,7 +56,7 @@ impl TelegramOperator {
         let url = format!("{}/bot{}/sendMessage", self.base_api_url, self.token);
         let payload = json!({
             "chat_id": self.chat_id,
-            "text": build_trade_signal_message(signal),
+            "text": format_trade_signal_message(signal),
             "disable_web_page_preview": true,
         });
 
@@ -123,44 +123,41 @@ fn normalize_chat_id(raw: &str) -> String {
     }
 }
 
-fn build_trade_signal_message(signal: &TradeSignalNotification) -> String {
-    let mut lines = vec![
-        "Workflow Trade Signal".to_string(),
-        format!("Decision: {}", signal.decision),
-        format!("Symbol: {}", signal.symbol),
-    ];
-    if let Some(context_key) = signal.context_key.as_deref() {
-        lines.push(format!("Context: {}", context_key));
-    }
-    if let Some(path_id) = signal.path_id.as_deref() {
-        lines.push(format!("Path: {}", path_id));
-    }
-    lines.push(format!("Entry: {}", format_opt_price(signal.entry_price)));
-    lines.push(format!("TP1: {}", format_opt_price(signal.take_profit_1)));
-    lines.push(format!("TP2: {}", format_opt_price(signal.take_profit_2)));
-    lines.push(format!("SL: {}", format_opt_price(signal.stop_loss)));
-    lines.push(format!(
-        "Leverage: {}",
-        format_opt_leverage(signal.leverage)
-    ));
-    lines.push(format!(
-        "RR: {}",
-        format_opt_ratio(signal.risk_reward_ratio)
-    ));
-    lines.push(format!("Time: {} UTC", signal.ts_bucket.format("%H:%M:%S")));
-    lines.push(format!("Trigger: {}", signal.trigger));
-    lines.push(format!("Model: {}", signal.model_name));
-    lines.push(format!("Reason: {}", single_line_text(&signal.reason, 800)));
-    lines.join("\n")
+pub fn format_trade_signal_message(signal: &TradeSignalNotification) -> String {
+    [
+        decision_heading(&signal.decision).to_string(),
+        format!("📌 Symbol: {}", signal.symbol),
+        format!("🟢 Entry: {}", format_opt_price(signal.entry_price)),
+        format!("⚙️ Leverage: {}", format_opt_leverage(signal.leverage)),
+        format!("📊 RR: {}", format_opt_ratio(signal.risk_reward_ratio)),
+        format!("🎯 TP1: {}", format_opt_price(signal.take_profit_1)),
+        format!("🎯 TP2: {}", format_opt_price(signal.take_profit_2)),
+        format!("🛑 SL: {}", format_opt_price(signal.stop_loss)),
+        format!("🕒 Time: {} UTC", signal.ts_bucket.format("%H:%M:%S")),
+    ]
+    .join("\n")
 }
 
-fn single_line_text(input: &str, max_len: usize) -> String {
-    let mut output = input.split_whitespace().collect::<Vec<_>>().join(" ");
-    if output.len() > max_len {
-        output.truncate(max_len);
-        output.push_str("...");
+fn decision_heading(decision: &str) -> &'static str {
+    if decision.eq_ignore_ascii_case("LONG") {
+        "📈 LONG"
+    } else if decision.eq_ignore_ascii_case("SHORT") {
+        "📉 SHORT"
+    } else if decision.eq_ignore_ascii_case("ADD") {
+        "➕ ADD"
+    } else if decision.eq_ignore_ascii_case("REDUCE") {
+        "➖ REDUCE"
+    } else if decision.eq_ignore_ascii_case("CLOSE") {
+        "🔒 CLOSE"
+    } else if decision.eq_ignore_ascii_case("MODIFY_TPSL") {
+        "🛠 MODIFY_TPSL"
+    } else if decision.eq_ignore_ascii_case("HOLD") {
+        "⏸ HOLD"
+    } else if decision.eq_ignore_ascii_case("NO_TRADE") {
+        "🚫 NO_TRADE"
+    } else {
+        "🔔 SIGNAL"
     }
-    output
 }
 
 fn format_opt_price(value: Option<f64>) -> String {
@@ -185,4 +182,74 @@ fn format_opt_leverage(value: Option<f64>) -> String {
             }
         })
         .unwrap_or_else(|| "-".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{format_trade_signal_message, TradeSignalNotification};
+    use chrono::{DateTime, Utc};
+
+    #[test]
+    fn format_trade_signal_message_uses_structured_layout_without_reason() {
+        let ts_bucket = DateTime::parse_from_rfc3339("2026-04-01T08:36:00Z")
+            .expect("ts")
+            .with_timezone(&Utc);
+        let signal = TradeSignalNotification {
+            ts_bucket,
+            trigger: "watcher_fast_consumer".to_string(),
+            symbol: "ETHUSDT".to_string(),
+            model_name: "workflow_watcher_fast".to_string(),
+            decision: "SHORT".to_string(),
+            context_key: Some("ctx".to_string()),
+            path_id: Some("path".to_string()),
+            entry_price: Some(2142.89),
+            leverage: Some(12.0),
+            risk_reward_ratio: Some(6.84),
+            take_profit_1: Some(2113.4),
+            take_profit_2: Some(2101.8),
+            stop_loss: Some(2147.2),
+            reason: "do not show me".to_string(),
+        };
+
+        let rendered = format_trade_signal_message(&signal);
+
+        assert_eq!(
+            rendered,
+            "📉 SHORT\n📌 Symbol: ETHUSDT\n🟢 Entry: 2142.89\n⚙️ Leverage: 12\n📊 RR: 6.84\n🎯 TP1: 2113.4\n🎯 TP2: 2101.8\n🛑 SL: 2147.2\n🕒 Time: 08:36:00 UTC"
+        );
+        assert!(!rendered.contains("Reason"));
+        assert!(!rendered.contains("do not show me"));
+        assert!(!rendered.contains("Context"));
+        assert!(!rendered.contains("Path"));
+    }
+
+    #[test]
+    fn format_trade_signal_message_keeps_fixed_shape_for_missing_fields() {
+        let ts_bucket = DateTime::parse_from_rfc3339("2026-04-01T08:36:00Z")
+            .expect("ts")
+            .with_timezone(&Utc);
+        let signal = TradeSignalNotification {
+            ts_bucket,
+            trigger: "schedule".to_string(),
+            symbol: "ETHUSDT".to_string(),
+            model_name: "custom_llm".to_string(),
+            decision: "NO_TRADE".to_string(),
+            context_key: None,
+            path_id: None,
+            entry_price: None,
+            leverage: None,
+            risk_reward_ratio: None,
+            take_profit_1: None,
+            take_profit_2: None,
+            stop_loss: None,
+            reason: "path_invalidated".to_string(),
+        };
+
+        let rendered = format_trade_signal_message(&signal);
+
+        assert_eq!(
+            rendered,
+            "🚫 NO_TRADE\n📌 Symbol: ETHUSDT\n🟢 Entry: -\n⚙️ Leverage: -\n📊 RR: -\n🎯 TP1: -\n🎯 TP2: -\n🛑 SL: -\n🕒 Time: 08:36:00 UTC"
+        );
+    }
 }

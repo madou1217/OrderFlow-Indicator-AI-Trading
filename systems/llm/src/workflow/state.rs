@@ -21,6 +21,8 @@ pub struct WorkflowState {
     #[serde(default)]
     pub approved_tactical_plan_source_ts_bucket: Option<DateTime<Utc>>,
     #[serde(default)]
+    pub approved_tactical_plan_replayed_at: Option<DateTime<Utc>>,
+    #[serde(default)]
     pub approved_position_management_plans: BTreeMap<String, PositionManagementPlan>,
     #[serde(default)]
     pub approved_position_management_plans_updated_at: BTreeMap<String, DateTime<Utc>>,

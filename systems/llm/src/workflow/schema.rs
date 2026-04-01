@@ -547,7 +547,6 @@ pub struct Stage2APromptInput {
     #[serde(default)]
     pub options_guardrail_snapshot: Option<Value>,
     pub stage1_output: Stage1Output,
-    pub account: WorkflowAccountContext,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

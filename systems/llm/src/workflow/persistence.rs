@@ -119,153 +119,6 @@ fn migrate_legacy_plan_fields(
     }
 }
 
-fn migrate_position_management_action_trigger_contract(action: &mut Map<String, Value>) -> bool {
-    if action.contains_key("trigger_condition") {
-        return false;
-    }
-    let Some(legacy_trigger) = action.remove("watcher_trigger_condition") else {
-        return false;
-    };
-
-    let action_type = action
-        .get("action_type")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let mut execution_price = Value::Null;
-    let trigger_condition = if let Some(trigger) = legacy_trigger.as_object() {
-        let trigger_type = trigger
-            .get("trigger_type")
-            .and_then(Value::as_str)
-            .map(|value| match value {
-                "price_above_on_close" => "price_above",
-                "price_below_on_close" => "price_below",
-                other => other,
-            })
-            .unwrap_or("price_below");
-        let trigger_level = trigger
-            .get("trigger_level")
-            .and_then(Value::as_f64)
-            .unwrap_or_default();
-        if matches!(action_type, "reduce" | "exit_full") {
-            execution_price = Value::from(trigger_level);
-        }
-        serde_json::json!({
-            "trigger_type": trigger_type,
-            "trigger_price": trigger_level,
-        })
-    } else {
-        Value::Null
-    };
-    action.insert("trigger_condition".to_string(), trigger_condition);
-    action.insert("execution_price".to_string(), execution_price);
-    true
-}
-
-fn migrate_pending_order_action_trigger_contract(action: &mut Map<String, Value>) -> bool {
-    if action.contains_key("trigger_condition") {
-        return false;
-    }
-    let Some(legacy_trigger) = action.remove("watcher_trigger_condition") else {
-        return false;
-    };
-    let trigger_condition = if let Some(trigger) = legacy_trigger.as_object() {
-        let trigger_type = trigger
-            .get("trigger_type")
-            .and_then(Value::as_str)
-            .map(|value| match value {
-                "price_above_on_close" => "price_above",
-                "price_below_on_close" => "price_below",
-                other => other,
-            })
-            .unwrap_or("price_below");
-        let trigger_level = trigger
-            .get("trigger_level")
-            .and_then(Value::as_f64)
-            .unwrap_or_default();
-        serde_json::json!({
-            "trigger_type": trigger_type,
-            "trigger_price": trigger_level,
-        })
-    } else {
-        Value::Null
-    };
-    action.insert("trigger_condition".to_string(), trigger_condition);
-    action.insert("execution_price".to_string(), Value::Null);
-    true
-}
-
-fn migrate_position_management_plan_trigger_contract(plan: &mut Map<String, Value>) -> bool {
-    let Some(actions) = plan.get_mut("actions").and_then(Value::as_array_mut) else {
-        return false;
-    };
-    let mut migrated = false;
-    for action in actions {
-        let Some(action) = action.as_object_mut() else {
-            continue;
-        };
-        migrated |= migrate_position_management_action_trigger_contract(action);
-    }
-    migrated
-}
-
-fn migrate_position_management_trigger_contracts(object: &mut Map<String, Value>) -> bool {
-    let mut migrated = false;
-    if let Some(plan) = object
-        .get_mut("approved_position_management_plan")
-        .and_then(Value::as_object_mut)
-    {
-        migrated |= migrate_position_management_plan_trigger_contract(plan);
-    }
-    if let Some(plans) = object
-        .get_mut("approved_position_management_plans")
-        .and_then(Value::as_object_mut)
-    {
-        for plan in plans.values_mut() {
-            let Some(plan) = plan.as_object_mut() else {
-                continue;
-            };
-            migrated |= migrate_position_management_plan_trigger_contract(plan);
-        }
-    }
-    migrated
-}
-
-fn migrate_pending_order_plan_trigger_contract(plan: &mut Map<String, Value>) -> bool {
-    let Some(actions) = plan.get_mut("actions").and_then(Value::as_array_mut) else {
-        return false;
-    };
-    let mut migrated = false;
-    for action in actions {
-        let Some(action) = action.as_object_mut() else {
-            continue;
-        };
-        migrated |= migrate_pending_order_action_trigger_contract(action);
-    }
-    migrated
-}
-
-fn migrate_pending_order_trigger_contracts(object: &mut Map<String, Value>) -> bool {
-    let mut migrated = false;
-    if let Some(plan) = object
-        .get_mut("approved_pending_order_management_plan")
-        .and_then(Value::as_object_mut)
-    {
-        migrated |= migrate_pending_order_plan_trigger_contract(plan);
-    }
-    if let Some(plans) = object
-        .get_mut("approved_pending_order_management_plans")
-        .and_then(Value::as_object_mut)
-    {
-        for plan in plans.values_mut() {
-            let Some(plan) = plan.as_object_mut() else {
-                continue;
-            };
-            migrated |= migrate_pending_order_plan_trigger_contract(plan);
-        }
-    }
-    migrated
-}
-
 fn write_json<T: serde::Serialize + ?Sized>(path: &Path, value: &T) -> Result<()> {
     let data = serde_json::to_vec_pretty(value)
         .with_context(|| format!("serialize workflow json {}", path.display()))?;
@@ -343,8 +196,6 @@ pub fn load_workflow_state(state_dir: &str, symbol: &str) -> Result<Option<Workf
             "approved_pending_order_management_plans",
             "approved_pending_order_management_plans_updated_at",
         );
-        migrate_position_management_trigger_contracts(object);
-        migrate_pending_order_trigger_contracts(object);
     }
     serde_json::from_value(value)
         .with_context(|| format!("parse workflow json {}", path.display()))
@@ -570,7 +421,8 @@ mod tests {
                     "action_type": "hold",
                     "context_key": "ETHUSDT:LONG:path_a",
                     "path_id": "path_a",
-                    "watcher_trigger_condition": null,
+                    "trigger_condition": null,
+                    "execution_price": null,
                     "add_ratio": null,
                     "reuse_current_entry_template": null,
                     "reduce_ratio": null,
@@ -592,7 +444,8 @@ mod tests {
                     "action_type": "keep_order",
                     "context_key": "ETHUSDT:LONG:path_a",
                     "path_id": "path_a",
-                    "watcher_trigger_condition": null,
+                    "trigger_condition": null,
+                    "execution_price": null,
                     "replacement_entry_zone": null,
                     "replacement_entry_invalidation_level": null,
                     "replacement_stop_loss": null,
@@ -645,175 +498,6 @@ mod tests {
             .expect("loaded pending plan");
         assert!(loaded_pending_plan.actions[0].trigger_condition.is_none());
         assert!(loaded_pending_plan.actions[0].execution_price.is_none());
-
-        let _ = fs::remove_dir_all(&state_dir);
-    }
-
-    #[test]
-    fn load_workflow_state_migrates_legacy_position_trigger_contract() {
-        let state_dir = format!("/tmp/workflow_test_state_trigger_{}", Uuid::new_v4());
-        fs::create_dir_all(&state_dir).expect("create state dir");
-        let path = super::workflow_state_path(&state_dir, "ETHUSDT").expect("state path");
-        let legacy = serde_json::json!({
-            "symbol": "ETHUSDT",
-            "pending_stage1_refresh_reason": null,
-            "last_stage1_ts": null,
-            "approved_tactical_plan": null,
-            "approved_tactical_plan_updated_at": null,
-            "approved_position_management_plans": {
-                "ETHUSDT:LONG:path_a": {
-                    "path_id": "path_a",
-                    "exposure_state": "in_position",
-                    "path_live_assessment": "degraded",
-                    "path_assessment_reason": "legacy",
-                    "actions": [{
-                        "action_type": "reduce",
-                        "context_key": "ETHUSDT:LONG:path_a",
-                        "path_id": "path_a",
-                        "watcher_trigger_condition": {
-                            "trigger_type": "price_below_on_close",
-                            "trigger_level": 2045.2,
-                            "note": "legacy"
-                        },
-                        "add_ratio": null,
-                        "reuse_current_entry_template": null,
-                        "reduce_ratio": 0.5,
-                        "new_stop_loss": null,
-                        "reuse_current_bracket_template": null,
-                        "take_profit_1": null,
-                        "take_profit_2": null,
-                        "reason": "legacy reduce"
-                    }],
-                    "management_note": "legacy"
-                }
-            },
-            "approved_position_management_plans_updated_at": {
-                "ETHUSDT:LONG:path_a": Utc::now()
-            },
-            "approved_pending_order_management_plans": {},
-            "approved_pending_order_management_plans_updated_at": {},
-            "pending_entry_bracket_template_override": null,
-            "active_15m_window_start": null,
-            "filled_stopout_attempts": 0,
-            "last_filled_context_key": null
-        });
-        fs::write(
-            &path,
-            serde_json::to_vec_pretty(&legacy).expect("serialize legacy"),
-        )
-        .expect("write legacy state");
-
-        let loaded = load_workflow_state(&state_dir, "ETHUSDT")
-            .expect("load state")
-            .expect("state exists");
-        let action = &loaded
-            .approved_position_management_plans
-            .get("ETHUSDT:LONG:path_a")
-            .expect("plan")
-            .actions[0];
-
-        assert_eq!(
-            action
-                .trigger_condition
-                .as_ref()
-                .expect("trigger condition")
-                .trigger_type,
-            "price_below"
-        );
-        assert_eq!(
-            action
-                .trigger_condition
-                .as_ref()
-                .expect("trigger condition")
-                .trigger_price,
-            2045.2
-        );
-        assert_eq!(action.execution_price, Some(2045.2));
-
-        let _ = fs::remove_dir_all(&state_dir);
-    }
-
-    #[test]
-    fn load_workflow_state_migrates_legacy_pending_order_trigger_contract() {
-        let state_dir = format!(
-            "/tmp/workflow_test_state_pending_trigger_{}",
-            Uuid::new_v4()
-        );
-        fs::create_dir_all(&state_dir).expect("create state dir");
-        let path = super::workflow_state_path(&state_dir, "ETHUSDT").expect("state path");
-        let legacy = serde_json::json!({
-            "symbol": "ETHUSDT",
-            "pending_stage1_refresh_reason": null,
-            "last_stage1_ts": null,
-            "approved_tactical_plan": null,
-            "approved_tactical_plan_updated_at": null,
-            "approved_position_management_plans": {},
-            "approved_position_management_plans_updated_at": {},
-            "approved_pending_order_management_plans": {
-                "ETHUSDT:LONG:path_a": {
-                    "path_id": "path_a",
-                    "exposure_state": "flat_with_live_entry_orders",
-                    "path_live_assessment": "degraded",
-                    "path_assessment_reason": "legacy",
-                    "actions": [{
-                        "action_type": "cancel_pending_order",
-                        "context_key": "ETHUSDT:LONG:path_a",
-                        "path_id": "path_a",
-                        "watcher_trigger_condition": {
-                            "trigger_type": "price_above_on_close",
-                            "trigger_level": 2050.0,
-                            "note": "legacy"
-                        },
-                        "replacement_entry_zone": null,
-                        "replacement_entry_invalidation_level": null,
-                        "replacement_stop_loss": null,
-                        "reuse_current_entry_template": null,
-                        "post_fill_bracket_template": null,
-                        "reason": "legacy cancel"
-                    }],
-                    "management_note": "legacy"
-                }
-            },
-            "approved_pending_order_management_plans_updated_at": {
-                "ETHUSDT:LONG:path_a": Utc::now()
-            },
-            "pending_entry_bracket_template_override": null,
-            "active_15m_window_start": null,
-            "filled_stopout_attempts": 0,
-            "last_filled_context_key": null
-        });
-        fs::write(
-            &path,
-            serde_json::to_vec_pretty(&legacy).expect("serialize legacy"),
-        )
-        .expect("write legacy state");
-
-        let loaded = load_workflow_state(&state_dir, "ETHUSDT")
-            .expect("load state")
-            .expect("state exists");
-        let action = &loaded
-            .approved_pending_order_management_plans
-            .get("ETHUSDT:LONG:path_a")
-            .expect("plan")
-            .actions[0];
-
-        assert_eq!(
-            action
-                .trigger_condition
-                .as_ref()
-                .expect("trigger condition")
-                .trigger_type,
-            "price_above"
-        );
-        assert_eq!(
-            action
-                .trigger_condition
-                .as_ref()
-                .expect("trigger condition")
-                .trigger_price,
-            2050.0
-        );
-        assert!(action.execution_price.is_none());
 
         let _ = fs::remove_dir_all(&state_dir);
     }

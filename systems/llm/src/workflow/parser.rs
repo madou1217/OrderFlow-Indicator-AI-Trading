@@ -1569,10 +1569,7 @@ mod tests {
 
         let parsed =
             parse_stage2b_output(value, &stage1_output, "ctx_1", "legacy_path").expect("parse");
-        assert_eq!(
-            parsed.position_management_plan.path_id,
-            "legacy_path"
-        );
+        assert_eq!(parsed.position_management_plan.path_id, "legacy_path");
     }
 
     #[test]
@@ -1606,8 +1603,8 @@ mod tests {
                 "management_note": "bad add"
             }
         });
-        let err =
-            parse_stage2b_output(value, &stage1_output, "ctx_1", "path_1").expect_err("should fail");
+        let err = parse_stage2b_output(value, &stage1_output, "ctx_1", "path_1")
+            .expect_err("should fail");
         assert!(err
             .to_string()
             .contains("position_management_plan.actions[].take_profit_1 must be null for add"));
@@ -1645,8 +1642,8 @@ mod tests {
             }
         });
 
-        let err =
-            parse_stage2b_output(value, &stage1_output, "ctx_1", "path_1").expect_err("should fail");
+        let err = parse_stage2b_output(value, &stage1_output, "ctx_1", "path_1")
+            .expect_err("should fail");
         assert!(err.to_string().contains("reduce requires execution_price"));
     }
 
@@ -1769,8 +1766,8 @@ mod tests {
             }
         });
 
-        let err =
-            parse_stage2b_output(value, &stage1_output, "ctx_1", "path_1").expect_err("should fail");
+        let err = parse_stage2b_output(value, &stage1_output, "ctx_1", "path_1")
+            .expect_err("should fail");
         assert!(err
             .to_string()
             .contains("position_management_plan.actions[].context_key must match the current Stage2B context_key"));
