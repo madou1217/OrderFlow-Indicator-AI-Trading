@@ -489,6 +489,8 @@ pub struct Stage2AOutput {
     pub tactical_entry_plan: Option<TacticalEntryPlan>,
     #[serde(default)]
     pub reevaluation_reason: Option<String>,
+    #[serde(default)]
+    pub wait_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -666,7 +668,7 @@ mod tests {
     #[test]
     fn stage2a_output_roundtrips_single_entry_plan() {
         let output = Stage2AOutput {
-            stage2_decision: "PATH_CONFIRMED".to_string(),
+            stage2_decision: "PATH_CONFIRMED_ENTRY".to_string(),
             path_audit_note: "path still live".to_string(),
             tactical_entry_plan: Some(TacticalEntryPlan {
                 path_id: "path_a".to_string(),
@@ -704,11 +706,33 @@ mod tests {
                 },
             }),
             reevaluation_reason: None,
+            wait_reason: None,
         };
         let encoded = serde_json::to_value(&output).expect("encode");
         let decoded: Stage2AOutput = serde_json::from_value(encoded).expect("decode");
-        assert_eq!(decoded.stage2_decision, "PATH_CONFIRMED");
+        assert_eq!(decoded.stage2_decision, "PATH_CONFIRMED_ENTRY");
         assert!(decoded.tactical_entry_plan.is_some());
+    }
+
+    #[test]
+    fn stage2a_output_roundtrips_wait_state() {
+        let output = Stage2AOutput {
+            stage2_decision: "PATH_CONFIRMED_WAIT".to_string(),
+            path_audit_note: "path still live but entry quality is not there yet".to_string(),
+            tactical_entry_plan: None,
+            reevaluation_reason: None,
+            wait_reason: Some(
+                "Price is still inside a noisy value pocket and reward is compressed.".to_string(),
+            ),
+        };
+        let encoded = serde_json::to_value(&output).expect("encode");
+        let decoded: Stage2AOutput = serde_json::from_value(encoded).expect("decode");
+        assert_eq!(decoded.stage2_decision, "PATH_CONFIRMED_WAIT");
+        assert!(decoded.tactical_entry_plan.is_none());
+        assert_eq!(
+            decoded.wait_reason.as_deref(),
+            Some("Price is still inside a noisy value pocket and reward is compressed.")
+        );
     }
 
     #[test]

@@ -1358,7 +1358,7 @@ pub fn build_stage2a_prompt_input(
     stage1_output: &Stage1Output,
 ) -> Stage2APromptInput {
     Stage2APromptInput {
-        task: "Review the current strategic path and design the tactical entry from the dedicated Stage2 context"
+        task: "Review the current strategic path and either arm a tactical entry, explicitly wait without trading, or request a Stage1 reevaluation from the dedicated Stage2 context"
             .to_string(),
         strategic_context_frozen: build_strategic_context_frozen(summary, stage1_output),
         entry_location_context_15m: build_entry_location_context_15m(input, summary, stage1_output),

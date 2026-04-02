@@ -530,10 +530,18 @@ fn inject_derived_stage2a_fields(value: &mut Value, current_path: &CurrentPath) 
 pub fn parse_stage2a_output(value: Value, stage1_output: &Stage1Output) -> Result<Stage2AOutput> {
     let current_path = stage1_output.current_path.as_ref();
     let mut normalized = value;
+    if let Some(object) = normalized.as_object_mut() {
+        if object.get("stage2_decision").and_then(Value::as_str) == Some("PATH_CONFIRMED") {
+            object.insert(
+                "stage2_decision".to_string(),
+                Value::String("PATH_CONFIRMED_ENTRY".to_string()),
+            );
+        }
+    }
     if let Some(current_path) = current_path {
         inject_derived_stage2a_fields(&mut normalized, current_path)?;
     }
-    if normalized.get("stage2_decision").and_then(Value::as_str) == Some("PATH_CONFIRMED") {
+    if normalized.get("stage2_decision").and_then(Value::as_str) == Some("PATH_CONFIRMED_ENTRY") {
         let has_leverage = normalized
             .get("tactical_entry_plan")
             .and_then(|plan| plan.get("entry_plan"))
@@ -542,17 +550,17 @@ pub fn parse_stage2a_output(value: Value, stage1_output: &Stage1Output) -> Resul
             .unwrap_or(false);
         if !has_leverage {
             return Err(anyhow!(
-                "PATH_CONFIRMED requires tactical_entry_plan.entry_plan.leverage"
+                "PATH_CONFIRMED_ENTRY requires tactical_entry_plan.entry_plan.leverage"
             ));
         }
     }
     let mut output: Stage2AOutput = serde_json::from_value(normalized)?;
     if !matches!(
         output.stage2_decision.as_str(),
-        "PATH_CONFIRMED" | "REQUEST_STAGE1_REEVALUATION"
+        "PATH_CONFIRMED_ENTRY" | "PATH_CONFIRMED_WAIT" | "REQUEST_STAGE1_REEVALUATION"
     ) {
         return Err(anyhow!(
-            "stage2_decision must be PATH_CONFIRMED or REQUEST_STAGE1_REEVALUATION"
+            "stage2_decision must be PATH_CONFIRMED_ENTRY, PATH_CONFIRMED_WAIT, or REQUEST_STAGE1_REEVALUATION"
         ));
     }
     if output.path_audit_note.trim().is_empty() {
@@ -576,19 +584,53 @@ pub fn parse_stage2a_output(value: Value, stage1_output: &Stage1Output) -> Resul
                 "REQUEST_STAGE1_REEVALUATION must set tactical_entry_plan=null"
             ));
         }
+        if output.wait_reason.is_some() {
+            return Err(anyhow!(
+                "REQUEST_STAGE1_REEVALUATION must set wait_reason=null"
+            ));
+        }
+        return Ok(output);
+    }
+
+    if output.stage2_decision == "PATH_CONFIRMED_WAIT" {
+        current_path.ok_or_else(|| anyhow!("PATH_CONFIRMED_WAIT requires Stage1 current_path"))?;
+        if output.reevaluation_reason.is_some() {
+            return Err(anyhow!(
+                "PATH_CONFIRMED_WAIT must set reevaluation_reason=null"
+            ));
+        }
+        if output.tactical_entry_plan.is_some() {
+            return Err(anyhow!(
+                "PATH_CONFIRMED_WAIT must set tactical_entry_plan=null"
+            ));
+        }
+        if output
+            .wait_reason
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .is_empty()
+        {
+            return Err(anyhow!("PATH_CONFIRMED_WAIT requires wait_reason"));
+        }
         return Ok(output);
     }
 
     if output.reevaluation_reason.is_some() {
-        return Err(anyhow!("PATH_CONFIRMED must set reevaluation_reason=null"));
+        return Err(anyhow!(
+            "PATH_CONFIRMED_ENTRY must set reevaluation_reason=null"
+        ));
+    }
+    if output.wait_reason.is_some() {
+        return Err(anyhow!("PATH_CONFIRMED_ENTRY must set wait_reason=null"));
     }
 
     let current_path =
-        current_path.ok_or_else(|| anyhow!("PATH_CONFIRMED requires Stage1 current_path"))?;
+        current_path.ok_or_else(|| anyhow!("PATH_CONFIRMED_ENTRY requires Stage1 current_path"))?;
     let tactical_plan = output
         .tactical_entry_plan
         .as_mut()
-        .ok_or_else(|| anyhow!("PATH_CONFIRMED requires tactical_entry_plan"))?;
+        .ok_or_else(|| anyhow!("PATH_CONFIRMED_ENTRY requires tactical_entry_plan"))?;
     if tactical_plan.path_id != current_path.id {
         return Err(anyhow!(
             "tactical_entry_plan.path_id must match Stage1 current_path.id"
@@ -1422,7 +1464,7 @@ mod tests {
     fn stage2a_parser_accepts_single_entry_plan() {
         let stage1_output = sample_stage1_output();
         let value = json!({
-            "stage2_decision": "PATH_CONFIRMED",
+            "stage2_decision": "PATH_CONFIRMED_ENTRY",
             "path_audit_note": "Path is still live because 4h acceptance and driver state remain supportive.",
             "tactical_entry_plan": {
                 "path_id": "path_1",
@@ -1439,10 +1481,11 @@ mod tests {
                     "stop_loss_reason": "The live stop sits beyond the normal sweep path for this execution."
                 }
             },
-            "reevaluation_reason": null
+            "reevaluation_reason": null,
+            "wait_reason": null
         });
         let parsed = parse_stage2a_output(value, &stage1_output).expect("parse");
-        assert_eq!(parsed.stage2_decision, "PATH_CONFIRMED");
+        assert_eq!(parsed.stage2_decision, "PATH_CONFIRMED_ENTRY");
         assert_eq!(
             parsed
                 .tactical_entry_plan
@@ -1479,7 +1522,8 @@ mod tests {
             "stage2_decision": "REQUEST_STAGE1_REEVALUATION",
             "path_audit_note": "The current path no longer has a clean high-timeframe execution structure.",
             "tactical_entry_plan": null,
-            "reevaluation_reason": "Path quality degraded and needs a fresh strategic review."
+            "reevaluation_reason": "Path quality degraded and needs a fresh strategic review.",
+            "wait_reason": null
         });
         let parsed = parse_stage2a_output(value, &stage1_output).expect("parse");
         assert_eq!(parsed.stage2_decision, "REQUEST_STAGE1_REEVALUATION");
@@ -1489,7 +1533,7 @@ mod tests {
     fn stage2a_parser_allows_path_confirmation_without_runtime_path_verdict() {
         let stage1_output = sample_stage1_output();
         let value = json!({
-            "stage2_decision": "PATH_CONFIRMED",
+            "stage2_decision": "PATH_CONFIRMED_ENTRY",
             "path_audit_note": "Path remains valid and execution can still be designed around the same thesis.",
             "tactical_entry_plan": {
                 "path_id": "path_1",
@@ -1506,17 +1550,18 @@ mod tests {
                     "stop_loss_reason": "Stop stays beyond the expected sweep depth."
                 }
             },
-            "reevaluation_reason": null
+            "reevaluation_reason": null,
+            "wait_reason": null
         });
         let parsed = parse_stage2a_output(value, &stage1_output).expect("parse");
-        assert_eq!(parsed.stage2_decision, "PATH_CONFIRMED");
+        assert_eq!(parsed.stage2_decision, "PATH_CONFIRMED_ENTRY");
     }
 
     #[test]
     fn stage2a_parser_allows_tactical_stop_beyond_stage1_failure_level_when_structure_is_valid() {
         let stage1_output = sample_stage1_output();
         let value = json!({
-            "stage2_decision": "PATH_CONFIRMED",
+            "stage2_decision": "PATH_CONFIRMED_ENTRY",
             "path_audit_note": "Path is still intact even though the executable stop sits well beyond Stage1 failure reference.",
             "tactical_entry_plan": {
                 "path_id": "path_1",
@@ -1533,10 +1578,11 @@ mod tests {
                     "stop_loss_reason": "Stop is intentionally beyond local noise and sweep risk."
                 }
             },
-            "reevaluation_reason": null
+            "reevaluation_reason": null,
+            "wait_reason": null
         });
         let parsed = parse_stage2a_output(value, &stage1_output).expect("parse");
-        assert_eq!(parsed.stage2_decision, "PATH_CONFIRMED");
+        assert_eq!(parsed.stage2_decision, "PATH_CONFIRMED_ENTRY");
         assert_eq!(
             parsed
                 .tactical_entry_plan
@@ -1552,7 +1598,7 @@ mod tests {
     fn stage2a_parser_allows_execution_stop_to_differ_from_structural_invalidation() {
         let stage1_output = sample_stage1_output();
         let value = json!({
-            "stage2_decision": "PATH_CONFIRMED",
+            "stage2_decision": "PATH_CONFIRMED_ENTRY",
             "path_audit_note": "The path is still live and allows a wider live stop than the structural invalidation marker.",
             "tactical_entry_plan": {
                 "path_id": "path_1",
@@ -1569,7 +1615,8 @@ mod tests {
                     "stop_loss_reason": "structural invalidation and execution stop are intentionally different"
                 }
             },
-            "reevaluation_reason": null
+            "reevaluation_reason": null,
+            "wait_reason": null
         });
         let parsed = parse_stage2a_output(value, &stage1_output).expect("parse");
         let entry_plan = &parsed
@@ -1585,7 +1632,7 @@ mod tests {
     fn stage2a_parser_requires_leverage_key() {
         let stage1_output = sample_stage1_output();
         let value = json!({
-            "stage2_decision": "PATH_CONFIRMED",
+            "stage2_decision": "PATH_CONFIRMED_ENTRY",
             "path_audit_note": "Path is still live.",
             "tactical_entry_plan": {
                 "path_id": "path_1",
@@ -1601,12 +1648,60 @@ mod tests {
                     "stop_loss_reason": "Stop sits beyond the normal sweep."
                 }
             },
-            "reevaluation_reason": null
+            "reevaluation_reason": null,
+            "wait_reason": null
         });
         let err = parse_stage2a_output(value, &stage1_output).expect_err("missing leverage");
         assert!(err
             .to_string()
             .contains("tactical_entry_plan.entry_plan.leverage"));
+    }
+
+    #[test]
+    fn stage2a_parser_allows_wait_without_tactical_plan() {
+        let stage1_output = sample_stage1_output();
+        let value = json!({
+            "stage2_decision": "PATH_CONFIRMED_WAIT",
+            "path_audit_note": "The higher-timeframe path is still live but the current execution pocket is too crowded.",
+            "tactical_entry_plan": null,
+            "reevaluation_reason": null,
+            "wait_reason": "Wait for a cleaner reclaim or a deeper pullback before arming an entry."
+        });
+        let parsed = parse_stage2a_output(value, &stage1_output).expect("parse");
+        assert_eq!(parsed.stage2_decision, "PATH_CONFIRMED_WAIT");
+        assert!(parsed.tactical_entry_plan.is_none());
+        assert_eq!(
+            parsed.wait_reason.as_deref(),
+            Some("Wait for a cleaner reclaim or a deeper pullback before arming an entry.")
+        );
+    }
+
+    #[test]
+    fn stage2a_parser_normalizes_legacy_path_confirmed_to_entry() {
+        let stage1_output = sample_stage1_output();
+        let value = json!({
+            "stage2_decision": "PATH_CONFIRMED",
+            "path_audit_note": "Legacy outputs should still map onto the entry state.",
+            "tactical_entry_plan": {
+                "path_id": "path_1",
+                "entry_plan": {
+                    "entry_profile": "reclaim_then_hold",
+                    "intent_mode": "immediate",
+                    "entry_activation_level": null,
+                    "entry_zone": {"low": 1999.0, "high": 2001.0, "timeframe": "1d", "label": "entry", "reason": "ok"},
+                    "entry_invalidation_level": {"low": 1992.0, "high": 1994.0, "timeframe": "4h", "label": "invalid", "reason": "ok"},
+                    "stop_loss": 1993.0,
+                    "leverage": 5,
+                    "entry_reason": "Entry is placed at the higher-timeframe support reclaim.",
+                    "invalidation_reason": "The execution fails if this support pocket loses acceptance.",
+                    "stop_loss_reason": "The live stop sits beyond the normal sweep path for this execution."
+                }
+            },
+            "reevaluation_reason": null,
+            "wait_reason": null
+        });
+        let parsed = parse_stage2a_output(value, &stage1_output).expect("parse");
+        assert_eq!(parsed.stage2_decision, "PATH_CONFIRMED_ENTRY");
     }
 
     #[test]

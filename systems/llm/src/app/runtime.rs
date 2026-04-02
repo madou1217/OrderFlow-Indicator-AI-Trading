@@ -5486,7 +5486,35 @@ async fn invoke_workflow_bundle_models(
                                 }),
                             );
                         }
-                        "PATH_CONFIRMED" => {
+                        "PATH_CONFIRMED_WAIT" => {
+                            clear_approved_tactical_plan(&mut workflow_state);
+                            workflow_state.pending_stage1_refresh_reason = None;
+                            crate::workflow::persistence::save_workflow_state(
+                                &state_dir,
+                                &workflow_state,
+                            )?;
+                            append_workflow_journal_event(
+                                "workflow_stage2a_wait",
+                                &symbol,
+                                bundle.raw.ts_bucket,
+                                json!({
+                                    "trigger": &*trigger,
+                                    "model_name": selected_stage2a_model_name.clone(),
+                                    "source_ts_bucket": bundle.raw.ts_bucket,
+                                    "path_id": stage1_output.current_path.as_ref().map(|path| path.id.clone()),
+                                    "wait_reason": parsed_stage2a.wait_reason,
+                                }),
+                            );
+                            info!(
+                                symbol = %symbol,
+                                trigger = &*trigger,
+                                source_ts_bucket = %bundle.raw.ts_bucket,
+                                path_id = ?stage1_output.current_path.as_ref().map(|path| path.id.clone()),
+                                wait_reason = ?parsed_stage2a.wait_reason,
+                                "workflow stage2a path confirmed but waiting for better execution"
+                            );
+                        }
+                        "PATH_CONFIRMED_ENTRY" => {
                             if let Some(tactical_plan) = parsed_stage2a.tactical_entry_plan.clone()
                             {
                                 set_approved_tactical_plan(

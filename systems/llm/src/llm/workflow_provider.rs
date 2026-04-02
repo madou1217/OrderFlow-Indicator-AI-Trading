@@ -434,15 +434,26 @@ fn workflow_stage2a_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["stage2_decision", "path_audit_note", "tactical_entry_plan", "reevaluation_reason"],
+        "required": [
+            "stage2_decision",
+            "path_audit_note",
+            "tactical_entry_plan",
+            "reevaluation_reason",
+            "wait_reason"
+        ],
         "properties": {
             "stage2_decision": {
                 "type": "string",
-                "enum": ["PATH_CONFIRMED", "REQUEST_STAGE1_REEVALUATION"]
+                "enum": [
+                    "PATH_CONFIRMED_ENTRY",
+                    "PATH_CONFIRMED_WAIT",
+                    "REQUEST_STAGE1_REEVALUATION"
+                ]
             },
             "path_audit_note": {"type": "string"},
             "tactical_entry_plan": nullable(tactical_entry_plan_schema()),
-            "reevaluation_reason": {"type": ["string", "null"]}
+            "reevaluation_reason": {"type": ["string", "null"]},
+            "wait_reason": {"type": ["string", "null"]}
         }
     })
 }
@@ -1179,6 +1190,24 @@ mod tests {
         assert!(required
             .iter()
             .any(|value| value.as_str() == Some("leverage")));
+    }
+
+    #[test]
+    fn stage2a_schema_supports_wait_decision_and_reason() {
+        let schema = workflow_stage2a_schema();
+        let decisions = schema["properties"]["stage2_decision"]["enum"]
+            .as_array()
+            .expect("stage2_decision enum")
+            .iter()
+            .filter_map(|value| value.as_str())
+            .collect::<Vec<_>>();
+        assert!(decisions.contains(&"PATH_CONFIRMED_ENTRY"));
+        assert!(decisions.contains(&"PATH_CONFIRMED_WAIT"));
+        assert!(decisions.contains(&"REQUEST_STAGE1_REEVALUATION"));
+        assert_eq!(
+            schema["properties"]["wait_reason"],
+            json!({"type": ["string", "null"]})
+        );
     }
 
     #[test]
