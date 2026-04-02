@@ -11,6 +11,7 @@ pub struct AdaptedExecutionIntent {
     pub take_profit_1: f64,
     pub take_profit_2: f64,
     pub ttl_minutes: u64,
+    pub leverage: u32,
     pub max_drift_pct: f64,
     pub path_id: String,
     pub context_key: String,
@@ -55,6 +56,9 @@ pub fn adapt_execution_intent(intent: &ExecutionIntent) -> Result<AdaptedExecuti
             "execution entry_snapshot.path_id must match execution path_id"
         ));
     }
+    if !(1..=20).contains(&intent.leverage) {
+        return Err(anyhow!("execution leverage must be between 1 and 20"));
+    }
     Ok(AdaptedExecutionIntent {
         side: intent.side.clone(),
         intent_mode: intent.intent_mode.clone(),
@@ -64,6 +68,7 @@ pub fn adapt_execution_intent(intent: &ExecutionIntent) -> Result<AdaptedExecuti
         take_profit_1: intent.take_profit_1,
         take_profit_2: intent.take_profit_2,
         ttl_minutes: intent.ttl_minutes,
+        leverage: intent.leverage,
         max_drift_pct: intent.max_drift_pct,
         path_id: intent.path_id.clone(),
         context_key: intent.entry_snapshot.context_key.clone(),
@@ -193,6 +198,7 @@ mod tests {
             take_profit_1: 104.0,
             take_profit_2: 107.0,
             ttl_minutes: 15,
+            leverage: 6,
             max_drift_pct: 0.2,
             path_id: "path_a".to_string(),
             entry_snapshot: EntrySnapshotRef {
@@ -240,6 +246,7 @@ mod tests {
                 reason: None,
             }),
             max_drift_pct: Some(0.2),
+            leverage: Some(6),
             stop_loss: 99.0,
             take_profit_1: 104.0,
             take_profit_2: 107.0,
@@ -297,6 +304,7 @@ mod tests {
                 reason: None,
             }),
             max_drift_pct: Some(0.2),
+            leverage: Some(6),
             stop_loss: 99.0,
             take_profit_1: 104.0,
             take_profit_2: 107.0,
@@ -352,6 +360,7 @@ mod tests {
                 reason: None,
             }),
             max_drift_pct: Some(0.2),
+            leverage: Some(6),
             stop_loss: 99.0,
             take_profit_1: 104.0,
             take_profit_2: 107.0,

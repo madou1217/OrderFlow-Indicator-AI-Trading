@@ -35,6 +35,7 @@ pub fn snapshot_from_execution_intent(
         entry_zone: Some(intent.entry_zone.clone()),
         entry_invalidation_level: intent.entry_invalidation_level.clone(),
         max_drift_pct: Some(intent.max_drift_pct),
+        leverage: Some(intent.leverage),
         stop_loss: intent.stop_loss,
         take_profit_1: intent.take_profit_1,
         take_profit_2: intent.take_profit_2,
@@ -96,6 +97,7 @@ mod tests {
             take_profit_1: 103.0,
             take_profit_2: 105.0,
             ttl_minutes: 15,
+            leverage: 6,
             max_drift_pct: 0.2,
             path_id: "path_a".to_string(),
             entry_snapshot: EntrySnapshotRef {
@@ -149,6 +151,7 @@ mod tests {
         };
         let snapshot = snapshot_from_execution_intent("ETHUSDT", &intent, &path, Utc::now());
         assert_eq!(snapshot.allowed_stop_loss_levels, vec![99.0]);
+        assert_eq!(snapshot.leverage, Some(6));
         assert_eq!(snapshot.allowed_take_profit_levels, vec![103.0, 105.0]);
     }
 
@@ -172,6 +175,7 @@ mod tests {
             take_profit_1: 97.0,
             take_profit_2: 94.0,
             ttl_minutes: 15,
+            leverage: 3,
             max_drift_pct: 0.2,
             path_id: "path_a".to_string(),
             entry_snapshot: EntrySnapshotRef {

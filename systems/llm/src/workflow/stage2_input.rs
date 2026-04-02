@@ -1183,6 +1183,13 @@ fn workflow_position_relevance_key(position: &WorkflowPosition) -> (u8, i64, i64
         .unwrap_or((0, i64::MIN, i64::MIN))
 }
 
+fn entry_snapshot_relevance_key(snapshot: &EntrySnapshot) -> (i64, i64) {
+    (
+        snapshot.updated_at.timestamp_millis(),
+        snapshot.created_at.timestamp_millis(),
+    )
+}
+
 fn order_direction(order: &OpenOrderSnapshot) -> Option<&'static str> {
     if order.reduce_only || order.close_position {
         return None;
@@ -1200,12 +1207,28 @@ fn workflow_pending_order_for_open_order(
     symbol: &str,
     order: &OpenOrderSnapshot,
     entry_snapshots: &HashMap<String, EntrySnapshot>,
+    preferred_path_id: Option<&str>,
 ) -> Option<WorkflowPendingOrder> {
     let direction = order_direction(order)?;
-    let entry_snapshot = entry_snapshots
+    let matching_snapshots = entry_snapshots
         .values()
-        .find(|snapshot| snapshot_matches_direction(snapshot, symbol, direction))
-        .cloned();
+        .filter(|snapshot| snapshot_matches_direction(snapshot, symbol, direction))
+        .cloned()
+        .collect::<Vec<_>>();
+    let entry_snapshot = preferred_path_id
+        .and_then(|path_id| {
+            matching_snapshots
+                .iter()
+                .filter(|snapshot| snapshot.path_id == path_id)
+                .max_by_key(|snapshot| entry_snapshot_relevance_key(snapshot))
+                .cloned()
+        })
+        .or_else(|| {
+            matching_snapshots
+                .iter()
+                .max_by_key(|snapshot| entry_snapshot_relevance_key(snapshot))
+                .cloned()
+        });
     Some(WorkflowPendingOrder {
         context_key: entry_snapshot
             .as_ref()
@@ -1289,11 +1312,29 @@ pub fn stage2c_active_orders_for_current_path(
     let Some(current_path) = stage1_output.current_path.as_ref() else {
         return Vec::new();
     };
-    trading_state
+    let same_side_orders = trading_state
         .open_orders
         .iter()
         .filter_map(|order| {
-            workflow_pending_order_for_open_order(&trading_state.symbol, order, entry_snapshots)
+            workflow_pending_order_for_open_order(
+                &trading_state.symbol,
+                order,
+                entry_snapshots,
+                None,
+            )
+        })
+        .filter(|order| order.side.eq_ignore_ascii_case(&current_path.side))
+        .collect::<Vec<_>>();
+    let current_path_orders = trading_state
+        .open_orders
+        .iter()
+        .filter_map(|order| {
+            workflow_pending_order_for_open_order(
+                &trading_state.symbol,
+                order,
+                entry_snapshots,
+                Some(&current_path.id),
+            )
         })
         .filter(|order| order.side.eq_ignore_ascii_case(&current_path.side))
         .filter(|order| {
@@ -1303,7 +1344,12 @@ pub fn stage2c_active_orders_for_current_path(
                 .map(|snapshot| snapshot.path_id == current_path.id)
                 .unwrap_or(true)
         })
-        .collect()
+        .collect::<Vec<_>>();
+    if !current_path_orders.is_empty() {
+        return current_path_orders;
+    }
+
+    same_side_orders
 }
 
 pub fn build_stage2a_prompt_input(
@@ -1379,6 +1425,7 @@ mod tests {
     use super::{
         aggregate_kline_history_5m, build_stage2a_prompt_input, build_stage2b_prompt_input,
         build_stage2c_prompt_input, stage2b_active_positions_for_current_path,
+        stage2c_active_orders_for_current_path,
     };
     use crate::execution::binance::TradingStateSnapshot;
     use crate::llm::input::ManagementSnapshotForLlm;
@@ -1860,6 +1907,7 @@ mod tests {
             entry_zone: None,
             entry_invalidation_level: None,
             max_drift_pct: Some(0.2),
+            leverage: Some(3),
             stop_loss: 96.0,
             take_profit_1: 106.0,
             take_profit_2: 109.0,
@@ -1885,6 +1933,7 @@ mod tests {
             entry_zone: None,
             entry_invalidation_level: None,
             max_drift_pct: Some(0.2),
+            leverage: Some(3),
             stop_loss: 97.0,
             take_profit_1: 107.0,
             take_profit_2: 110.0,
@@ -1982,6 +2031,7 @@ mod tests {
             entry_zone: None,
             entry_invalidation_level: None,
             max_drift_pct: Some(0.2),
+            leverage: Some(3),
             stop_loss: 96.0,
             take_profit_1: 108.0,
             take_profit_2: 111.0,
@@ -2058,6 +2108,7 @@ mod tests {
             entry_zone: None,
             entry_invalidation_level: None,
             max_drift_pct: Some(0.2),
+            leverage: Some(3),
             stop_loss: 96.0,
             take_profit_1: 108.0,
             take_profit_2: 111.0,
@@ -2085,6 +2136,210 @@ mod tests {
         assert_eq!(positions[0].context_key, entry_snapshot.context_key);
         assert_eq!(positions[0].current_tp_price, None);
         assert_eq!(positions[0].current_sl_price, None);
+    }
+
+    #[test]
+    fn stage2c_active_orders_fall_back_to_latest_same_side_snapshot_when_path_switched() {
+        let stage1_output = sample_stage1_output();
+        let trading_state = TradingStateSnapshot {
+            symbol: "TESTUSDT".to_string(),
+            has_active_context: true,
+            has_active_positions: false,
+            has_open_orders: true,
+            active_positions: Vec::new(),
+            open_orders: vec![crate::execution::binance::OpenOrderSnapshot {
+                order_id: 77,
+                side: "BUY".to_string(),
+                position_side: "LONG".to_string(),
+                order_type: "LIMIT".to_string(),
+                status: "NEW".to_string(),
+                orig_qty: 1.0,
+                executed_qty: 0.0,
+                price: 101.0,
+                stop_price: 0.0,
+                close_position: false,
+                reduce_only: false,
+                is_algo_order: false,
+            }],
+            total_wallet_balance: 1000.0,
+            available_balance: 750.0,
+        };
+        let older_snapshot = EntrySnapshot {
+            symbol: "TESTUSDT".to_string(),
+            context_key: "TESTUSDT:LONG:path_older".to_string(),
+            path_id: "path_older".to_string(),
+            side: "LONG".to_string(),
+            entry_profile: Some("pullback_acceptance".to_string()),
+            intent_mode: Some("pullback".to_string()),
+            entry_activation_level: None,
+            entry_zone: None,
+            entry_invalidation_level: None,
+            max_drift_pct: Some(0.2),
+            leverage: Some(3),
+            stop_loss: 96.0,
+            take_profit_1: 106.0,
+            take_profit_2: 109.0,
+            allowed_stop_loss_levels: vec![96.0],
+            allowed_take_profit_levels: vec![106.0, 109.0],
+            tp1_realized: false,
+            applied_driver_deterioration_signals: Vec::new(),
+            created_at: DateTime::parse_from_rfc3339("2026-03-30T05:00:00Z")
+                .expect("older created")
+                .with_timezone(&Utc),
+            updated_at: DateTime::parse_from_rfc3339("2026-03-30T05:10:00Z")
+                .expect("older updated")
+                .with_timezone(&Utc),
+        };
+        let newer_snapshot = EntrySnapshot {
+            symbol: "TESTUSDT".to_string(),
+            context_key: "TESTUSDT:LONG:path_previous".to_string(),
+            path_id: "path_previous".to_string(),
+            side: "LONG".to_string(),
+            entry_profile: Some("pullback_acceptance".to_string()),
+            intent_mode: Some("pullback".to_string()),
+            entry_activation_level: None,
+            entry_zone: None,
+            entry_invalidation_level: None,
+            max_drift_pct: Some(0.2),
+            leverage: Some(3),
+            stop_loss: 97.0,
+            take_profit_1: 107.0,
+            take_profit_2: 110.0,
+            allowed_stop_loss_levels: vec![97.0],
+            allowed_take_profit_levels: vec![107.0, 110.0],
+            tp1_realized: false,
+            applied_driver_deterioration_signals: Vec::new(),
+            created_at: DateTime::parse_from_rfc3339("2026-03-31T05:00:00Z")
+                .expect("newer created")
+                .with_timezone(&Utc),
+            updated_at: DateTime::parse_from_rfc3339("2026-03-31T05:10:00Z")
+                .expect("newer updated")
+                .with_timezone(&Utc),
+        };
+        let entry_snapshots = HashMap::from([
+            (older_snapshot.context_key.clone(), older_snapshot),
+            (newer_snapshot.context_key.clone(), newer_snapshot),
+        ]);
+
+        let orders = stage2c_active_orders_for_current_path(
+            &stage1_output,
+            &trading_state,
+            &entry_snapshots,
+        );
+
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0].order_id, 77);
+        assert_eq!(orders[0].context_key, "TESTUSDT:LONG:path_previous");
+        assert_eq!(
+            orders[0]
+                .entry_snapshot
+                .as_ref()
+                .expect("fallback snapshot")
+                .path_id,
+            "path_previous"
+        );
+    }
+
+    #[test]
+    fn stage2c_active_orders_prefer_current_path_snapshot_when_present() {
+        let stage1_output = sample_stage1_output();
+        let trading_state = TradingStateSnapshot {
+            symbol: "TESTUSDT".to_string(),
+            has_active_context: true,
+            has_active_positions: false,
+            has_open_orders: true,
+            active_positions: Vec::new(),
+            open_orders: vec![crate::execution::binance::OpenOrderSnapshot {
+                order_id: 78,
+                side: "BUY".to_string(),
+                position_side: "LONG".to_string(),
+                order_type: "LIMIT".to_string(),
+                status: "NEW".to_string(),
+                orig_qty: 1.0,
+                executed_qty: 0.0,
+                price: 101.0,
+                stop_price: 0.0,
+                close_position: false,
+                reduce_only: false,
+                is_algo_order: false,
+            }],
+            total_wallet_balance: 1000.0,
+            available_balance: 750.0,
+        };
+        let current_snapshot = EntrySnapshot {
+            symbol: "TESTUSDT".to_string(),
+            context_key: "TESTUSDT:LONG:path_long".to_string(),
+            path_id: "path_long".to_string(),
+            side: "LONG".to_string(),
+            entry_profile: Some("pullback_acceptance".to_string()),
+            intent_mode: Some("pullback".to_string()),
+            entry_activation_level: None,
+            entry_zone: None,
+            entry_invalidation_level: None,
+            max_drift_pct: Some(0.2),
+            leverage: Some(3),
+            stop_loss: 96.0,
+            take_profit_1: 106.0,
+            take_profit_2: 109.0,
+            allowed_stop_loss_levels: vec![96.0],
+            allowed_take_profit_levels: vec![106.0, 109.0],
+            tp1_realized: false,
+            applied_driver_deterioration_signals: Vec::new(),
+            created_at: DateTime::parse_from_rfc3339("2026-03-30T05:00:00Z")
+                .expect("current created")
+                .with_timezone(&Utc),
+            updated_at: DateTime::parse_from_rfc3339("2026-03-30T05:10:00Z")
+                .expect("current updated")
+                .with_timezone(&Utc),
+        };
+        let newer_other_snapshot = EntrySnapshot {
+            symbol: "TESTUSDT".to_string(),
+            context_key: "TESTUSDT:LONG:path_other".to_string(),
+            path_id: "path_other".to_string(),
+            side: "LONG".to_string(),
+            entry_profile: Some("pullback_acceptance".to_string()),
+            intent_mode: Some("pullback".to_string()),
+            entry_activation_level: None,
+            entry_zone: None,
+            entry_invalidation_level: None,
+            max_drift_pct: Some(0.2),
+            leverage: Some(3),
+            stop_loss: 97.0,
+            take_profit_1: 107.0,
+            take_profit_2: 110.0,
+            allowed_stop_loss_levels: vec![97.0],
+            allowed_take_profit_levels: vec![107.0, 110.0],
+            tp1_realized: false,
+            applied_driver_deterioration_signals: Vec::new(),
+            created_at: DateTime::parse_from_rfc3339("2026-03-31T05:00:00Z")
+                .expect("other created")
+                .with_timezone(&Utc),
+            updated_at: DateTime::parse_from_rfc3339("2026-03-31T05:10:00Z")
+                .expect("other updated")
+                .with_timezone(&Utc),
+        };
+        let entry_snapshots = HashMap::from([
+            (current_snapshot.context_key.clone(), current_snapshot),
+            (newer_other_snapshot.context_key.clone(), newer_other_snapshot),
+        ]);
+
+        let orders = stage2c_active_orders_for_current_path(
+            &stage1_output,
+            &trading_state,
+            &entry_snapshots,
+        );
+
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0].order_id, 78);
+        assert_eq!(orders[0].context_key, "TESTUSDT:LONG:path_long");
+        assert_eq!(
+            orders[0]
+                .entry_snapshot
+                .as_ref()
+                .expect("current snapshot")
+                .path_id,
+            "path_long"
+        );
     }
 
     #[test]
