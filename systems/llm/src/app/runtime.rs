@@ -4155,6 +4155,7 @@ async fn handle_fast_market_event(
     }
     let watch_facts = fast_watcher_price_facts(event.price);
     let stage1_replay_attempt = maybe_replay_stage1_path_boundary_window(
+        Some(ctx),
         &mut workflow_state,
         active_current_path.as_ref(),
         &symbol,
@@ -4163,6 +4164,19 @@ async fn handle_fast_market_event(
         &event,
     )?;
     if stage1_replay_attempt.requested_refresh {
+        *fast_state = None;
+        return Ok(());
+    }
+    if maybe_dispatch_immediate_stage1_refresh_on_failure_level_touch(
+        Some(ctx),
+        &mut workflow_state,
+        active_current_path.as_ref(),
+        &symbol,
+        &trading_state,
+        &state_dir,
+        &event,
+        Stage1RefreshOrigin::Live,
+    )? {
         *fast_state = None;
         return Ok(());
     }
@@ -4714,7 +4728,116 @@ fn maybe_request_stage1_refresh_on_path_boundary_touch(
     Ok(true)
 }
 
+fn maybe_dispatch_immediate_stage1_refresh_on_failure_level_touch(
+    ctx: Option<&AppContext>,
+    workflow_state: &mut crate::workflow::state::WorkflowState,
+    current_path: Option<&crate::workflow::schema::CurrentPath>,
+    symbol: &str,
+    trading_state: &TradingStateSnapshot,
+    state_dir: &str,
+    event: &FastPriceEvent,
+    origin: Stage1RefreshOrigin,
+) -> Result<bool> {
+    if workflow_state.pending_stage1_refresh_reason.is_some() {
+        return Ok(false);
+    }
+    let Some(current_path) = current_path else {
+        return Ok(false);
+    };
+    if has_active_position_for_side(trading_state, &current_path.side) {
+        return Ok(false);
+    }
+    if live_entry_order_count_for_side(trading_state, &current_path.side) > 0 {
+        return Ok(false);
+    }
+    let Some(boundary) = stage1_path_boundary_touched(current_path, event.price) else {
+        return Ok(false);
+    };
+    if boundary != Stage1PathBoundary::FailureLevel {
+        return Ok(false);
+    }
+
+    let refresh_reason = boundary.refresh_reason(origin).to_string();
+    workflow_state.pending_stage1_refresh_reason = Some(refresh_reason.clone());
+    clear_approved_tactical_plan(workflow_state);
+    crate::workflow::persistence::save_workflow_state(state_dir, workflow_state)?;
+
+    let latest_bundle = load_persisted_latest_bundle_for_symbol(symbol)?;
+    let dispatch_mode = match (ctx.is_some(), latest_bundle.is_some()) {
+        (true, true) => "immediate_spawned",
+        (false, true) => "queued_no_dispatch_context",
+        (_, false) => "queued_missing_bundle",
+    };
+    append_workflow_journal_event(
+        "workflow_stage1_refresh_requested",
+        symbol,
+        event.event_ts,
+        json!({
+            "trigger": "watcher_fast_consumer",
+            "refresh_reason": refresh_reason,
+            "refresh_origin": origin.as_str(),
+            "dispatch_mode": dispatch_mode,
+            "path_id": &current_path.id,
+            "side": &current_path.side,
+            "trigger_price": event.price,
+            "price_source": event.source.as_str(),
+            "routing_key": &event.routing_key,
+            "boundary_type": boundary.name(),
+            "boundary_zone": boundary.zone(current_path),
+            "boundary_level": boundary.trigger_level(current_path),
+        }),
+    );
+
+    match (ctx, latest_bundle) {
+        (Some(dispatch_ctx), Some(bundle)) => {
+            let invoke_ctx = dispatch_ctx.clone();
+            let trigger = Arc::<str>::from("watcher_fast_consumer".to_string());
+            let refresh_reason_for_task = refresh_reason.clone();
+            let symbol_for_task = symbol.to_string();
+            let print_response = dispatch_ctx.config.llm.print_response;
+            tokio::spawn(async move {
+                if let Err(err) = invoke_priority_stage1_refresh_from_bundle(
+                    invoke_ctx,
+                    print_response,
+                    bundle,
+                    trigger,
+                    refresh_reason_for_task.clone(),
+                )
+                .await
+                {
+                    warn!(
+                        symbol = %symbol_for_task,
+                        trigger = "watcher_fast_consumer",
+                        refresh_reason = %refresh_reason_for_task,
+                        error = %err,
+                        "workflow watcher immediate stage1 refresh failed"
+                    );
+                }
+            });
+        }
+        (None, Some(_)) => {
+            debug!(
+                symbol = %symbol,
+                trigger = "watcher_fast_consumer",
+                refresh_reason = %refresh_reason,
+                "workflow watcher left failure-level stage1 refresh queued because no dispatch context was provided"
+            );
+        }
+        (_, None) => {
+            warn!(
+                symbol = %symbol,
+                trigger = "watcher_fast_consumer",
+                refresh_reason = %refresh_reason,
+                "workflow watcher could not find a persisted minute bundle for immediate stage1 refresh; leaving refresh queued"
+            );
+        }
+    }
+
+    Ok(true)
+}
+
 fn maybe_replay_stage1_path_boundary_window(
+    ctx: Option<&AppContext>,
     workflow_state: &mut crate::workflow::state::WorkflowState,
     current_path: Option<&crate::workflow::schema::CurrentPath>,
     symbol: &str,
@@ -4798,6 +4921,21 @@ fn maybe_replay_stage1_path_boundary_window(
     );
 
     for replay_event in &replay_events {
+        if maybe_dispatch_immediate_stage1_refresh_on_failure_level_touch(
+            ctx,
+            workflow_state,
+            Some(current_path),
+            symbol,
+            trading_state,
+            state_dir,
+            replay_event,
+            Stage1RefreshOrigin::Replay,
+        )? {
+            return Ok(Stage1ReplayAttempt {
+                requested_refresh: true,
+                current_event_was_replayed,
+            });
+        }
         if maybe_request_stage1_refresh_on_path_boundary_touch(
             workflow_state,
             Some(current_path),
@@ -4918,6 +5056,63 @@ fn append_workflow_journal_event(
     if let Err(err) = append_journal_event(event) {
         warn!(error = %err, event_type = event_type, "append workflow journal failed");
     }
+}
+
+fn latest_temp_indicator_bundle_path_for_symbol(
+    dir: &Path,
+    symbol: &str,
+) -> Result<Option<PathBuf>> {
+    let target_symbol = sanitize_filename_component(&symbol.to_ascii_uppercase());
+    let mut latest: Option<(DateTime<Utc>, PathBuf)> = None;
+
+    for entry in fs::read_dir(dir).with_context(|| format!("read {}", dir.display()))? {
+        let entry = entry.with_context(|| format!("iterate {}", dir.display()))?;
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("stat {}", path.display()))?;
+        if !file_type.is_file() {
+            continue;
+        }
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !file_name.ends_with(".json") || !file_name.ends_with(&format!("_{target_symbol}.json"))
+        {
+            continue;
+        }
+        let Some(file_ts_bucket) = temp_indicator_ts_bucket_from_path(&path) else {
+            continue;
+        };
+        let replace = latest
+            .as_ref()
+            .map(|(current_ts, _)| file_ts_bucket > *current_ts)
+            .unwrap_or(true);
+        if replace {
+            latest = Some((file_ts_bucket, path));
+        }
+    }
+
+    Ok(latest.map(|(_, path)| path))
+}
+
+fn load_persisted_latest_bundle_for_symbol(symbol: &str) -> Result<Option<LatestBundle>> {
+    let dir = Path::new(TEMP_INDICATOR_DIR);
+    if !dir.exists() {
+        return Ok(None);
+    }
+    let Some(path) = latest_temp_indicator_bundle_path_for_symbol(dir, symbol)? else {
+        return Ok(None);
+    };
+    let raw = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+    let envelope: MinuteBundleEnvelope =
+        serde_json::from_slice(&raw).with_context(|| format!("parse {}", path.display()))?;
+    Ok(Some(LatestBundle {
+        indicators: envelope.indicators.clone(),
+        raw: envelope,
+        missing_indicator_codes: Vec::new(),
+        received_at: Utc::now(),
+    }))
 }
 
 async fn maybe_refresh_stage1(
@@ -5103,6 +5298,102 @@ async fn maybe_refresh_stage1(
     })
 }
 
+async fn invoke_priority_stage1_refresh_from_bundle(
+    ctx: AppContext,
+    print_response: bool,
+    bundle: LatestBundle,
+    trigger: Arc<str>,
+    refresh_reason: String,
+) -> Result<()> {
+    let config = Arc::clone(&ctx.config);
+    let db_pool = ctx.db_pool.clone();
+    let http_client = ctx.http_client.clone();
+    let loopback_http_client = ctx.loopback_http_client.clone();
+    let symbol = bundle.raw.symbol.to_ascii_uppercase();
+    let state_dir = config.llm.workflow.state_dir.clone();
+    let retention_minutes = config.llm.temp_cache_retention_minutes();
+
+    let mut input = build_persist_only_input(&bundle);
+    patch_input_kline_history_from_db(
+        &db_pool,
+        &mut input,
+        &format!("{}:priority_stage1", trigger.as_ref()),
+    )
+    .await?;
+
+    let mut workflow_state =
+        crate::workflow::persistence::load_workflow_state(&state_dir, &symbol)?
+            .unwrap_or_else(|| default_workflow_state(&symbol));
+    workflow_state.symbol = symbol.clone();
+    let mut stage1_output = crate::workflow::persistence::load_stage1_output(&state_dir, &symbol)?;
+    let mut tracked_zones = crate::workflow::persistence::load_tracked_zones(&state_dir, &symbol)?;
+
+    let _ = maybe_refresh_stage1(
+        &config,
+        &http_client,
+        &loopback_http_client,
+        print_response,
+        &bundle,
+        trigger.as_ref(),
+        &symbol,
+        &state_dir,
+        retention_minutes,
+        &input,
+        &mut workflow_state,
+        &mut stage1_output,
+        &mut tracked_zones,
+        Some(refresh_reason),
+    )
+    .await?;
+
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Stage2aStaleInfo {
+    reason: &'static str,
+    latest_path_id: Option<String>,
+    latest_stage1_completed_at: Option<DateTime<Utc>>,
+}
+
+fn detect_stale_stage2a_response(
+    expected_path_id: Option<&str>,
+    expected_stage1_completed_at: Option<DateTime<Utc>>,
+    latest_path_id: Option<&str>,
+    latest_stage1_completed_at: Option<DateTime<Utc>>,
+    stage1_inflight: bool,
+) -> Option<Stage2aStaleInfo> {
+    if stage1_inflight {
+        return Some(Stage2aStaleInfo {
+            reason: "stage1_inflight",
+            latest_path_id: latest_path_id.map(str::to_string),
+            latest_stage1_completed_at,
+        });
+    }
+
+    if latest_path_id != expected_path_id {
+        return Some(Stage2aStaleInfo {
+            reason: "path_switched",
+            latest_path_id: latest_path_id.map(str::to_string),
+            latest_stage1_completed_at,
+        });
+    }
+
+    if let (Some(expected), Some(latest)) =
+        (expected_stage1_completed_at, latest_stage1_completed_at)
+    {
+        if latest > expected {
+            return Some(Stage2aStaleInfo {
+                reason: "stage1_snapshot_advanced",
+                latest_path_id: latest_path_id.map(str::to_string),
+                latest_stage1_completed_at: Some(latest),
+            });
+        }
+    }
+
+    None
+}
+
 async fn invoke_workflow_bundle_models(
     ctx: AppContext,
     print_response: bool,
@@ -5267,6 +5558,11 @@ async fn invoke_workflow_bundle_models(
                     .as_ref()
                     .map(|path| path.id.clone())
                     .unwrap_or_default();
+                let stage2a_snapshot_path_id = stage1_output
+                    .current_path
+                    .as_ref()
+                    .map(|path| path.id.clone());
+                let stage2a_snapshot_completed_at = workflow_state.last_stage1_completed_at;
                 let path_side = stage1_output
                     .current_path
                     .as_ref()
@@ -5466,103 +5762,147 @@ async fn invoke_workflow_bundle_models(
                     let parsed_stage2a = stage2a_output
                         .clone()
                         .ok_or_else(|| anyhow!("workflow stage2a produced no valid output"))?;
-                    match parsed_stage2a.stage2_decision.as_str() {
-                        "REQUEST_STAGE1_REEVALUATION" => {
-                            workflow_state.pending_stage1_refresh_reason =
-                                Some("thesis_invalidated".to_string());
-                            clear_approved_tactical_plan(&mut workflow_state);
-                            crate::workflow::persistence::save_workflow_state(
-                                &state_dir,
-                                &workflow_state,
-                            )?;
-                            append_workflow_journal_event(
-                                "workflow_stage1_reevaluation_requested",
-                                &symbol,
-                                bundle.raw.ts_bucket,
-                                json!({
-                                    "trigger": &*trigger,
-                                    "reevaluation_reason": parsed_stage2a.reevaluation_reason,
-                                    "path_id": stage1_output.current_path.as_ref().map(|path| path.id.clone()),
-                                }),
-                            );
-                        }
-                        "PATH_CONFIRMED_WAIT" => {
-                            clear_approved_tactical_plan(&mut workflow_state);
-                            workflow_state.pending_stage1_refresh_reason = None;
-                            crate::workflow::persistence::save_workflow_state(
-                                &state_dir,
-                                &workflow_state,
-                            )?;
-                            append_workflow_journal_event(
-                                "workflow_stage2a_wait",
-                                &symbol,
-                                bundle.raw.ts_bucket,
-                                json!({
-                                    "trigger": &*trigger,
-                                    "model_name": selected_stage2a_model_name.clone(),
-                                    "source_ts_bucket": bundle.raw.ts_bucket,
-                                    "path_id": stage1_output.current_path.as_ref().map(|path| path.id.clone()),
-                                    "wait_reason": parsed_stage2a.wait_reason,
-                                }),
-                            );
-                            info!(
-                                symbol = %symbol,
-                                trigger = &*trigger,
-                                source_ts_bucket = %bundle.raw.ts_bucket,
-                                path_id = ?stage1_output.current_path.as_ref().map(|path| path.id.clone()),
-                                wait_reason = ?parsed_stage2a.wait_reason,
-                                "workflow stage2a path confirmed but waiting for better execution"
-                            );
-                        }
-                        "PATH_CONFIRMED_ENTRY" => {
-                            if let Some(tactical_plan) = parsed_stage2a.tactical_entry_plan.clone()
-                            {
-                                set_approved_tactical_plan(
-                                    &mut workflow_state,
-                                    tactical_plan,
-                                    bundle.raw.ts_bucket,
-                                    true,
-                                );
-                            } else {
+                    let persisted_workflow_state =
+                        crate::workflow::persistence::load_workflow_state(&state_dir, &symbol)?
+                            .unwrap_or_else(|| default_workflow_state(&symbol));
+                    let persisted_stage1_output =
+                        crate::workflow::persistence::load_stage1_output(&state_dir, &symbol)?;
+                    let latest_path_id = persisted_stage1_output
+                        .as_ref()
+                        .filter(|stage1| stage1.monitoring_status == "active")
+                        .and_then(|stage1| stage1.current_path.as_ref())
+                        .map(|path| path.id.as_str());
+                    if let Some(stale) = detect_stale_stage2a_response(
+                        stage2a_snapshot_path_id.as_deref(),
+                        stage2a_snapshot_completed_at,
+                        latest_path_id,
+                        persisted_workflow_state.last_stage1_completed_at,
+                        workflow_stage_inflight(&symbol, WorkflowStageKind::Stage1),
+                    ) {
+                        append_workflow_journal_event(
+                            "workflow_stage2a_response_stale",
+                            &symbol,
+                            bundle.raw.ts_bucket,
+                            json!({
+                                "trigger": &*trigger,
+                                "model_name": selected_stage2a_model_name.clone(),
+                                "expected_path_id": stage2a_snapshot_path_id.clone(),
+                                "expected_stage1_completed_at": stage2a_snapshot_completed_at,
+                                "latest_path_id": stale.latest_path_id.clone(),
+                                "latest_stage1_completed_at": stale.latest_stage1_completed_at,
+                                "reason": stale.reason,
+                            }),
+                        );
+                        warn!(
+                            symbol = %symbol,
+                            trigger = &*trigger,
+                            expected_path_id = ?stage2a_snapshot_path_id,
+                            latest_path_id = ?stale.latest_path_id,
+                            reason = stale.reason,
+                            "dropping stale workflow stage2a response"
+                        );
+                        stage2a_output = None;
+                        selected_stage2a_model_name = None;
+                    } else {
+                        match parsed_stage2a.stage2_decision.as_str() {
+                            "REQUEST_STAGE1_REEVALUATION" => {
+                                workflow_state.pending_stage1_refresh_reason =
+                                    Some("thesis_invalidated".to_string());
                                 clear_approved_tactical_plan(&mut workflow_state);
+                                crate::workflow::persistence::save_workflow_state(
+                                    &state_dir,
+                                    &workflow_state,
+                                )?;
+                                append_workflow_journal_event(
+                                    "workflow_stage1_reevaluation_requested",
+                                    &symbol,
+                                    bundle.raw.ts_bucket,
+                                    json!({
+                                        "trigger": &*trigger,
+                                        "reevaluation_reason": parsed_stage2a.reevaluation_reason,
+                                        "path_id": stage1_output.current_path.as_ref().map(|path| path.id.clone()),
+                                    }),
+                                );
                             }
-                            workflow_state.pending_stage1_refresh_reason = None;
-                            crate::workflow::persistence::save_workflow_state(
-                                &state_dir,
-                                &workflow_state,
-                            )?;
-                            append_workflow_journal_event(
-                                "workflow_tactical_plan_approved",
-                                &symbol,
-                                bundle.raw.ts_bucket,
-                                json!({
-                                    "trigger": &*trigger,
-                                    "model_name": selected_stage2a_model_name.clone(),
-                                    "source_ts_bucket": bundle.raw.ts_bucket,
-                                    "tactical_entry_plan": parsed_stage2a.tactical_entry_plan.clone(),
-                                }),
-                            );
-                            if let Some(tactical_plan) =
-                                workflow_state.approved_tactical_plan.as_ref()
-                            {
+                            "PATH_CONFIRMED_WAIT" => {
+                                clear_approved_tactical_plan(&mut workflow_state);
+                                workflow_state.pending_stage1_refresh_reason = None;
+                                crate::workflow::persistence::save_workflow_state(
+                                    &state_dir,
+                                    &workflow_state,
+                                )?;
+                                append_workflow_journal_event(
+                                    "workflow_stage2a_wait",
+                                    &symbol,
+                                    bundle.raw.ts_bucket,
+                                    json!({
+                                        "trigger": &*trigger,
+                                        "model_name": selected_stage2a_model_name.clone(),
+                                        "source_ts_bucket": bundle.raw.ts_bucket,
+                                        "path_id": stage1_output.current_path.as_ref().map(|path| path.id.clone()),
+                                        "wait_reason": parsed_stage2a.wait_reason,
+                                    }),
+                                );
                                 info!(
                                     symbol = %symbol,
                                     trigger = &*trigger,
                                     source_ts_bucket = %bundle.raw.ts_bucket,
-                                    path_id = %tactical_plan.path_id,
-                                    side = %tactical_plan.entry_plan.side,
-                                    entry_profile = %tactical_plan.entry_plan.entry_profile,
-                                    intent_mode = %tactical_plan.entry_plan.intent_mode,
-                                    entry_zone_low = tactical_plan.entry_plan.entry_zone.low,
-                                    entry_zone_high = tactical_plan.entry_plan.entry_zone.high,
-                                    invalidation_low = tactical_plan.entry_plan.entry_invalidation_level.low,
-                                    invalidation_high = tactical_plan.entry_plan.entry_invalidation_level.high,
-                                    stop_loss = tactical_plan.entry_plan.stop_loss,
-                                    "workflow tactical plan approved"
+                                    path_id = ?stage1_output.current_path.as_ref().map(|path| path.id.clone()),
+                                    wait_reason = ?parsed_stage2a.wait_reason,
+                                    "workflow stage2a path confirmed but waiting for better execution"
                                 );
                             }
+                            "PATH_CONFIRMED_ENTRY" => {
+                                if let Some(tactical_plan) =
+                                    parsed_stage2a.tactical_entry_plan.clone()
+                                {
+                                    set_approved_tactical_plan(
+                                        &mut workflow_state,
+                                        tactical_plan,
+                                        bundle.raw.ts_bucket,
+                                        true,
+                                    );
+                                } else {
+                                    clear_approved_tactical_plan(&mut workflow_state);
+                                }
+                                workflow_state.pending_stage1_refresh_reason = None;
+                                crate::workflow::persistence::save_workflow_state(
+                                    &state_dir,
+                                    &workflow_state,
+                                )?;
+                                append_workflow_journal_event(
+                                    "workflow_tactical_plan_approved",
+                                    &symbol,
+                                    bundle.raw.ts_bucket,
+                                    json!({
+                                        "trigger": &*trigger,
+                                        "model_name": selected_stage2a_model_name.clone(),
+                                        "source_ts_bucket": bundle.raw.ts_bucket,
+                                        "tactical_entry_plan": parsed_stage2a.tactical_entry_plan.clone(),
+                                    }),
+                                );
+                                if let Some(tactical_plan) =
+                                    workflow_state.approved_tactical_plan.as_ref()
+                                {
+                                    info!(
+                                        symbol = %symbol,
+                                        trigger = &*trigger,
+                                        source_ts_bucket = %bundle.raw.ts_bucket,
+                                        path_id = %tactical_plan.path_id,
+                                        side = %tactical_plan.entry_plan.side,
+                                        entry_profile = %tactical_plan.entry_plan.entry_profile,
+                                        intent_mode = %tactical_plan.entry_plan.intent_mode,
+                                        entry_zone_low = tactical_plan.entry_plan.entry_zone.low,
+                                        entry_zone_high = tactical_plan.entry_plan.entry_zone.high,
+                                        invalidation_low = tactical_plan.entry_plan.entry_invalidation_level.low,
+                                        invalidation_high = tactical_plan.entry_plan.entry_invalidation_level.high,
+                                        stop_loss = tactical_plan.entry_plan.stop_loss,
+                                        "workflow tactical plan approved"
+                                    );
+                                }
+                            }
+                            other => return Err(anyhow!("unsupported stage2a decision {}", other)),
                         }
-                        other => return Err(anyhow!("unsupported stage2a decision {}", other)),
                     }
                 } else if active_position_count == 0 && live_entry_order_count == 0 {
                     clear_approved_tactical_plan(&mut workflow_state);
@@ -7803,6 +8143,64 @@ mod tests {
     }
 
     #[test]
+    fn latest_temp_indicator_bundle_path_for_symbol_picks_most_recent_matching_file() {
+        let dir = std::env::temp_dir().join(format!("llm-temp-indicator-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("create temp indicator dir");
+        fs::write(dir.join("20260330T120000Z_ETHUSDT.json"), "{}").expect("write old bundle");
+        fs::write(dir.join("20260330T120100Z_BTCUSDT.json"), "{}").expect("write other symbol");
+        fs::write(dir.join("20260330T120200Z_ETHUSDT.json"), "{}").expect("write latest bundle");
+
+        let latest =
+            latest_temp_indicator_bundle_path_for_symbol(&dir, "ethusdt").expect("scan temp dir");
+
+        assert_eq!(
+            latest.as_deref(),
+            Some(dir.join("20260330T120200Z_ETHUSDT.json").as_path())
+        );
+
+        fs::remove_dir_all(&dir).expect("cleanup temp indicator dir");
+    }
+
+    #[test]
+    fn detect_stale_stage2a_response_flags_path_switch_and_inflight_stage1() {
+        let expected_completed_at = DateTime::parse_from_rfc3339("2026-03-30T12:00:00Z")
+            .expect("expected ts")
+            .with_timezone(&Utc);
+        let latest_completed_at = DateTime::parse_from_rfc3339("2026-03-30T12:05:00Z")
+            .expect("latest ts")
+            .with_timezone(&Utc);
+
+        let path_switch = detect_stale_stage2a_response(
+            Some("path_a"),
+            Some(expected_completed_at),
+            Some("path_b"),
+            Some(latest_completed_at),
+            false,
+        )
+        .expect("path switch");
+        assert_eq!(path_switch.reason, "path_switched");
+
+        let inflight = detect_stale_stage2a_response(
+            Some("path_a"),
+            Some(expected_completed_at),
+            Some("path_a"),
+            Some(expected_completed_at),
+            true,
+        )
+        .expect("inflight");
+        assert_eq!(inflight.reason, "stage1_inflight");
+
+        assert!(detect_stale_stage2a_response(
+            Some("path_a"),
+            Some(expected_completed_at),
+            Some("path_a"),
+            Some(expected_completed_at),
+            false,
+        )
+        .is_none());
+    }
+
+    #[test]
     fn path_boundary_touch_does_not_request_stage1_refresh_with_live_same_side_position() {
         let state_dir =
             std::env::temp_dir().join(format!("llm-workflow-state-{}", uuid::Uuid::new_v4()));
@@ -7847,7 +8245,8 @@ mod tests {
 
     #[test]
     fn stage1_replay_requests_refresh_when_failure_level_was_touched_during_gap() {
-        clear_fast_price_event_buffer_for_symbol("ETHUSDT");
+        let symbol = "ETHUSDT_REPLAY_FAILURE";
+        clear_fast_price_event_buffer_for_symbol(symbol);
         let state_dir =
             std::env::temp_dir().join(format!("llm-workflow-state-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&state_dir).expect("create workflow state dir");
@@ -7858,10 +8257,12 @@ mod tests {
         let replay_end = DateTime::parse_from_rfc3339("2026-03-30T12:06:00Z")
             .expect("replay end")
             .with_timezone(&Utc);
-        record_fast_price_event_in_buffer(&sample_fast_price_event("2026-03-30T12:04:00Z", 98.0));
+        let mut replay_event = sample_fast_price_event("2026-03-30T12:04:00Z", 98.0);
+        replay_event.symbol = symbol.to_string();
+        record_fast_price_event_in_buffer(&replay_event);
 
         let mut workflow_state = WorkflowState {
-            symbol: "ETHUSDT".to_string(),
+            symbol: symbol.to_string(),
             approved_tactical_plan: Some(sample_tactical_plan()),
             approved_tactical_plan_updated_at: Some(Utc::now()),
             last_stage1_source_ts_bucket: Some(replay_start),
@@ -7873,9 +8274,10 @@ mod tests {
         let current_event = sample_fast_price_event("2026-03-30T12:06:05Z", 101.0);
 
         let attempt = maybe_replay_stage1_path_boundary_window(
+            None,
             &mut workflow_state,
             Some(&current_path),
-            "ETHUSDT",
+            symbol,
             &sample_flat_trading_state(),
             state_dir.to_str().expect("state dir"),
             &current_event,
@@ -7890,13 +8292,14 @@ mod tests {
         assert!(workflow_state.approved_tactical_plan.is_none());
         assert!(workflow_state.last_stage1_replayed_at.is_none());
 
-        clear_fast_price_event_buffer_for_symbol("ETHUSDT");
+        clear_fast_price_event_buffer_for_symbol(symbol);
         fs::remove_dir_all(&state_dir).expect("cleanup workflow state dir");
     }
 
     #[test]
     fn stage1_replay_requests_refresh_when_first_path_target_was_touched_during_gap() {
-        clear_fast_price_event_buffer_for_symbol("ETHUSDT");
+        let symbol = "ETHUSDT_REPLAY_TARGET";
+        clear_fast_price_event_buffer_for_symbol(symbol);
         let state_dir =
             std::env::temp_dir().join(format!("llm-workflow-state-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&state_dir).expect("create workflow state dir");
@@ -7907,10 +8310,12 @@ mod tests {
         let replay_end = DateTime::parse_from_rfc3339("2026-03-30T12:06:00Z")
             .expect("replay end")
             .with_timezone(&Utc);
-        record_fast_price_event_in_buffer(&sample_fast_price_event("2026-03-30T12:04:00Z", 104.0));
+        let mut replay_event = sample_fast_price_event("2026-03-30T12:04:00Z", 104.0);
+        replay_event.symbol = symbol.to_string();
+        record_fast_price_event_in_buffer(&replay_event);
 
         let mut workflow_state = WorkflowState {
-            symbol: "ETHUSDT".to_string(),
+            symbol: symbol.to_string(),
             approved_tactical_plan: Some(sample_tactical_plan()),
             approved_tactical_plan_updated_at: Some(Utc::now()),
             last_stage1_source_ts_bucket: Some(replay_start),
@@ -7922,9 +8327,10 @@ mod tests {
         let current_event = sample_fast_price_event("2026-03-30T12:06:05Z", 101.0);
 
         let attempt = maybe_replay_stage1_path_boundary_window(
+            None,
             &mut workflow_state,
             Some(&current_path),
-            "ETHUSDT",
+            symbol,
             &sample_flat_trading_state(),
             state_dir.to_str().expect("state dir"),
             &current_event,
@@ -7939,13 +8345,14 @@ mod tests {
         assert!(workflow_state.approved_tactical_plan.is_none());
         assert!(workflow_state.last_stage1_replayed_at.is_none());
 
-        clear_fast_price_event_buffer_for_symbol("ETHUSDT");
+        clear_fast_price_event_buffer_for_symbol(symbol);
         fs::remove_dir_all(&state_dir).expect("cleanup workflow state dir");
     }
 
     #[test]
     fn stage1_replay_marks_window_completed_when_no_boundary_was_touched() {
-        clear_fast_price_event_buffer_for_symbol("ETHUSDT");
+        let symbol = "ETHUSDT_REPLAY_NONE";
+        clear_fast_price_event_buffer_for_symbol(symbol);
         let state_dir =
             std::env::temp_dir().join(format!("llm-workflow-state-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&state_dir).expect("create workflow state dir");
@@ -7956,10 +8363,12 @@ mod tests {
         let replay_end = DateTime::parse_from_rfc3339("2026-03-30T12:06:00Z")
             .expect("replay end")
             .with_timezone(&Utc);
-        record_fast_price_event_in_buffer(&sample_fast_price_event("2026-03-30T12:04:00Z", 101.0));
+        let mut replay_event = sample_fast_price_event("2026-03-30T12:04:00Z", 101.0);
+        replay_event.symbol = symbol.to_string();
+        record_fast_price_event_in_buffer(&replay_event);
 
         let mut workflow_state = WorkflowState {
-            symbol: "ETHUSDT".to_string(),
+            symbol: symbol.to_string(),
             last_stage1_source_ts_bucket: Some(replay_start),
             last_stage1_completed_at: Some(replay_end),
             last_stage1_replayed_at: None,
@@ -7969,9 +8378,10 @@ mod tests {
         let current_event = sample_fast_price_event("2026-03-30T12:06:05Z", 101.2);
 
         let attempt = maybe_replay_stage1_path_boundary_window(
+            None,
             &mut workflow_state,
             Some(&current_path),
-            "ETHUSDT",
+            symbol,
             &sample_flat_trading_state(),
             state_dir.to_str().expect("state dir"),
             &current_event,
@@ -7982,7 +8392,7 @@ mod tests {
         assert!(workflow_state.pending_stage1_refresh_reason.is_none());
         assert!(workflow_state.last_stage1_replayed_at.is_some());
 
-        clear_fast_price_event_buffer_for_symbol("ETHUSDT");
+        clear_fast_price_event_buffer_for_symbol(symbol);
         fs::remove_dir_all(&state_dir).expect("cleanup workflow state dir");
     }
 
