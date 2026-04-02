@@ -1708,6 +1708,21 @@ fn workflow_entry_context_key(symbol: &str, side: &str, path_id: &str) -> String
     )
 }
 
+fn activation_or_entry_zone<'a>(
+    plan: &'a crate::workflow::schema::EntryPlan,
+) -> &'a crate::workflow::schema::PriceZone {
+    plan.entry_activation_level
+        .as_ref()
+        .unwrap_or(&plan.entry_zone)
+}
+
+fn entry_plan_reason(plan: &crate::workflow::schema::EntryPlan) -> String {
+    format!(
+        "entry_reason: {}; invalidation_reason: {}; stop_loss_reason: {}",
+        plan.entry_reason, plan.invalidation_reason, plan.stop_loss_reason
+    )
+}
+
 fn entry_plan_log_payload(
     path_id: &str,
     context_key: &str,
@@ -1724,6 +1739,9 @@ fn entry_plan_log_payload(
         "entry_invalidation_level": &plan.entry_invalidation_level,
         "stop_loss": plan.stop_loss,
         "max_drift_pct": plan.max_drift_pct,
+        "entry_reason": &plan.entry_reason,
+        "invalidation_reason": &plan.invalidation_reason,
+        "stop_loss_reason": &plan.stop_loss_reason,
     })
 }
 
@@ -1879,8 +1897,8 @@ fn pullback_dispatch_price_ok(plan: &crate::workflow::schema::EntryPlan, price: 
 }
 
 fn inside_or_beyond_activation(plan: &crate::workflow::schema::EntryPlan, price: f64) -> bool {
-    plan.entry_activation_level.contains(price)
-        || favorable_beyond_zone(&plan.side, price, &plan.entry_activation_level)
+    let activation_zone = activation_or_entry_zone(plan);
+    activation_zone.contains(price) || favorable_beyond_zone(&plan.side, price, activation_zone)
 }
 
 fn breakout_crossed(plan: &crate::workflow::schema::EntryPlan, price: f64) -> bool {
@@ -3411,7 +3429,7 @@ fn execution_intent_from_entry_plan(
         side: plan.side.clone(),
         entry_profile: Some(plan.entry_profile.clone()),
         intent_mode: plan.intent_mode.clone(),
-        entry_activation_level: Some(plan.entry_activation_level.clone()),
+        entry_activation_level: plan.entry_activation_level.clone(),
         entry_zone: plan.entry_zone.clone(),
         entry_invalidation_level: Some(plan.entry_invalidation_level.clone()),
         trigger_price: Some(trigger_price),
@@ -3425,7 +3443,7 @@ fn execution_intent_from_entry_plan(
             context_key: workflow_entry_context_key(symbol, &plan.side, path_id),
             path_id: path_id.to_string(),
         },
-        reason: Some(plan.entry_note.clone()),
+        reason: Some(entry_plan_reason(plan)),
         quantity_override,
     }
 }
@@ -3461,7 +3479,7 @@ fn build_fallback_entry_snapshot(
             .unwrap_or_else(|| current_path.side.clone()),
         entry_profile: fallback_plan.map(|plan| plan.entry_profile.clone()),
         intent_mode: fallback_plan.map(|plan| plan.intent_mode.clone()),
-        entry_activation_level: fallback_plan.map(|plan| plan.entry_activation_level.clone()),
+        entry_activation_level: fallback_plan.and_then(|plan| plan.entry_activation_level.clone()),
         entry_zone: fallback_plan.map(|plan| plan.entry_zone.clone()),
         entry_invalidation_level: fallback_plan.map(|plan| plan.entry_invalidation_level.clone()),
         max_drift_pct: fallback_plan.map(|plan| plan.max_drift_pct),
@@ -3541,13 +3559,7 @@ fn entry_plan_from_snapshot_template(
     let entry_activation_level = snapshot
         .entry_activation_level
         .clone()
-        .or_else(|| fallback_plan.map(|plan| plan.entry_activation_level.clone()))
-        .ok_or_else(|| {
-            anyhow!(
-                "entry template missing entry_activation_level for {}",
-                snapshot.context_key
-            )
-        })?;
+        .or_else(|| fallback_plan.and_then(|plan| plan.entry_activation_level.clone()));
     let entry_zone = snapshot
         .entry_zone
         .clone()
@@ -3587,9 +3599,15 @@ fn entry_plan_from_snapshot_template(
         entry_invalidation_level,
         stop_loss: snapshot.stop_loss,
         max_drift_pct,
-        entry_note: fallback_plan
-            .map(|plan| plan.entry_note.clone())
-            .unwrap_or_default(),
+        entry_reason: fallback_plan
+            .map(|plan| plan.entry_reason.clone())
+            .unwrap_or_else(|| "reused_from_snapshot_template".to_string()),
+        invalidation_reason: fallback_plan
+            .map(|plan| plan.invalidation_reason.clone())
+            .unwrap_or_else(|| "reused_from_snapshot_template".to_string()),
+        stop_loss_reason: fallback_plan
+            .map(|plan| plan.stop_loss_reason.clone())
+            .unwrap_or_else(|| "reused_from_snapshot_template".to_string()),
     })
 }
 
@@ -4102,6 +4120,32 @@ async fn handle_fast_market_event(
         crate::workflow::persistence::save_workflow_state(&state_dir, &workflow_state)?;
     }
     let watch_facts = fast_watcher_price_facts(event.price);
+    let stage1_replay_attempt = maybe_replay_stage1_path_boundary_window(
+        &mut workflow_state,
+        active_current_path.as_ref(),
+        &symbol,
+        &trading_state,
+        &state_dir,
+        &event,
+    )?;
+    if stage1_replay_attempt.requested_refresh {
+        *fast_state = None;
+        return Ok(());
+    }
+    if !stage1_replay_attempt.current_event_was_replayed
+        && maybe_request_stage1_refresh_on_path_boundary_touch(
+            &mut workflow_state,
+            active_current_path.as_ref(),
+            &symbol,
+            &trading_state,
+            &state_dir,
+            &event,
+            Stage1RefreshOrigin::Live,
+        )?
+    {
+        *fast_state = None;
+        return Ok(());
+    }
 
     if process_fast_position_management_actions(
         ctx,
@@ -4396,6 +4440,362 @@ fn stop_loss_hit(plan: &crate::workflow::schema::EntryPlan, latest_price: f64) -
     }
 }
 
+fn first_path_target_hit(
+    current_path: &crate::workflow::schema::CurrentPath,
+    latest_price: f64,
+) -> bool {
+    let target_price = current_path
+        .first_path_target
+        .directional_target(&current_path.side);
+    match current_path.side.as_str() {
+        "LONG" => latest_price >= target_price,
+        "SHORT" => latest_price <= target_price,
+        _ => false,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stage1RefreshOrigin {
+    Live,
+    Replay,
+}
+
+impl Stage1RefreshOrigin {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Live => "fast_event",
+            Self::Replay => "replay",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stage1PathBoundary {
+    FailureLevel,
+    FirstPathTarget,
+}
+
+impl Stage1PathBoundary {
+    fn name(self) -> &'static str {
+        match self {
+            Self::FailureLevel => "failure_level",
+            Self::FirstPathTarget => "first_path_target",
+        }
+    }
+
+    fn zone<'a>(
+        self,
+        current_path: &'a crate::workflow::schema::CurrentPath,
+    ) -> &'a crate::workflow::schema::PriceZone {
+        match self {
+            Self::FailureLevel => &current_path.failure_level,
+            Self::FirstPathTarget => &current_path.first_path_target,
+        }
+    }
+
+    fn trigger_level(self, current_path: &crate::workflow::schema::CurrentPath) -> f64 {
+        match self {
+            Self::FailureLevel => failure_level_touch_price(current_path),
+            Self::FirstPathTarget => current_path
+                .first_path_target
+                .directional_target(&current_path.side),
+        }
+    }
+
+    fn refresh_reason(self, origin: Stage1RefreshOrigin) -> &'static str {
+        match (self, origin) {
+            (Self::FailureLevel, Stage1RefreshOrigin::Live) => "failure_level_touched",
+            (Self::FailureLevel, Stage1RefreshOrigin::Replay) => {
+                "failure_level_touched_during_replay"
+            }
+            (Self::FirstPathTarget, Stage1RefreshOrigin::Live) => "first_path_target_touched",
+            (Self::FirstPathTarget, Stage1RefreshOrigin::Replay) => {
+                "first_path_target_touched_during_replay"
+            }
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct Stage1ReplayAttempt {
+    requested_refresh: bool,
+    current_event_was_replayed: bool,
+}
+
+fn failure_level_touch_price(current_path: &crate::workflow::schema::CurrentPath) -> f64 {
+    match current_path.side.as_str() {
+        "LONG" => current_path.failure_level.low,
+        "SHORT" => current_path.failure_level.high,
+        _ => current_path.failure_level.midpoint(),
+    }
+}
+
+fn failure_level_touched(
+    current_path: &crate::workflow::schema::CurrentPath,
+    latest_price: f64,
+) -> bool {
+    match current_path.side.as_str() {
+        "LONG" => latest_price <= current_path.failure_level.low,
+        "SHORT" => latest_price >= current_path.failure_level.high,
+        _ => false,
+    }
+}
+
+fn stage1_path_boundary_touched(
+    current_path: &crate::workflow::schema::CurrentPath,
+    latest_price: f64,
+) -> Option<Stage1PathBoundary> {
+    if failure_level_touched(current_path, latest_price) {
+        Some(Stage1PathBoundary::FailureLevel)
+    } else if first_path_target_hit(current_path, latest_price) {
+        Some(Stage1PathBoundary::FirstPathTarget)
+    } else {
+        None
+    }
+}
+
+fn stage1_replay_pending(workflow_state: &crate::workflow::state::WorkflowState) -> bool {
+    workflow_state.last_stage1_completed_at.is_some()
+        && workflow_state.last_stage1_replayed_at.is_none()
+}
+
+fn stage1_replay_cutoff(
+    workflow_state: &crate::workflow::state::WorkflowState,
+    fallback_cutoff: DateTime<Utc>,
+) -> DateTime<Utc> {
+    workflow_state
+        .last_stage1_completed_at
+        .unwrap_or(fallback_cutoff)
+}
+
+fn mark_stage1_replay_completed(
+    workflow_state: &mut crate::workflow::state::WorkflowState,
+    symbol: &str,
+    path_id: Option<&str>,
+    replay_start: Option<DateTime<Utc>>,
+    replay_end: DateTime<Utc>,
+    replay_count: usize,
+    state_dir: &str,
+) -> Result<()> {
+    if workflow_state.last_stage1_replayed_at.is_some() {
+        return Ok(());
+    }
+    let completed_at = Utc::now();
+    workflow_state.last_stage1_replayed_at = Some(completed_at);
+    crate::workflow::persistence::save_workflow_state(state_dir, workflow_state)?;
+    append_workflow_journal_event(
+        "workflow_stage1_replay_completed",
+        symbol,
+        replay_end,
+        json!({
+            "trigger": "watcher_fast_consumer",
+            "path_id": path_id,
+            "replay_start": replay_start,
+            "replay_end": replay_end,
+            "replay_count": replay_count,
+            "completed_at": completed_at,
+        }),
+    );
+    Ok(())
+}
+
+fn mark_stage1_replay_skipped(
+    workflow_state: &mut crate::workflow::state::WorkflowState,
+    symbol: &str,
+    path_id: Option<&str>,
+    replay_start: Option<DateTime<Utc>>,
+    replay_end: DateTime<Utc>,
+    reason: &str,
+    state_dir: &str,
+) -> Result<()> {
+    if workflow_state.last_stage1_replayed_at.is_some() {
+        return Ok(());
+    }
+    let completed_at = Utc::now();
+    workflow_state.last_stage1_replayed_at = Some(completed_at);
+    crate::workflow::persistence::save_workflow_state(state_dir, workflow_state)?;
+    append_workflow_journal_event(
+        "workflow_stage1_replay_skipped",
+        symbol,
+        replay_end,
+        json!({
+            "trigger": "watcher_fast_consumer",
+            "path_id": path_id,
+            "replay_start": replay_start,
+            "replay_end": replay_end,
+            "reason": reason,
+            "completed_at": completed_at,
+        }),
+    );
+    Ok(())
+}
+
+fn maybe_request_stage1_refresh_on_path_boundary_touch(
+    workflow_state: &mut crate::workflow::state::WorkflowState,
+    current_path: Option<&crate::workflow::schema::CurrentPath>,
+    symbol: &str,
+    trading_state: &TradingStateSnapshot,
+    state_dir: &str,
+    event: &FastPriceEvent,
+    origin: Stage1RefreshOrigin,
+) -> Result<bool> {
+    if workflow_state.pending_stage1_refresh_reason.is_some() {
+        return Ok(false);
+    }
+    let Some(current_path) = current_path else {
+        return Ok(false);
+    };
+    if has_active_position_for_side(trading_state, &current_path.side) {
+        return Ok(false);
+    }
+    if live_entry_order_count_for_side(trading_state, &current_path.side) > 0 {
+        return Ok(false);
+    }
+    let Some(boundary) = stage1_path_boundary_touched(current_path, event.price) else {
+        return Ok(false);
+    };
+
+    let refresh_reason = boundary.refresh_reason(origin).to_string();
+    workflow_state.pending_stage1_refresh_reason = Some(refresh_reason.clone());
+    clear_approved_tactical_plan(workflow_state);
+    crate::workflow::persistence::save_workflow_state(state_dir, workflow_state)?;
+    append_workflow_journal_event(
+        "workflow_stage1_refresh_requested",
+        symbol,
+        event.event_ts,
+        json!({
+            "trigger": "watcher_fast_consumer",
+            "refresh_reason": refresh_reason,
+            "refresh_origin": origin.as_str(),
+            "path_id": &current_path.id,
+            "side": &current_path.side,
+            "trigger_price": event.price,
+            "price_source": event.source.as_str(),
+            "routing_key": &event.routing_key,
+            "boundary_type": boundary.name(),
+            "boundary_zone": boundary.zone(current_path),
+            "boundary_level": boundary.trigger_level(current_path),
+        }),
+    );
+    Ok(true)
+}
+
+fn maybe_replay_stage1_path_boundary_window(
+    workflow_state: &mut crate::workflow::state::WorkflowState,
+    current_path: Option<&crate::workflow::schema::CurrentPath>,
+    symbol: &str,
+    trading_state: &TradingStateSnapshot,
+    state_dir: &str,
+    event: &FastPriceEvent,
+) -> Result<Stage1ReplayAttempt> {
+    if !stage1_replay_pending(workflow_state) {
+        return Ok(Stage1ReplayAttempt::default());
+    }
+
+    let replay_cutoff = stage1_replay_cutoff(workflow_state, event.event_ts);
+    let replay_start = workflow_state.last_stage1_source_ts_bucket;
+    let Some(current_path) = current_path else {
+        mark_stage1_replay_skipped(
+            workflow_state,
+            symbol,
+            None,
+            replay_start,
+            replay_cutoff,
+            "no_active_path",
+            state_dir,
+        )?;
+        return Ok(Stage1ReplayAttempt::default());
+    };
+
+    if has_active_position_for_side(trading_state, &current_path.side)
+        || live_entry_order_count_for_side(trading_state, &current_path.side) > 0
+    {
+        mark_stage1_replay_skipped(
+            workflow_state,
+            symbol,
+            Some(&current_path.id),
+            replay_start,
+            replay_cutoff,
+            "same_side_exposure_exists",
+            state_dir,
+        )?;
+        return Ok(Stage1ReplayAttempt::default());
+    }
+
+    let Some(replay_start) = replay_start else {
+        mark_stage1_replay_skipped(
+            workflow_state,
+            symbol,
+            Some(&current_path.id),
+            None,
+            replay_cutoff,
+            "missing_source_ts_bucket",
+            state_dir,
+        )?;
+        return Ok(Stage1ReplayAttempt::default());
+    };
+
+    let replay_events = buffered_fast_price_events_in_range(symbol, replay_start, replay_cutoff);
+    let replay_count = replay_events.len();
+    let current_event_was_replayed = replay_events
+        .iter()
+        .any(|replay_event| fast_event_matches(replay_event, event));
+
+    info!(
+        symbol = %symbol,
+        trigger = "watcher_fast_consumer",
+        path_id = %current_path.id,
+        replay_start = %replay_start,
+        replay_end = %replay_cutoff,
+        replay_count = replay_count,
+        "workflow watcher replaying stage1 path boundaries"
+    );
+    append_workflow_journal_event(
+        "workflow_stage1_replay",
+        symbol,
+        replay_cutoff,
+        json!({
+            "trigger": "watcher_fast_consumer",
+            "path_id": &current_path.id,
+            "replay_start": replay_start,
+            "replay_end": replay_cutoff,
+            "replay_count": replay_count,
+        }),
+    );
+
+    for replay_event in &replay_events {
+        if maybe_request_stage1_refresh_on_path_boundary_touch(
+            workflow_state,
+            Some(current_path),
+            symbol,
+            trading_state,
+            state_dir,
+            replay_event,
+            Stage1RefreshOrigin::Replay,
+        )? {
+            return Ok(Stage1ReplayAttempt {
+                requested_refresh: true,
+                current_event_was_replayed,
+            });
+        }
+    }
+
+    mark_stage1_replay_completed(
+        workflow_state,
+        symbol,
+        Some(&current_path.id),
+        Some(replay_start),
+        replay_cutoff,
+        replay_count,
+        state_dir,
+    )?;
+
+    Ok(Stage1ReplayAttempt {
+        requested_refresh: false,
+        current_event_was_replayed,
+    })
+}
+
 fn maybe_record_stopout_and_cleanup(
     workflow_state: &mut crate::workflow::state::WorkflowState,
     approved_tactical_plan: Option<&crate::workflow::schema::TacticalEntryPlan>,
@@ -4644,9 +5044,17 @@ async fn maybe_refresh_stage1(
         .as_ref()
         .map(|path| path.tracked_zones.clone())
         .unwrap_or_default();
+    let stage1_completed_at = Utc::now();
     workflow_state.last_stage1_ts = Some(parsed_stage1.meta.stage1_ts);
     workflow_state.last_stage1_source_ts_bucket = Some(bundle.raw.ts_bucket);
     workflow_state.last_stage1_refresh_reason = Some(refresh_reason.clone());
+    workflow_state.last_stage1_completed_at = Some(stage1_completed_at);
+    workflow_state.last_stage1_replayed_at =
+        if parsed_stage1.monitoring_status == "active" && parsed_stage1.current_path.is_some() {
+            None
+        } else {
+            Some(stage1_completed_at)
+        };
     workflow_state.pending_stage1_refresh_reason = None;
     clear_approved_tactical_plan(workflow_state);
     crate::workflow::persistence::save_stage1_output(state_dir, symbol, &parsed_stage1)?;
@@ -6183,12 +6591,14 @@ mod tests {
             side: "LONG".to_string(),
             entry_profile: entry_profile.to_string(),
             intent_mode: intent_mode.to_string(),
-            entry_activation_level: sample_price_zone(100.0, 101.2, "15m"),
+            entry_activation_level: Some(sample_price_zone(100.0, 101.2, "15m")),
             entry_zone: sample_price_zone(100.0, 101.0, "15m"),
             entry_invalidation_level: sample_price_zone(98.5, 99.0, "15m"),
             stop_loss: 98.4,
             max_drift_pct: 0.2,
-            entry_note: String::new(),
+            entry_reason: "entry".to_string(),
+            invalidation_reason: "invalidation".to_string(),
+            stop_loss_reason: "stop".to_string(),
         }
     }
 
@@ -6312,14 +6722,61 @@ mod tests {
                 side: "LONG".to_string(),
                 entry_profile: "reclaim_then_hold".to_string(),
                 intent_mode: "breakout".to_string(),
-                entry_activation_level: sample_price_zone(100.0, 101.0, "15m"),
+                entry_activation_level: Some(sample_price_zone(100.0, 101.0, "15m")),
                 entry_zone: sample_price_zone(101.0, 102.0, "15m"),
                 entry_invalidation_level: sample_price_zone(98.0, 99.0, "15m"),
                 stop_loss: 98.8,
                 max_drift_pct: 0.2,
-                entry_note: "entry".to_string(),
+                entry_reason: "entry".to_string(),
+                invalidation_reason: "invalidation".to_string(),
+                stop_loss_reason: "stop".to_string(),
             },
         }
+    }
+
+    #[test]
+    fn inside_or_beyond_activation_falls_back_to_entry_zone_when_activation_is_missing() {
+        let mut plan = sample_fast_entry_plan("pullback", "pullback_acceptance");
+        plan.entry_activation_level = None;
+
+        assert!(inside_or_beyond_activation(&plan, 100.5));
+        assert!(inside_or_beyond_activation(&plan, 101.2));
+        assert!(!inside_or_beyond_activation(&plan, 99.0));
+    }
+
+    #[test]
+    fn entry_plan_from_snapshot_template_allows_missing_activation_level() {
+        let mut fallback_plan = sample_fast_entry_plan("breakout", "reclaim_then_hold");
+        fallback_plan.entry_activation_level = None;
+        let snapshot = EntrySnapshot {
+            symbol: "ETHUSDT".to_string(),
+            context_key: "ETHUSDT:LONG:path_a".to_string(),
+            path_id: "path_a".to_string(),
+            side: "LONG".to_string(),
+            entry_profile: Some("reclaim_then_hold".to_string()),
+            intent_mode: Some("breakout".to_string()),
+            entry_activation_level: None,
+            entry_zone: Some(sample_price_zone(101.0, 102.0, "15m")),
+            entry_invalidation_level: Some(sample_price_zone(98.0, 99.0, "15m")),
+            max_drift_pct: Some(0.2),
+            stop_loss: 98.8,
+            take_profit_1: 104.0,
+            take_profit_2: 107.0,
+            allowed_stop_loss_levels: vec![98.8],
+            allowed_take_profit_levels: vec![104.0, 107.0],
+            tp1_realized: false,
+            applied_driver_deterioration_signals: vec![],
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let plan = entry_plan_from_snapshot_template(&snapshot, Some(&fallback_plan))
+            .expect("snapshot template should allow missing activation");
+
+        assert!(plan.entry_activation_level.is_none());
+        assert_eq!(plan.entry_reason, fallback_plan.entry_reason);
+        assert_eq!(plan.invalidation_reason, fallback_plan.invalidation_reason);
+        assert_eq!(plan.stop_loss_reason, fallback_plan.stop_loss_reason);
     }
 
     #[test]
@@ -6636,12 +7093,14 @@ mod tests {
             side: "LONG".to_string(),
             entry_profile: "reclaim_then_hold".to_string(),
             intent_mode: "pullback".to_string(),
-            entry_activation_level: sample_price_zone(100.0, 101.0, "15m"),
+            entry_activation_level: Some(sample_price_zone(100.0, 101.0, "15m")),
             entry_zone: sample_price_zone(100.5, 101.5, "15m"),
             entry_invalidation_level: sample_price_zone(98.0, 99.0, "15m"),
             stop_loss: 97.5,
             max_drift_pct: 0.2,
-            entry_note: "entry".to_string(),
+            entry_reason: "entry".to_string(),
+            invalidation_reason: "invalidation".to_string(),
+            stop_loss_reason: "stop".to_string(),
         };
         let short_plan = crate::workflow::schema::EntryPlan {
             side: "SHORT".to_string(),
@@ -7100,6 +7559,305 @@ mod tests {
             &sample_fast_price_event("2026-03-30T09:35:03Z", 100.9),
             &watcher_cfg,
         ));
+    }
+
+    #[test]
+    fn first_path_target_hit_uses_tp1_edge_for_long_and_short_paths() {
+        let long_path = sample_stage1_output().current_path.expect("long path");
+        assert!(!first_path_target_hit(&long_path, 103.9));
+        assert!(first_path_target_hit(&long_path, 104.0));
+
+        let mut short_path = long_path.clone();
+        short_path.side = "SHORT".to_string();
+        short_path.first_path_target = sample_price_zone(96.0, 97.0, "4h");
+
+        assert!(!first_path_target_hit(&short_path, 96.1));
+        assert!(first_path_target_hit(&short_path, 96.0));
+    }
+
+    #[test]
+    fn failure_level_touch_uses_low_for_long_and_high_for_short_paths() {
+        let long_path = sample_stage1_output().current_path.expect("long path");
+        assert!(!failure_level_touched(&long_path, 98.1));
+        assert!(failure_level_touched(&long_path, 98.0));
+
+        let mut short_path = long_path.clone();
+        short_path.side = "SHORT".to_string();
+        short_path.failure_level = sample_price_zone(97.0, 98.0, "4h");
+
+        assert!(!failure_level_touched(&short_path, 97.9));
+        assert!(failure_level_touched(&short_path, 98.0));
+    }
+
+    #[test]
+    fn first_path_target_touch_requests_stage1_refresh_when_flat() {
+        let state_dir =
+            std::env::temp_dir().join(format!("llm-workflow-state-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&state_dir).expect("create workflow state dir");
+
+        let mut workflow_state = WorkflowState {
+            symbol: "ETHUSDT".to_string(),
+            approved_tactical_plan: Some(sample_tactical_plan()),
+            approved_tactical_plan_updated_at: Some(Utc::now()),
+            filled_stopout_attempts: 2,
+            last_filled_context_key: Some("ETHUSDT:LONG:path_a".to_string()),
+            ..WorkflowState::default()
+        };
+        let current_path = sample_stage1_output().current_path.expect("current path");
+        let event = sample_fast_price_event("2026-03-30T09:35:00Z", 104.0);
+
+        let requested = maybe_request_stage1_refresh_on_path_boundary_touch(
+            &mut workflow_state,
+            Some(&current_path),
+            "ETHUSDT",
+            &sample_flat_trading_state(),
+            state_dir.to_str().expect("state dir"),
+            &event,
+            Stage1RefreshOrigin::Live,
+        )
+        .expect("request stage1 refresh");
+
+        assert!(requested);
+        assert_eq!(
+            workflow_state.pending_stage1_refresh_reason.as_deref(),
+            Some("first_path_target_touched")
+        );
+        assert!(workflow_state.approved_tactical_plan.is_none());
+        assert_eq!(workflow_state.filled_stopout_attempts, 0);
+        assert!(workflow_state.last_filled_context_key.is_none());
+
+        let persisted = crate::workflow::persistence::load_workflow_state(
+            state_dir.to_str().expect("state dir"),
+            "ETHUSDT",
+        )
+        .expect("load workflow state")
+        .expect("persisted workflow state");
+        assert_eq!(
+            persisted.pending_stage1_refresh_reason.as_deref(),
+            Some("first_path_target_touched")
+        );
+
+        fs::remove_dir_all(&state_dir).expect("cleanup workflow state dir");
+    }
+
+    #[test]
+    fn failure_level_touch_requests_stage1_refresh_when_flat() {
+        let state_dir =
+            std::env::temp_dir().join(format!("llm-workflow-state-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&state_dir).expect("create workflow state dir");
+
+        let mut workflow_state = WorkflowState {
+            symbol: "ETHUSDT".to_string(),
+            approved_tactical_plan: Some(sample_tactical_plan()),
+            approved_tactical_plan_updated_at: Some(Utc::now()),
+            ..WorkflowState::default()
+        };
+        let current_path = sample_stage1_output().current_path.expect("current path");
+        let event = sample_fast_price_event("2026-03-30T09:35:00Z", 98.0);
+
+        let requested = maybe_request_stage1_refresh_on_path_boundary_touch(
+            &mut workflow_state,
+            Some(&current_path),
+            "ETHUSDT",
+            &sample_flat_trading_state(),
+            state_dir.to_str().expect("state dir"),
+            &event,
+            Stage1RefreshOrigin::Live,
+        )
+        .expect("request stage1 refresh");
+
+        assert!(requested);
+        assert_eq!(
+            workflow_state.pending_stage1_refresh_reason.as_deref(),
+            Some("failure_level_touched")
+        );
+        assert!(workflow_state.approved_tactical_plan.is_none());
+
+        fs::remove_dir_all(&state_dir).expect("cleanup workflow state dir");
+    }
+
+    #[test]
+    fn path_boundary_touch_does_not_request_stage1_refresh_with_live_same_side_position() {
+        let state_dir =
+            std::env::temp_dir().join(format!("llm-workflow-state-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&state_dir).expect("create workflow state dir");
+
+        let mut workflow_state = WorkflowState {
+            symbol: "ETHUSDT".to_string(),
+            approved_tactical_plan: Some(sample_tactical_plan()),
+            approved_tactical_plan_updated_at: Some(Utc::now()),
+            ..WorkflowState::default()
+        };
+        let current_path = sample_stage1_output().current_path.expect("current path");
+        let event = sample_fast_price_event("2026-03-30T09:35:00Z", 104.0);
+        let mut trading_state = sample_flat_trading_state();
+        trading_state.has_active_positions = true;
+        trading_state.active_positions.push(ActivePositionSnapshot {
+            position_side: "LONG".to_string(),
+            position_amt: 1.0,
+            entry_price: 100.0,
+            mark_price: 104.0,
+            unrealized_pnl: 4.0,
+            leverage: 3,
+        });
+
+        let requested = maybe_request_stage1_refresh_on_path_boundary_touch(
+            &mut workflow_state,
+            Some(&current_path),
+            "ETHUSDT",
+            &trading_state,
+            state_dir.to_str().expect("state dir"),
+            &event,
+            Stage1RefreshOrigin::Live,
+        )
+        .expect("skip stage1 refresh");
+
+        assert!(!requested);
+        assert!(workflow_state.pending_stage1_refresh_reason.is_none());
+        assert!(workflow_state.approved_tactical_plan.is_some());
+
+        fs::remove_dir_all(&state_dir).expect("cleanup workflow state dir");
+    }
+
+    #[test]
+    fn stage1_replay_requests_refresh_when_failure_level_was_touched_during_gap() {
+        clear_fast_price_event_buffer_for_symbol("ETHUSDT");
+        let state_dir =
+            std::env::temp_dir().join(format!("llm-workflow-state-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&state_dir).expect("create workflow state dir");
+
+        let replay_start = DateTime::parse_from_rfc3339("2026-03-30T12:00:00Z")
+            .expect("replay start")
+            .with_timezone(&Utc);
+        let replay_end = DateTime::parse_from_rfc3339("2026-03-30T12:06:00Z")
+            .expect("replay end")
+            .with_timezone(&Utc);
+        record_fast_price_event_in_buffer(&sample_fast_price_event("2026-03-30T12:04:00Z", 98.0));
+
+        let mut workflow_state = WorkflowState {
+            symbol: "ETHUSDT".to_string(),
+            approved_tactical_plan: Some(sample_tactical_plan()),
+            approved_tactical_plan_updated_at: Some(Utc::now()),
+            last_stage1_source_ts_bucket: Some(replay_start),
+            last_stage1_completed_at: Some(replay_end),
+            last_stage1_replayed_at: None,
+            ..WorkflowState::default()
+        };
+        let current_path = sample_stage1_output().current_path.expect("current path");
+        let current_event = sample_fast_price_event("2026-03-30T12:06:05Z", 101.0);
+
+        let attempt = maybe_replay_stage1_path_boundary_window(
+            &mut workflow_state,
+            Some(&current_path),
+            "ETHUSDT",
+            &sample_flat_trading_state(),
+            state_dir.to_str().expect("state dir"),
+            &current_event,
+        )
+        .expect("replay attempt");
+
+        assert!(attempt.requested_refresh);
+        assert_eq!(
+            workflow_state.pending_stage1_refresh_reason.as_deref(),
+            Some("failure_level_touched_during_replay")
+        );
+        assert!(workflow_state.approved_tactical_plan.is_none());
+        assert!(workflow_state.last_stage1_replayed_at.is_none());
+
+        clear_fast_price_event_buffer_for_symbol("ETHUSDT");
+        fs::remove_dir_all(&state_dir).expect("cleanup workflow state dir");
+    }
+
+    #[test]
+    fn stage1_replay_requests_refresh_when_first_path_target_was_touched_during_gap() {
+        clear_fast_price_event_buffer_for_symbol("ETHUSDT");
+        let state_dir =
+            std::env::temp_dir().join(format!("llm-workflow-state-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&state_dir).expect("create workflow state dir");
+
+        let replay_start = DateTime::parse_from_rfc3339("2026-03-30T12:00:00Z")
+            .expect("replay start")
+            .with_timezone(&Utc);
+        let replay_end = DateTime::parse_from_rfc3339("2026-03-30T12:06:00Z")
+            .expect("replay end")
+            .with_timezone(&Utc);
+        record_fast_price_event_in_buffer(&sample_fast_price_event("2026-03-30T12:04:00Z", 104.0));
+
+        let mut workflow_state = WorkflowState {
+            symbol: "ETHUSDT".to_string(),
+            approved_tactical_plan: Some(sample_tactical_plan()),
+            approved_tactical_plan_updated_at: Some(Utc::now()),
+            last_stage1_source_ts_bucket: Some(replay_start),
+            last_stage1_completed_at: Some(replay_end),
+            last_stage1_replayed_at: None,
+            ..WorkflowState::default()
+        };
+        let current_path = sample_stage1_output().current_path.expect("current path");
+        let current_event = sample_fast_price_event("2026-03-30T12:06:05Z", 101.0);
+
+        let attempt = maybe_replay_stage1_path_boundary_window(
+            &mut workflow_state,
+            Some(&current_path),
+            "ETHUSDT",
+            &sample_flat_trading_state(),
+            state_dir.to_str().expect("state dir"),
+            &current_event,
+        )
+        .expect("replay attempt");
+
+        assert!(attempt.requested_refresh);
+        assert_eq!(
+            workflow_state.pending_stage1_refresh_reason.as_deref(),
+            Some("first_path_target_touched_during_replay")
+        );
+        assert!(workflow_state.approved_tactical_plan.is_none());
+        assert!(workflow_state.last_stage1_replayed_at.is_none());
+
+        clear_fast_price_event_buffer_for_symbol("ETHUSDT");
+        fs::remove_dir_all(&state_dir).expect("cleanup workflow state dir");
+    }
+
+    #[test]
+    fn stage1_replay_marks_window_completed_when_no_boundary_was_touched() {
+        clear_fast_price_event_buffer_for_symbol("ETHUSDT");
+        let state_dir =
+            std::env::temp_dir().join(format!("llm-workflow-state-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&state_dir).expect("create workflow state dir");
+
+        let replay_start = DateTime::parse_from_rfc3339("2026-03-30T12:00:00Z")
+            .expect("replay start")
+            .with_timezone(&Utc);
+        let replay_end = DateTime::parse_from_rfc3339("2026-03-30T12:06:00Z")
+            .expect("replay end")
+            .with_timezone(&Utc);
+        record_fast_price_event_in_buffer(&sample_fast_price_event("2026-03-30T12:04:00Z", 101.0));
+
+        let mut workflow_state = WorkflowState {
+            symbol: "ETHUSDT".to_string(),
+            last_stage1_source_ts_bucket: Some(replay_start),
+            last_stage1_completed_at: Some(replay_end),
+            last_stage1_replayed_at: None,
+            ..WorkflowState::default()
+        };
+        let current_path = sample_stage1_output().current_path.expect("current path");
+        let current_event = sample_fast_price_event("2026-03-30T12:06:05Z", 101.2);
+
+        let attempt = maybe_replay_stage1_path_boundary_window(
+            &mut workflow_state,
+            Some(&current_path),
+            "ETHUSDT",
+            &sample_flat_trading_state(),
+            state_dir.to_str().expect("state dir"),
+            &current_event,
+        )
+        .expect("replay attempt");
+
+        assert!(!attempt.requested_refresh);
+        assert!(workflow_state.pending_stage1_refresh_reason.is_none());
+        assert!(workflow_state.last_stage1_replayed_at.is_some());
+
+        clear_fast_price_event_buffer_for_symbol("ETHUSDT");
+        fs::remove_dir_all(&state_dir).expect("cleanup workflow state dir");
     }
 
     #[test]

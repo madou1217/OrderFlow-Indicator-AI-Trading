@@ -417,16 +417,19 @@ pub struct WorkflowAccountContext {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct EntryPlan {
+    #[serde(default)]
     pub side: String,
     pub entry_profile: String,
     pub intent_mode: String,
-    pub entry_activation_level: PriceZone,
+    #[serde(default)]
+    pub entry_activation_level: Option<PriceZone>,
     pub entry_zone: PriceZone,
     pub entry_invalidation_level: PriceZone,
     pub stop_loss: f64,
     pub max_drift_pct: f64,
-    #[serde(default)]
-    pub entry_note: String,
+    pub entry_reason: String,
+    pub invalidation_reason: String,
+    pub stop_loss_reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -440,6 +443,7 @@ pub struct TacticalEntryPlan {
 #[serde(deny_unknown_fields)]
 pub struct Stage2AOutput {
     pub stage2_decision: String,
+    pub path_audit_note: String,
     #[serde(default)]
     pub tactical_entry_plan: Option<TacticalEntryPlan>,
     #[serde(default)]
@@ -549,7 +553,6 @@ pub struct Stage2APromptInput {
     pub task: String,
     pub strategic_context_frozen: Value,
     pub entry_location_context_15m: Value,
-    pub continuity_confirmation_context_5m: Value,
     pub state_guardrail_snapshot: Value,
     pub driver_guardrail_snapshot: Value,
     #[serde(default)]
@@ -623,19 +626,20 @@ mod tests {
     fn stage2a_output_roundtrips_single_entry_plan() {
         let output = Stage2AOutput {
             stage2_decision: "PATH_CONFIRMED".to_string(),
+            path_audit_note: "path still live".to_string(),
             tactical_entry_plan: Some(TacticalEntryPlan {
                 path_id: "path_a".to_string(),
                 entry_plan: super::EntryPlan {
                     side: "LONG".to_string(),
                     entry_profile: "reclaim_then_hold".to_string(),
                     intent_mode: "immediate".to_string(),
-                    entry_activation_level: PriceZone {
+                    entry_activation_level: Some(PriceZone {
                         low: 100.0,
                         high: 101.0,
                         timeframe: Some("15m".to_string()),
                         label: None,
                         reason: None,
-                    },
+                    }),
                     entry_zone: PriceZone {
                         low: 100.0,
                         high: 101.0,
@@ -652,7 +656,9 @@ mod tests {
                     },
                     stop_loss: 99.0,
                     max_drift_pct: 0.12,
-                    entry_note: "test".to_string(),
+                    entry_reason: "entry".to_string(),
+                    invalidation_reason: "invalidation".to_string(),
+                    stop_loss_reason: "stop".to_string(),
                 },
             }),
             reevaluation_reason: None,

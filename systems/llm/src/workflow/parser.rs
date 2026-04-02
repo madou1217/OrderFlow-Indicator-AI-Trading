@@ -19,12 +19,6 @@ const ALLOWED_RISK_GRADES: &[&str] = &[
     "high_conflict_repair",
 ];
 const ALLOWED_SETUP_TYPES: &[&str] = &["A_continuation", "B_reversal", "C_value_return"];
-const ALLOWED_ENTRY_PROFILES: &[&str] = &[
-    "reclaim_then_hold",
-    "pullback_acceptance",
-    "failed_auction_reentry",
-];
-const ALLOWED_INTENT_MODES: &[&str] = &["immediate", "pullback", "breakout"];
 const ALLOWED_FLOW_DRIVERS: &[&str] = &["spot_led", "futures_led", "mixed"];
 const ALLOWED_OPPORTUNITY_QUALITIES: &[&str] = &["high", "medium", "low"];
 const ALLOWED_ZONE_TRIGGER_KINDS: &[&str] = &[
@@ -34,7 +28,7 @@ const ALLOWED_ZONE_TRIGGER_KINDS: &[&str] = &[
     "reaccepted_through_zone",
 ];
 const ALLOWED_STRATEGIC_TIMEFRAMES: &[&str] = &["4h", "1d", "4h-1d"];
-const ALLOWED_TACTICAL_TIMEFRAMES: &[&str] = &["15m", "15m-4h"];
+const ALLOWED_PENDING_ORDER_REPLACEMENT_TIMEFRAMES: &[&str] = &["15m", "15m-4h"];
 const ALLOWED_DRIVER_TRIGGER_KINDS: &[&str] = &[
     "driver_flip",
     "spot_confirmation_lost",
@@ -464,40 +458,17 @@ pub fn parse_stage1_output(value: Value) -> Result<Stage1Output> {
 }
 
 fn validate_stage2a_entry_plan(entry_plan: &EntryPlan, current_path: &CurrentPath) -> Result<()> {
-    if !matches!(entry_plan.side.as_str(), "LONG" | "SHORT") {
-        return Err(anyhow!("entry_plan.side must be LONG or SHORT"));
-    }
-    if entry_plan.side != current_path.side {
-        return Err(anyhow!(
-            "entry_plan.side must match Stage1 current_path.side"
-        ));
-    }
-    if !ALLOWED_ENTRY_PROFILES.contains(&entry_plan.entry_profile.as_str()) {
-        return Err(anyhow!("entry_plan.entry_profile has an unsupported value"));
-    }
-    if !ALLOWED_INTENT_MODES.contains(&entry_plan.intent_mode.as_str()) {
-        return Err(anyhow!("entry_plan.intent_mode has an unsupported value"));
-    }
-    validate_zone_timeframe(
-        "entry_plan.entry_activation_level",
-        &entry_plan.entry_activation_level,
-        ALLOWED_TACTICAL_TIMEFRAMES,
-        true,
-    )?;
-    validate_zone_timeframe(
-        "entry_plan.entry_zone",
-        &entry_plan.entry_zone,
-        ALLOWED_TACTICAL_TIMEFRAMES,
-        true,
-    )?;
-    validate_zone_timeframe(
-        "entry_plan.entry_invalidation_level",
-        &entry_plan.entry_invalidation_level,
-        ALLOWED_TACTICAL_TIMEFRAMES,
-        true,
-    )?;
     if entry_plan.max_drift_pct < 0.0 {
         return Err(anyhow!("entry_plan.max_drift_pct must be >= 0"));
+    }
+    if entry_plan.entry_reason.trim().is_empty() {
+        return Err(anyhow!("entry_plan.entry_reason must be non-empty"));
+    }
+    if entry_plan.invalidation_reason.trim().is_empty() {
+        return Err(anyhow!("entry_plan.invalidation_reason must be non-empty"));
+    }
+    if entry_plan.stop_loss_reason.trim().is_empty() {
+        return Err(anyhow!("entry_plan.stop_loss_reason must be non-empty"));
     }
 
     match current_path.side.as_str() {
@@ -522,7 +493,7 @@ fn validate_stage2a_entry_plan(entry_plan: &EntryPlan, current_path: &CurrentPat
 }
 
 pub fn parse_stage2a_output(value: Value, stage1_output: &Stage1Output) -> Result<Stage2AOutput> {
-    let output: Stage2AOutput = serde_json::from_value(value)?;
+    let mut output: Stage2AOutput = serde_json::from_value(value)?;
     if !matches!(
         output.stage2_decision.as_str(),
         "PATH_CONFIRMED" | "REQUEST_STAGE1_REEVALUATION"
@@ -530,6 +501,9 @@ pub fn parse_stage2a_output(value: Value, stage1_output: &Stage1Output) -> Resul
         return Err(anyhow!(
             "stage2_decision must be PATH_CONFIRMED or REQUEST_STAGE1_REEVALUATION"
         ));
+    }
+    if output.path_audit_note.trim().is_empty() {
+        return Err(anyhow!("path_audit_note must be non-empty"));
     }
 
     if output.stage2_decision == "REQUEST_STAGE1_REEVALUATION" {
@@ -562,13 +536,14 @@ pub fn parse_stage2a_output(value: Value, stage1_output: &Stage1Output) -> Resul
         .ok_or_else(|| anyhow!("PATH_CONFIRMED requires Stage1 current_path"))?;
     let tactical_plan = output
         .tactical_entry_plan
-        .as_ref()
+        .as_mut()
         .ok_or_else(|| anyhow!("PATH_CONFIRMED requires tactical_entry_plan"))?;
     if tactical_plan.path_id != current_path.id {
         return Err(anyhow!(
             "tactical_entry_plan.path_id must match Stage1 current_path.id"
         ));
     }
+    tactical_plan.entry_plan.side = current_path.side.clone();
     validate_stage2a_entry_plan(&tactical_plan.entry_plan, current_path)?;
 
     Ok(output)
@@ -1003,7 +978,7 @@ fn validate_pending_order_management_action(
                     .replacement_entry_zone
                     .as_ref()
                     .ok_or_else(|| anyhow!("replace_entry requires replacement_entry_zone"))?,
-                ALLOWED_TACTICAL_TIMEFRAMES,
+                ALLOWED_PENDING_ORDER_REPLACEMENT_TIMEFRAMES,
                 true,
             )?;
             validate_zone_timeframe(
@@ -1014,7 +989,7 @@ fn validate_pending_order_management_action(
                     .ok_or_else(|| {
                         anyhow!("replace_entry requires replacement_entry_invalidation_level")
                     })?,
-                ALLOWED_TACTICAL_TIMEFRAMES,
+                ALLOWED_PENDING_ORDER_REPLACEMENT_TIMEFRAMES,
                 true,
             )?;
             if action.replacement_stop_loss.is_none() {
@@ -1395,24 +1370,35 @@ mod tests {
         let stage1_output = sample_stage1_output();
         let value = json!({
             "stage2_decision": "PATH_CONFIRMED",
+            "path_audit_note": "Path is still live because 4h acceptance and driver state remain supportive.",
             "tactical_entry_plan": {
                 "path_id": "path_1",
                 "entry_plan": {
-                    "side": "LONG",
                     "entry_profile": "reclaim_then_hold",
                     "intent_mode": "immediate",
-                    "entry_activation_level": {"low": 1998.0, "high": 2002.0, "timeframe": "15m", "label": "activation", "reason": "ok"},
-                    "entry_zone": {"low": 1999.0, "high": 2001.0, "timeframe": "15m", "label": "entry", "reason": "ok"},
-                    "entry_invalidation_level": {"low": 1992.0, "high": 1994.0, "timeframe": "15m", "label": "invalid", "reason": "ok"},
+                    "entry_activation_level": null,
+                    "entry_zone": {"low": 1999.0, "high": 2001.0, "timeframe": "1d", "label": "entry", "reason": "ok"},
+                    "entry_invalidation_level": {"low": 1992.0, "high": 1994.0, "timeframe": "4h", "label": "invalid", "reason": "ok"},
                     "stop_loss": 1993.0,
                     "max_drift_pct": 0.12,
-                    "entry_note": "ok"
+                    "entry_reason": "Entry is placed at the higher-timeframe support reclaim.",
+                    "invalidation_reason": "The execution fails if this support pocket loses acceptance.",
+                    "stop_loss_reason": "The live stop sits beyond the normal sweep path for this execution."
                 }
             },
             "reevaluation_reason": null
         });
         let parsed = parse_stage2a_output(value, &stage1_output).expect("parse");
         assert_eq!(parsed.stage2_decision, "PATH_CONFIRMED");
+        assert_eq!(
+            parsed
+                .tactical_entry_plan
+                .as_ref()
+                .expect("tactical")
+                .entry_plan
+                .side,
+            "LONG"
+        );
     }
 
     #[test]
@@ -1420,6 +1406,7 @@ mod tests {
         let stage1_output = sample_stage1_output();
         let value = json!({
             "stage2_decision": "REQUEST_STAGE1_REEVALUATION",
+            "path_audit_note": "The current path no longer has a clean high-timeframe execution structure.",
             "tactical_entry_plan": null,
             "reevaluation_reason": "Path quality degraded and needs a fresh strategic review."
         });
@@ -1432,18 +1419,20 @@ mod tests {
         let stage1_output = sample_stage1_output();
         let value = json!({
             "stage2_decision": "PATH_CONFIRMED",
+            "path_audit_note": "Path remains valid and execution can still be designed around the same thesis.",
             "tactical_entry_plan": {
                 "path_id": "path_1",
                 "entry_plan": {
-                    "side": "LONG",
                     "entry_profile": "reclaim_then_hold",
                     "intent_mode": "immediate",
-                    "entry_activation_level": {"low": 1998.0, "high": 2002.0, "timeframe": "15m", "label": "activation", "reason": "ok"},
-                    "entry_zone": {"low": 1999.0, "high": 2001.0, "timeframe": "15m", "label": "entry", "reason": "ok"},
-                    "entry_invalidation_level": {"low": 1992.0, "high": 1994.0, "timeframe": "15m", "label": "invalid", "reason": "ok"},
+                    "entry_activation_level": {"low": 1998.0, "high": 2002.0, "timeframe": "15m", "label": "activation", "reason": "timing only"},
+                    "entry_zone": {"low": 1999.0, "high": 2001.0, "timeframe": "4h-1d", "label": "entry", "reason": "ok"},
+                    "entry_invalidation_level": {"low": 1992.0, "high": 1994.0, "timeframe": "4h", "label": "invalid", "reason": "ok"},
                     "stop_loss": 1993.0,
                     "max_drift_pct": 0.12,
-                    "entry_note": "ok"
+                    "entry_reason": "Entry stays aligned with the current path.",
+                    "invalidation_reason": "Losing this structure breaks the execution setup.",
+                    "stop_loss_reason": "Stop stays beyond the expected sweep depth."
                 }
             },
             "reevaluation_reason": null
@@ -1457,18 +1446,20 @@ mod tests {
         let stage1_output = sample_stage1_output();
         let value = json!({
             "stage2_decision": "PATH_CONFIRMED",
+            "path_audit_note": "Path is still intact even though the executable stop sits well beyond Stage1 failure reference.",
             "tactical_entry_plan": {
                 "path_id": "path_1",
                 "entry_plan": {
-                    "side": "LONG",
                     "entry_profile": "reclaim_then_hold",
                     "intent_mode": "immediate",
-                    "entry_activation_level": {"low": 1998.0, "high": 2002.0, "timeframe": "15m", "label": "activation", "reason": "ok"},
-                    "entry_zone": {"low": 1999.0, "high": 2001.0, "timeframe": "15m", "label": "entry", "reason": "ok"},
-                    "entry_invalidation_level": {"low": 1984.0, "high": 1988.0, "timeframe": "15m", "label": "invalid", "reason": "ok"},
+                    "entry_activation_level": {"low": 1998.0, "high": 2002.0, "timeframe": "15m", "label": "activation", "reason": "timing only"},
+                    "entry_zone": {"low": 1999.0, "high": 2001.0, "timeframe": "1d", "label": "entry", "reason": "ok"},
+                    "entry_invalidation_level": {"low": 1984.0, "high": 1988.0, "timeframe": "4h-1d", "label": "invalid", "reason": "ok"},
                     "stop_loss": 1987.5,
                     "max_drift_pct": 0.12,
-                    "entry_note": "ok"
+                    "entry_reason": "Entry remains attractive at this higher-timeframe pocket.",
+                    "invalidation_reason": "Execution breaks only if the broader support shelf fails.",
+                    "stop_loss_reason": "Stop is intentionally beyond local noise and sweep risk."
                 }
             },
             "reevaluation_reason": null
@@ -1491,18 +1482,20 @@ mod tests {
         let stage1_output = sample_stage1_output();
         let value = json!({
             "stage2_decision": "PATH_CONFIRMED",
+            "path_audit_note": "The path is still live and allows a wider live stop than the structural invalidation marker.",
             "tactical_entry_plan": {
                 "path_id": "path_1",
                 "entry_plan": {
-                    "side": "LONG",
                     "entry_profile": "reclaim_then_hold",
                     "intent_mode": "immediate",
-                    "entry_activation_level": {"low": 1998.0, "high": 2002.0, "timeframe": "15m", "label": "activation", "reason": "ok"},
-                    "entry_zone": {"low": 1999.0, "high": 2001.0, "timeframe": "15m", "label": "entry", "reason": "ok"},
-                    "entry_invalidation_level": {"low": 1992.0, "high": 1994.0, "timeframe": "15m", "label": "invalid", "reason": "ok"},
+                    "entry_activation_level": {"low": 1998.0, "high": 2002.0, "timeframe": "15m", "label": "activation", "reason": "timing only"},
+                    "entry_zone": {"low": 1999.0, "high": 2001.0, "timeframe": "4h", "label": "entry", "reason": "ok"},
+                    "entry_invalidation_level": {"low": 1992.0, "high": 1994.0, "timeframe": "4h", "label": "invalid", "reason": "ok"},
                     "stop_loss": 1997.5,
                     "max_drift_pct": 0.12,
-                    "entry_note": "structural invalidation and execution stop are intentionally different"
+                    "entry_reason": "Entry is still justified at this location.",
+                    "invalidation_reason": "Structural invalidation occurs below the reclaim shelf.",
+                    "stop_loss_reason": "structural invalidation and execution stop are intentionally different"
                 }
             },
             "reevaluation_reason": null

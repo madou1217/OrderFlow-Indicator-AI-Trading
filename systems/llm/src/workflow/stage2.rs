@@ -7,8 +7,8 @@ pub fn failure_level_breached(stage1_output: &Stage1Output, latest_price: f64) -
         .as_ref()
         .ok_or_else(|| anyhow!("active stage1 path missing"))?;
     Ok(match path.side.as_str() {
-        "LONG" => latest_price <= path.failure_level.high,
-        "SHORT" => latest_price >= path.failure_level.low,
+        "LONG" => latest_price <= path.failure_level.low,
+        "SHORT" => latest_price >= path.failure_level.high,
         other => return Err(anyhow!("unsupported path side {}", other)),
     })
 }
@@ -88,13 +88,13 @@ mod tests {
 
     #[test]
     fn long_failure_level_breach_is_mechanical() {
-        assert!(failure_level_breached(&sample_stage1_output("LONG"), 98.5).expect("check"));
+        assert!(failure_level_breached(&sample_stage1_output("LONG"), 98.0).expect("check"));
         assert!(!failure_level_breached(&sample_stage1_output("LONG"), 101.0).expect("check"));
     }
 
     #[test]
     fn short_failure_level_breach_is_mechanical() {
         assert!(failure_level_breached(&sample_stage1_output("SHORT"), 99.0).expect("check"));
-        assert!(!failure_level_breached(&sample_stage1_output("SHORT"), 97.0).expect("check"));
+        assert!(!failure_level_breached(&sample_stage1_output("SHORT"), 98.5).expect("check"));
     }
 }

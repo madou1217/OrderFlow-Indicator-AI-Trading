@@ -2977,8 +2977,7 @@ where
                 "md.kline"
                     | "md.mark_price"
                     | "md.agg.trade.1s"
-                    |
-                "md.open_interest_current"
+                    | "md.open_interest_current"
                     | "md.open_interest_hist_5m"
                     | "md.long_short_ratio_5m"
                     | "md.option_mark_greeks_5m"

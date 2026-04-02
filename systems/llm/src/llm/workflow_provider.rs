@@ -208,6 +208,21 @@ fn price_zone_schema(timeframes: &[&str]) -> Value {
     })
 }
 
+fn freeform_price_zone_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["low", "high", "timeframe", "label", "reason"],
+        "properties": {
+            "low": {"type": "number"},
+            "high": {"type": "number"},
+            "timeframe": {"type": ["string", "null"]},
+            "label": {"type": ["string", "null"]},
+            "reason": {"type": ["string", "null"]}
+        }
+    })
+}
+
 fn tracked_zone_schema() -> Value {
     json!({
         "type": "object",
@@ -370,18 +385,17 @@ fn entry_plan_schema() -> Value {
         "type": "object",
         "additionalProperties": false,
         "required": [
-            "side",
             "entry_profile",
             "intent_mode",
-            "entry_activation_level",
             "entry_zone",
             "entry_invalidation_level",
             "stop_loss",
             "max_drift_pct",
-            "entry_note"
+            "entry_reason",
+            "invalidation_reason",
+            "stop_loss_reason"
         ],
         "properties": {
-            "side": {"type": "string", "enum": ["LONG", "SHORT"]},
             "entry_profile": {
                 "type": "string",
                 "enum": [
@@ -391,12 +405,14 @@ fn entry_plan_schema() -> Value {
                 ]
             },
             "intent_mode": {"type": "string", "enum": ["immediate", "pullback", "breakout"]},
-            "entry_activation_level": price_zone_schema(&["15m", "15m-4h"]),
-            "entry_zone": price_zone_schema(&["15m", "15m-4h"]),
-            "entry_invalidation_level": price_zone_schema(&["15m", "15m-4h"]),
+            "entry_activation_level": nullable(freeform_price_zone_schema()),
+            "entry_zone": freeform_price_zone_schema(),
+            "entry_invalidation_level": freeform_price_zone_schema(),
             "stop_loss": {"type": "number"},
             "max_drift_pct": {"type": "number", "minimum": 0},
-            "entry_note": {"type": "string"}
+            "entry_reason": {"type": "string"},
+            "invalidation_reason": {"type": "string"},
+            "stop_loss_reason": {"type": "string"}
         }
     })
 }
@@ -417,12 +433,13 @@ fn workflow_stage2a_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["stage2_decision", "tactical_entry_plan", "reevaluation_reason"],
+        "required": ["stage2_decision", "path_audit_note", "tactical_entry_plan", "reevaluation_reason"],
         "properties": {
             "stage2_decision": {
                 "type": "string",
                 "enum": ["PATH_CONFIRMED", "REQUEST_STAGE1_REEVALUATION"]
             },
+            "path_audit_note": {"type": "string"},
             "tactical_entry_plan": nullable(tactical_entry_plan_schema()),
             "reevaluation_reason": {"type": ["string", "null"]}
         }

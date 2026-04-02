@@ -168,6 +168,18 @@ fn tracked_zone_for_anchor<'a>(
         .find(|zone| zone.zone_id == anchor_id)
 }
 
+fn zone_state_for_zone_id<'a>(
+    summary: &'a StrategicIndicatorSummary,
+    zone_id: Option<&str>,
+) -> Option<&'a crate::workflow::schema::ZoneState> {
+    let zone_id = zone_id?;
+    summary
+        .auction_context
+        .zone_states
+        .iter()
+        .find(|state| state.zone_id == zone_id)
+}
+
 fn avwap_reference_for_window(avwap: &Value, window: &str) -> Value {
     match window {
         "15m" | "4h" | "1d" => latest_series_entry(avwap, "series_by_window", window),
@@ -227,6 +239,8 @@ fn build_selected_avwap_anchors(
         .into_iter()
         .map(|(anchor_role, anchor_id, zone)| {
             let tracked_zone = tracked_zone_for_anchor(stage1_output, anchor_id);
+            let zone_state =
+                zone_state_for_zone_id(summary, tracked_zone.map(|item| item.zone_id.as_str()));
             let timeframe_hint = tracked_zone
                 .map(|item| item.timeframe.clone())
                 .or_else(|| zone.timeframe.clone())
@@ -249,6 +263,7 @@ fn build_selected_avwap_anchors(
                 "timeframe_hint": timeframe_hint,
                 "zone": zone,
                 "tracked_zone": tracked_zone,
+                "zone_state": zone_state,
                 "current_price": current_price,
                 "distance_to_zone_midpoint": current_price - zone.midpoint(),
                 "mapped_reference_window": mapped_reference_window,
@@ -402,6 +417,319 @@ fn summarize_footprint_15m(summary: &StrategicIndicatorSummary) -> Value {
     })
 }
 
+fn json_number_or_null(value: Option<f64>) -> Value {
+    value.map_or(Value::Null, |item| json!(item))
+}
+
+fn json_bool_or_null(value: Option<bool>) -> Value {
+    value.map_or(Value::Null, Value::Bool)
+}
+
+fn latest_closed_15m_bars<'a>(
+    summary: &'a StrategicIndicatorSummary,
+    max_bars: usize,
+) -> Vec<&'a crate::workflow::schema::RecentBar> {
+    let mut bars = summary
+        .auction_context
+        .recent_15m_bars
+        .iter()
+        .filter(|bar| bar.is_closed)
+        .collect::<Vec<_>>();
+    let start = bars.len().saturating_sub(max_bars);
+    bars.drain(0..start);
+    bars
+}
+
+fn build_recent_15m_bars_summary(summary: &StrategicIndicatorSummary) -> Value {
+    let bars = latest_closed_15m_bars(summary, 5);
+    let Some(first_bar) = bars.first() else {
+        return Value::Null;
+    };
+    let Some(last_bar) = bars.last() else {
+        return Value::Null;
+    };
+    let first_open = first_bar.open;
+    if !first_open.is_finite() || first_open.abs() <= f64::EPSILON {
+        return Value::Null;
+    }
+
+    let overall_high = bars
+        .iter()
+        .map(|bar| bar.high)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let overall_low = bars.iter().map(|bar| bar.low).fold(f64::INFINITY, f64::min);
+    let last_close = last_bar.close;
+
+    let mut running_high = bars[0].high;
+    let mut max_pullback_pct: f64 = 0.0;
+    let mut running_low = bars[0].low;
+    let mut max_rebound_pct: f64 = 0.0;
+    let mut up_close_count = 0_u64;
+    let mut down_close_count = 0_u64;
+    for bar in &bars {
+        if bar.close > bar.open {
+            up_close_count += 1;
+        } else if bar.close < bar.open {
+            down_close_count += 1;
+        }
+        max_pullback_pct = max_pullback_pct.max((running_high - bar.low) / first_open);
+        max_rebound_pct = max_rebound_pct.max((bar.high - running_low) / first_open);
+        running_high = running_high.max(bar.high);
+        running_low = running_low.min(bar.low);
+    }
+
+    let last_bar_range = last_bar.high - last_bar.low;
+
+    json!({
+        "bar_count": bars.len(),
+        "last_5_bars_net_move_pct": (last_close - first_open) / first_open,
+        "last_5_bars_range_pct": (overall_high - overall_low) / first_open,
+        "max_pullback_pct": max_pullback_pct,
+        "max_rebound_pct": max_rebound_pct,
+        "last_close_vs_last_5_mid": (last_close - ((overall_high + overall_low) / 2.0)) / first_open,
+        "last_close_vs_last_bar_range": if last_bar_range > 0.0 {
+            json!((last_close - last_bar.low) / last_bar_range)
+        } else {
+            Value::Null
+        },
+        "up_close_count": up_close_count,
+        "down_close_count": down_close_count
+    })
+}
+
+fn nearest_selected_anchor(avwap_anchor_distances: &Value) -> (Option<f64>, Option<String>) {
+    avwap_anchor_distances
+        .get("selected_anchor_distances")
+        .and_then(Value::as_array)
+        .and_then(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    item.get("distance_to_zone_midpoint")
+                        .and_then(Value::as_f64)
+                        .map(|distance| {
+                            let role = item
+                                .get("anchor_role")
+                                .and_then(Value::as_str)
+                                .map(ToString::to_string);
+                            (distance, role)
+                        })
+                })
+                .min_by(|left, right| left.0.abs().total_cmp(&right.0.abs()))
+        })
+        .map(|(distance, role)| (Some(distance), role))
+        .unwrap_or((None, None))
+}
+
+fn build_local_price_location_summary(
+    input: &ModelInvocationInput,
+    summary: &StrategicIndicatorSummary,
+    avwap_anchor_distances: &Value,
+) -> Value {
+    let current_price = current_reference_price(input, summary);
+    let price_volume_15m = context_child(&summary.position_layer, "price_volume_structure")
+        .get("by_window")
+        .and_then(|value| value.get("15m"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let rvwap_15m = context_child(&summary.position_layer, "rvwap_sigma_bands")
+        .get("by_window")
+        .and_then(|value| value.get("15m"))
+        .cloned()
+        .unwrap_or(Value::Null);
+
+    let poc_price = price_volume_15m.get("poc_price").and_then(Value::as_f64);
+    let vah = price_volume_15m.get("vah").and_then(Value::as_f64);
+    let val = price_volume_15m.get("val").and_then(Value::as_f64);
+    let z_price_minus_rvwap = rvwap_15m.get("z_price_minus_rvwap").and_then(Value::as_f64);
+    let (nearest_selected_anchor_distance, nearest_selected_anchor_role) =
+        nearest_selected_anchor(avwap_anchor_distances);
+    json!({
+        "current_price": current_price,
+        "distance_to_15m_poc": json_number_or_null(poc_price.map(|value| current_price - value)),
+        "distance_to_15m_vah": json_number_or_null(vah.map(|value| current_price - value)),
+        "distance_to_15m_val": json_number_or_null(val.map(|value| current_price - value)),
+        "inside_15m_value_area": json_bool_or_null(val.zip(vah).map(|(value_low, value_high)| {
+            current_price >= value_low && current_price <= value_high
+        })),
+        "z_price_minus_rvwap_15m": json_number_or_null(z_price_minus_rvwap),
+        "is_rvwap_stretched_15m": json_bool_or_null(z_price_minus_rvwap.map(|value| value.abs() >= 1.5)),
+        "nearest_selected_anchor_distance": json_number_or_null(nearest_selected_anchor_distance),
+        "nearest_selected_anchor_role": nearest_selected_anchor_role.map(Value::String).unwrap_or(Value::Null),
+    })
+}
+
+fn latest_window_metric(window_payload: &Value, field: &str) -> Option<f64> {
+    window_payload
+        .get("series")
+        .and_then(Value::as_array)
+        .and_then(|items| items.last())
+        .and_then(|item| item.get(field))
+        .and_then(Value::as_f64)
+        .or_else(|| window_payload.get(field).and_then(Value::as_f64))
+}
+
+fn build_local_flow_summary(summary: &StrategicIndicatorSummary) -> Value {
+    let cvd_pack_15m = context_child(&summary.driver_layer, "cvd_pack")
+        .get("by_window")
+        .and_then(|value| value.get("15m"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let divergence_15m_summary = summarize_divergence_15m(summary);
+    let footprint_15m_summary = summarize_footprint_15m(summary);
+
+    json!({
+        "delta_fut_15m": json_number_or_null(latest_window_metric(&cvd_pack_15m, "delta_fut")),
+        "delta_spot_15m": json_number_or_null(latest_window_metric(&cvd_pack_15m, "delta_spot")),
+        "divergence_type_15m": divergence_15m_summary
+            .get("divergence_type")
+            .cloned()
+            .unwrap_or(Value::Null),
+        "spot_lead_score_15m": divergence_15m_summary
+            .get("spot_lead_score")
+            .cloned()
+            .unwrap_or(Value::Null),
+        "stacked_buy_15m": footprint_15m_summary
+            .get("stacked_buy")
+            .cloned()
+            .unwrap_or(Value::Null),
+        "stacked_sell_15m": footprint_15m_summary
+            .get("stacked_sell")
+            .cloned()
+            .unwrap_or(Value::Null),
+        "unfinished_auction_15m": footprint_15m_summary
+            .get("unfinished_auction")
+            .cloned()
+            .unwrap_or(Value::Null),
+        "window_delta_15m": footprint_15m_summary
+            .get("window_delta")
+            .cloned()
+            .unwrap_or(Value::Null),
+    })
+}
+
+fn contains_case_insensitive(value: Option<&str>, needle: &str) -> bool {
+    value
+        .map(|text| {
+            text.to_ascii_lowercase()
+                .contains(&needle.to_ascii_lowercase())
+        })
+        .unwrap_or(false)
+}
+
+fn build_chasing_risk_flags(
+    stage1_output: &Stage1Output,
+    recent_15m_bars_summary: &Value,
+    local_price_location_summary: &Value,
+    local_flow_summary: &Value,
+) -> Value {
+    let Some(side) = stage1_output
+        .current_path
+        .as_ref()
+        .map(|path| path.side.as_str())
+    else {
+        return Value::Null;
+    };
+
+    let last_5_bars_net_move_pct = recent_15m_bars_summary
+        .get("last_5_bars_net_move_pct")
+        .and_then(Value::as_f64);
+    let up_close_count = recent_15m_bars_summary
+        .get("up_close_count")
+        .and_then(Value::as_u64);
+    let down_close_count = recent_15m_bars_summary
+        .get("down_close_count")
+        .and_then(Value::as_u64);
+
+    let delta_fut_15m = local_flow_summary
+        .get("delta_fut_15m")
+        .and_then(Value::as_f64);
+    let delta_spot_15m = local_flow_summary
+        .get("delta_spot_15m")
+        .and_then(Value::as_f64);
+    let divergence_type_15m = local_flow_summary
+        .get("divergence_type_15m")
+        .and_then(Value::as_str);
+    let stacked_buy_15m = local_flow_summary
+        .get("stacked_buy_15m")
+        .and_then(Value::as_bool);
+    let stacked_sell_15m = local_flow_summary
+        .get("stacked_sell_15m")
+        .and_then(Value::as_bool);
+    let is_rvwap_stretched_15m = local_price_location_summary
+        .get("is_rvwap_stretched_15m")
+        .and_then(Value::as_bool);
+    let distance_to_15m_vah = local_price_location_summary
+        .get("distance_to_15m_vah")
+        .and_then(Value::as_f64);
+    let distance_to_15m_val = local_price_location_summary
+        .get("distance_to_15m_val")
+        .and_then(Value::as_f64);
+
+    let one_sided_impulse_with_path = match side {
+        "LONG" => up_close_count
+            .zip(last_5_bars_net_move_pct)
+            .map(|(count, move_pct)| count >= 4 && move_pct > 0.0),
+        "SHORT" => down_close_count
+            .zip(last_5_bars_net_move_pct)
+            .map(|(count, move_pct)| count >= 4 && move_pct < 0.0),
+        _ => None,
+    };
+
+    let flow_supports_path = match side {
+        "LONG" => Some(
+            delta_fut_15m.map(|value| value > 0.0).unwrap_or(false)
+                || delta_spot_15m.map(|value| value > 0.0).unwrap_or(false)
+                || stacked_buy_15m.unwrap_or(false)
+                || contains_case_insensitive(divergence_type_15m, "bullish"),
+        ),
+        "SHORT" => Some(
+            delta_fut_15m.map(|value| value < 0.0).unwrap_or(false)
+                || delta_spot_15m.map(|value| value < 0.0).unwrap_or(false)
+                || stacked_sell_15m.unwrap_or(false)
+                || contains_case_insensitive(divergence_type_15m, "bearish"),
+        ),
+        _ => None,
+    };
+
+    let local_flow_conflicted = match side {
+        "LONG" => Some(
+            stacked_sell_15m.unwrap_or(false)
+                || contains_case_insensitive(divergence_type_15m, "bearish"),
+        ),
+        "SHORT" => Some(
+            stacked_buy_15m.unwrap_or(false)
+                || contains_case_insensitive(divergence_type_15m, "bullish"),
+        ),
+        _ => None,
+    };
+
+    let chasing_risk_with_path = match side {
+        "LONG" => Some(
+            is_rvwap_stretched_15m.unwrap_or(false)
+                && distance_to_15m_vah
+                    .map(|value| value > 0.0)
+                    .unwrap_or(false)
+                && one_sided_impulse_with_path.unwrap_or(false),
+        ),
+        "SHORT" => Some(
+            is_rvwap_stretched_15m.unwrap_or(false)
+                && distance_to_15m_val
+                    .map(|value| value < 0.0)
+                    .unwrap_or(false)
+                && one_sided_impulse_with_path.unwrap_or(false),
+        ),
+        _ => None,
+    };
+
+    json!({
+        "one_sided_impulse_with_path": json_bool_or_null(one_sided_impulse_with_path),
+        "flow_supports_path": json_bool_or_null(flow_supports_path),
+        "local_flow_conflicted": json_bool_or_null(local_flow_conflicted),
+        "chasing_risk_with_path": json_bool_or_null(chasing_risk_with_path),
+    })
+}
+
 #[derive(Debug, Clone)]
 struct AggregateFiveMinuteBar {
     open_time: DateTime<Utc>,
@@ -521,16 +849,16 @@ fn build_strategic_context_frozen(
     let options_surface = context_child(&summary.aux_context, "options_surface");
 
     json!({
-        "price_volume_structure_4h": context_child(position_layer, "price_volume_structure")
-            .get("by_window")
-            .and_then(|value| value.get("4h"))
-            .cloned()
-            .unwrap_or(Value::Null),
-        "liquidation_density_4h": context_child(position_layer, "liquidation_density")
-            .get("by_window")
-            .and_then(|value| value.get("4h"))
-            .cloned()
-            .unwrap_or(Value::Null),
+        "price_volume_structure_4h": window_slice(
+            context_child(position_layer, "price_volume_structure"),
+            "by_window",
+            &["4h", "1d"]
+        ),
+        "liquidation_density_4h": window_slice(
+            context_child(position_layer, "liquidation_density"),
+            "by_window",
+            &["4h", "1d"]
+        ),
         "selected_avwap_anchors": build_selected_avwap_anchors(summary, stage1_output),
         "tpo_4h_1d": json!({
             "as_of_ts": tpo_market_profile.get("as_of_ts").cloned().unwrap_or(Value::Null),
@@ -539,11 +867,11 @@ fn build_strategic_context_frozen(
                 &["4h", "1d"]
             ),
         }),
-        "rvwap_sigma_bands_4h": context_child(position_layer, "rvwap_sigma_bands")
-            .get("by_window")
-            .and_then(|value| value.get("4h"))
-            .cloned()
-            .unwrap_or(Value::Null),
+        "rvwap_sigma_bands_4h": window_slice(
+            context_child(position_layer, "rvwap_sigma_bands"),
+            "by_window",
+            &["4h", "1d"]
+        ),
         "ema_trend_regime_4h_1d": json!({
             "ema_100_htf": object_slice(
                 context_child(position_layer, "ema_trend_regime")
@@ -564,16 +892,16 @@ fn build_strategic_context_frozen(
                 &["4h", "1d"]
             ),
         }),
-        "open_interest_4h": context_child(state_layer, "open_interest")
-            .get("by_window")
-            .and_then(|value| value.get("4h"))
-            .cloned()
-            .unwrap_or(Value::Null),
-        "long_short_ratios_4h": context_child(state_layer, "long_short_ratios")
-            .get("by_window")
-            .and_then(|value| value.get("4h"))
-            .cloned()
-            .unwrap_or(Value::Null),
+        "open_interest_4h": window_slice(
+            context_child(state_layer, "open_interest"),
+            "by_window",
+            &["4h", "1d"]
+        ),
+        "long_short_ratios_4h": window_slice(
+            context_child(state_layer, "long_short_ratios"),
+            "by_window",
+            &["4h", "1d"]
+        ),
         "options_regime_1d": options_surface
             .get("strategic_summary")
             .and_then(|value| value.get("windows"))
@@ -594,39 +922,24 @@ fn build_entry_location_context_15m(
     summary: &StrategicIndicatorSummary,
     stage1_output: &Stage1Output,
 ) -> Value {
-    let position_layer = &summary.position_layer;
-    let state_layer = &summary.state_layer;
-    let driver_layer = &summary.driver_layer;
+    let avwap_anchor_distances = build_avwap_anchor_distances(input, summary, stage1_output);
+    let recent_15m_bars_summary = build_recent_15m_bars_summary(summary);
+    let local_price_location_summary =
+        build_local_price_location_summary(input, summary, &avwap_anchor_distances);
+    let local_flow_summary = build_local_flow_summary(summary);
+    let chasing_risk_flags = build_chasing_risk_flags(
+        stage1_output,
+        &recent_15m_bars_summary,
+        &local_price_location_summary,
+        &local_flow_summary,
+    );
 
     json!({
-        "price_volume_structure_15m": context_child(position_layer, "price_volume_structure")
-            .get("by_window")
-            .and_then(|value| value.get("15m"))
-            .cloned()
-            .unwrap_or(Value::Null),
-        "liquidation_density_15m": context_child(position_layer, "liquidation_density")
-            .get("by_window")
-            .and_then(|value| value.get("15m"))
-            .cloned()
-            .unwrap_or(Value::Null),
-        "avwap_anchor_distances": build_avwap_anchor_distances(input, summary, stage1_output),
-        "rvwap_sigma_bands_15m": context_child(position_layer, "rvwap_sigma_bands")
-            .get("by_window")
-            .and_then(|value| value.get("15m"))
-            .cloned()
-            .unwrap_or(Value::Null),
-        "cvd_pack_15m": context_child(driver_layer, "cvd_pack")
-            .get("by_window")
-            .and_then(|value| value.get("15m"))
-            .cloned()
-            .unwrap_or(Value::Null),
-        "divergence_15m_summary": summarize_divergence_15m(summary),
-        "vpin_15m": context_child(state_layer, "vpin")
-            .get("by_window")
-            .and_then(|value| value.get("15m"))
-            .cloned()
-            .unwrap_or(Value::Null),
-        "footprint_15m_summary": summarize_footprint_15m(summary),
+        "recent_15m_bars_summary": recent_15m_bars_summary,
+        "avwap_anchor_distances": avwap_anchor_distances,
+        "local_price_location_summary": local_price_location_summary,
+        "local_flow_summary": local_flow_summary,
+        "chasing_risk_flags": chasing_risk_flags,
     })
 }
 
@@ -1003,7 +1316,6 @@ pub fn build_stage2a_prompt_input(
             .to_string(),
         strategic_context_frozen: build_strategic_context_frozen(summary, stage1_output),
         entry_location_context_15m: build_entry_location_context_15m(input, summary, stage1_output),
-        continuity_confirmation_context_5m: build_continuity_confirmation_context_5m(input, summary),
         state_guardrail_snapshot: build_state_guardrail_snapshot(summary),
         driver_guardrail_snapshot: build_driver_guardrail_snapshot(summary),
         options_guardrail_snapshot: build_options_guardrail_snapshot(summary, stage1_output),
@@ -1276,7 +1588,8 @@ mod tests {
                     "payload": {
                         "by_window": {
                             "15m": {"poc_price": 104.0, "vah": 105.0, "val": 103.0, "value_area_levels": [{"price": 104.0, "volume": 40.0}]},
-                            "4h": {"poc_price": 101.0, "vah": 102.0, "val": 99.5, "value_area_levels": [{"price": 101.0, "volume": 200.0}]}
+                            "4h": {"poc_price": 101.0, "vah": 102.0, "val": 99.5, "value_area_levels": [{"price": 101.0, "volume": 200.0}]},
+                            "1d": {"poc_price": 99.0, "vah": 103.0, "val": 96.0, "value_area_levels": [{"price": 99.0, "volume": 320.0}]}
                         }
                     }
                 },
@@ -1284,7 +1597,8 @@ mod tests {
                     "payload": {
                         "by_window": {
                             "15m": {"clusters": [{"price": 104.5, "notional_usd": 100000.0}]},
-                            "4h": {"clusters": [{"price": 101.5, "notional_usd": 500000.0}]}
+                            "4h": {"clusters": [{"price": 101.5, "notional_usd": 500000.0}]},
+                            "1d": {"clusters": [{"price": 98.5, "notional_usd": 900000.0}]}
                         }
                     }
                 },
@@ -1316,8 +1630,9 @@ mod tests {
                 "rvwap_sigma_bands": {
                     "payload": {
                         "by_window": {
-                            "15m": {"mid": 104.0, "sigma_1_up": 105.0},
-                            "4h": {"mid": 101.0, "sigma_1_up": 103.0}
+                            "15m": {"mid": 104.0, "sigma_1_up": 105.0, "z_price_minus_rvwap": 1.8},
+                            "4h": {"mid": 101.0, "sigma_1_up": 103.0, "z_price_minus_rvwap": 0.9},
+                            "1d": {"mid": 99.5, "sigma_1_up": 102.5, "z_price_minus_rvwap": 1.1}
                         }
                     }
                 },
@@ -1380,7 +1695,7 @@ mod tests {
                     "payload": {
                         "by_window": {
                             "5m": {"delta_fut": 10.0},
-                            "15m": {"delta_fut": 20.0},
+                            "15m": {"delta_fut": 20.0, "delta_spot": 12.0},
                             "4h": {"delta_fut": 50.0},
                             "1d": {"delta_fut": 80.0}
                         }
@@ -1789,11 +2104,11 @@ mod tests {
         for key in [
             "strategic_context_frozen",
             "entry_location_context_15m",
-            "continuity_confirmation_context_5m",
             "stage1_output",
         ] {
             assert!(encoded.get(key).is_some(), "missing key {key}");
         }
+        assert!(encoded.get("continuity_confirmation_context_5m").is_none());
         assert!(
             encoded.get("account").is_none(),
             "legacy key leaked: account"
@@ -1829,11 +2144,56 @@ mod tests {
                 ["4h"],
             json!("bullish_supportive")
         );
+        assert_eq!(
+            encoded["strategic_context_frozen"]["price_volume_structure_4h"]["1d"]["poc_price"],
+            json!(99.0)
+        );
+        for removed_key in [
+            "funding_4h_1d",
+            "vpin_4h_1d",
+            "cvd_pack_4h_1d",
+            "divergence_4h_1d_summary",
+            "whale_trades_4h_1d",
+        ] {
+            assert!(
+                encoded["strategic_context_frozen"]
+                    .get(removed_key)
+                    .is_none(),
+                "unexpected key leaked into strategic_context_frozen: {removed_key}"
+            );
+        }
         let mapped_distance = encoded["entry_location_context_15m"]["avwap_anchor_distances"]
             ["selected_anchor_distances"][2]["distance_to_mapped_avwap_fut"]
             .as_f64()
             .expect("mapped avwap distance");
         assert!((mapped_distance - 0.5).abs() < 1e-9);
+        assert_eq!(
+            selected_anchors[0]["zone_state"]["acceptance_state"],
+            json!("accepted_above")
+        );
+        assert!(encoded["entry_location_context_15m"]
+            .get("recent_15m_bars_summary")
+            .is_some());
+        assert!(encoded["entry_location_context_15m"]
+            .get("local_price_location_summary")
+            .is_some());
+        assert!(encoded["entry_location_context_15m"]
+            .get("local_flow_summary")
+            .is_some());
+        assert!(encoded["entry_location_context_15m"]
+            .get("chasing_risk_flags")
+            .is_some());
+        assert!(encoded["entry_location_context_15m"]
+            .get("price_volume_structure_15m")
+            .is_none());
+        assert!(
+            encoded["entry_location_context_15m"]["local_price_location_summary"]
+                .get("nearest_liquidation_cluster_distance")
+                .is_none()
+        );
+        assert!(encoded["entry_location_context_15m"]["local_flow_summary"]
+            .get("vpin_fut_15m")
+            .is_none());
     }
 
     #[test]

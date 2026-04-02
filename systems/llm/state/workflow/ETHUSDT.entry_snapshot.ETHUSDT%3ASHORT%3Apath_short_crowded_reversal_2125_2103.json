@@ -1,0 +1,44 @@
+{
+  "symbol": "ETHUSDT",
+  "context_key": "ETHUSDT:SHORT:path_short_crowded_reversal_2125_2103",
+  "path_id": "path_short_crowded_reversal_2125_2103",
+  "side": "SHORT",
+  "entry_profile": "pullback_acceptance",
+  "intent_mode": "pullback",
+  "entry_activation_level": {
+    "low": 2124.74,
+    "high": 2126.52,
+    "timeframe": "15m",
+    "label": "Lower reclaim-band trigger",
+    "reason": "Only arm the short once ETH rallies back into the fresh 15m bear-FVG / ask-wall pocket that starts the stage1 activation band."
+  },
+  "entry_zone": {
+    "low": 2128.6,
+    "high": 2130.6,
+    "timeframe": "15m-4h",
+    "label": "4H POC retest sell zone",
+    "reason": "Best-quality fill is deeper inside the reclaim band around the 4H volume/TPO POC cluster, where relief rally repair is more mature and reward back to 2107/2090 improves."
+  },
+  "entry_invalidation_level": {
+    "low": 2132.9,
+    "high": 2134.2,
+    "timeframe": "15m-4h",
+    "label": "POC reclaim failure band",
+    "reason": "If price starts accepting above the POC cluster into the upper half of the reclaim band, the tactical rejection has failed even before the broader 4H strategic invalidation zone is reached."
+  },
+  "max_drift_pct": 0.3,
+  "stop_loss": 2136.8,
+  "take_profit_1": 2102.79,
+  "take_profit_2": 2088.0,
+  "allowed_stop_loss_levels": [
+    2136.8
+  ],
+  "allowed_take_profit_levels": [
+    2102.79,
+    2088.0
+  ],
+  "tp1_realized": false,
+  "applied_driver_deterioration_signals": [],
+  "created_at": "2026-04-01T14:14:12.422144660Z",
+  "updated_at": "2026-04-01T14:14:12.422144660Z"
+}
