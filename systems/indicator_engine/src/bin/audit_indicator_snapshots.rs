@@ -390,6 +390,7 @@ async fn fetch_futures_orderbook_heatmap_rows(
             symbol: row.get("symbol"),
             routing_key: row.get("routing_key"),
             data_json,
+            row_tid_text: String::new(),
         });
     }
     Ok(out)
@@ -510,6 +511,7 @@ async fn main() -> Result<()> {
                 market: row.market.clone(),
                 symbol: row.symbol.clone(),
                 routing_key: row.routing_key.clone(),
+                row_tid_text: row.row_tid_text.clone(),
             });
             let event = replay_row_to_engine_event(row)?;
             max_seen_event_ts = Some(match max_seen_event_ts {

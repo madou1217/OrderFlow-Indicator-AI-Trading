@@ -249,6 +249,7 @@ async fn run_db_validation(
                 market: row.market.clone(),
                 symbol: row.symbol.clone(),
                 routing_key: row.routing_key.clone(),
+                row_tid_text: row.row_tid_text.clone(),
             });
 
             let event = replay_row_to_engine_event(row)?;

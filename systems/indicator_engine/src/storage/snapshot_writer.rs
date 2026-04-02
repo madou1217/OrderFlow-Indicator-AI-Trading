@@ -598,14 +598,17 @@ async fn enqueue_outbox_batch_in_tx(
         "#,
     );
 
-    payload_builder.push_values(messages.iter().zip(payload_bytes.iter()), |mut b, (message, payload_bytes)| {
-        b.push_bind(&message.symbol)
-            .push_bind(message.ts_bucket)
-            .push_bind(message.schema_version)
-            .push_bind(message.indicator_count)
-            .push_bind(&message.payload_encoding)
-            .push_bind(payload_bytes);
-    });
+    payload_builder.push_values(
+        messages.iter().zip(payload_bytes.iter()),
+        |mut b, (message, payload_bytes)| {
+            b.push_bind(&message.symbol)
+                .push_bind(message.ts_bucket)
+                .push_bind(message.schema_version)
+                .push_bind(message.indicator_count)
+                .push_bind(&message.payload_encoding)
+                .push_bind(payload_bytes);
+        },
+    );
 
     payload_builder.push(
         r#"

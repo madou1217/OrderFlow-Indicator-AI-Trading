@@ -118,8 +118,8 @@ impl IndPublisher {
         indicators_json: &Value,
         indicator_count: usize,
     ) -> Result<OutboxMessage> {
-        let (routing_key, message_id, _trace_id, payload_json) =
-            self.build_minute_bundle_payload_template(
+        let (routing_key, message_id, _trace_id, payload_json) = self
+            .build_minute_bundle_payload_template(
                 ts_bucket,
                 symbol,
                 indicators_json,
@@ -160,8 +160,13 @@ impl IndPublisher {
         indicator_count: usize,
         extra_headers: Option<Value>,
     ) -> Result<BundleOutboxMessage> {
-        let (routing_key, message_id, _trace_id, payload_template_json) =
-            self.build_minute_bundle_payload_template(ts_bucket, symbol, indicators_json, indicator_count)?;
+        let (routing_key, message_id, _trace_id, payload_template_json) = self
+            .build_minute_bundle_payload_template(
+                ts_bucket,
+                symbol,
+                indicators_json,
+                indicator_count,
+            )?;
         let headers_json = merge_headers(self.build_headers_json(), extra_headers);
 
         Ok(BundleOutboxMessage {

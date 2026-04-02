@@ -70,15 +70,16 @@ const LIVE_CANONICAL_TAIL_RECONCILE_LOOKBACK_MINUTES: i64 = 31;
 const CANONICAL_REPLAY_FETCH_WINDOW_MINUTES: i64 = 360;
 const STARTUP_BACKFILL_YIELD_EVERY_MINUTES: usize = 64;
 const STARTUP_BACKFILL_PROGRESS_LOG_INTERVAL_SECS: u64 = 15;
+const BACKFILL_PAGED_FETCH_DEFAULT_LIMIT: i64 = 1_000;
+const PERIODIC_RUNTIME_SNAPSHOT_POLL_SECS: u64 = 60;
+const PERIODIC_RUNTIME_SNAPSHOT_INTERVAL_SECS: u64 = 15 * 60;
+const PERIODIC_RUNTIME_SNAPSHOT_MIN_ADVANCE_MINUTES: i64 = 100;
 const MAX_CONSECUTIVE_NULL_PRICE_MINUTES_IN_SNAPSHOT: usize = 60;
 const MIN_RECENT_BARS_AFTER_NULL_RUN_IN_SNAPSHOT: usize = 1440;
 
 enum SnapshotLoadOutcome {
     Fresh(StateSnapshot),
-    StaleRecoverySeed {
-        snap: StateSnapshot,
-        age_hours: i64,
-    },
+    StaleRecoverySeed { snap: StateSnapshot, age_hours: i64 },
     Rejected,
 }
 
@@ -118,6 +119,7 @@ pub struct ReplayRow {
     pub symbol: String,
     pub routing_key: String,
     pub data_json: Value,
+    pub row_tid_text: String,
 }
 
 #[derive(Debug, Clone)]
@@ -127,6 +129,7 @@ pub struct BackfillCursor {
     pub market: String,
     pub symbol: String,
     pub routing_key: String,
+    pub row_tid_text: String,
 }
 
 #[derive(Debug)]
@@ -502,6 +505,12 @@ async fn run_ingest_forwarder(
 
 pub async fn run(ctx: AppContext) -> Result<()> {
     let ctx = Arc::new(ctx);
+    let snapshot_path = ctx
+        .config
+        .indicator
+        .snapshot_file_path
+        .replace("{symbol}", &ctx.config.indicator.symbol);
+    let startup_backfill_batch_size = ctx.config.indicator.startup_backfill_batch_size.max(100);
 
     let metrics = Arc::new(AppMetrics::default());
     let (trade_tx, trade_rx) = mpsc::channel(INGEST_TRADE_CHANNEL_CAPACITY);
@@ -638,11 +647,6 @@ pub async fn run(ctx: AppContext) -> Result<()> {
     };
 
     if got_signal_before_live {
-        let snapshot_path = ctx
-            .config
-            .indicator
-            .snapshot_file_path
-            .replace("{symbol}", &ctx.config.indicator.symbol);
         let snap = state_store.extract_snapshot();
         let history_len = snap.history_futures.len();
         if !snapshot_path.is_empty() && snapshot_is_reusable_recovery_seed(&snap) {
@@ -672,6 +676,14 @@ pub async fn run(ctx: AppContext) -> Result<()> {
     metrics.set_backfill_mode(false);
 
     let state_store = Arc::new(Mutex::new(state_store));
+    let mut periodic_snapshot_handle = if snapshot_path.is_empty() {
+        None
+    } else {
+        Some(tokio::spawn(run_periodic_runtime_snapshot_loop(
+            state_store.clone(),
+            snapshot_path.clone(),
+        )))
+    };
     let (live_ready_job_tx_raw, live_ready_job_rx_raw) =
         mpsc::channel(LIVE_READY_JOB_QUEUE_CAPACITY);
     let mut live_ready_job_tx = Some(live_ready_job_tx_raw);
@@ -706,8 +718,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
         })
         .collect::<Vec<_>>();
     drop(live_computed_job_tx);
-    let live_commit_initial_persisted_ts =
-        ts_from_millis(metrics.snapshot().last_persisted_ts_ms);
+    let live_commit_initial_persisted_ts = ts_from_millis(metrics.snapshot().last_persisted_ts_ms);
     let mut live_commit_handle = Some(tokio::spawn(run_live_ordered_commit_loop(
         metrics.clone(),
         dispatcher.clone(),
@@ -909,6 +920,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                                 &mut scheduler,
                                 next_minute,
                                 repair_to_ts,
+                                startup_backfill_batch_size,
                                 "live_gap_repair",
                             )
                             .await
@@ -1009,6 +1021,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                                 &mut scheduler,
                                 tail_start_ts,
                                 tail_to_ts,
+                                startup_backfill_batch_size,
                                 "live_tail_reconcile",
                             )
                             .await
@@ -1180,6 +1193,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
         .await;
         outbox_handle.abort();
         snapshot_fanout_handle.abort();
+        abort_periodic_runtime_snapshot_handle(&mut periodic_snapshot_handle).await;
 
         let mut state_store = Arc::try_unwrap(state_store)
             .map_err(|_| anyhow::anyhow!("state_store still shared during shutdown drain"))?
@@ -1215,11 +1229,6 @@ pub async fn run(ctx: AppContext) -> Result<()> {
             warn!(error = %err, "shutdown drain + persist failed before snapshot save");
         }
 
-        let snapshot_path = ctx
-            .config
-            .indicator
-            .snapshot_file_path
-            .replace("{symbol}", &ctx.config.indicator.symbol);
         if !snapshot_path.is_empty() {
             info!("Saving state snapshot before exit...");
             let snap = state_store.extract_snapshot();
@@ -1287,15 +1296,11 @@ pub async fn run(ctx: AppContext) -> Result<()> {
     }
     outbox_handle.abort();
     snapshot_fanout_handle.abort();
+    abort_periodic_runtime_snapshot_handle(&mut periodic_snapshot_handle).await;
     for h in consumer_handles {
         h.abort();
     }
 
-    let snapshot_path = ctx
-        .config
-        .indicator
-        .snapshot_file_path
-        .replace("{symbol}", &ctx.config.indicator.symbol);
     let state_store = Arc::try_unwrap(state_store)
         .map_err(|_| anyhow::anyhow!("state_store still shared while saving snapshot"))?
         .into_inner();
@@ -1656,11 +1661,7 @@ fn format_stale_msg_type_distribution(counter: &HashMap<String, u64>) -> String 
         .join(",")
 }
 
-fn try_load_state_snapshot(
-    path: &str,
-    symbol: &str,
-    max_age_hours: u64,
-) -> SnapshotLoadOutcome {
+fn try_load_state_snapshot(path: &str, symbol: &str, max_age_hours: u64) -> SnapshotLoadOutcome {
     use flate2::read::GzDecoder;
     use std::fs::File;
 
@@ -1991,6 +1992,101 @@ async fn save_state_snapshot(snap: &StateSnapshot, path: &str) -> anyhow::Result
     serde_json::to_writer(gz, snap)?;
     std::fs::rename(&tmp_path, path)?;
     Ok(())
+}
+
+async fn run_periodic_runtime_snapshot_loop(
+    state_store: Arc<Mutex<StateStore>>,
+    snapshot_path: String,
+) {
+    let mut tick = interval(Duration::from_secs(PERIODIC_RUNTIME_SNAPSHOT_POLL_SECS));
+    tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+    let mut last_snapshot_attempt_at =
+        Instant::now() - Duration::from_secs(PERIODIC_RUNTIME_SNAPSHOT_INTERVAL_SECS);
+    let mut last_saved_finalized_ts: Option<DateTime<Utc>> = None;
+
+    loop {
+        tick.tick().await;
+
+        let current_finalized_ts = {
+            let state_store = state_store.lock().await;
+            state_store.last_finalized_minute()
+        };
+        let Some(current_finalized_ts) = current_finalized_ts else {
+            continue;
+        };
+
+        let has_new_progress = last_saved_finalized_ts
+            .map(|last_saved| current_finalized_ts > last_saved)
+            .unwrap_or(true);
+        if !has_new_progress {
+            continue;
+        }
+
+        let due_by_interval = last_snapshot_attempt_at.elapsed()
+            >= Duration::from_secs(PERIODIC_RUNTIME_SNAPSHOT_INTERVAL_SECS);
+        let due_by_finalized_advance = last_saved_finalized_ts
+            .map(|last_saved| {
+                (current_finalized_ts - last_saved).num_minutes()
+                    >= PERIODIC_RUNTIME_SNAPSHOT_MIN_ADVANCE_MINUTES
+            })
+            .unwrap_or(false);
+        if !(due_by_interval || due_by_finalized_advance) {
+            continue;
+        }
+
+        last_snapshot_attempt_at = Instant::now();
+        let snap = {
+            let state_store = state_store.lock().await;
+            state_store.extract_snapshot()
+        };
+
+        if !snapshot_is_reusable_recovery_seed(&snap) {
+            debug!(
+                path = %snapshot_path,
+                last_ts = %snap.last_finalized_ts,
+                effective_history_floor_ts = ?snap.effective_history_floor_ts,
+                "skipping periodic runtime snapshot save because state is not yet reusable"
+            );
+            continue;
+        }
+
+        match save_state_snapshot(&snap, &snapshot_path).await {
+            Ok(()) => {
+                last_saved_finalized_ts = Some(snap.last_finalized_ts);
+                info!(
+                    path = %snapshot_path,
+                    futures_bars = snap.history_futures.len(),
+                    spot_bars = snap.history_spot.len(),
+                    last_ts = %snap.last_finalized_ts,
+                    "periodic runtime snapshot saved"
+                );
+            }
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    path = %snapshot_path,
+                    last_ts = %snap.last_finalized_ts,
+                    "periodic runtime snapshot save failed"
+                );
+            }
+        }
+    }
+}
+
+async fn abort_periodic_runtime_snapshot_handle(handle_slot: &mut Option<JoinHandle<()>>) {
+    let Some(handle) = handle_slot.take() else {
+        return;
+    };
+    handle.abort();
+    if let Err(err) = handle.await {
+        if !err.is_cancelled() {
+            warn!(
+                error = %err,
+                "periodic runtime snapshot task join failed during shutdown"
+            );
+        }
+    }
 }
 
 pub async fn load_kline_history_supplement(
@@ -2675,6 +2771,7 @@ async fn ingest_canonical_range_from_db(
     scheduler: &mut WindowScheduler,
     from_ts: DateTime<Utc>,
     to_ts_exclusive: DateTime<Utc>,
+    batch_limit: i64,
     reason: &'static str,
 ) -> Result<CanonicalRepairStats> {
     if from_ts >= to_ts_exclusive {
@@ -2683,53 +2780,64 @@ async fn ingest_canonical_range_from_db(
 
     let mut stats = CanonicalRepairStats::default();
     let mut window_from_ts = from_ts;
+    let effective_batch_limit = batch_limit.max(1);
     while window_from_ts < to_ts_exclusive {
         let window_to_ts = (window_from_ts
             + ChronoDuration::minutes(CANONICAL_REPLAY_FETCH_WINDOW_MINUTES))
         .min(to_ts_exclusive);
-        let rows = fetch_backfill_window(
-            pool,
-            window_from_ts,
-            window_to_ts,
-            symbol,
-            STARTUP_BACKFILL_MARKET,
-        )
-        .await
-        .with_context(|| {
-            format!(
-                "{reason} fetch canonical replay rows from_ts={window_from_ts} to_ts_exclusive={window_to_ts}"
+        let mut cursor: Option<BackfillCursor> = None;
+        loop {
+            let rows = fetch_backfill_batch(
+                pool,
+                window_from_ts,
+                window_to_ts,
+                symbol,
+                STARTUP_BACKFILL_MARKET,
+                effective_batch_limit,
+                cursor.as_ref(),
             )
-        })?;
-        stats.fetched_rows += rows.len();
+            .await
+            .with_context(|| {
+                format!(
+                    "{reason} fetch canonical replay rows from_ts={window_from_ts} to_ts_exclusive={window_to_ts}"
+                )
+            })?;
+            if rows.is_empty() {
+                break;
+            }
 
-        for row in rows {
-            match replay_row_to_engine_event(row) {
-                Ok(event) => {
-                    let bucket = logical_event_bucket_ts(&event);
-                    metrics.inc_processed(event.event_ts.timestamp_millis());
-                    if matches!(
-                        &event.data,
-                        MdData::AggTrade1m(_)
-                            | MdData::AggOrderbook1m(_)
-                            | MdData::AggLiq1m(_)
-                            | MdData::AggFundingMark1m(_)
-                    ) {
-                        scheduler.prime_start_from(bucket);
+            stats.fetched_rows += rows.len();
+            cursor = rows.last().map(backfill_cursor_from_row);
+
+            for row in rows {
+                match replay_row_to_engine_event(row) {
+                    Ok(event) => {
+                        let bucket = logical_event_bucket_ts(&event);
+                        metrics.inc_processed(event.event_ts.timestamp_millis());
+                        if matches!(
+                            &event.data,
+                            MdData::AggTrade1m(_)
+                                | MdData::AggOrderbook1m(_)
+                                | MdData::AggLiq1m(_)
+                                | MdData::AggFundingMark1m(_)
+                        ) {
+                            scheduler.prime_start_from(bucket);
+                        }
+                        stats.record_event(&event);
+                        let outcome = state_store.ingest(event);
+                        stats.ingested_rows += 1;
+                        stats.record_material_change(bucket, outcome);
                     }
-                    stats.record_event(&event);
-                    let outcome = state_store.ingest(event);
-                    stats.ingested_rows += 1;
-                    stats.record_material_change(bucket, outcome);
-                }
-                Err(err) => {
-                    metrics.inc_decode_error();
-                    warn!(
-                        error = %err,
-                        reason = reason,
-                        from_ts = %window_from_ts,
-                        to_ts_exclusive = %window_to_ts,
-                        "decode live canonical repair row failed"
-                    );
+                    Err(err) => {
+                        metrics.inc_decode_error();
+                        warn!(
+                            error = %err,
+                            reason = reason,
+                            from_ts = %window_from_ts,
+                            to_ts_exclusive = %window_to_ts,
+                            "decode live canonical repair row failed"
+                        );
+                    }
                 }
             }
         }
@@ -4188,6 +4296,7 @@ async fn run_startup_backfill(
     let startup_backfill_started_at = Instant::now();
     let mut last_progress_log_at = Instant::now();
     let mut completed_windows = 0usize;
+    let backfill_batch_size = ctx.config.indicator.startup_backfill_batch_size.max(100);
     while window_from_ts < to_ts {
         let window_to_ts = (window_from_ts
             + ChronoDuration::minutes(CANONICAL_REPLAY_FETCH_WINDOW_MINUTES))
@@ -4201,54 +4310,66 @@ async fn run_startup_backfill(
             elapsed_secs = startup_backfill_started_at.elapsed().as_secs(),
             "startup backfill replay ingest window begin"
         );
-        let rows = fetch_backfill_window(
-            &ctx.db_pool,
-            window_from_ts,
-            window_to_ts,
-            &ctx.config.indicator.symbol,
-            STARTUP_BACKFILL_MARKET,
-        )
-        .await?;
-        let window_rows_total = rows.len() as u64;
         let mut window_rows_processed = 0_u64;
+        let mut window_rows_fetched = 0_u64;
+        let mut cursor: Option<BackfillCursor> = None;
 
-        for row in rows {
-            match replay_row_to_engine_event(row) {
-                Ok(event) => {
-                    metrics.inc_processed(event.event_ts.timestamp_millis());
-                    state_store.ingest(event);
-                    total_rows += 1;
-                    window_rows_processed += 1;
-                }
-                Err(err) => {
-                    warn!(error = %err, "decode startup backfill row failed");
-                }
+        loop {
+            let rows = fetch_backfill_batch(
+                &ctx.db_pool,
+                window_from_ts,
+                window_to_ts,
+                &ctx.config.indicator.symbol,
+                STARTUP_BACKFILL_MARKET,
+                backfill_batch_size,
+                cursor.as_ref(),
+            )
+            .await?;
+            if rows.is_empty() {
+                break;
             }
 
-            if last_progress_log_at.elapsed()
-                >= Duration::from_secs(STARTUP_BACKFILL_PROGRESS_LOG_INTERVAL_SECS)
-            {
-                let completed_minutes = (window_to_ts - from_ts).num_minutes().max(0);
-                let progress_pct = if total_minutes > 0 {
-                    (completed_minutes as f64 / total_minutes as f64) * 100.0
-                } else {
-                    100.0
-                };
-                info!(
-                    window_index = completed_windows + 1,
-                    windows_total = total_windows,
-                    window_from_ts = %window_from_ts,
-                    window_to_ts = %window_to_ts,
-                    window_rows_processed,
-                    window_rows_total,
-                    total_rows,
-                    completed_minutes,
-                    total_minutes,
-                    progress_pct = format_args!("{progress_pct:.1}"),
-                    elapsed_secs = startup_backfill_started_at.elapsed().as_secs(),
-                    "startup backfill replay ingest progress"
-                );
-                last_progress_log_at = Instant::now();
+            window_rows_fetched += rows.len() as u64;
+            cursor = rows.last().map(backfill_cursor_from_row);
+
+            for row in rows {
+                match replay_row_to_engine_event(row) {
+                    Ok(event) => {
+                        metrics.inc_processed(event.event_ts.timestamp_millis());
+                        state_store.ingest(event);
+                        total_rows += 1;
+                        window_rows_processed += 1;
+                    }
+                    Err(err) => {
+                        warn!(error = %err, "decode startup backfill row failed");
+                    }
+                }
+
+                if last_progress_log_at.elapsed()
+                    >= Duration::from_secs(STARTUP_BACKFILL_PROGRESS_LOG_INTERVAL_SECS)
+                {
+                    let completed_minutes = (window_to_ts - from_ts).num_minutes().max(0);
+                    let progress_pct = if total_minutes > 0 {
+                        (completed_minutes as f64 / total_minutes as f64) * 100.0
+                    } else {
+                        100.0
+                    };
+                    info!(
+                        window_index = completed_windows + 1,
+                        windows_total = total_windows,
+                        window_from_ts = %window_from_ts,
+                        window_to_ts = %window_to_ts,
+                        window_rows_processed,
+                        window_rows_fetched,
+                        total_rows,
+                        completed_minutes,
+                        total_minutes,
+                        progress_pct = format_args!("{progress_pct:.1}"),
+                        elapsed_secs = startup_backfill_started_at.elapsed().as_secs(),
+                        "startup backfill replay ingest progress"
+                    );
+                    last_progress_log_at = Instant::now();
+                }
             }
         }
 
@@ -4263,7 +4384,7 @@ async fn run_startup_backfill(
         let window_elapsed_secs = window_elapsed.as_secs_f64();
         let window_minutes = (window_to_ts - window_from_ts).num_minutes().max(0) as f64;
         let rows_per_sec = if window_elapsed_secs > 0.0 {
-            window_rows_total as f64 / window_elapsed_secs
+            window_rows_fetched as f64 / window_elapsed_secs
         } else {
             0.0
         };
@@ -4277,7 +4398,7 @@ async fn run_startup_backfill(
             windows_total = total_windows,
             window_from_ts = %window_from_ts,
             window_to_ts = %window_to_ts,
-            window_rows_total,
+            window_rows_total = window_rows_fetched,
             total_rows,
             completed_minutes,
             total_minutes,
@@ -4970,6 +5091,379 @@ __OUTER_WHERE__
         .replace("__LIMIT_PARAM__", &limit_param.to_string())
 }
 
+fn build_paged_backfill_sql(filter_market: bool, with_cursor: bool) -> String {
+    const SQL_TEMPLATE: &str = r#"
+    WITH events AS (
+        (
+            SELECT
+                t.ctid::text AS row_tid_text,
+                t.ts_event AS event_ts,
+                'md.agg.trade.1m'::text AS msg_type,
+                t.market::text AS market,
+                t.symbol AS symbol,
+                format('md.agg.%s.trade.1m.%s', t.market::text, lower(t.symbol)) AS routing_key,
+                jsonb_build_object(
+                    'ts_bucket', t.ts_bucket,
+                    'chunk_start_ts', t.chunk_start_ts,
+                    'chunk_end_ts', t.chunk_end_ts,
+                    'source_event_count', t.source_event_count,
+                    'trade_count', t.trade_count,
+                    'buy_qty', t.buy_qty,
+                    'sell_qty', t.sell_qty,
+                    'buy_notional', t.buy_notional,
+                    'sell_notional', t.sell_notional,
+                    'first_price', t.first_price,
+                    'last_price', t.last_price,
+                    'high_price', t.high_price,
+                    'low_price', t.low_price,
+                    'profile_levels', t.profile_levels,
+                    'whale', t.whale_json,
+                    'payload_json', COALESCE(t.payload_json, '{}'::jsonb)
+                ) AS data_json
+            FROM md.agg_trade_1m t
+            WHERE t.ts_bucket >= $1
+              AND t.ts_bucket < $2
+              AND t.symbol = $3
+__TRADE_MARKET_FILTER__
+__TRADE_CURSOR_FILTER__
+            ORDER BY event_ts ASC, market ASC, symbol ASC, routing_key ASC, row_tid_text ASC
+            LIMIT $__LIMIT_PARAM__
+        )
+
+        UNION ALL
+
+        (
+            SELECT
+                b.ctid::text AS row_tid_text,
+                b.ts_event AS event_ts,
+                'md.agg.orderbook.1m'::text AS msg_type,
+                b.market::text AS market,
+                b.symbol AS symbol,
+                format('md.agg.%s.orderbook.1m.%s', b.market::text, lower(b.symbol)) AS routing_key,
+                jsonb_build_object(
+                    'ts_bucket', b.ts_bucket,
+                    'chunk_start_ts', b.chunk_start_ts,
+                    'chunk_end_ts', b.chunk_end_ts,
+                    'source_event_count', b.source_event_count,
+                    'sample_count', b.sample_count,
+                    'bbo_updates', b.bbo_updates,
+                    'spread_sum', b.spread_sum,
+                    'topk_depth_sum', b.topk_depth_sum,
+                    'obi_sum', b.obi_sum,
+                    'obi_l1_sum', b.obi_l1_sum,
+                    'obi_k_sum', b.obi_k_sum,
+                    'obi_k_dw_sum', b.obi_k_dw_sum,
+                    'obi_k_dw_change_sum', b.obi_k_dw_change_sum,
+                    'obi_k_dw_adj_sum', b.obi_k_dw_adj_sum,
+                    'microprice_sum', b.microprice_sum,
+                    'microprice_classic_sum', b.microprice_classic_sum,
+                    'microprice_kappa_sum', b.microprice_kappa_sum,
+                    'microprice_adj_sum', b.microprice_adj_sum,
+                    'ofi_sum', b.ofi_sum,
+                    'obi_k_dw_close', b.obi_k_dw_close,
+                    'heatmap_levels', '[]'::jsonb,
+                    'heatmap_loaded', FALSE
+                ) AS data_json
+            FROM md.agg_orderbook_1m b
+            WHERE b.ts_bucket >= $1
+              AND b.ts_bucket < $2
+              AND b.symbol = $3
+__ORDERBOOK_MARKET_FILTER__
+__ORDERBOOK_CURSOR_FILTER__
+            ORDER BY event_ts ASC, market ASC, symbol ASC, routing_key ASC, row_tid_text ASC
+            LIMIT $__LIMIT_PARAM__
+        )
+
+        UNION ALL
+
+        (
+            SELECT
+                l.ctid::text AS row_tid_text,
+                l.ts_event AS event_ts,
+                'md.agg.liq.1m'::text AS msg_type,
+                l.market::text AS market,
+                l.symbol AS symbol,
+                format('md.agg.%s.liq.1m.%s', l.market::text, lower(l.symbol)) AS routing_key,
+                jsonb_build_object(
+                    'ts_bucket', l.ts_bucket,
+                    'chunk_start_ts', l.chunk_start_ts,
+                    'chunk_end_ts', l.chunk_end_ts,
+                    'source_event_count', l.source_event_count,
+                    'force_liq_levels', l.force_liq_levels
+                ) AS data_json
+            FROM md.agg_liq_1m l
+            WHERE l.ts_bucket >= $1
+              AND l.ts_bucket < $2
+              AND l.symbol = $3
+__LIQ_MARKET_FILTER__
+__LIQ_CURSOR_FILTER__
+            ORDER BY event_ts ASC, market ASC, symbol ASC, routing_key ASC, row_tid_text ASC
+            LIMIT $__LIMIT_PARAM__
+        )
+
+        UNION ALL
+
+        (
+            SELECT
+                f.ctid::text AS row_tid_text,
+                f.ts_event AS event_ts,
+                'md.agg.funding_mark.1m'::text AS msg_type,
+                f.market::text AS market,
+                f.symbol AS symbol,
+                format('md.agg.%s.funding_mark.1m.%s', f.market::text, lower(f.symbol)) AS routing_key,
+                jsonb_build_object(
+                    'ts_bucket', f.ts_bucket,
+                    'chunk_start_ts', f.chunk_start_ts,
+                    'chunk_end_ts', f.chunk_end_ts,
+                    'source_event_count', f.source_event_count,
+                    'mark_points', f.mark_points,
+                    'funding_points', f.funding_points
+                ) AS data_json
+            FROM md.agg_funding_mark_1m f
+            WHERE f.ts_bucket >= $1
+              AND f.ts_bucket < $2
+              AND f.symbol = $3
+__FUNDING_MARKET_FILTER__
+__FUNDING_CURSOR_FILTER__
+            ORDER BY event_ts ASC, market ASC, symbol ASC, routing_key ASC, row_tid_text ASC
+            LIMIT $__LIMIT_PARAM__
+        )
+
+        UNION ALL
+
+        (
+            SELECT
+                oi.ctid::text AS row_tid_text,
+                oi.ts_event AS event_ts,
+                'md.open_interest_current'::text AS msg_type,
+                oi.market::text AS market,
+                oi.symbol AS symbol,
+                format('md.%s.open_interest.current.%s', oi.market::text, lower(oi.symbol)) AS routing_key,
+                jsonb_build_object(
+                    'ts_effective', oi.ts_event,
+                    'open_interest_contracts', oi.open_interest_contracts,
+                    'mark_price', oi.mark_price,
+                    'open_interest_value_usdt', oi.open_interest_value_usdt
+                ) AS data_json
+            FROM md.open_interest_current_1m oi
+            WHERE oi.ts_event >= $1
+              AND oi.ts_event < $2
+              AND oi.symbol = $3
+__OI_CURRENT_MARKET_FILTER__
+__OI_CURRENT_CURSOR_FILTER__
+            ORDER BY event_ts ASC, market ASC, symbol ASC, routing_key ASC, row_tid_text ASC
+            LIMIT $__LIMIT_PARAM__
+        )
+
+        UNION ALL
+
+        (
+            SELECT
+                oih.ctid::text AS row_tid_text,
+                oih.ts_event AS event_ts,
+                'md.open_interest_hist_5m'::text AS msg_type,
+                oih.market::text AS market,
+                oih.symbol AS symbol,
+                format('md.%s.open_interest.5m.%s', oih.market::text, lower(oih.symbol)) AS routing_key,
+                jsonb_build_object(
+                    'ts_effective', oih.ts_bucket,
+                    'ts_bucket', oih.ts_bucket,
+                    'open_interest_contracts', oih.open_interest_contracts,
+                    'open_interest_value_usdt', oih.open_interest_value_usdt
+                ) AS data_json
+            FROM md.open_interest_hist_5m oih
+            WHERE oih.ts_bucket >= $1
+              AND oih.ts_bucket < $2
+              AND oih.symbol = $3
+__OI_HIST_MARKET_FILTER__
+__OI_HIST_CURSOR_FILTER__
+            ORDER BY event_ts ASC, market ASC, symbol ASC, routing_key ASC, row_tid_text ASC
+            LIMIT $__LIMIT_PARAM__
+        )
+
+        UNION ALL
+
+        (
+            SELECT
+                lsr.ctid::text AS row_tid_text,
+                lsr.ts_event AS event_ts,
+                'md.long_short_ratio_5m'::text AS msg_type,
+                lsr.market::text AS market,
+                lsr.symbol AS symbol,
+                format(
+                    'md.%s.long_short_ratio.%s.5m.%s',
+                    lsr.market::text,
+                    lsr.ratio_type,
+                    lower(lsr.symbol)
+                ) AS routing_key,
+                jsonb_build_object(
+                    'ts_effective', lsr.ts_bucket,
+                    'ts_bucket', lsr.ts_bucket,
+                    'ratio_type', lsr.ratio_type,
+                    'long_short_ratio', lsr.long_short_ratio,
+                    'long_account_ratio', lsr.long_account_ratio,
+                    'short_account_ratio', lsr.short_account_ratio
+                ) AS data_json
+            FROM md.long_short_ratio_5m lsr
+            WHERE lsr.ts_bucket >= $1
+              AND lsr.ts_bucket < $2
+              AND lsr.symbol = $3
+              AND lsr.ratio_type IN ('global_account', 'top_account', 'top_position')
+__LONG_SHORT_RATIO_MARKET_FILTER__
+__LONG_SHORT_RATIO_CURSOR_FILTER__
+            ORDER BY event_ts ASC, market ASC, symbol ASC, routing_key ASC, row_tid_text ASC
+            LIMIT $__LIMIT_PARAM__
+        )
+
+        UNION ALL
+
+        (
+            SELECT
+                opt.ctid::text AS row_tid_text,
+                opt.ts_event AS event_ts,
+                'md.option_mark_greeks_5m'::text AS msg_type,
+                opt.market::text AS market,
+                opt.symbol AS symbol,
+                format('md.futures.option_mark_greeks.5m.%s', lower(opt.symbol)) AS routing_key,
+                jsonb_build_object(
+                    'ts_effective', opt.ts_bucket,
+                    'ts_bucket', opt.ts_bucket,
+                    'option_symbol', opt.option_symbol,
+                    'underlying_asset', opt.underlying_asset,
+                    'expiry_ts', opt.expiry_ts,
+                    'strike_price', opt.strike_price,
+                    'contract_side', opt.contract_side,
+                    'unit', opt.unit,
+                    'index_price', opt.index_price,
+                    'mark_price', opt.mark_price,
+                    'bid_iv', opt.bid_iv,
+                    'ask_iv', opt.ask_iv,
+                    'mark_iv', opt.mark_iv,
+                    'delta', opt.delta,
+                    'gamma', opt.gamma,
+                    'vega', opt.vega,
+                    'theta', opt.theta,
+                    'risk_free_interest', opt.risk_free_interest
+                ) AS data_json
+            FROM md.option_mark_greeks_5m opt
+            WHERE opt.ts_bucket >= $1
+              AND opt.ts_bucket < $2
+              AND opt.symbol = $3
+__OPTION_MARKET_FILTER__
+__OPTION_CURSOR_FILTER__
+            ORDER BY event_ts ASC, market ASC, symbol ASC, routing_key ASC, row_tid_text ASC
+            LIMIT $__LIMIT_PARAM__
+        )
+    )
+    SELECT row_tid_text, event_ts, msg_type, market, symbol, routing_key, data_json
+    FROM events
+    ORDER BY event_ts ASC, msg_type ASC, market ASC, symbol ASC, routing_key ASC, row_tid_text ASC
+    LIMIT $__LIMIT_PARAM__
+    "#;
+
+    let market_param = 4usize;
+    let limit_param = if filter_market { 5usize } else { 4usize };
+    let cursor_ts_param = if filter_market { 6usize } else { 5usize };
+    let cursor_msg_type_param = cursor_ts_param + 1;
+    let cursor_market_param = cursor_ts_param + 2;
+    let cursor_symbol_param = cursor_ts_param + 3;
+    let cursor_routing_key_param = cursor_ts_param + 4;
+    let cursor_row_tid_param = cursor_ts_param + 5;
+
+    let mk_market_filter = |alias: &str| -> String {
+        if filter_market {
+            format!("              AND {alias}.market::text = ${market_param}")
+        } else {
+            String::new()
+        }
+    };
+
+    let mk_cursor_filter = |alias: &str, msg_type_expr: &str, routing_key_expr: &str| -> String {
+        if with_cursor {
+            format!(
+                "              AND ({alias}.ts_event, {msg_type_expr}, {alias}.market::text, {alias}.symbol, {routing_key_expr}, {alias}.ctid::text)\n                  > (${cursor_ts_param}::timestamptz, ${cursor_msg_type_param}::text, ${cursor_market_param}::text, ${cursor_symbol_param}::text, ${cursor_routing_key_param}::text, ${cursor_row_tid_param}::text)"
+            )
+        } else {
+            String::new()
+        }
+    };
+
+    SQL_TEMPLATE
+        .replace("__TRADE_MARKET_FILTER__", &mk_market_filter("t"))
+        .replace(
+            "__TRADE_CURSOR_FILTER__",
+            &mk_cursor_filter(
+                "t",
+                "'md.agg.trade.1m'::text",
+                "format('md.agg.%s.trade.1m.%s', t.market::text, lower(t.symbol))",
+            ),
+        )
+        .replace("__ORDERBOOK_MARKET_FILTER__", &mk_market_filter("b"))
+        .replace(
+            "__ORDERBOOK_CURSOR_FILTER__",
+            &mk_cursor_filter(
+                "b",
+                "'md.agg.orderbook.1m'::text",
+                "format('md.agg.%s.orderbook.1m.%s', b.market::text, lower(b.symbol))",
+            ),
+        )
+        .replace("__LIQ_MARKET_FILTER__", &mk_market_filter("l"))
+        .replace(
+            "__LIQ_CURSOR_FILTER__",
+            &mk_cursor_filter(
+                "l",
+                "'md.agg.liq.1m'::text",
+                "format('md.agg.%s.liq.1m.%s', l.market::text, lower(l.symbol))",
+            ),
+        )
+        .replace("__FUNDING_MARKET_FILTER__", &mk_market_filter("f"))
+        .replace(
+            "__FUNDING_CURSOR_FILTER__",
+            &mk_cursor_filter(
+                "f",
+                "'md.agg.funding_mark.1m'::text",
+                "format('md.agg.%s.funding_mark.1m.%s', f.market::text, lower(f.symbol))",
+            ),
+        )
+        .replace("__OI_CURRENT_MARKET_FILTER__", &mk_market_filter("oi"))
+        .replace(
+            "__OI_CURRENT_CURSOR_FILTER__",
+            &mk_cursor_filter(
+                "oi",
+                "'md.open_interest_current'::text",
+                "format('md.%s.open_interest.current.%s', oi.market::text, lower(oi.symbol))",
+            ),
+        )
+        .replace("__OI_HIST_MARKET_FILTER__", &mk_market_filter("oih"))
+        .replace(
+            "__OI_HIST_CURSOR_FILTER__",
+            &mk_cursor_filter(
+                "oih",
+                "'md.open_interest_hist_5m'::text",
+                "format('md.%s.open_interest.5m.%s', oih.market::text, lower(oih.symbol))",
+            ),
+        )
+        .replace("__LONG_SHORT_RATIO_MARKET_FILTER__", &mk_market_filter("lsr"))
+        .replace(
+            "__LONG_SHORT_RATIO_CURSOR_FILTER__",
+            &mk_cursor_filter(
+                "lsr",
+                "'md.long_short_ratio_5m'::text",
+                "format('md.%s.long_short_ratio.%s.5m.%s', lsr.market::text, lsr.ratio_type, lower(lsr.symbol))",
+            ),
+        )
+        .replace("__OPTION_MARKET_FILTER__", &mk_market_filter("opt"))
+        .replace(
+            "__OPTION_CURSOR_FILTER__",
+            &mk_cursor_filter(
+                "opt",
+                "'md.option_mark_greeks_5m'::text",
+                "format('md.futures.option_mark_greeks.5m.%s', lower(opt.symbol))",
+            ),
+        )
+        .replace("__LIMIT_PARAM__", &limit_param.to_string())
+}
+
 fn require_backfill_field<T>(src: &str, field: &'static str, value: Option<T>) -> Result<T> {
     value.with_context(|| {
         format!("startup backfill row missing required field {field} for src={src}")
@@ -5342,139 +5836,26 @@ async fn fetch_backfill_window(
         return Ok(Vec::new());
     }
 
-    let symbol_upper = symbol.to_uppercase();
-    let include_all = market.eq_ignore_ascii_case("all");
-    let include_futures = include_all || market.eq_ignore_ascii_case("futures");
-    let include_spot = include_all || market.eq_ignore_ascii_case("spot");
     let mut rows = Vec::new();
-
-    if include_futures {
-        let (
-            trade_rows,
-            orderbook_rows,
-            liq_rows,
-            funding_rows,
-            oi_current_rows,
-            oi_hist_rows,
-            long_short_ratio_rows,
-            option_mark_rows,
-        ) = tokio::try_join!(
-            fetch_backfill_source_rows(
-                pool,
-                TRADE_BACKFILL_WINDOW_SQL,
-                "trade",
-                from_ts,
-                to_ts,
-                &symbol_upper,
-                "futures",
-            ),
-            fetch_backfill_source_rows(
-                pool,
-                ORDERBOOK_BACKFILL_WINDOW_SQL_SCALAR,
-                "orderbook",
-                from_ts,
-                to_ts,
-                &symbol_upper,
-                "futures",
-            ),
-            fetch_backfill_source_rows(
-                pool,
-                LIQ_BACKFILL_WINDOW_SQL,
-                "liq",
-                from_ts,
-                to_ts,
-                &symbol_upper,
-                "futures",
-            ),
-            fetch_backfill_source_rows(
-                pool,
-                FUNDING_BACKFILL_WINDOW_SQL,
-                "funding_mark",
-                from_ts,
-                to_ts,
-                &symbol_upper,
-                "futures",
-            ),
-            fetch_backfill_source_rows(
-                pool,
-                OI_CURRENT_BACKFILL_WINDOW_SQL,
-                "oi_current",
-                from_ts,
-                to_ts,
-                &symbol_upper,
-                "futures",
-            ),
-            fetch_backfill_source_rows(
-                pool,
-                OI_HIST_5M_BACKFILL_WINDOW_SQL,
-                "oi_hist_5m",
-                from_ts,
-                to_ts,
-                &symbol_upper,
-                "futures",
-            ),
-            fetch_backfill_source_rows(
-                pool,
-                LONG_SHORT_RATIO_5M_BACKFILL_WINDOW_SQL,
-                "long_short_ratio_5m",
-                from_ts,
-                to_ts,
-                &symbol_upper,
-                "futures",
-            ),
-            fetch_backfill_source_rows(
-                pool,
-                OPTION_MARK_GREEKS_5M_BACKFILL_WINDOW_SQL,
-                "option_mark_greeks_5m",
-                from_ts,
-                to_ts,
-                &symbol_upper,
-                "futures",
-            ),
-        )?;
-        rows.extend(trade_rows);
-        rows.extend(orderbook_rows);
-        rows.extend(liq_rows);
-        rows.extend(funding_rows);
-        rows.extend(oi_current_rows);
-        rows.extend(oi_hist_rows);
-        rows.extend(long_short_ratio_rows);
-        rows.extend(option_mark_rows);
+    let mut cursor: Option<BackfillCursor> = None;
+    loop {
+        let batch = fetch_backfill_batch(
+            pool,
+            from_ts,
+            to_ts,
+            symbol,
+            market,
+            BACKFILL_PAGED_FETCH_DEFAULT_LIMIT,
+            cursor.as_ref(),
+        )
+        .await?;
+        if batch.is_empty() {
+            break;
+        }
+        cursor = batch.last().map(backfill_cursor_from_row);
+        rows.extend(batch);
     }
 
-    if include_spot {
-        let (trade_rows, orderbook_rows) = tokio::try_join!(
-            fetch_backfill_source_rows(
-                pool,
-                TRADE_BACKFILL_WINDOW_SQL,
-                "trade",
-                from_ts,
-                to_ts,
-                &symbol_upper,
-                "spot",
-            ),
-            fetch_backfill_source_rows(
-                pool,
-                ORDERBOOK_BACKFILL_WINDOW_SQL_SCALAR,
-                "orderbook",
-                from_ts,
-                to_ts,
-                &symbol_upper,
-                "spot",
-            ),
-        )?;
-        rows.extend(trade_rows);
-        rows.extend(orderbook_rows);
-    }
-
-    rows.sort_by(|a, b| {
-        a.event_ts
-            .cmp(&b.event_ts)
-            .then_with(|| a.msg_type.cmp(&b.msg_type))
-            .then_with(|| a.market.cmp(&b.market))
-            .then_with(|| a.symbol.cmp(&b.symbol))
-            .then_with(|| a.routing_key.cmp(&b.routing_key))
-    });
     Ok(rows)
 }
 
@@ -5511,6 +5892,7 @@ async fn fetch_backfill_source_rows(
             symbol: row.get("symbol"),
             routing_key: row.get("routing_key"),
             data_json,
+            row_tid_text: String::new(),
         });
     }
     Ok(out)
@@ -5761,19 +6143,53 @@ pub async fn fetch_backfill_batch(
     limit: i64,
     cursor: Option<&BackfillCursor>,
 ) -> Result<Vec<ReplayRow>> {
-    let mut rows = fetch_backfill_window(pool, from_ts, to_ts, symbol, market)
-        .await
-        .context("fetch startup backfill batch")?;
+    if from_ts >= to_ts {
+        return Ok(Vec::new());
+    }
 
+    let filter_market = !market.eq_ignore_ascii_case("all");
+    let with_cursor = cursor.is_some();
+    let sql = build_paged_backfill_sql(filter_market, with_cursor);
+    let symbol_upper = symbol.to_uppercase();
+    let market_lower = market.to_lowercase();
+    let effective_limit = limit.max(1);
+
+    let mut query = sqlx::query(&sql)
+        .bind(from_ts)
+        .bind(to_ts)
+        .bind(symbol_upper);
+    if filter_market {
+        query = query.bind(market_lower);
+    }
+    query = query.bind(effective_limit);
     if let Some(cursor) = cursor {
-        rows.retain(|row| replay_row_after_cursor(row, cursor));
+        query = query
+            .bind(cursor.event_ts)
+            .bind(cursor.msg_type.as_str())
+            .bind(cursor.market.as_str())
+            .bind(cursor.symbol.as_str())
+            .bind(cursor.routing_key.as_str())
+            .bind(cursor.row_tid_text.as_str());
     }
 
-    if limit >= 0 && rows.len() > limit as usize {
-        rows.truncate(limit as usize);
-    }
+    let rows = query
+        .fetch_all(pool)
+        .await
+        .context("fetch startup/live repair backfill batch")?;
 
-    Ok(rows)
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        out.push(ReplayRow {
+            event_ts: row.get("event_ts"),
+            msg_type: row.get("msg_type"),
+            market: row.get("market"),
+            symbol: row.get("symbol"),
+            routing_key: row.get("routing_key"),
+            data_json: row.get("data_json"),
+            row_tid_text: row.get("row_tid_text"),
+        });
+    }
+    Ok(out)
 }
 
 fn replay_row_after_cursor(row: &ReplayRow, cursor: &BackfillCursor) -> bool {
@@ -5783,13 +6199,26 @@ fn replay_row_after_cursor(row: &ReplayRow, cursor: &BackfillCursor) -> bool {
         row.market.as_str(),
         row.symbol.as_str(),
         row.routing_key.as_str(),
+        row.row_tid_text.as_str(),
     ) > (
         cursor.event_ts,
         cursor.msg_type.as_str(),
         cursor.market.as_str(),
         cursor.symbol.as_str(),
         cursor.routing_key.as_str(),
+        cursor.row_tid_text.as_str(),
     )
+}
+
+fn backfill_cursor_from_row(row: &ReplayRow) -> BackfillCursor {
+    BackfillCursor {
+        event_ts: row.event_ts,
+        msg_type: row.msg_type.clone(),
+        market: row.market.clone(),
+        symbol: row.symbol.clone(),
+        routing_key: row.routing_key.clone(),
+        row_tid_text: row.row_tid_text.clone(),
+    }
 }
 
 async fn hydrate_futures_orderbook_heatmaps_for_range_with_fetch<F, Fut>(
@@ -6014,17 +6443,18 @@ async fn export_snapshots(
 mod tests {
     use super::{
         allow_live_tail_reconcile, allow_oi_ratio_patch_processing, build_backfill_sql,
-        expand_startup_backfill_to_minimum_recovery_window, find_long_null_price_run,
-        handle_ingest_event,
+        build_paged_backfill_sql, expand_startup_backfill_to_minimum_recovery_window,
+        find_long_null_price_run, handle_ingest_event,
         hydrate_futures_orderbook_heatmaps_for_range_with_fetch, live_tail_reconcile_start_ts,
-        minute_exclusive_upper_bound, minute_history_is_strictly_contiguous,
-        minimum_startup_recovery_history_floor, replay_heatmap_hydration_batch_end,
-        save_state_snapshot, shutdown_ready_through_candidate, snapshot_has_required_history,
-        snapshot_null_price_run_reaches_recent_tail, try_load_state_snapshot,
-        LiveCanonicalRepairController, SnapshotLoadOutcome, FUNDING_BACKFILL_WINDOW_SQL,
-        LIQ_BACKFILL_WINDOW_SQL, LIVE_CANONICAL_TAIL_RECONCILE_LOOKBACK_MINUTES,
-        MIN_REUSABLE_SNAPSHOT_HISTORY_MINUTES, ORDERBOOK_BACKFILL_WINDOW_SQL_SCALAR,
-        ORDERBOOK_BACKFILL_WINDOW_SQL_WITH_HEATMAP, TRADE_BACKFILL_WINDOW_SQL,
+        minimum_startup_recovery_history_floor, minute_exclusive_upper_bound,
+        minute_history_is_strictly_contiguous, replay_heatmap_hydration_batch_end,
+        replay_row_after_cursor, save_state_snapshot, shutdown_ready_through_candidate,
+        snapshot_has_required_history, snapshot_null_price_run_reaches_recent_tail,
+        try_load_state_snapshot, BackfillCursor, LiveCanonicalRepairController, ReplayRow,
+        SnapshotLoadOutcome, FUNDING_BACKFILL_WINDOW_SQL, LIQ_BACKFILL_WINDOW_SQL,
+        LIVE_CANONICAL_TAIL_RECONCILE_LOOKBACK_MINUTES, MIN_REUSABLE_SNAPSHOT_HISTORY_MINUTES,
+        ORDERBOOK_BACKFILL_WINDOW_SQL_SCALAR, ORDERBOOK_BACKFILL_WINDOW_SQL_WITH_HEATMAP,
+        TRADE_BACKFILL_WINDOW_SQL,
     };
     use crate::ingest::decoder::{
         AggHeatmapLevel, AggOrderbook1mEvent, EngineEvent, MarketKind, MdData, TradeEvent,
@@ -6036,6 +6466,7 @@ mod tests {
     };
     use crate::runtime::window_scheduler::WindowScheduler;
     use chrono::{Duration as ChronoDuration, TimeZone, Utc};
+    use serde_json::json;
     use std::collections::{BTreeMap, HashMap};
     use std::sync::Arc;
     use uuid::Uuid;
@@ -6290,6 +6721,50 @@ mod tests {
     }
 
     #[test]
+    fn paged_backfill_sql_includes_extended_sources_and_row_tie_breaker() {
+        let sql = build_paged_backfill_sql(false, true);
+        assert!(sql.contains("FROM md.agg_trade_1m t"));
+        assert!(sql.contains("FROM md.agg_orderbook_1m b"));
+        assert!(sql.contains("FROM md.agg_liq_1m l"));
+        assert!(sql.contains("FROM md.agg_funding_mark_1m f"));
+        assert!(sql.contains("FROM md.open_interest_current_1m oi"));
+        assert!(sql.contains("FROM md.open_interest_hist_5m oih"));
+        assert!(sql.contains("FROM md.long_short_ratio_5m lsr"));
+        assert!(sql.contains("FROM md.option_mark_greeks_5m opt"));
+        assert!(sql.contains("row_tid_text"));
+        assert!(sql.contains("ctid::text"));
+    }
+
+    #[test]
+    fn replay_row_after_cursor_uses_row_tid_as_final_tie_breaker() {
+        let event_ts = Utc.with_ymd_and_hms(2026, 3, 24, 0, 0, 0).single().unwrap();
+        let cursor = BackfillCursor {
+            event_ts,
+            msg_type: "md.agg.trade.1m".to_string(),
+            market: "futures".to_string(),
+            symbol: "TESTUSDT".to_string(),
+            routing_key: "md.agg.futures.trade.1m.testusdt".to_string(),
+            row_tid_text: "(0,1)".to_string(),
+        };
+        let same_row = ReplayRow {
+            event_ts,
+            msg_type: cursor.msg_type.clone(),
+            market: cursor.market.clone(),
+            symbol: cursor.symbol.clone(),
+            routing_key: cursor.routing_key.clone(),
+            data_json: json!({}),
+            row_tid_text: cursor.row_tid_text.clone(),
+        };
+        let later_row = ReplayRow {
+            row_tid_text: "(0,2)".to_string(),
+            ..same_row.clone()
+        };
+
+        assert!(!replay_row_after_cursor(&same_row, &cursor));
+        assert!(replay_row_after_cursor(&later_row, &cursor));
+    }
+
+    #[test]
     fn minute_exclusive_upper_bound_rounds_partial_minute_up() {
         let raw_to_ts = Utc
             .with_ymd_and_hms(2026, 3, 21, 8, 23, 52)
@@ -6536,7 +7011,10 @@ mod tests {
 
     #[test]
     fn startup_missing_snapshot_fallback_uses_minimum_reusable_history_window() {
-        let to_ts = Utc.with_ymd_and_hms(2026, 3, 31, 21, 53, 0).single().unwrap();
+        let to_ts = Utc
+            .with_ymd_and_hms(2026, 3, 31, 21, 53, 0)
+            .single()
+            .unwrap();
         let recent_from_ts = to_ts - ChronoDuration::minutes(30);
         let expanded = expand_startup_backfill_to_minimum_recovery_window(recent_from_ts, to_ts)
             .expect("expected expansion to reusable floor");
