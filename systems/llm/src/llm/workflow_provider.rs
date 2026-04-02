@@ -725,6 +725,9 @@ fn should_retry_workflow_stage_once(
     let normalized = error.to_ascii_lowercase();
     normalized.contains("invalid schema for response_format")
         || normalized.contains("call workflow custom_llm api")
+        || normalized.contains("finish_reason=length")
+        || normalized.contains("response truncated")
+        || normalized.contains("eof while parsing")
 }
 
 async fn invoke_provider_stage_once(
@@ -1232,6 +1235,16 @@ mod tests {
             WorkflowPromptStage::Stage1,
             &custom_llm,
             Some("workflow custom_llm status=400 body={\"error\":{\"message\":\"Invalid schema for response_format 'workflow_stage1'\"}}"),
+        ));
+        assert!(should_retry_workflow_stage_once(
+            WorkflowPromptStage::Stage2A,
+            &custom_llm,
+            Some("workflow openai-compatible response truncated finish_reason=length"),
+        ));
+        assert!(should_retry_workflow_stage_once(
+            WorkflowPromptStage::Stage2A,
+            &custom_llm,
+            Some("parse JSON from model text failed: EOF while parsing a string at line 1 column 2121"),
         ));
     }
 }

@@ -57,11 +57,14 @@ struct ChatCompletionsResponse {
 #[derive(Debug, Deserialize)]
 struct ChatChoice {
     message: ChatMessageResponse,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ChatMessageResponse {
-    content: String,
+    #[serde(default)]
+    content: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -395,26 +398,113 @@ pub(crate) async fn invoke_openai_compatible_json_stage(
         .send()
         .await;
 
-    provider_result_from_response(
-        started,
-        request.model.provider.as_str(),
-        response,
-        |response| async move {
-            let body = response
+    match response {
+        Ok(response) => {
+            let status = response.status();
+            if !status.is_success() {
+                let body = response.text().await.unwrap_or_default();
+                return ProviderInvocationOutput {
+                    latency_ms: started.elapsed().as_millis(),
+                    raw_response_text: None,
+                    parsed_value: None,
+                    error: Some(format!(
+                        "workflow {} status={} body={}",
+                        request.model.provider, status, body
+                    )),
+                };
+            }
+
+            let body = match response
                 .json::<ChatCompletionsResponse>()
                 .await
-                .context("decode openai-compatible workflow response")?;
-            let text = body
-                .choices
-                .first()
-                .map(|choice| choice.message.content.trim().to_string())
-                .filter(|text| !text.is_empty())
-                .ok_or_else(|| anyhow!("workflow response text is empty"))?;
-            let parsed = parse_json_from_text(&text)?;
-            Ok((text, parsed))
+                .context("decode openai-compatible workflow response")
+            {
+                Ok(body) => body,
+                Err(error) => {
+                    return ProviderInvocationOutput {
+                        latency_ms: started.elapsed().as_millis(),
+                        raw_response_text: None,
+                        parsed_value: None,
+                        error: Some(format!("{error:#}")),
+                    };
+                }
+            };
+
+            let (text, finish_reason) = match extract_openai_compatible_text_and_finish_reason(body)
+            {
+                Ok(value) => value,
+                Err(error) => {
+                    return ProviderInvocationOutput {
+                        latency_ms: started.elapsed().as_millis(),
+                        raw_response_text: None,
+                        parsed_value: None,
+                        error: Some(format!("{error:#}")),
+                    };
+                }
+            };
+
+            if finish_reason
+                .as_deref()
+                .is_some_and(|reason| reason != "stop")
+            {
+                return ProviderInvocationOutput {
+                    latency_ms: started.elapsed().as_millis(),
+                    raw_response_text: Some(text),
+                    parsed_value: None,
+                    error: Some(format!(
+                        "workflow openai-compatible response truncated finish_reason={}",
+                        finish_reason.as_deref().unwrap_or("unknown")
+                    )),
+                };
+            }
+
+            match parse_json_from_text(&text) {
+                Ok(parsed) => ProviderInvocationOutput {
+                    latency_ms: started.elapsed().as_millis(),
+                    raw_response_text: Some(text),
+                    parsed_value: Some(parsed),
+                    error: None,
+                },
+                Err(error) => ProviderInvocationOutput {
+                    latency_ms: started.elapsed().as_millis(),
+                    raw_response_text: Some(text),
+                    parsed_value: None,
+                    error: Some(format!("{error:#}")),
+                },
+            }
+        }
+        Err(error) => ProviderInvocationOutput {
+            latency_ms: started.elapsed().as_millis(),
+            raw_response_text: None,
+            parsed_value: None,
+            error: Some(format!(
+                "{:#}",
+                anyhow::Error::from(error)
+                    .context(format!("call workflow {} api", request.model.provider))
+            )),
         },
-    )
-    .await
+    }
+}
+
+fn extract_openai_compatible_text_and_finish_reason(
+    body: ChatCompletionsResponse,
+) -> Result<(String, Option<String>)> {
+    let choice = body
+        .choices
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("workflow response choices are empty"))?;
+    let text = choice
+        .message
+        .content
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_string();
+    if text.is_empty() {
+        return Err(anyhow!("workflow response text is empty"));
+    }
+    Ok((text, choice.finish_reason))
 }
 
 pub(crate) async fn invoke_claude_json_stage(
@@ -727,8 +817,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_grok_response_text, openrouter_gemini_model_name, GrokResponseContentItem,
-        GrokResponseOutputItem, GrokResponsesApiResponse,
+        extract_grok_response_text, extract_openai_compatible_text_and_finish_reason,
+        openrouter_gemini_model_name, ChatChoice, ChatCompletionsResponse, ChatMessageResponse,
+        GrokResponseContentItem, GrokResponseOutputItem, GrokResponsesApiResponse,
     };
 
     #[test]
@@ -763,5 +854,22 @@ mod tests {
             extract_grok_response_text(&body).as_deref(),
             Some("{\"stage2_decision\":\"PATH_CONFIRMED\"}")
         );
+    }
+
+    #[test]
+    fn extract_openai_compatible_text_and_finish_reason_keeps_length_finish_reason() {
+        let (text, finish_reason) =
+            extract_openai_compatible_text_and_finish_reason(ChatCompletionsResponse {
+                choices: vec![ChatChoice {
+                    message: ChatMessageResponse {
+                        content: Some("{\"foo\":\"bar".to_string()),
+                    },
+                    finish_reason: Some("length".to_string()),
+                }],
+            })
+            .expect("extract response");
+
+        assert_eq!(text, "{\"foo\":\"bar");
+        assert_eq!(finish_reason.as_deref(), Some("length"));
     }
 }
