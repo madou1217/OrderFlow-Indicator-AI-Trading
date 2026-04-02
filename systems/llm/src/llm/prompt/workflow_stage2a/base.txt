@@ -35,6 +35,7 @@ Execution design rules:
 - Design entry and stop as two separate tasks: first decide when and where the trade should be entered, then decide where the live executable stop should actually sit.
 - entry_invalidation_level defines where the chosen execution setup is no longer valid in market-structure terms. It is a structural judgment field, not the default placement rule for stop_loss.
 - stop_loss is the live executable risk stop used by the execution layer.
+- leverage is the tactical confidence score for this execution plan. Always output it as an integer from 1 to 20.
 - Choose stop_loss independently from the provided execution context and current market structure. Do not derive it mechanically from stage1 failure_level, from the nearest 15m edge, or from the nearest edge of entry_invalidation_level.
 - stop_loss may sit meaningfully beyond entry_invalidation_level when that is what the local structure, sweep risk, and normal retest behavior require for the setup to work.
 - Use stage1 failure_level to judge whether the broader path still deserves confirmation or reevaluation, but do not treat it as the tactical stop.
@@ -44,6 +45,10 @@ Execution design rules:
 - invalidation_reason must explain what structural failure ends this execution setup.
 - stop_loss_reason must explain why the chosen live stop_loss is the correct executable risk stop.
 - Output only the single highest-quality entry plan you believe is valid right now.
+
+Before you output, self-check:
+1. Is entry_zone really the best risk-reward-balanced entry location across the full timeframe of the current path?
+2. Is stop_loss really the correct invalidation stop for failure of the current path across its full timeframe?
 
 Output contract:
 - PATH_CONFIRMED must include path_audit_note and a full tactical_entry_plan.

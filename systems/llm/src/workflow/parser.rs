@@ -458,9 +458,6 @@ pub fn parse_stage1_output(value: Value) -> Result<Stage1Output> {
 }
 
 fn validate_stage2a_entry_plan(entry_plan: &EntryPlan, current_path: &CurrentPath) -> Result<()> {
-    if entry_plan.max_drift_pct < 0.0 {
-        return Err(anyhow!("entry_plan.max_drift_pct must be >= 0"));
-    }
     if entry_plan.entry_reason.trim().is_empty() {
         return Err(anyhow!("entry_plan.entry_reason must be non-empty"));
     }
@@ -469,6 +466,9 @@ fn validate_stage2a_entry_plan(entry_plan: &EntryPlan, current_path: &CurrentPat
     }
     if entry_plan.stop_loss_reason.trim().is_empty() {
         return Err(anyhow!("entry_plan.stop_loss_reason must be non-empty"));
+    }
+    if !(1..=20).contains(&entry_plan.leverage) {
+        return Err(anyhow!("entry_plan.leverage must be between 1 and 20"));
     }
 
     match current_path.side.as_str() {
@@ -492,8 +492,61 @@ fn validate_stage2a_entry_plan(entry_plan: &EntryPlan, current_path: &CurrentPat
     Ok(())
 }
 
+fn inject_derived_stage2a_fields(value: &mut Value, current_path: &CurrentPath) -> Result<()> {
+    let Some(entry_plan) = value
+        .get_mut("tactical_entry_plan")
+        .and_then(|plan| plan.get_mut("entry_plan"))
+    else {
+        return Ok(());
+    };
+    let Some(entry_plan_object) = entry_plan.as_object_mut() else {
+        return Ok(());
+    };
+    if entry_plan_object.contains_key("max_drift_pct") {
+        return Ok(());
+    }
+    let entry_invalidation_level: PriceZone = serde_json::from_value(
+        entry_plan_object
+            .get("entry_invalidation_level")
+            .cloned()
+            .ok_or_else(|| anyhow!("entry_plan.entry_invalidation_level is required"))?,
+    )?;
+    let stop_loss = entry_plan_object
+        .get("stop_loss")
+        .and_then(Value::as_f64)
+        .ok_or_else(|| anyhow!("entry_plan.stop_loss is required"))?;
+    let max_drift_pct = crate::workflow::schema::derive_max_drift_pct(
+        &current_path.side,
+        &entry_invalidation_level,
+        stop_loss,
+    )?;
+    entry_plan_object.insert(
+        "max_drift_pct".to_string(),
+        serde_json::json!(max_drift_pct),
+    );
+    Ok(())
+}
+
 pub fn parse_stage2a_output(value: Value, stage1_output: &Stage1Output) -> Result<Stage2AOutput> {
-    let mut output: Stage2AOutput = serde_json::from_value(value)?;
+    let current_path = stage1_output.current_path.as_ref();
+    let mut normalized = value;
+    if let Some(current_path) = current_path {
+        inject_derived_stage2a_fields(&mut normalized, current_path)?;
+    }
+    if normalized.get("stage2_decision").and_then(Value::as_str) == Some("PATH_CONFIRMED") {
+        let has_leverage = normalized
+            .get("tactical_entry_plan")
+            .and_then(|plan| plan.get("entry_plan"))
+            .and_then(Value::as_object)
+            .map(|entry_plan| entry_plan.contains_key("leverage"))
+            .unwrap_or(false);
+        if !has_leverage {
+            return Err(anyhow!(
+                "PATH_CONFIRMED requires tactical_entry_plan.entry_plan.leverage"
+            ));
+        }
+    }
+    let mut output: Stage2AOutput = serde_json::from_value(normalized)?;
     if !matches!(
         output.stage2_decision.as_str(),
         "PATH_CONFIRMED" | "REQUEST_STAGE1_REEVALUATION"
@@ -530,10 +583,8 @@ pub fn parse_stage2a_output(value: Value, stage1_output: &Stage1Output) -> Resul
         return Err(anyhow!("PATH_CONFIRMED must set reevaluation_reason=null"));
     }
 
-    let current_path = stage1_output
-        .current_path
-        .as_ref()
-        .ok_or_else(|| anyhow!("PATH_CONFIRMED requires Stage1 current_path"))?;
+    let current_path =
+        current_path.ok_or_else(|| anyhow!("PATH_CONFIRMED requires Stage1 current_path"))?;
     let tactical_plan = output
         .tactical_entry_plan
         .as_mut()
@@ -1380,7 +1431,7 @@ mod tests {
                     "entry_zone": {"low": 1999.0, "high": 2001.0, "timeframe": "1d", "label": "entry", "reason": "ok"},
                     "entry_invalidation_level": {"low": 1992.0, "high": 1994.0, "timeframe": "4h", "label": "invalid", "reason": "ok"},
                     "stop_loss": 1993.0,
-                    "max_drift_pct": 0.12,
+                    "leverage": 5,
                     "entry_reason": "Entry is placed at the higher-timeframe support reclaim.",
                     "invalidation_reason": "The execution fails if this support pocket loses acceptance.",
                     "stop_loss_reason": "The live stop sits beyond the normal sweep path for this execution."
@@ -1398,6 +1449,24 @@ mod tests {
                 .entry_plan
                 .side,
             "LONG"
+        );
+        assert_eq!(
+            parsed
+                .tactical_entry_plan
+                .as_ref()
+                .expect("tactical")
+                .entry_plan
+                .max_drift_pct,
+            0.05
+        );
+        assert_eq!(
+            parsed
+                .tactical_entry_plan
+                .as_ref()
+                .expect("tactical")
+                .entry_plan
+                .leverage,
+            5
         );
     }
 
@@ -1429,7 +1498,7 @@ mod tests {
                     "entry_zone": {"low": 1999.0, "high": 2001.0, "timeframe": "4h-1d", "label": "entry", "reason": "ok"},
                     "entry_invalidation_level": {"low": 1992.0, "high": 1994.0, "timeframe": "4h", "label": "invalid", "reason": "ok"},
                     "stop_loss": 1993.0,
-                    "max_drift_pct": 0.12,
+                    "leverage": 4,
                     "entry_reason": "Entry stays aligned with the current path.",
                     "invalidation_reason": "Losing this structure breaks the execution setup.",
                     "stop_loss_reason": "Stop stays beyond the expected sweep depth."
@@ -1456,7 +1525,7 @@ mod tests {
                     "entry_zone": {"low": 1999.0, "high": 2001.0, "timeframe": "1d", "label": "entry", "reason": "ok"},
                     "entry_invalidation_level": {"low": 1984.0, "high": 1988.0, "timeframe": "4h-1d", "label": "invalid", "reason": "ok"},
                     "stop_loss": 1987.5,
-                    "max_drift_pct": 0.12,
+                    "leverage": 7,
                     "entry_reason": "Entry remains attractive at this higher-timeframe pocket.",
                     "invalidation_reason": "Execution breaks only if the broader support shelf fails.",
                     "stop_loss_reason": "Stop is intentionally beyond local noise and sweep risk."
@@ -1492,7 +1561,7 @@ mod tests {
                     "entry_zone": {"low": 1999.0, "high": 2001.0, "timeframe": "4h", "label": "entry", "reason": "ok"},
                     "entry_invalidation_level": {"low": 1992.0, "high": 1994.0, "timeframe": "4h", "label": "invalid", "reason": "ok"},
                     "stop_loss": 1997.5,
-                    "max_drift_pct": 0.12,
+                    "leverage": 3,
                     "entry_reason": "Entry is still justified at this location.",
                     "invalidation_reason": "Structural invalidation occurs below the reclaim shelf.",
                     "stop_loss_reason": "structural invalidation and execution stop are intentionally different"
@@ -1508,6 +1577,34 @@ mod tests {
             .entry_plan;
         assert_eq!(entry_plan.entry_invalidation_level.high, 1994.0);
         assert_eq!(entry_plan.stop_loss, 1997.5);
+    }
+
+    #[test]
+    fn stage2a_parser_requires_leverage_key() {
+        let stage1_output = sample_stage1_output();
+        let value = json!({
+            "stage2_decision": "PATH_CONFIRMED",
+            "path_audit_note": "Path is still live.",
+            "tactical_entry_plan": {
+                "path_id": "path_1",
+                "entry_plan": {
+                    "entry_profile": "reclaim_then_hold",
+                    "intent_mode": "immediate",
+                    "entry_activation_level": null,
+                    "entry_zone": {"low": 1999.0, "high": 2001.0, "timeframe": "1d", "label": "entry", "reason": "ok"},
+                    "entry_invalidation_level": {"low": 1992.0, "high": 1994.0, "timeframe": "4h", "label": "invalid", "reason": "ok"},
+                    "stop_loss": 1993.0,
+                    "entry_reason": "Entry is placed at support.",
+                    "invalidation_reason": "Losing support breaks the setup.",
+                    "stop_loss_reason": "Stop sits beyond the normal sweep."
+                }
+            },
+            "reevaluation_reason": null
+        });
+        let err = parse_stage2a_output(value, &stage1_output).expect_err("missing leverage");
+        assert!(err
+            .to_string()
+            .contains("tactical_entry_plan.entry_plan.leverage"));
     }
 
     #[test]

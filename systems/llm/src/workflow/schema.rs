@@ -1,6 +1,11 @@
+use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+pub fn default_stage2a_leverage() -> u32 {
+    1
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -31,6 +36,36 @@ impl PriceZone {
             self.high
         }
     }
+
+    pub fn risk_boundary(&self, side: &str) -> Result<f64> {
+        if side.eq_ignore_ascii_case("LONG") {
+            Ok(self.low)
+        } else if side.eq_ignore_ascii_case("SHORT") {
+            Ok(self.high)
+        } else {
+            Err(anyhow!("unsupported side {side} for risk boundary"))
+        }
+    }
+}
+
+pub fn derive_max_drift_pct(
+    side: &str,
+    entry_invalidation_level: &PriceZone,
+    stop_loss: f64,
+) -> Result<f64> {
+    if !stop_loss.is_finite() {
+        return Err(anyhow!(
+            "stop_loss must be finite when deriving max_drift_pct"
+        ));
+    }
+    let risk_boundary = entry_invalidation_level.risk_boundary(side)?;
+    if !risk_boundary.is_finite() || risk_boundary.abs() <= f64::EPSILON {
+        return Err(anyhow!(
+            "entry_invalidation_level risk boundary must be finite and non-zero when deriving max_drift_pct"
+        ));
+    }
+    let drift_pct = ((stop_loss - risk_boundary).abs() / risk_boundary.abs()) * 100.0;
+    Ok((drift_pct * 100.0).round() / 100.0)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -293,6 +328,8 @@ pub struct ExecutionIntent {
     pub take_profit_1: f64,
     pub take_profit_2: f64,
     pub ttl_minutes: u64,
+    #[serde(default = "default_stage2a_leverage")]
+    pub leverage: u32,
     pub max_drift_pct: f64,
     pub path_id: String,
     pub entry_snapshot: EntrySnapshotRef,
@@ -342,6 +379,8 @@ pub struct EntrySnapshot {
     pub entry_invalidation_level: Option<PriceZone>,
     #[serde(default)]
     pub max_drift_pct: Option<f64>,
+    #[serde(default)]
+    pub leverage: Option<u32>,
     pub stop_loss: f64,
     pub take_profit_1: f64,
     pub take_profit_2: f64,
@@ -426,6 +465,8 @@ pub struct EntryPlan {
     pub entry_zone: PriceZone,
     pub entry_invalidation_level: PriceZone,
     pub stop_loss: f64,
+    #[serde(default = "default_stage2a_leverage")]
+    pub leverage: u32,
     pub max_drift_pct: f64,
     pub entry_reason: String,
     pub invalidation_reason: String,
@@ -599,8 +640,8 @@ pub struct Stage2CPromptInput {
 #[cfg(test)]
 mod tests {
     use super::{
-        EntrySnapshotRef, ExecutionIntent, PositionManagementPlan, PostFillBracketTemplate,
-        PriceZone, Stage2AOutput, TacticalEntryPlan,
+        derive_max_drift_pct, EntrySnapshotRef, ExecutionIntent, PositionManagementPlan,
+        PostFillBracketTemplate, PriceZone, Stage2AOutput, TacticalEntryPlan,
     };
     use serde_json::json;
 
@@ -655,6 +696,7 @@ mod tests {
                         reason: None,
                     },
                     stop_loss: 99.0,
+                    leverage: 5,
                     max_drift_pct: 0.12,
                     entry_reason: "entry".to_string(),
                     invalidation_reason: "invalidation".to_string(),
@@ -667,6 +709,25 @@ mod tests {
         let decoded: Stage2AOutput = serde_json::from_value(encoded).expect("decode");
         assert_eq!(decoded.stage2_decision, "PATH_CONFIRMED");
         assert!(decoded.tactical_entry_plan.is_some());
+    }
+
+    #[test]
+    fn derive_max_drift_pct_uses_risk_boundary_by_side() {
+        let invalidation = PriceZone {
+            low: 99.0,
+            high: 101.0,
+            timeframe: None,
+            label: None,
+            reason: None,
+        };
+        assert_eq!(
+            derive_max_drift_pct("LONG", &invalidation, 98.5).expect("long drift"),
+            0.51
+        );
+        assert_eq!(
+            derive_max_drift_pct("SHORT", &invalidation, 101.5).expect("short drift"),
+            0.5
+        );
     }
 
     #[test]
@@ -700,6 +761,7 @@ mod tests {
             take_profit_1: 103.0,
             take_profit_2: 105.0,
             ttl_minutes: 15,
+            leverage: 4,
             max_drift_pct: 0.2,
             path_id: "path_a".to_string(),
             entry_snapshot: EntrySnapshotRef {
@@ -712,6 +774,25 @@ mod tests {
         let encoded = serde_json::to_value(&intent).expect("encode");
         let decoded: ExecutionIntent = serde_json::from_value(encoded).expect("decode");
         assert_eq!(decoded.quantity_override, Some(0.5));
+    }
+
+    #[test]
+    fn entry_plan_without_leverage_defaults_to_one_for_legacy_state() {
+        let value = json!({
+            "side": "LONG",
+            "entry_profile": "reclaim_then_hold",
+            "intent_mode": "immediate",
+            "entry_activation_level": null,
+            "entry_zone": {"low": 100.0, "high": 101.0},
+            "entry_invalidation_level": {"low": 99.0, "high": 99.5},
+            "stop_loss": 99.0,
+            "max_drift_pct": 0.2,
+            "entry_reason": "entry",
+            "invalidation_reason": "invalidation",
+            "stop_loss_reason": "stop"
+        });
+        let decoded: super::EntryPlan = serde_json::from_value(value).expect("decode");
+        assert_eq!(decoded.leverage, 1);
     }
 
     #[test]

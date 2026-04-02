@@ -1289,7 +1289,7 @@ pub async fn execute_workflow_execution_intent(
 
     let symbol_filters = fetch_symbol_filters(http_client, api_config, symbol).await?;
     let account_balance = fetch_account_balance(http_client, api_config, exec_config).await?;
-    let leverage = normalize_leverage(exec_config.default_leverage_ratio, exec_config.max_leverage);
+    let leverage = scaled_workflow_leverage(intent, exec_config);
     let (margin_budget_usdt, _) = select_margin_budget(exec_config, &account_balance)?;
     let position_side = resolve_position_side(exec_config, decision);
     let entry_plan = workflow_entry_plan_from_intent(intent)?;
@@ -2093,6 +2093,16 @@ fn parse_numeric_id(value: &Value, keys: &[&str], label: &str) -> Result<i64> {
 
 fn normalize_leverage(leverage: f64, max_leverage: u32) -> u32 {
     leverage.round().clamp(1.0, max_leverage as f64) as u32
+}
+
+fn scaled_workflow_leverage(
+    intent: &AdaptedExecutionIntent,
+    exec_config: &LlmExecutionConfig,
+) -> u32 {
+    normalize_leverage(
+        intent.leverage as f64 * exec_config.default_leverage_ratio,
+        exec_config.max_leverage,
+    )
 }
 
 fn resolve_position_side(
@@ -3985,6 +3995,7 @@ mod tests {
             take_profit_1: 106.0,
             take_profit_2: 109.0,
             ttl_minutes: 15,
+            leverage: 5,
             max_drift_pct: 0.2,
             path_id: "path_a".to_string(),
             entry_snapshot: EntrySnapshotRef {
@@ -4010,6 +4021,27 @@ mod tests {
         let (budget, source) = select_margin_budget(&exec, &account_balance).expect("budget");
         assert!((budget - 20.0).abs() < f64::EPSILON);
         assert_eq!(source, "available_account_ratio");
+    }
+
+    #[test]
+    fn scaled_workflow_leverage_multiplies_stage2a_signal_by_default_ratio() {
+        let intent = sample_workflow_execution_intent("LONG", "immediate", Some(101.0));
+        let mut exec = LlmExecutionConfig::default();
+        exec.default_leverage_ratio = 4.0;
+        exec.max_leverage = 50;
+
+        assert_eq!(scaled_workflow_leverage(&intent, &exec), 20);
+    }
+
+    #[test]
+    fn scaled_workflow_leverage_clamps_to_exchange_cap() {
+        let mut intent = sample_workflow_execution_intent("LONG", "immediate", Some(101.0));
+        intent.leverage = 20;
+        let mut exec = LlmExecutionConfig::default();
+        exec.default_leverage_ratio = 4.0;
+        exec.max_leverage = 50;
+
+        assert_eq!(scaled_workflow_leverage(&intent, &exec), 50);
     }
 
     #[test]

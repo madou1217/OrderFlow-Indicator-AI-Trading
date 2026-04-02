@@ -391,7 +391,7 @@ fn entry_plan_schema() -> Value {
             "entry_zone",
             "entry_invalidation_level",
             "stop_loss",
-            "max_drift_pct",
+            "leverage",
             "entry_reason",
             "invalidation_reason",
             "stop_loss_reason"
@@ -410,7 +410,7 @@ fn entry_plan_schema() -> Value {
             "entry_zone": freeform_price_zone_schema(),
             "entry_invalidation_level": freeform_price_zone_schema(),
             "stop_loss": {"type": "number"},
-            "max_drift_pct": {"type": "number", "minimum": 0},
+            "leverage": {"type": "integer", "minimum": 1, "maximum": 20},
             "entry_reason": {"type": "string"},
             "invalidation_reason": {"type": "string"},
             "stop_loss_reason": {"type": "string"}
@@ -1149,6 +1149,36 @@ mod tests {
                 ]
             })
         );
+    }
+
+    #[test]
+    fn stage2a_schema_does_not_expose_max_drift_pct() {
+        let schema = workflow_stage2a_schema();
+        let entry_plan =
+            &schema["properties"]["tactical_entry_plan"]["anyOf"][0]["properties"]["entry_plan"];
+        assert!(entry_plan["properties"].get("max_drift_pct").is_none());
+        let required = entry_plan["required"]
+            .as_array()
+            .expect("entry_plan required array");
+        assert!(!required
+            .iter()
+            .any(|value| value.as_str() == Some("max_drift_pct")));
+    }
+
+    #[test]
+    fn stage2a_schema_requires_confidence_leverage() {
+        let schema = workflow_stage2a_schema();
+        let entry_plan =
+            &schema["properties"]["tactical_entry_plan"]["anyOf"][0]["properties"]["entry_plan"];
+        assert_eq!(entry_plan["properties"]["leverage"]["type"], "integer");
+        assert_eq!(entry_plan["properties"]["leverage"]["minimum"], 1);
+        assert_eq!(entry_plan["properties"]["leverage"]["maximum"], 20);
+        let required = entry_plan["required"]
+            .as_array()
+            .expect("entry_plan required array");
+        assert!(required
+            .iter()
+            .any(|value| value.as_str() == Some("leverage")));
     }
 
     #[test]

@@ -1756,6 +1756,7 @@ fn entry_plan_log_payload(
         "entry_zone": &plan.entry_zone,
         "entry_invalidation_level": &plan.entry_invalidation_level,
         "stop_loss": plan.stop_loss,
+        "leverage": plan.leverage,
         "max_drift_pct": plan.max_drift_pct,
         "entry_reason": &plan.entry_reason,
         "invalidation_reason": &plan.invalidation_reason,
@@ -3455,6 +3456,7 @@ fn execution_intent_from_entry_plan(
         take_profit_1,
         take_profit_2,
         ttl_minutes,
+        leverage: plan.leverage,
         max_drift_pct: plan.max_drift_pct,
         path_id: path_id.to_string(),
         entry_snapshot: crate::workflow::schema::EntrySnapshotRef {
@@ -3501,6 +3503,7 @@ fn build_fallback_entry_snapshot(
         entry_zone: fallback_plan.map(|plan| plan.entry_zone.clone()),
         entry_invalidation_level: fallback_plan.map(|plan| plan.entry_invalidation_level.clone()),
         max_drift_pct: fallback_plan.map(|plan| plan.max_drift_pct),
+        leverage: fallback_plan.map(|plan| plan.leverage),
         stop_loss,
         take_profit_1: bracket_override
             .map(|item| item.take_profit_1)
@@ -3601,12 +3604,24 @@ fn entry_plan_from_snapshot_template(
     let max_drift_pct = snapshot
         .max_drift_pct
         .or_else(|| fallback_plan.map(|plan| plan.max_drift_pct))
+        .or_else(|| {
+            crate::workflow::schema::derive_max_drift_pct(
+                &snapshot.side,
+                &entry_invalidation_level,
+                snapshot.stop_loss,
+            )
+            .ok()
+        })
         .ok_or_else(|| {
             anyhow!(
                 "entry template missing max_drift_pct for {}",
                 snapshot.context_key
             )
         })?;
+    let leverage = snapshot
+        .leverage
+        .or_else(|| fallback_plan.map(|plan| plan.leverage))
+        .unwrap_or_else(crate::workflow::schema::default_stage2a_leverage);
 
     Ok(crate::workflow::schema::EntryPlan {
         side: snapshot.side.clone(),
@@ -3616,6 +3631,7 @@ fn entry_plan_from_snapshot_template(
         entry_zone,
         entry_invalidation_level,
         stop_loss: snapshot.stop_loss,
+        leverage,
         max_drift_pct,
         entry_reason: fallback_plan
             .map(|plan| plan.entry_reason.clone())
@@ -6641,6 +6657,7 @@ mod tests {
             entry_zone: sample_price_zone(100.0, 101.0, "15m"),
             entry_invalidation_level: sample_price_zone(98.5, 99.0, "15m"),
             stop_loss: 98.4,
+            leverage: 4,
             max_drift_pct: 0.2,
             entry_reason: "entry".to_string(),
             invalidation_reason: "invalidation".to_string(),
@@ -6772,6 +6789,7 @@ mod tests {
                 entry_zone: sample_price_zone(101.0, 102.0, "15m"),
                 entry_invalidation_level: sample_price_zone(98.0, 99.0, "15m"),
                 stop_loss: 98.8,
+                leverage: 5,
                 max_drift_pct: 0.2,
                 entry_reason: "entry".to_string(),
                 invalidation_reason: "invalidation".to_string(),
@@ -6805,6 +6823,7 @@ mod tests {
             entry_zone: Some(sample_price_zone(101.0, 102.0, "15m")),
             entry_invalidation_level: Some(sample_price_zone(98.0, 99.0, "15m")),
             max_drift_pct: Some(0.2),
+            leverage: Some(5),
             stop_loss: 98.8,
             take_profit_1: 104.0,
             take_profit_2: 107.0,
@@ -7143,6 +7162,7 @@ mod tests {
             entry_zone: sample_price_zone(100.5, 101.5, "15m"),
             entry_invalidation_level: sample_price_zone(98.0, 99.0, "15m"),
             stop_loss: 97.5,
+            leverage: 5,
             max_drift_pct: 0.2,
             entry_reason: "entry".to_string(),
             invalidation_reason: "invalidation".to_string(),
@@ -7207,6 +7227,7 @@ mod tests {
                 entry_zone: Some(sample_price_zone(101.0, 102.0, "15m")),
                 entry_invalidation_level: Some(sample_price_zone(98.0, 99.0, "15m")),
                 max_drift_pct: Some(0.2),
+                leverage: Some(5),
                 stop_loss: 98.8,
                 take_profit_1: 104.0,
                 take_profit_2: 107.0,
@@ -7271,6 +7292,7 @@ mod tests {
                 entry_zone: Some(sample_price_zone(101.0, 102.0, "15m")),
                 entry_invalidation_level: Some(sample_price_zone(98.0, 99.0, "15m")),
                 max_drift_pct: Some(0.2),
+                leverage: Some(5),
                 stop_loss: 1980.0,
                 take_profit_1: 2040.0,
                 take_profit_2: 2080.0,
@@ -7319,6 +7341,35 @@ mod tests {
         assert_eq!(snapshot.take_profit_2, 107.0);
         assert_eq!(snapshot.entry_profile.as_deref(), Some("reclaim_then_hold"));
         assert_eq!(snapshot.intent_mode.as_deref(), Some("breakout"));
+    }
+
+    #[test]
+    fn entry_plan_from_snapshot_template_derives_missing_max_drift_pct() {
+        let snapshot = crate::workflow::schema::EntrySnapshot {
+            symbol: "ETHUSDT".to_string(),
+            context_key: "ETHUSDT:LONG:path_a".to_string(),
+            path_id: "path_a".to_string(),
+            side: "LONG".to_string(),
+            entry_profile: Some("reclaim_then_hold".to_string()),
+            intent_mode: Some("pullback".to_string()),
+            entry_activation_level: None,
+            entry_zone: Some(sample_price_zone(100.0, 101.0, "15m")),
+            entry_invalidation_level: Some(sample_price_zone(99.0, 99.5, "15m")),
+            max_drift_pct: None,
+            leverage: None,
+            stop_loss: 98.5,
+            take_profit_1: 104.0,
+            take_profit_2: 107.0,
+            allowed_stop_loss_levels: vec![98.5],
+            allowed_take_profit_levels: vec![104.0, 107.0],
+            tp1_realized: false,
+            applied_driver_deterioration_signals: vec![],
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let plan = entry_plan_from_snapshot_template(&snapshot, None).expect("entry plan");
+        assert_eq!(plan.max_drift_pct, 0.51);
     }
 
     #[test]
@@ -7391,6 +7442,7 @@ mod tests {
             entry_zone: Some(sample_price_zone(101.0, 102.0, "15m")),
             entry_invalidation_level: Some(sample_price_zone(98.0, 99.0, "15m")),
             max_drift_pct: Some(0.2),
+            leverage: Some(5),
             stop_loss: 98.8,
             take_profit_1: 104.0,
             take_profit_2: 107.0,
