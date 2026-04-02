@@ -30,7 +30,8 @@ Execution priority:
 
 Execution design rules:
 - entry_activation_level, entry_zone, entry_invalidation_level, and stop_loss are tactical fields owned by this prompt.
-- entry_activation_level is optional. Only output it when the plan genuinely needs a separate trigger layer beyond entry_zone.
+- entry_activation_level is optional in meaning. Only use a non-null value when the plan genuinely needs a separate trigger layer beyond entry_zone.
+- Always include the entry_activation_level key in JSON. If no separate activation layer is needed, set entry_activation_level to null instead of omitting it.
 - Design entry and stop as two separate tasks: first decide when and where the trade should be entered, then decide where the live executable stop should actually sit.
 - entry_invalidation_level defines where the chosen execution setup is no longer valid in market-structure terms. It is a structural judgment field, not the default placement rule for stop_loss.
 - stop_loss is the live executable risk stop used by the execution layer.

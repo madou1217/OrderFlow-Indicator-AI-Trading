@@ -126,6 +126,29 @@ fn write_json<T: serde::Serialize + ?Sized>(path: &Path, value: &T) -> Result<()
     Ok(())
 }
 
+fn preserve_existing_replay_progress(next: &mut WorkflowState, persisted: &WorkflowState) {
+    if next.last_stage1_completed_at == persisted.last_stage1_completed_at
+        && next.last_stage1_replayed_at.is_none()
+    {
+        next.last_stage1_replayed_at = persisted.last_stage1_replayed_at;
+    }
+
+    let next_plan_id = next
+        .approved_tactical_plan
+        .as_ref()
+        .map(|plan| plan.path_id.as_str());
+    let persisted_plan_id = persisted
+        .approved_tactical_plan
+        .as_ref()
+        .map(|plan| plan.path_id.as_str());
+    if next.approved_tactical_plan_updated_at == persisted.approved_tactical_plan_updated_at
+        && next_plan_id == persisted_plan_id
+        && next.approved_tactical_plan_replayed_at.is_none()
+    {
+        next.approved_tactical_plan_replayed_at = persisted.approved_tactical_plan_replayed_at;
+    }
+}
+
 fn read_json<T: for<'de> serde::Deserialize<'de>>(path: &Path) -> Result<T> {
     let data = fs::read(path).with_context(|| format!("read workflow file {}", path.display()))?;
     serde_json::from_slice(&data).with_context(|| format!("parse workflow json {}", path.display()))
@@ -204,7 +227,13 @@ pub fn load_workflow_state(state_dir: &str, symbol: &str) -> Result<Option<Workf
 
 pub fn save_workflow_state(state_dir: &str, state: &WorkflowState) -> Result<()> {
     let path = workflow_state_path(state_dir, &state.symbol)?;
-    write_json(&path, state)
+    let mut next_state = state.clone();
+    if path.exists() {
+        if let Some(persisted_state) = load_workflow_state(state_dir, &state.symbol)? {
+            preserve_existing_replay_progress(&mut next_state, &persisted_state);
+        }
+    }
+    write_json(&path, &next_state)
 }
 
 pub fn load_stage1_output(state_dir: &str, symbol: &str) -> Result<Option<Stage1Output>> {
@@ -306,13 +335,44 @@ mod tests {
         delete_entry_snapshot, load_entry_snapshots_for_symbol, load_stage1_output,
         load_workflow_state, save_entry_snapshot, save_workflow_state, stage1_output_path,
     };
-    use crate::workflow::schema::EntrySnapshot;
+    use crate::workflow::schema::{EntryPlan, EntrySnapshot, PriceZone, TacticalEntryPlan};
     use crate::workflow::state::WorkflowState;
-    use chrono::Utc;
+    use chrono::{DateTime, Utc};
     use serde_json::Value;
     use std::fs;
     use std::path::PathBuf;
     use uuid::Uuid;
+
+    fn sample_tactical_plan(path_id: &str) -> TacticalEntryPlan {
+        TacticalEntryPlan {
+            path_id: path_id.to_string(),
+            entry_plan: EntryPlan {
+                side: "LONG".to_string(),
+                entry_profile: "reclaim_then_hold".to_string(),
+                intent_mode: "pullback".to_string(),
+                entry_activation_level: None,
+                entry_zone: PriceZone {
+                    low: 100.0,
+                    high: 101.0,
+                    timeframe: Some("15m".to_string()),
+                    label: Some("entry".to_string()),
+                    reason: Some("test".to_string()),
+                },
+                entry_invalidation_level: PriceZone {
+                    low: 99.0,
+                    high: 99.5,
+                    timeframe: Some("15m".to_string()),
+                    label: Some("invalidation".to_string()),
+                    reason: Some("test".to_string()),
+                },
+                stop_loss: 98.5,
+                max_drift_pct: 0.1,
+                entry_reason: "test".to_string(),
+                invalidation_reason: "test".to_string(),
+                stop_loss_reason: "test".to_string(),
+            },
+        }
+    }
 
     #[test]
     fn entry_snapshots_do_not_override_across_context_keys() {
@@ -399,6 +459,172 @@ mod tests {
             .expect("load workflow state")
             .expect("workflow state exists");
         assert_eq!(loaded, state);
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn save_workflow_state_preserves_stage1_replay_completion_for_same_generation() {
+        let state_dir = format!("/tmp/workflow_test_stage1_replay_merge_{}", Uuid::new_v4());
+        let completed_at = DateTime::parse_from_rfc3339("2026-04-02T05:37:08Z")
+            .expect("completed_at")
+            .with_timezone(&Utc);
+        let replayed_at = DateTime::parse_from_rfc3339("2026-04-02T05:37:11Z")
+            .expect("replayed_at")
+            .with_timezone(&Utc);
+
+        let completed_state = WorkflowState {
+            symbol: "ETHUSDT".to_string(),
+            last_stage1_completed_at: Some(completed_at),
+            last_stage1_replayed_at: Some(replayed_at),
+            ..WorkflowState::default()
+        };
+        save_workflow_state(&state_dir, &completed_state).expect("save completed state");
+
+        let stale_state = WorkflowState {
+            symbol: "ETHUSDT".to_string(),
+            last_stage1_completed_at: Some(completed_at),
+            last_stage1_replayed_at: None,
+            ..WorkflowState::default()
+        };
+        save_workflow_state(&state_dir, &stale_state).expect("save stale state");
+
+        let loaded = load_workflow_state(&state_dir, "ETHUSDT")
+            .expect("load state")
+            .expect("state exists");
+        assert_eq!(loaded.last_stage1_completed_at, Some(completed_at));
+        assert_eq!(loaded.last_stage1_replayed_at, Some(replayed_at));
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn save_workflow_state_allows_new_stage1_generation_to_reset_replay_pending() {
+        let state_dir = format!("/tmp/workflow_test_stage1_replay_reset_{}", Uuid::new_v4());
+        let old_completed_at = DateTime::parse_from_rfc3339("2026-04-02T05:31:27Z")
+            .expect("old completed_at")
+            .with_timezone(&Utc);
+        let old_replayed_at = DateTime::parse_from_rfc3339("2026-04-02T05:31:28Z")
+            .expect("old replayed_at")
+            .with_timezone(&Utc);
+        let new_completed_at = DateTime::parse_from_rfc3339("2026-04-02T05:37:08Z")
+            .expect("new completed_at")
+            .with_timezone(&Utc);
+
+        let old_state = WorkflowState {
+            symbol: "ETHUSDT".to_string(),
+            last_stage1_completed_at: Some(old_completed_at),
+            last_stage1_replayed_at: Some(old_replayed_at),
+            ..WorkflowState::default()
+        };
+        save_workflow_state(&state_dir, &old_state).expect("save old state");
+
+        let new_state = WorkflowState {
+            symbol: "ETHUSDT".to_string(),
+            last_stage1_completed_at: Some(new_completed_at),
+            last_stage1_replayed_at: None,
+            ..WorkflowState::default()
+        };
+        save_workflow_state(&state_dir, &new_state).expect("save new state");
+
+        let loaded = load_workflow_state(&state_dir, "ETHUSDT")
+            .expect("load state")
+            .expect("state exists");
+        assert_eq!(loaded.last_stage1_completed_at, Some(new_completed_at));
+        assert!(loaded.last_stage1_replayed_at.is_none());
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn save_workflow_state_preserves_tactical_replay_completion_for_same_plan_version() {
+        let state_dir = format!(
+            "/tmp/workflow_test_tactical_replay_merge_{}",
+            Uuid::new_v4()
+        );
+        let updated_at = DateTime::parse_from_rfc3339("2026-04-02T05:37:08Z")
+            .expect("updated_at")
+            .with_timezone(&Utc);
+        let replayed_at = DateTime::parse_from_rfc3339("2026-04-02T05:37:11Z")
+            .expect("replayed_at")
+            .with_timezone(&Utc);
+
+        let completed_state = WorkflowState {
+            symbol: "ETHUSDT".to_string(),
+            approved_tactical_plan: Some(sample_tactical_plan("path_a")),
+            approved_tactical_plan_updated_at: Some(updated_at),
+            approved_tactical_plan_replayed_at: Some(replayed_at),
+            ..WorkflowState::default()
+        };
+        save_workflow_state(&state_dir, &completed_state).expect("save completed state");
+
+        let stale_state = WorkflowState {
+            symbol: "ETHUSDT".to_string(),
+            approved_tactical_plan: Some(sample_tactical_plan("path_a")),
+            approved_tactical_plan_updated_at: Some(updated_at),
+            approved_tactical_plan_replayed_at: None,
+            ..WorkflowState::default()
+        };
+        save_workflow_state(&state_dir, &stale_state).expect("save stale state");
+
+        let loaded = load_workflow_state(&state_dir, "ETHUSDT")
+            .expect("load state")
+            .expect("state exists");
+        assert_eq!(loaded.approved_tactical_plan_updated_at, Some(updated_at));
+        assert_eq!(loaded.approved_tactical_plan_replayed_at, Some(replayed_at));
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn save_workflow_state_allows_new_tactical_plan_to_reset_replay_pending() {
+        let state_dir = format!(
+            "/tmp/workflow_test_tactical_replay_reset_{}",
+            Uuid::new_v4()
+        );
+        let old_updated_at = DateTime::parse_from_rfc3339("2026-04-02T05:31:27Z")
+            .expect("old updated_at")
+            .with_timezone(&Utc);
+        let old_replayed_at = DateTime::parse_from_rfc3339("2026-04-02T05:31:28Z")
+            .expect("old replayed_at")
+            .with_timezone(&Utc);
+        let new_updated_at = DateTime::parse_from_rfc3339("2026-04-02T05:37:08Z")
+            .expect("new updated_at")
+            .with_timezone(&Utc);
+
+        let old_state = WorkflowState {
+            symbol: "ETHUSDT".to_string(),
+            approved_tactical_plan: Some(sample_tactical_plan("path_a")),
+            approved_tactical_plan_updated_at: Some(old_updated_at),
+            approved_tactical_plan_replayed_at: Some(old_replayed_at),
+            ..WorkflowState::default()
+        };
+        save_workflow_state(&state_dir, &old_state).expect("save old state");
+
+        let new_state = WorkflowState {
+            symbol: "ETHUSDT".to_string(),
+            approved_tactical_plan: Some(sample_tactical_plan("path_b")),
+            approved_tactical_plan_updated_at: Some(new_updated_at),
+            approved_tactical_plan_replayed_at: None,
+            ..WorkflowState::default()
+        };
+        save_workflow_state(&state_dir, &new_state).expect("save new state");
+
+        let loaded = load_workflow_state(&state_dir, "ETHUSDT")
+            .expect("load state")
+            .expect("state exists");
+        assert_eq!(
+            loaded.approved_tactical_plan_updated_at,
+            Some(new_updated_at)
+        );
+        assert_eq!(
+            loaded
+                .approved_tactical_plan
+                .as_ref()
+                .map(|plan| plan.path_id.as_str()),
+            Some("path_b")
+        );
+        assert!(loaded.approved_tactical_plan_replayed_at.is_none());
+
         let _ = fs::remove_dir_all(&state_dir);
     }
 

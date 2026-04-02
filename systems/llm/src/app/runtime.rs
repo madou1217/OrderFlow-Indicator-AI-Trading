@@ -1538,6 +1538,24 @@ fn workflow_stage2_review_due(
     config.llm.workflow.stage2_review_minutes.contains(&minute)
 }
 
+fn startup_stage1_immediate_stage2a_due(
+    stage1_refresh_reason: Option<&str>,
+    stage1_refreshed_this_bundle: bool,
+    stage1_output: Option<&crate::workflow::schema::Stage1Output>,
+    trading_state: &TradingStateSnapshot,
+) -> bool {
+    if !stage1_refreshed_this_bundle || stage1_refresh_reason != Some("startup_force_stage1") {
+        return false;
+    }
+    let Some(stage1_output) = stage1_output else {
+        return false;
+    };
+    if stage1_output.monitoring_status != "active" || stage1_output.current_path.is_none() {
+        return false;
+    }
+    !trading_state.has_active_positions && !trading_state.has_open_orders
+}
+
 fn default_workflow_state(symbol: &str) -> crate::workflow::state::WorkflowState {
     crate::workflow::state::WorkflowState {
         symbol: symbol.to_string(),
@@ -5210,12 +5228,19 @@ async fn invoke_workflow_bundle_models(
     let stage1_refresh_blocking = (stage1_refresh_reason.is_some()
         && !stage1_refreshed_this_bundle)
         || workflow_stage_inflight(&symbol, WorkflowStageKind::Stage1);
-    let stage2_review_due = workflow_stage2_review_due(
-        &config,
-        &bundle,
+    let startup_immediate_stage2a_due = startup_stage1_immediate_stage2a_due(
+        stage1_refresh_reason.as_deref(),
+        stage1_refreshed_this_bundle,
         Some(&stage1_output),
-        stage1_refresh_blocking,
+        &trading_state,
     );
+    let stage2_review_due = startup_immediate_stage2a_due
+        || workflow_stage2_review_due(
+            &config,
+            &bundle,
+            Some(&stage1_output),
+            stage1_refresh_blocking,
+        );
 
     if stage2_review_due {
         if let Some(_stage2_guard) = try_acquire_workflow_stage(&symbol, WorkflowStageKind::Stage2)
@@ -5261,7 +5286,8 @@ async fn invoke_workflow_bundle_models(
                         &trading_state,
                         &entry_snapshots,
                     );
-                let should_run_stage2a = dispatch_flags.should_run_stage2a;
+                let should_run_stage2a =
+                    startup_immediate_stage2a_due || dispatch_flags.should_run_stage2a;
                 let stage2b_dispatch_enabled = dispatch_flags.should_run_stage2b;
                 let stage2b_context_count = stage2b_contexts.len();
                 let should_run_stage2b = stage2b_dispatch_enabled && stage2b_context_count > 0;
@@ -5313,6 +5339,26 @@ async fn invoke_workflow_bundle_models(
                                 .map(|position| position.context_key.clone())
                                 .collect::<Vec<_>>(),
                             "skip_reason": stage2b_skip_reason,
+                        }),
+                    );
+                }
+
+                if startup_immediate_stage2a_due {
+                    info!(
+                        symbol = %symbol,
+                        ts_bucket = %bundle.raw.ts_bucket,
+                        trigger = &*trigger,
+                        path_id = %current_path_id,
+                        "workflow startup stage1 forcing immediate stage2a review"
+                    );
+                    append_workflow_journal_event(
+                        "workflow_stage2a_startup_immediate",
+                        &symbol,
+                        bundle.raw.ts_bucket,
+                        json!({
+                            "trigger": &*trigger,
+                            "path_id": current_path_id,
+                            "reason": "startup_force_stage1_active_path_without_live_exposure",
                         }),
                     );
                 }
@@ -8838,6 +8884,98 @@ mod tests {
             &bundle,
             Some(&stage1_output),
             false,
+        ));
+    }
+
+    #[test]
+    fn startup_stage1_immediate_stage2a_due_when_active_path_and_no_live_exposure() {
+        let stage1_output = sample_stage1_output();
+        assert!(startup_stage1_immediate_stage2a_due(
+            Some("startup_force_stage1"),
+            true,
+            Some(&stage1_output),
+            &sample_flat_trading_state(),
+        ));
+        assert!(!workflow_stage2_review_due(
+            &workflow_test_config(),
+            &LatestBundle {
+                raw: MinuteBundleEnvelope {
+                    msg_type: "bundle".to_string(),
+                    routing_key: "test.route".to_string(),
+                    symbol: "ETHUSDT".to_string(),
+                    ts_bucket: DateTime::parse_from_rfc3339("2026-03-28T05:14:00Z")
+                        .expect("ts")
+                        .with_timezone(&Utc),
+                    window_code: "1m".to_string(),
+                    indicator_count: 0,
+                    published_at: None,
+                    indicators: json!({}),
+                },
+                indicators: json!({}),
+                missing_indicator_codes: vec![],
+                received_at: Utc::now(),
+            },
+            Some(&stage1_output),
+            false,
+        ));
+    }
+
+    #[test]
+    fn startup_stage1_immediate_stage2a_due_is_false_when_live_exposure_exists_or_stage1_is_not_active() {
+        let active_stage1 = sample_stage1_output();
+        let trading_state_with_position = TradingStateSnapshot {
+            symbol: "ETHUSDT".to_string(),
+            has_active_context: true,
+            has_active_positions: true,
+            has_open_orders: false,
+            active_positions: vec![],
+            open_orders: vec![],
+            total_wallet_balance: 1000.0,
+            available_balance: 900.0,
+        };
+        let trading_state_with_order = TradingStateSnapshot {
+            symbol: "ETHUSDT".to_string(),
+            has_active_context: true,
+            has_active_positions: false,
+            has_open_orders: true,
+            active_positions: vec![],
+            open_orders: vec![],
+            total_wallet_balance: 1000.0,
+            available_balance: 900.0,
+        };
+        let mut no_edge_stage1 = sample_stage1_output();
+        no_edge_stage1.monitoring_status = "no_edge".to_string();
+        no_edge_stage1.current_path = None;
+
+        assert!(!startup_stage1_immediate_stage2a_due(
+            Some("startup_force_stage1"),
+            true,
+            Some(&active_stage1),
+            &trading_state_with_position,
+        ));
+        assert!(!startup_stage1_immediate_stage2a_due(
+            Some("startup_force_stage1"),
+            true,
+            Some(&active_stage1),
+            &trading_state_with_order,
+        ));
+        assert!(!startup_stage1_immediate_stage2a_due(
+            Some("startup_force_stage1"),
+            true,
+            Some(&no_edge_stage1),
+            &sample_flat_trading_state(),
+        ));
+        assert!(!startup_stage1_immediate_stage2a_due(
+            Some("scheduled_2h"),
+            true,
+            Some(&active_stage1),
+            &sample_flat_trading_state(),
+        ));
+        assert!(!startup_stage1_immediate_stage2a_due(
+            Some("startup_force_stage1"),
+            false,
+            Some(&active_stage1),
+            &sample_flat_trading_state(),
         ));
     }
 

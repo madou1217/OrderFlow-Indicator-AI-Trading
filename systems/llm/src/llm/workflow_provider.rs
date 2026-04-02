@@ -387,6 +387,7 @@ fn entry_plan_schema() -> Value {
         "required": [
             "entry_profile",
             "intent_mode",
+            "entry_activation_level",
             "entry_zone",
             "entry_invalidation_level",
             "stop_loss",
@@ -997,6 +998,34 @@ mod tests {
                         Some(&json!(false)),
                         "object schema missing additionalProperties=false: {schema}"
                     );
+                    let property_names = map
+                        .get("properties")
+                        .and_then(Value::as_object)
+                        .map(|properties| properties.keys().cloned().collect::<Vec<_>>())
+                        .unwrap_or_default();
+                    let required = map
+                        .get("required")
+                        .and_then(Value::as_array)
+                        .map(|values| {
+                            values
+                                .iter()
+                                .filter_map(|value| value.as_str().map(|text| text.to_string()))
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    assert_eq!(
+                        property_names.len(),
+                        required.len(),
+                        "object schema required/property length mismatch: {schema}"
+                    );
+                    for property_name in &property_names {
+                        assert!(
+                            required
+                                .iter()
+                                .any(|required_name| required_name == property_name),
+                            "object schema missing required property '{property_name}': {schema}"
+                        );
+                    }
                 }
                 for value in map.values() {
                     assert_closed_object_schemas(value);
@@ -1083,6 +1112,40 @@ mod tests {
     #[test]
     fn stage2a_schema_closes_all_object_nodes() {
         assert_closed_object_schemas(&workflow_stage2a_schema());
+    }
+
+    #[test]
+    fn stage2a_schema_requires_nullable_entry_activation_level_key() {
+        let schema = workflow_stage2a_schema();
+        let required = schema["properties"]["tactical_entry_plan"]["anyOf"][0]["properties"]
+            ["entry_plan"]["required"]
+            .as_array()
+            .expect("entry_plan required array")
+            .iter()
+            .filter_map(|value| value.as_str())
+            .collect::<Vec<_>>();
+        assert!(required.contains(&"entry_activation_level"));
+        assert_eq!(
+            schema["properties"]["tactical_entry_plan"]["anyOf"][0]["properties"]["entry_plan"]
+                ["properties"]["entry_activation_level"],
+            json!({
+                "anyOf": [
+                    {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["low", "high", "timeframe", "label", "reason"],
+                        "properties": {
+                            "low": {"type": "number"},
+                            "high": {"type": "number"},
+                            "timeframe": {"type": ["string", "null"]},
+                            "label": {"type": ["string", "null"]},
+                            "reason": {"type": ["string", "null"]}
+                        }
+                    },
+                    {"type": "null"}
+                ]
+            })
+        );
     }
 
     #[test]
