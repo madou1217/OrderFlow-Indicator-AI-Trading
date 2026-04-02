@@ -52,13 +52,11 @@ sudo rabbitmqctl set_permissions -p /orderflow orderflow ".*" ".*" ".*"
 - `config/config.yaml -> mq.password_env`
 - `/etc/default/orderflow-common`
 
-RabbitMQ 交换机和队列不需要手工在 UI 里创建。服务启动时会自动幂等声明。当前会自动声明的核心拓扑如下：
+RabbitMQ 交换机和队列不需要手工在 UI 里创建。服务启动时会自动幂等声明。
 
-- exchanges: `x.md.live`, `x.md.replay`, `x.ind`, `x.dlx`
-- queues: `q.ingestor.selfcheck`
-- queues: `q.indicator.grp.ob_heavy`, `q.indicator.grp.flow`, `q.indicator.grp.deriv`
-- queues: `q.strategy.ind.minute`, `q.llm.ind.minute`, `q.monitor.ind.events`
-- replay 队列会按实例名动态创建，属于临时队列，不需要手工预建
+当前 `/orderflow` vhost 的交换机、队列、TTL、binding 和动态队列规则已经单独整理到 [mq_topology.md](/data/docs/mq_topology.md)。
+
+如果你想复核新服务器当前 broker 是否和现网一致，直接按 [mq_topology.md](/data/docs/mq_topology.md) 里的 `rabbitmqctl` 命令检查即可。
 
 ## 安装 systemd 服务
 
