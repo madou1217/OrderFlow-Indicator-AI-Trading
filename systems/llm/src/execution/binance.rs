@@ -167,6 +167,12 @@ pub struct ManagementExecutionReport {
     pub realized_pnl_usdt: f64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct WorkflowReducePlan {
+    quantity: f64,
+    promoted_to_full_close: bool,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct TrackedExitOrder {
     order_id: i64,
@@ -1611,8 +1617,31 @@ pub async fn execute_workflow_management_action(
             if exec_config.dry_run {
                 return Ok(report);
             }
+            let symbol_filters = fetch_symbol_filters(http_client, api_config, symbol).await?;
             if let Some(execution_price) = action.execution_price {
                 for position in &matching_positions {
+                    let Some(reduce_plan) = plan_workflow_reduce_quantity(
+                        position,
+                        reduce_ratio,
+                        &symbol_filters,
+                        exec_config,
+                    ) else {
+                        continue;
+                    };
+                    if reduce_plan.promoted_to_full_close {
+                        info!(
+                            symbol,
+                            context_key = %snapshot.context_key,
+                            path_id = %snapshot.path_id,
+                            live_position_qty = position.position_amt.abs(),
+                            reduce_ratio,
+                            planned_reduce_qty = reduce_plan.quantity,
+                            mark_price = position.mark_price,
+                            leverage = position.leverage,
+                            dust_margin_threshold_usdt = exec_config.reduce_dust_margin_usdt,
+                            "workflow reduce promoted to full close to avoid dust remainder"
+                        );
+                    }
                     if let Some(reduce_order_id) = place_workflow_reduce_exit_for_position(
                         http_client,
                         api_config,
@@ -1620,52 +1649,68 @@ pub async fn execute_workflow_management_action(
                         symbol,
                         position,
                         execution_price,
-                        reduce_ratio,
+                        reduce_plan.quantity,
+                        &symbol_filters,
                     )
                     .await?
                     {
                         report.reduce_order_ids.push(reduce_order_id);
                     }
                 }
-                return Ok(report);
-            }
-            let symbol_filters = fetch_symbol_filters(http_client, api_config, symbol).await?;
-            for position in &matching_positions {
-                let reduce_qty = round_down_to_step(
-                    position.position_amt.abs() * reduce_ratio,
-                    symbol_filters.step_size,
-                );
-                if reduce_qty < symbol_filters.min_qty {
-                    continue;
-                }
-                let reduce_qty_str = format_decimal(reduce_qty, symbol_filters.qty_precision);
-                let reduce_side = if position.position_amt > 0.0 {
-                    "SELL"
-                } else {
-                    "BUY"
-                };
-                let reduce_order_id = place_market_order_with_side_reduce(
-                    http_client,
-                    api_config,
-                    exec_config,
-                    symbol,
-                    reduce_side,
-                    target_position_side,
-                    &reduce_qty_str,
-                    "workflow_reduce",
-                )
-                .await?;
-                report.reduce_order_ids.push(reduce_order_id);
-                if let Ok(pnl) = fetch_order_realized_pnl(
-                    http_client,
-                    api_config,
-                    exec_config,
-                    symbol,
-                    reduce_order_id,
-                )
-                .await
-                {
-                    report.realized_pnl_usdt += pnl;
+            } else {
+                for position in &matching_positions {
+                    let Some(reduce_plan) = plan_workflow_reduce_quantity(
+                        position,
+                        reduce_ratio,
+                        &symbol_filters,
+                        exec_config,
+                    ) else {
+                        continue;
+                    };
+                    if reduce_plan.promoted_to_full_close {
+                        info!(
+                            symbol,
+                            context_key = %snapshot.context_key,
+                            path_id = %snapshot.path_id,
+                            live_position_qty = position.position_amt.abs(),
+                            reduce_ratio,
+                            planned_reduce_qty = reduce_plan.quantity,
+                            mark_price = position.mark_price,
+                            leverage = position.leverage,
+                            dust_margin_threshold_usdt = exec_config.reduce_dust_margin_usdt,
+                            "workflow reduce promoted to full close to avoid dust remainder"
+                        );
+                    }
+                    let reduce_qty_str =
+                        format_decimal(reduce_plan.quantity, symbol_filters.qty_precision);
+                    let reduce_side = if position.position_amt > 0.0 {
+                        "SELL"
+                    } else {
+                        "BUY"
+                    };
+                    let reduce_order_id = place_market_order_with_side_reduce(
+                        http_client,
+                        api_config,
+                        exec_config,
+                        symbol,
+                        reduce_side,
+                        target_position_side,
+                        &reduce_qty_str,
+                        "workflow_reduce",
+                    )
+                    .await?;
+                    report.reduce_order_ids.push(reduce_order_id);
+                    if let Ok(pnl) = fetch_order_realized_pnl(
+                        http_client,
+                        api_config,
+                        exec_config,
+                        symbol,
+                        reduce_order_id,
+                    )
+                    .await
+                    {
+                        report.realized_pnl_usdt += pnl;
+                    }
                 }
             }
 
@@ -2035,14 +2080,10 @@ async fn place_workflow_reduce_exit_for_position(
     symbol: &str,
     position: &ActivePositionSnapshot,
     trigger_price: f64,
-    reduce_ratio: f64,
+    reduce_qty: f64,
+    symbol_filters: &SymbolFilters,
 ) -> Result<Option<i64>> {
-    let symbol_filters = fetch_symbol_filters(http_client, api_config, symbol).await?;
     let position_side = effective_active_position_side(position, exec_config.hedge_mode);
-    let reduce_qty = round_down_to_step(
-        position.position_amt.abs() * reduce_ratio,
-        symbol_filters.step_size,
-    );
     if reduce_qty < symbol_filters.min_qty {
         return Ok(None);
     }
@@ -3861,6 +3902,68 @@ fn round_down_to_step(value: f64, step: f64) -> f64 {
     ((value / step) + 1e-9).floor() * step
 }
 
+fn plan_workflow_reduce_quantity(
+    position: &ActivePositionSnapshot,
+    reduce_ratio: f64,
+    symbol_filters: &SymbolFilters,
+    exec_config: &LlmExecutionConfig,
+) -> Option<WorkflowReducePlan> {
+    let full_close_qty = round_down_to_step(position.position_amt.abs(), symbol_filters.step_size);
+    if full_close_qty < symbol_filters.min_qty {
+        return None;
+    }
+    let reduce_qty = round_down_to_step(
+        position.position_amt.abs() * reduce_ratio,
+        symbol_filters.step_size,
+    )
+    .min(full_close_qty);
+    if reduce_qty < symbol_filters.min_qty {
+        return None;
+    }
+    let remaining_qty = (full_close_qty - reduce_qty).max(0.0);
+    if remaining_qty > f64::EPSILON
+        && should_promote_reduce_to_full_close(
+            position,
+            remaining_qty,
+            exec_config.reduce_dust_margin_usdt,
+        )
+    {
+        return Some(WorkflowReducePlan {
+            quantity: full_close_qty,
+            promoted_to_full_close: true,
+        });
+    }
+    Some(WorkflowReducePlan {
+        quantity: reduce_qty,
+        promoted_to_full_close: false,
+    })
+}
+
+fn should_promote_reduce_to_full_close(
+    position: &ActivePositionSnapshot,
+    remaining_qty: f64,
+    dust_margin_threshold_usdt: f64,
+) -> bool {
+    dust_margin_threshold_usdt > 0.0
+        && estimate_position_margin_usdt(position, remaining_qty)
+            .is_some_and(|margin| margin <= dust_margin_threshold_usdt + 1e-9)
+}
+
+fn estimate_position_margin_usdt(position: &ActivePositionSnapshot, quantity: f64) -> Option<f64> {
+    if quantity <= f64::EPSILON {
+        return Some(0.0);
+    }
+    let reference_price = if position.mark_price > 0.0 {
+        position.mark_price.abs()
+    } else {
+        position.entry_price.abs()
+    };
+    if reference_price <= f64::EPSILON {
+        return None;
+    }
+    Some(quantity * reference_price / position.leverage.max(1) as f64)
+}
+
 fn precision_from_step(step: f64) -> usize {
     let text = format!("{:.12}", step);
     text.trim_end_matches('0')
@@ -4073,6 +4176,60 @@ mod tests {
         let (budget, source) = select_margin_budget(&exec, &account_balance).expect("budget");
         assert!((budget - 30.0).abs() < f64::EPSILON);
         assert_eq!(source, "fixed_usdt_capped");
+    }
+
+    #[test]
+    fn workflow_reduce_plan_keeps_partial_reduce_when_remainder_is_not_dust() {
+        let mut exec = LlmExecutionConfig::default();
+        exec.reduce_dust_margin_usdt = 1.0;
+        let position = ActivePositionSnapshot {
+            position_side: "LONG".to_string(),
+            position_amt: 0.045,
+            entry_price: 2044.2,
+            mark_price: 2047.0,
+            unrealized_pnl: 0.0,
+            leverage: 20,
+        };
+        let filters = SymbolFilters {
+            step_size: 0.001,
+            min_qty: 0.001,
+            tick_size: 0.1,
+            qty_precision: 3,
+            price_precision: 1,
+        };
+
+        let plan =
+            plan_workflow_reduce_quantity(&position, 0.5, &filters, &exec).expect("reduce plan");
+
+        assert!(!plan.promoted_to_full_close);
+        assert!((plan.quantity - 0.022).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn workflow_reduce_plan_promotes_full_close_when_remainder_margin_is_dust() {
+        let mut exec = LlmExecutionConfig::default();
+        exec.reduce_dust_margin_usdt = 1.0;
+        let position = ActivePositionSnapshot {
+            position_side: "LONG".to_string(),
+            position_amt: 0.023,
+            entry_price: 2044.2,
+            mark_price: 2047.0,
+            unrealized_pnl: 0.0,
+            leverage: 48,
+        };
+        let filters = SymbolFilters {
+            step_size: 0.001,
+            min_qty: 0.001,
+            tick_size: 0.1,
+            qty_precision: 3,
+            price_precision: 1,
+        };
+
+        let plan =
+            plan_workflow_reduce_quantity(&position, 0.5, &filters, &exec).expect("reduce plan");
+
+        assert!(plan.promoted_to_full_close);
+        assert!((plan.quantity - 0.023).abs() < f64::EPSILON);
     }
 
     #[test]

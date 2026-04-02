@@ -1706,7 +1706,11 @@ mod tests {
             parse_stage2b_output(value, &stage1_output, "ctx_1", "legacy_path").expect("parse");
         assert_eq!(
             parsed.position_management_plan.path_id,
-            stage1_output.current_path.as_ref().expect("current_path").id
+            stage1_output
+                .current_path
+                .as_ref()
+                .expect("current_path")
+                .id
         );
     }
 

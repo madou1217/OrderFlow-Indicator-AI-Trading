@@ -514,6 +514,8 @@ pub struct LlmExecutionConfig {
         alias = "default_leverage"
     )]
     pub default_leverage_ratio: f64,
+    #[serde(default = "default_execution_reduce_dust_margin_usdt")]
+    pub reduce_dust_margin_usdt: f64,
     #[serde(default = "default_execution_max_leverage")]
     pub max_leverage: u32,
     #[serde(default = "default_execution_hedge_mode")]
@@ -870,6 +872,7 @@ impl Default for LlmExecutionConfig {
             max_margin_usdt: default_execution_max_margin_usdt(),
             margin_usdt: default_execution_margin_usdt(),
             default_leverage_ratio: default_execution_default_leverage_ratio(),
+            reduce_dust_margin_usdt: default_execution_reduce_dust_margin_usdt(),
             max_leverage: default_execution_max_leverage(),
             hedge_mode: default_execution_hedge_mode(),
             recv_window_ms: default_execution_recv_window_ms(),
@@ -1524,6 +1527,10 @@ fn default_execution_default_leverage_ratio() -> f64 {
     30.0
 }
 
+fn default_execution_reduce_dust_margin_usdt() -> f64 {
+    1.0
+}
+
 fn default_execution_hedge_mode() -> bool {
     true
 }
@@ -1989,6 +1996,16 @@ fn validate_config(cfg: &RootConfig) -> Result<()> {
         }
         if cfg.llm.execution.default_leverage_ratio <= 0.0 {
             return Err(anyhow!("llm.execution.default_leverage_ratio must be > 0"));
+        }
+        if !cfg.llm.execution.reduce_dust_margin_usdt.is_finite() {
+            return Err(anyhow!(
+                "llm.execution.reduce_dust_margin_usdt must be finite"
+            ));
+        }
+        if cfg.llm.execution.reduce_dust_margin_usdt < 0.0 {
+            return Err(anyhow!(
+                "llm.execution.reduce_dust_margin_usdt must be >= 0"
+            ));
         }
         if cfg.llm.execution.recv_window_ms == 0 {
             return Err(anyhow!("llm.execution.recv_window_ms must be > 0"));

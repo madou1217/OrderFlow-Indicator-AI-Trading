@@ -2320,7 +2320,10 @@ mod tests {
         };
         let entry_snapshots = HashMap::from([
             (current_snapshot.context_key.clone(), current_snapshot),
-            (newer_other_snapshot.context_key.clone(), newer_other_snapshot),
+            (
+                newer_other_snapshot.context_key.clone(),
+                newer_other_snapshot,
+            ),
         ]);
 
         let orders = stage2c_active_orders_for_current_path(
