@@ -100,6 +100,8 @@ impl MdDbWriter {
             }
         }
 
+        dedupe_open_interest_hist_rows(&mut open_interest_hist_rows);
+        dedupe_long_short_ratio_rows(&mut long_short_ratio_rows);
         dedupe_agg_trade_rows(&mut agg_trade_rows);
         dedupe_agg_orderbook_rows(&mut agg_orderbook_rows);
         dedupe_agg_liq_rows(&mut agg_liq_rows);
@@ -2286,6 +2288,51 @@ struct ChunkConflictKey {
     chunk_end_ts: DateTime<Utc>,
 }
 
+#[derive(Hash, Eq, PartialEq)]
+struct OpenInterestHistConflictKey {
+    market: String,
+    symbol: String,
+    ts_bucket: DateTime<Utc>,
+}
+
+#[derive(Hash, Eq, PartialEq)]
+struct LongShortRatioConflictKey {
+    market: String,
+    symbol: String,
+    ratio_type: String,
+    ts_bucket: DateTime<Utc>,
+}
+
+// Keep the last row for each natural key so batched upserts match the final
+// state produced by the single-row fallback path.
+fn dedupe_keep_last<T, K, F>(rows: &mut Vec<T>, mut key_fn: F)
+where
+    K: Eq + std::hash::Hash,
+    F: FnMut(&T) -> K,
+{
+    let mut seen = HashSet::with_capacity(rows.len());
+    rows.reverse();
+    rows.retain(|row| seen.insert(key_fn(row)));
+    rows.reverse();
+}
+
+fn dedupe_open_interest_hist_rows(rows: &mut Vec<OpenInterestHist5mBatchRow>) {
+    dedupe_keep_last(rows, |row| OpenInterestHistConflictKey {
+        market: row.market.clone(),
+        symbol: row.symbol.clone(),
+        ts_bucket: row.ts_bucket,
+    });
+}
+
+fn dedupe_long_short_ratio_rows(rows: &mut Vec<LongShortRatio5mBatchRow>) {
+    dedupe_keep_last(rows, |row| LongShortRatioConflictKey {
+        market: row.market.clone(),
+        symbol: row.symbol.clone(),
+        ratio_type: row.ratio_type.clone(),
+        ts_bucket: row.ts_bucket,
+    });
+}
+
 fn dedupe_agg_trade_rows(rows: &mut Vec<AggTrade1mBatchRow>) {
     let mut seen = HashSet::with_capacity(rows.len());
     rows.retain(|row| {
@@ -2644,8 +2691,19 @@ fn to_f64(value: &Value) -> Result<f64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{compact_orderbook_heatmap_for_db, should_write_kline_hotpath};
+    use super::{
+        compact_orderbook_heatmap_for_db, dedupe_long_short_ratio_rows,
+        dedupe_open_interest_hist_rows, should_write_kline_hotpath, LongShortRatio5mBatchRow,
+        OpenInterestHist5mBatchRow,
+    };
+    use chrono::{DateTime, Utc};
     use serde_json::json;
+
+    fn ts(raw: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(raw)
+            .expect("valid timestamp")
+            .with_timezone(&Utc)
+    }
 
     #[test]
     fn closed_htf_klines_are_persisted() {
@@ -2723,5 +2781,96 @@ mod tests {
         assert_eq!(compacted.payload_json["heatmap_total_levels"], json!(2));
         assert_eq!(compacted.payload_json["heatmap_stored_levels"], json!(2));
         assert_eq!(compacted.payload_json["heatmap_db_compacted"], json!(false));
+    }
+
+    #[test]
+    fn dedupe_open_interest_hist_rows_keeps_last_duplicate_bucket() {
+        let bucket = ts("2026-04-02T11:25:00Z");
+        let mut rows = vec![
+            OpenInterestHist5mBatchRow {
+                ts_event: ts("2026-04-02T11:25:01Z"),
+                ts_recv: ts("2026-04-02T11:25:02Z"),
+                ts_bucket: bucket,
+                market: "futures".to_string(),
+                symbol: "ETHUSDT".to_string(),
+                source_kind: "rest".to_string(),
+                stream_name: "first".to_string(),
+                open_interest_contracts: 100.0,
+                open_interest_value_usdt: 200.0,
+                payload_json: json!({"version": 1}),
+            },
+            OpenInterestHist5mBatchRow {
+                ts_event: ts("2026-04-02T11:30:01Z"),
+                ts_recv: ts("2026-04-02T11:30:02Z"),
+                ts_bucket: ts("2026-04-02T11:30:00Z"),
+                market: "futures".to_string(),
+                symbol: "ETHUSDT".to_string(),
+                source_kind: "rest".to_string(),
+                stream_name: "other".to_string(),
+                open_interest_contracts: 300.0,
+                open_interest_value_usdt: 400.0,
+                payload_json: json!({"version": 1}),
+            },
+            OpenInterestHist5mBatchRow {
+                ts_event: ts("2026-04-02T11:25:03Z"),
+                ts_recv: ts("2026-04-02T11:25:04Z"),
+                ts_bucket: bucket,
+                market: "futures".to_string(),
+                symbol: "ETHUSDT".to_string(),
+                source_kind: "rest".to_string(),
+                stream_name: "last".to_string(),
+                open_interest_contracts: 101.0,
+                open_interest_value_usdt: 201.0,
+                payload_json: json!({"version": 2}),
+            },
+        ];
+
+        dedupe_open_interest_hist_rows(&mut rows);
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].ts_bucket, ts("2026-04-02T11:30:00Z"));
+        assert_eq!(rows[1].ts_bucket, bucket);
+        assert_eq!(rows[1].stream_name, "last");
+        assert_eq!(rows[1].open_interest_value_usdt, 201.0);
+    }
+
+    #[test]
+    fn dedupe_long_short_ratio_rows_keeps_last_duplicate_bucket() {
+        let mut rows = vec![
+            LongShortRatio5mBatchRow {
+                ts_event: ts("2026-04-02T11:25:01Z"),
+                ts_recv: ts("2026-04-02T11:25:02Z"),
+                ts_bucket: ts("2026-04-02T11:25:00Z"),
+                market: "futures".to_string(),
+                symbol: "ETHUSDT".to_string(),
+                source_kind: "rest".to_string(),
+                stream_name: "first".to_string(),
+                ratio_type: "global_account".to_string(),
+                long_short_ratio: 1.1,
+                long_account_ratio: Some(0.52),
+                short_account_ratio: Some(0.48),
+                payload_json: json!({"version": 1}),
+            },
+            LongShortRatio5mBatchRow {
+                ts_event: ts("2026-04-02T11:25:03Z"),
+                ts_recv: ts("2026-04-02T11:25:04Z"),
+                ts_bucket: ts("2026-04-02T11:25:00Z"),
+                market: "futures".to_string(),
+                symbol: "ETHUSDT".to_string(),
+                source_kind: "rest".to_string(),
+                stream_name: "last".to_string(),
+                ratio_type: "global_account".to_string(),
+                long_short_ratio: 1.2,
+                long_account_ratio: Some(0.55),
+                short_account_ratio: Some(0.45),
+                payload_json: json!({"version": 2}),
+            },
+        ];
+
+        dedupe_long_short_ratio_rows(&mut rows);
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].stream_name, "last");
+        assert_eq!(rows[0].long_short_ratio, 1.2);
     }
 }

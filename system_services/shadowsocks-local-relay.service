@@ -1,0 +1,18 @@
+[Unit]
+Description=Shadowsocks Local Relay
+Documentation=man:ss-local(1)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/data
+ExecStart=/usr/bin/ss-local -c /data/config/shadowsocks-libev.json
+Restart=always
+RestartSec=5
+LimitNOFILE=32768
+
+[Install]
+WantedBy=multi-user.target
