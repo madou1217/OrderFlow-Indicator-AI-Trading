@@ -105,8 +105,8 @@ CREATE TABLE IF NOT EXISTS cfg.instrument (
     symbol             TEXT NOT NULL,                  -- e.g. BTCUSDT
     market             cfg.market_type NOT NULL,       -- spot / futures
     contract_type      TEXT,                           -- perpetual for futures
-    quote_asset        TEXT NOT NULL DEFAULT '',
-    base_asset         TEXT NOT NULL DEFAULT '',
+    quote_asset        TEXT NOT NULL DEFAULT 'USDT',
+    base_asset         TEXT NOT NULL DEFAULT 'ETH',
     contract_multiplier DOUBLE PRECISION NOT NULL DEFAULT 1.0,
     tick_size          DOUBLE PRECISION,
     lot_size           DOUBLE PRECISION,
@@ -439,6 +439,67 @@ CREATE TABLE IF NOT EXISTS ops.bad_agg_orderbook_1m_quarantine (
     quarantine_reason  TEXT NOT NULL DEFAULT '',
     CONSTRAINT agg_orderbook_1m_check CHECK (chunk_end_ts >= chunk_start_ts)
 );
+
+CREATE TABLE IF NOT EXISTS ops.indicator_bundle_payload_cache (
+    symbol             TEXT NOT NULL,
+    ts_bucket          TIMESTAMPTZ NOT NULL,
+    schema_version     INTEGER NOT NULL,
+    indicator_count    INTEGER,
+    payload_encoding   TEXT NOT NULL DEFAULT 'gzip',
+    payload_bytes      BYTEA NOT NULL,
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (symbol, ts_bucket)
+);
+
+CREATE TABLE IF NOT EXISTS ops.indicator_bundle_outbox (
+    outbox_id          BIGSERIAL PRIMARY KEY,
+    status             TEXT NOT NULL DEFAULT 'pending',
+    available_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    retry_count        INTEGER NOT NULL DEFAULT 0,
+    exchange_name      TEXT NOT NULL,
+    routing_key        TEXT NOT NULL,
+    message_id         UUID NOT NULL UNIQUE,
+    schema_version     INTEGER NOT NULL,
+    headers_json       JSONB NOT NULL DEFAULT '{}'::jsonb,
+    symbol             TEXT,
+    ts_bucket          TIMESTAMPTZ,
+    indicator_count    INTEGER,
+    payload_json       JSONB NOT NULL DEFAULT '{}'::jsonb,
+    error_text         TEXT,
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT indicator_bundle_outbox_retry_count_nonneg_chk
+        CHECK (retry_count >= 0),
+    CONSTRAINT indicator_bundle_outbox_schema_version_pos_chk
+        CHECK (schema_version > 0),
+    CONSTRAINT indicator_bundle_outbox_status_chk
+        CHECK (status IN ('pending', 'sending', 'failed', 'dead'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_indicator_bundle_outbox_ready
+ON ops.indicator_bundle_outbox (exchange_name, available_at, outbox_id)
+WHERE status IN ('pending', 'failed', 'sending');
+
+CREATE OR REPLACE FUNCTION ops.notify_indicator_bundle_outbox_ready()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    PERFORM pg_notify('indicator_bundle_outbox_ready', NEW.exchange_name);
+    RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_indicator_bundle_outbox_notify
+ON ops.indicator_bundle_outbox;
+CREATE TRIGGER trg_indicator_bundle_outbox_notify
+AFTER INSERT ON ops.indicator_bundle_outbox
+FOR EACH ROW EXECUTE FUNCTION ops.notify_indicator_bundle_outbox_ready();
+
+CREATE TABLE IF NOT EXISTS ops.indicator_snapshot_fanout_progress (
+    symbol                     TEXT PRIMARY KEY,
+    last_published_snapshot_ts TIMESTAMPTZ,
+    updated_at                 TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 \endif
 
 CREATE OR REPLACE FUNCTION ops.ensure_outbox_event_partitions(
@@ -676,6 +737,20 @@ CREATE TABLE IF NOT EXISTS md.kline_bar (
 SELECT create_hypertable('md.kline_bar', 'open_time', if_not_exists => TRUE);
 CREATE UNIQUE INDEX IF NOT EXISTS uq_kline_bar ON md.kline_bar(market, symbol, interval_code, open_time);
 CREATE INDEX IF NOT EXISTS idx_kline_bar_lookup ON md.kline_bar(market, symbol, interval_code, open_time DESC);
+\if :is_orderflow
+CREATE INDEX IF NOT EXISTS idx_kline_bar_lookup_cover
+ON md.kline_bar (market, symbol, interval_code, open_time)
+INCLUDE (
+    close_time,
+    open_price,
+    high_price,
+    low_price,
+    close_price,
+    volume_base,
+    quote_volume,
+    is_closed
+);
+\endif
 
 -- 6.6 Mark price + funding (1s stream snapshots)
 CREATE TABLE IF NOT EXISTS md.mark_price_funding_1s (
@@ -741,6 +816,101 @@ CREATE TABLE IF NOT EXISTS md.force_order_event (
 SELECT create_hypertable('md.force_order_event', 'ts_event', if_not_exists => TRUE);
 CREATE INDEX IF NOT EXISTS idx_force_order_lookup ON md.force_order_event(symbol, ts_event DESC);
 CREATE INDEX IF NOT EXISTS idx_force_order_liq_side ON md.force_order_event(liq_side, ts_event DESC);
+
+\if :is_orderflow
+CREATE TABLE IF NOT EXISTS md.open_interest_current_1m (
+    ts_event                  TIMESTAMPTZ NOT NULL,
+    ts_recv                   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    venue                     TEXT NOT NULL DEFAULT 'binance',
+    market                    cfg.market_type NOT NULL,
+    symbol                    TEXT NOT NULL,
+    source_kind               cfg.source_type NOT NULL,
+    stream_name               TEXT NOT NULL,
+    open_interest_contracts   DOUBLE PRECISION NOT NULL,
+    mark_price                DOUBLE PRECISION,
+    open_interest_value_usdt  DOUBLE PRECISION,
+    payload_json              JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_open_interest_current_1m_natural
+ON md.open_interest_current_1m(market, symbol, ts_event);
+CREATE INDEX IF NOT EXISTS idx_open_interest_current_1m_lookup
+ON md.open_interest_current_1m(symbol, ts_event DESC);
+
+CREATE TABLE IF NOT EXISTS md.open_interest_hist_5m (
+    ts_event                  TIMESTAMPTZ NOT NULL,
+    ts_recv                   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    venue                     TEXT NOT NULL DEFAULT 'binance',
+    ts_bucket                 TIMESTAMPTZ NOT NULL,
+    market                    cfg.market_type NOT NULL,
+    symbol                    TEXT NOT NULL,
+    source_kind               cfg.source_type NOT NULL,
+    stream_name               TEXT NOT NULL,
+    open_interest_contracts   DOUBLE PRECISION NOT NULL,
+    open_interest_value_usdt  DOUBLE PRECISION NOT NULL,
+    payload_json              JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_open_interest_hist_5m_natural
+ON md.open_interest_hist_5m(market, symbol, ts_bucket);
+CREATE INDEX IF NOT EXISTS idx_open_interest_hist_5m_lookup
+ON md.open_interest_hist_5m(symbol, ts_bucket DESC);
+CREATE INDEX IF NOT EXISTS idx_open_interest_hist_5m_backfill
+ON md.open_interest_hist_5m(symbol, ts_bucket, market);
+
+CREATE TABLE IF NOT EXISTS md.long_short_ratio_5m (
+    ts_event              TIMESTAMPTZ NOT NULL,
+    ts_recv               TIMESTAMPTZ NOT NULL DEFAULT now(),
+    venue                 TEXT NOT NULL DEFAULT 'binance',
+    ts_bucket             TIMESTAMPTZ NOT NULL,
+    market                cfg.market_type NOT NULL,
+    symbol                TEXT NOT NULL,
+    source_kind           cfg.source_type NOT NULL,
+    stream_name           TEXT NOT NULL,
+    ratio_type            TEXT NOT NULL,
+    long_short_ratio      DOUBLE PRECISION NOT NULL,
+    long_account_ratio    DOUBLE PRECISION,
+    short_account_ratio   DOUBLE PRECISION,
+    payload_json          JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_long_short_ratio_5m_natural
+ON md.long_short_ratio_5m(market, symbol, ratio_type, ts_bucket);
+CREATE INDEX IF NOT EXISTS idx_long_short_ratio_5m_lookup
+ON md.long_short_ratio_5m(symbol, ratio_type, ts_bucket DESC);
+CREATE INDEX IF NOT EXISTS idx_long_short_ratio_5m_backfill
+ON md.long_short_ratio_5m(symbol, ts_bucket, market);
+
+CREATE TABLE IF NOT EXISTS md.option_mark_greeks_5m (
+    ts_event             TIMESTAMPTZ NOT NULL,
+    ts_recv              TIMESTAMPTZ NOT NULL DEFAULT now(),
+    venue                TEXT NOT NULL DEFAULT 'binance',
+    ts_bucket            TIMESTAMPTZ NOT NULL,
+    market               cfg.market_type NOT NULL,
+    symbol               TEXT NOT NULL,
+    option_symbol        TEXT NOT NULL,
+    underlying_asset     TEXT NOT NULL,
+    source_kind          cfg.source_type NOT NULL,
+    stream_name          TEXT NOT NULL,
+    expiry_ts            TIMESTAMPTZ NOT NULL,
+    strike_price         DOUBLE PRECISION NOT NULL,
+    contract_side        TEXT NOT NULL,
+    unit                 DOUBLE PRECISION,
+    index_price          DOUBLE PRECISION,
+    mark_price           DOUBLE PRECISION,
+    bid_iv               DOUBLE PRECISION,
+    ask_iv               DOUBLE PRECISION,
+    mark_iv              DOUBLE PRECISION,
+    delta                DOUBLE PRECISION,
+    gamma                DOUBLE PRECISION,
+    vega                 DOUBLE PRECISION,
+    theta                DOUBLE PRECISION,
+    risk_free_interest   DOUBLE PRECISION,
+    payload_json         JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+SELECT create_hypertable('md.option_mark_greeks_5m', 'ts_bucket', if_not_exists => TRUE);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_option_mark_greeks_5m_natural
+ON md.option_mark_greeks_5m(market, symbol, option_symbol, ts_bucket);
+CREATE INDEX IF NOT EXISTS idx_option_mark_greeks_5m_lookup
+ON md.option_mark_greeks_5m(symbol, ts_bucket DESC, expiry_ts, strike_price);
+\endif
 
 -- 6.8 Minute aggregate tables (aggregate-only ingest path)
 CREATE TABLE IF NOT EXISTS md.agg_trade_1m (
@@ -891,7 +1061,7 @@ CREATE TABLE IF NOT EXISTS feat.trade_flow_feature (
     market             cfg.market_type NOT NULL,
     symbol             TEXT NOT NULL,
     source_trade_stream TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
-    qty_mode           TEXT NOT NULL DEFAULT 'qty_base', -- qty_base / notional_usdt
+    qty_mode           TEXT NOT NULL DEFAULT 'qty_eth', -- legacy default; qty_eth / qty_base / notional_usdt
     trade_count        BIGINT,
     buy_qty            DOUBLE PRECISION,
     sell_qty           DOUBLE PRECISION,
@@ -1102,6 +1272,92 @@ SELECT create_hypertable('feat.funding_change_event', 'ts_change', if_not_exists
 CREATE INDEX IF NOT EXISTS idx_funding_change_event_lookup ON feat.funding_change_event(symbol, ts_change DESC);
 CREATE UNIQUE INDEX IF NOT EXISTS uq_funding_change_event_symbol_ts_rate ON feat.funding_change_event(symbol, ts_change, funding_new);
 
+\if :is_orderflow
+CREATE TABLE IF NOT EXISTS feat.open_interest_feature (
+    ts_bucket             TIMESTAMPTZ NOT NULL,
+    bar_interval          INTERVAL NOT NULL,
+    venue                 TEXT NOT NULL DEFAULT 'binance',
+    symbol                TEXT NOT NULL,
+    oi_latest_contracts   DOUBLE PRECISION,
+    oi_latest_value_usdt  DOUBLE PRECISION,
+    oi_start_value_usdt   DOUBLE PRECISION,
+    oi_delta_abs          DOUBLE PRECISION,
+    oi_delta_pct          DOUBLE PRECISION,
+    oi_log_return         DOUBLE PRECISION,
+    oi_zscore             DOUBLE PRECISION,
+    oi_accel              DOUBLE PRECISION,
+    price_start           DOUBLE PRECISION,
+    price_end             DOUBLE PRECISION,
+    price_delta_pct       DOUBLE PRECISION,
+    price_oi_relation     TEXT,
+    calc_version          TEXT NOT NULL,
+    extra_json            JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at            TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+SELECT create_hypertable('feat.open_interest_feature', 'ts_bucket', if_not_exists => TRUE);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_open_interest_feature_natural
+ON feat.open_interest_feature(venue, symbol, bar_interval, ts_bucket);
+CREATE INDEX IF NOT EXISTS idx_open_interest_feature_lookup
+ON feat.open_interest_feature(symbol, bar_interval, ts_bucket DESC);
+
+CREATE TABLE IF NOT EXISTS feat.long_short_ratio_feature (
+    ts_bucket                  TIMESTAMPTZ NOT NULL,
+    bar_interval               INTERVAL NOT NULL,
+    venue                      TEXT NOT NULL DEFAULT 'binance',
+    symbol                     TEXT NOT NULL,
+    global_ratio_latest        DOUBLE PRECISION,
+    top_account_ratio_latest   DOUBLE PRECISION,
+    top_position_ratio_latest  DOUBLE PRECISION,
+    global_ratio_log           DOUBLE PRECISION,
+    top_account_ratio_log      DOUBLE PRECISION,
+    top_position_ratio_log     DOUBLE PRECISION,
+    global_ratio_change        DOUBLE PRECISION,
+    top_account_ratio_change   DOUBLE PRECISION,
+    top_position_ratio_change  DOUBLE PRECISION,
+    account_crowding_gap       DOUBLE PRECISION,
+    position_crowding_gap      DOUBLE PRECISION,
+    crowding_stretch           DOUBLE PRECISION,
+    crowding_zscore            DOUBLE PRECISION,
+    crowding_state             TEXT,
+    calc_version               TEXT NOT NULL,
+    extra_json                 JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at                 TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+SELECT create_hypertable('feat.long_short_ratio_feature', 'ts_bucket', if_not_exists => TRUE);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_long_short_ratio_feature_natural
+ON feat.long_short_ratio_feature(venue, symbol, bar_interval, ts_bucket);
+CREATE INDEX IF NOT EXISTS idx_long_short_ratio_feature_lookup
+ON feat.long_short_ratio_feature(symbol, bar_interval, ts_bucket DESC);
+
+CREATE TABLE IF NOT EXISTS feat.options_surface_feature (
+    ts_bucket                TIMESTAMPTZ NOT NULL,
+    bar_interval             INTERVAL NOT NULL,
+    venue                    TEXT NOT NULL DEFAULT 'binance',
+    symbol                   TEXT NOT NULL,
+    front_expiry_ts          TIMESTAMPTZ,
+    second_expiry_ts         TIMESTAMPTZ,
+    atm_strike_front         DOUBLE PRECISION,
+    atm_iv_front             DOUBLE PRECISION,
+    atm_iv_second            DOUBLE PRECISION,
+    atm_iv_30d_proxy         DOUBLE PRECISION,
+    atm_iv_regime            TEXT,
+    rr_25d_front             DOUBLE PRECISION,
+    rr_25d_second            DOUBLE PRECISION,
+    atm_iv_front_change      DOUBLE PRECISION,
+    rr_25d_front_change      DOUBLE PRECISION,
+    skew_state               TEXT,
+    term_structure_state     TEXT,
+    calc_version             TEXT NOT NULL,
+    extra_json               JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at               TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+SELECT create_hypertable('feat.options_surface_feature', 'ts_bucket', if_not_exists => TRUE);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_options_surface_feature_natural
+ON feat.options_surface_feature(venue, symbol, bar_interval, ts_bucket);
+CREATE INDEX IF NOT EXISTS idx_options_surface_feature_lookup
+ON feat.options_surface_feature(symbol, bar_interval, ts_bucket DESC);
+\endif
+
 -- 7.6 Whale trade rollups (market-separated by design) + threshold tracking
 CREATE TABLE IF NOT EXISTS feat.whale_trade_rollup (
     ts_bucket          TIMESTAMPTZ NOT NULL,
@@ -1155,6 +1411,7 @@ CREATE TABLE IF NOT EXISTS feat.indicator_snapshot (
     tags               TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
     created_at         TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+\if :is_orderflow
 CREATE TABLE IF NOT EXISTS feat.indicator_snapshot_blob (
     blob_hash         TEXT PRIMARY KEY,
     payload_json      JSONB NOT NULL,
@@ -1265,6 +1522,7 @@ SELECT
     tags,
     created_at
 FROM feat.indicator_snapshot;
+\endif
 SELECT create_hypertable('feat.indicator_snapshot', 'ts_snapshot', if_not_exists => TRUE);
 \if :is_orderflow
 CREATE UNIQUE INDEX IF NOT EXISTS idx_indicator_snapshot_idempotent
@@ -1272,6 +1530,10 @@ ON feat.indicator_snapshot(ts_snapshot, symbol, indicator_code, window_code);
 \endif
 CREATE INDEX IF NOT EXISTS idx_indicator_snapshot_lookup ON feat.indicator_snapshot(indicator_code, symbol, ts_snapshot DESC);
 CREATE INDEX IF NOT EXISTS idx_indicator_snapshot_window ON feat.indicator_snapshot(window_code, ts_snapshot DESC);
+\if :is_orderflow
+CREATE INDEX IF NOT EXISTS idx_indicator_snapshot_symbol_ts
+ON feat.indicator_snapshot(symbol, ts_snapshot);
+\endif
 -- Do NOT create payload_json GIN index by default on this write-hot table.
 -- It is extremely expensive for large JSON payloads (footprint/orderbook_depth)
 -- and was not used by runtime queries.
@@ -1787,6 +2049,9 @@ VALUES
 ('cvd_pack', 'CVD Pack Rolling 7D', 'flow', 'timeseries+pack', 'mixed', TRUE, 'Dual-market CVD pack + attribution fields'),
 ('whale_trades', 'Whale Trades', 'flow', 'timeseries+event', 'mixed', TRUE, 'Spot/Futures split statistics'),
 ('funding_rate', 'Funding Rate', 'risk', 'timeseries', 'futures', FALSE, 'Funding + mark price'),
+('open_interest', 'Open Interest', 'flow', 'timeseries+summary', 'futures', FALSE, '5m normalized OI history with 5m/15m/4h/1d/3d crowding-state windows'),
+('long_short_ratios', 'Long Short Ratios', 'flow', 'timeseries+summary', 'futures', FALSE, 'Binance global/top account/position long-short ratio windows'),
+('options_surface', 'Options Surface', 'flow', 'timeseries+summary', 'futures', FALSE, 'Binance options ATM IV, RR/skew, and term-structure state by 5m/15m/4h/1d/3d windows'),
 ('vpin', 'VPIN', 'flow', 'timeseries', 'mixed', TRUE, 'VPIN_fut vs VPIN_spot toxicity diff'),
 ('avwap', 'AVWAP', 'anchor', 'timeseries', 'mixed', TRUE, 'Futures AVWAP + Spot AVWAP cash anchor'),
 ('kline_history', 'Kline History', 'context', 'timeseries+pack', 'mixed', FALSE, 'Multi-timeframe OHLCV history pack for snapshot/LLM context'),

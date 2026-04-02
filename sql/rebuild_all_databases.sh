@@ -13,6 +13,10 @@ ORDERFLOW_OPS_DB="${ORDERFLOW_OPS_DB:-orderflow_ops}"
 
 OUTBOX_PARTITION_DAYS_AHEAD="${OUTBOX_PARTITION_DAYS_AHEAD:-7}"
 OUTBOX_PARTITION_DAYS_BACK="${OUTBOX_PARTITION_DAYS_BACK:-2}"
+ORDERFLOW_OUTBOX_PARTITION_DAYS_AHEAD="${ORDERFLOW_OUTBOX_PARTITION_DAYS_AHEAD:-$OUTBOX_PARTITION_DAYS_AHEAD}"
+ORDERFLOW_OUTBOX_PARTITION_DAYS_BACK="${ORDERFLOW_OUTBOX_PARTITION_DAYS_BACK:-$OUTBOX_PARTITION_DAYS_BACK}"
+ORDERFLOW_OPS_OUTBOX_PARTITION_DAYS_AHEAD="${ORDERFLOW_OPS_OUTBOX_PARTITION_DAYS_AHEAD:-$OUTBOX_PARTITION_DAYS_AHEAD}"
+ORDERFLOW_OPS_OUTBOX_PARTITION_DAYS_BACK="${ORDERFLOW_OPS_OUTBOX_PARTITION_DAYS_BACK:-30}"
 RECREATE_DATABASES="${RECREATE_DATABASES:-0}"
 
 psql_base=(
@@ -60,21 +64,33 @@ apply_schema() {
   local db_name="$1"
   local entry_file="$2"
   local is_orderflow="$3"
+  local outbox_partition_days_ahead="$4"
+  local outbox_partition_days_back="$5"
 
   "${psql_base[@]}" \
     -d "$db_name" \
     -v expected_db="$db_name" \
     -v is_orderflow="$is_orderflow" \
-    -v outbox_partition_days_ahead="$OUTBOX_PARTITION_DAYS_AHEAD" \
-    -v outbox_partition_days_back="$OUTBOX_PARTITION_DAYS_BACK" \
+    -v outbox_partition_days_ahead="$outbox_partition_days_ahead" \
+    -v outbox_partition_days_back="$outbox_partition_days_back" \
     -f "$entry_file"
 }
 
 ensure_database "$ORDERFLOW_DB"
 ensure_database "$ORDERFLOW_OPS_DB"
 
-apply_schema "$ORDERFLOW_DB" "$SCRIPT_DIR/rebuild_orderflow.sql" 1
-apply_schema "$ORDERFLOW_OPS_DB" "$SCRIPT_DIR/rebuild_orderflow_ops.sql" 0
+apply_schema \
+  "$ORDERFLOW_DB" \
+  "$SCRIPT_DIR/rebuild_orderflow.sql" \
+  1 \
+  "$ORDERFLOW_OUTBOX_PARTITION_DAYS_AHEAD" \
+  "$ORDERFLOW_OUTBOX_PARTITION_DAYS_BACK"
+apply_schema \
+  "$ORDERFLOW_OPS_DB" \
+  "$SCRIPT_DIR/rebuild_orderflow_ops.sql" \
+  0 \
+  "$ORDERFLOW_OPS_OUTBOX_PARTITION_DAYS_AHEAD" \
+  "$ORDERFLOW_OPS_OUTBOX_PARTITION_DAYS_BACK"
 
 echo "Rebuild complete:"
 echo "  - $ORDERFLOW_DB"
