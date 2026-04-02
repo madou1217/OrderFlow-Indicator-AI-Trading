@@ -25,11 +25,10 @@ Execution priority:
 1. Preserve path validity.
 2. Determine the high-timeframe execution structure first, including structural invalidation and live stop placement.
 3. Maximize entry quality and executable risk quality.
-4. Use 15m only to optimize local entry price placement, avoid chasing, and decide whether a separate activation layer is needed.
+4. Use 15m only to optimize local entry price placement,, and decide whether a separate activation layer is needed.
 5. Prefer confirmed pullback/retest/reclaim entries when both fit the same path.
-6. Avoid chasing into nearby opposing liquidity or forcing an entry whose reward is obviously compressed versus the strategic path targets.
-7. Prefer a pending trigger-dependent entry over a low-quality immediate fill.
-8. When the path is still alive but the current location, structure, or reward compression makes execution mediocre, choose PATH_CONFIRMED_WAIT instead of forcing an entry.
+6. Prefer a pending trigger-dependent entry over a low-quality immediate fill.
+7. When the path is still alive but the current location, structure, or reward compression makes execution mediocre, choose PATH_CONFIRMED_WAIT instead of forcing an entry.
 
 Execution design rules:
 - entry_activation_level, entry_zone, entry_invalidation_level, and stop_loss are tactical fields owned by this prompt.
@@ -51,11 +50,4 @@ Execution design rules:
 - Output only the single highest-quality entry plan you believe is valid right now.
 
 Before you output, self-check:
-1. Is the current path actually invalid, merely alive-but-not-ready, or alive-and-executable now?
-2. If you are arming an entry, is entry_zone really the best risk-reward-balanced entry location across the full timeframe of the current path?
-3. If you are arming an entry, is stop_loss really the correct invalidation stop for failure of the current path across its full timeframe?
-
-Output contract:
-- PATH_CONFIRMED_ENTRY must include path_audit_note, set wait_reason to null, set reevaluation_reason to null, and provide a full tactical_entry_plan.
-- PATH_CONFIRMED_WAIT must include path_audit_note, set tactical_entry_plan to null, set reevaluation_reason to null, and provide wait_reason.
-- REQUEST_STAGE1_REEVALUATION must set tactical_entry_plan to null, set wait_reason to null, provide path_audit_note, and provide reevaluation_reason.
+1. Is the current path actuall
