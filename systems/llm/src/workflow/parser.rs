@@ -891,13 +891,15 @@ fn validate_position_management_plan(
     expected_context_key: &str,
     expected_path_id: &str,
 ) -> Result<()> {
-    stage1_output
+    let current_stage1_path = stage1_output
         .current_path
         .as_ref()
         .ok_or_else(|| anyhow!("Stage2B requires Stage1 current_path"))?;
-    if plan.path_id != expected_path_id {
+    let path_matches_live_context = plan.path_id == expected_path_id;
+    let path_matches_current_stage1 = plan.path_id == current_stage1_path.id;
+    if !path_matches_live_context && !path_matches_current_stage1 {
         return Err(anyhow!(
-            "position_management_plan.path_id must match the current Stage2B context path_id"
+            "position_management_plan.path_id must match the current Stage2B context path_id or Stage1 current_path.id"
         ));
     }
     if plan.exposure_state != "in_position" {
@@ -1660,6 +1662,52 @@ mod tests {
         let parsed =
             parse_stage2b_output(value, &stage1_output, "ctx_1", "legacy_path").expect("parse");
         assert_eq!(parsed.position_management_plan.path_id, "legacy_path");
+    }
+
+    #[test]
+    fn stage2b_parser_allows_management_for_live_context_with_current_stage1_path_id() {
+        let stage1_output = sample_stage1_output();
+        let current_path_id = stage1_output
+            .current_path
+            .as_ref()
+            .expect("current_path")
+            .id
+            .clone();
+        let value = json!({
+            "stage2b_decision": "MANAGE_POSITION",
+            "position_management_plan": {
+                "path_id": current_path_id,
+                "exposure_state": "in_position",
+                "path_live_assessment": "degraded",
+                "path_assessment_reason": "roll the live position forward under the refreshed path",
+                "actions": [{
+                    "action_type": "move_stop",
+                    "context_key": "ctx_1",
+                    "path_id": stage1_output.current_path.as_ref().expect("current_path").id,
+                    "trigger_condition": {
+                        "trigger_type": "price_above",
+                        "trigger_price": 2052.6
+                    },
+                    "execution_price": null,
+                    "add_ratio": null,
+                    "reuse_current_entry_template": null,
+                    "reduce_ratio": null,
+                    "new_stop_loss": 2044.2,
+                    "reuse_current_bracket_template": true,
+                    "take_profit_1": null,
+                    "take_profit_2": null,
+                    "reason": "protect the runner under the refreshed path"
+                }],
+                "management_note": "keep managing the same live context with the refreshed path"
+            }
+        });
+
+        let parsed =
+            parse_stage2b_output(value, &stage1_output, "ctx_1", "legacy_path").expect("parse");
+        assert_eq!(
+            parsed.position_management_plan.path_id,
+            stage1_output.current_path.as_ref().expect("current_path").id
+        );
     }
 
     #[test]

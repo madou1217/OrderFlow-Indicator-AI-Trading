@@ -92,11 +92,6 @@ pub fn adapt_management_action(
             "management action context_key must match persisted entry snapshot"
         ));
     }
-    if snapshot.path_id != action.path_id {
-        return Err(anyhow!(
-            "management action path_id must match persisted entry snapshot"
-        ));
-    }
     if let Some(execution_price) = action.execution_price {
         if !execution_price.is_finite() {
             return Err(anyhow!("management action execution_price must be finite"));
@@ -274,7 +269,65 @@ mod tests {
     }
 
     #[test]
-    fn management_adapter_rejects_path_mismatch() {
+    fn management_adapter_allows_path_roll_forward_with_same_live_context() {
+        let snapshot = EntrySnapshot {
+            symbol: "ETHUSDT".to_string(),
+            context_key: "ETHUSDT:LONG:path_a".to_string(),
+            path_id: "path_a".to_string(),
+            side: "LONG".to_string(),
+            entry_profile: Some("reclaim_then_hold".to_string()),
+            intent_mode: Some("immediate".to_string()),
+            entry_activation_level: Some(PriceZone {
+                low: 100.0,
+                high: 101.0,
+                timeframe: None,
+                label: None,
+                reason: None,
+            }),
+            entry_zone: Some(PriceZone {
+                low: 100.0,
+                high: 102.0,
+                timeframe: None,
+                label: None,
+                reason: None,
+            }),
+            entry_invalidation_level: Some(PriceZone {
+                low: 99.0,
+                high: 99.5,
+                timeframe: None,
+                label: None,
+                reason: None,
+            }),
+            max_drift_pct: Some(0.2),
+            leverage: Some(6),
+            stop_loss: 99.0,
+            take_profit_1: 104.0,
+            take_profit_2: 107.0,
+            allowed_stop_loss_levels: vec![99.0, 100.0],
+            allowed_take_profit_levels: vec![104.0, 107.0],
+            tp1_realized: false,
+            applied_driver_deterioration_signals: vec![],
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let action = ManagementAction {
+            action_type: "MOVE_STOP".to_string(),
+            context_key: snapshot.context_key.clone(),
+            path_id: "path_b".to_string(),
+            execution_price: None,
+            reduce_ratio: None,
+            new_stop_loss: Some(100.0),
+            take_profit_1: None,
+            take_profit_2: None,
+            reason: None,
+        };
+        let adapted = adapt_management_action(&action, &snapshot).expect("adapt");
+        assert_eq!(adapted.action_type, "MOVE_STOP");
+        assert_eq!(adapted.new_stop_loss, Some(100.0));
+    }
+
+    #[test]
+    fn management_adapter_rejects_context_mismatch() {
         let snapshot = EntrySnapshot {
             symbol: "ETHUSDT".to_string(),
             context_key: "ETHUSDT:LONG:path_a".to_string(),
@@ -317,9 +370,9 @@ mod tests {
         };
         let action = ManagementAction {
             action_type: "FLATTEN_POSITION".to_string(),
-            context_key: snapshot.context_key.clone(),
+            context_key: "ETHUSDT:LONG:path_b".to_string(),
             path_id: "path_b".to_string(),
-            execution_price: None,
+            execution_price: Some(98.5),
             reduce_ratio: None,
             new_stop_loss: None,
             take_profit_1: None,
