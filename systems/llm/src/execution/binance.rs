@@ -1618,99 +1618,60 @@ pub async fn execute_workflow_management_action(
                 return Ok(report);
             }
             let symbol_filters = fetch_symbol_filters(http_client, api_config, symbol).await?;
-            if let Some(execution_price) = action.execution_price {
-                for position in &matching_positions {
-                    let Some(reduce_plan) = plan_workflow_reduce_quantity(
-                        position,
-                        reduce_ratio,
-                        &symbol_filters,
-                        exec_config,
-                    ) else {
-                        continue;
-                    };
-                    if reduce_plan.promoted_to_full_close {
-                        info!(
-                            symbol,
-                            context_key = %snapshot.context_key,
-                            path_id = %snapshot.path_id,
-                            live_position_qty = position.position_amt.abs(),
-                            reduce_ratio,
-                            planned_reduce_qty = reduce_plan.quantity,
-                            mark_price = position.mark_price,
-                            leverage = position.leverage,
-                            dust_margin_threshold_usdt = exec_config.reduce_dust_margin_usdt,
-                            "workflow reduce promoted to full close to avoid dust remainder"
-                        );
-                    }
-                    if let Some(reduce_order_id) = place_workflow_reduce_exit_for_position(
-                        http_client,
-                        api_config,
-                        exec_config,
+            for position in &matching_positions {
+                let Some(reduce_plan) = plan_workflow_reduce_quantity(
+                    position,
+                    reduce_ratio,
+                    &symbol_filters,
+                    exec_config,
+                ) else {
+                    continue;
+                };
+                if reduce_plan.promoted_to_full_close {
+                    info!(
                         symbol,
-                        position,
-                        execution_price,
-                        reduce_plan.quantity,
-                        &symbol_filters,
-                    )
-                    .await?
-                    {
-                        report.reduce_order_ids.push(reduce_order_id);
-                    }
+                        context_key = %snapshot.context_key,
+                        path_id = %snapshot.path_id,
+                        live_position_qty = position.position_amt.abs(),
+                        reduce_ratio,
+                        planned_reduce_qty = reduce_plan.quantity,
+                        mark_price = position.mark_price,
+                        leverage = position.leverage,
+                        dust_margin_threshold_usdt = exec_config.reduce_dust_margin_usdt,
+                        "workflow reduce promoted to full close to avoid dust remainder"
+                    );
                 }
-            } else {
-                for position in &matching_positions {
-                    let Some(reduce_plan) = plan_workflow_reduce_quantity(
-                        position,
-                        reduce_ratio,
-                        &symbol_filters,
-                        exec_config,
-                    ) else {
-                        continue;
-                    };
-                    if reduce_plan.promoted_to_full_close {
-                        info!(
-                            symbol,
-                            context_key = %snapshot.context_key,
-                            path_id = %snapshot.path_id,
-                            live_position_qty = position.position_amt.abs(),
-                            reduce_ratio,
-                            planned_reduce_qty = reduce_plan.quantity,
-                            mark_price = position.mark_price,
-                            leverage = position.leverage,
-                            dust_margin_threshold_usdt = exec_config.reduce_dust_margin_usdt,
-                            "workflow reduce promoted to full close to avoid dust remainder"
-                        );
-                    }
-                    let reduce_qty_str =
-                        format_decimal(reduce_plan.quantity, symbol_filters.qty_precision);
-                    let reduce_side = if position.position_amt > 0.0 {
-                        "SELL"
-                    } else {
-                        "BUY"
-                    };
-                    let reduce_order_id = place_market_order_with_side_reduce(
-                        http_client,
-                        api_config,
-                        exec_config,
-                        symbol,
-                        reduce_side,
-                        target_position_side,
-                        &reduce_qty_str,
-                        "workflow_reduce",
-                    )
-                    .await?;
-                    report.reduce_order_ids.push(reduce_order_id);
-                    if let Ok(pnl) = fetch_order_realized_pnl(
-                        http_client,
-                        api_config,
-                        exec_config,
-                        symbol,
-                        reduce_order_id,
-                    )
-                    .await
-                    {
-                        report.realized_pnl_usdt += pnl;
-                    }
+                let reduce_qty_str =
+                    format_decimal(reduce_plan.quantity, symbol_filters.qty_precision);
+                let reduce_side = if position.position_amt > 0.0 {
+                    "SELL"
+                } else {
+                    "BUY"
+                };
+                // The watcher already satisfied the reduce trigger. Execute immediately at market
+                // instead of placing a second trigger-based STOP_MARKET order.
+                let reduce_order_id = place_market_order_with_side_reduce(
+                    http_client,
+                    api_config,
+                    exec_config,
+                    symbol,
+                    reduce_side,
+                    target_position_side,
+                    &reduce_qty_str,
+                    "workflow_reduce",
+                )
+                .await?;
+                report.reduce_order_ids.push(reduce_order_id);
+                if let Ok(pnl) = fetch_order_realized_pnl(
+                    http_client,
+                    api_config,
+                    exec_config,
+                    symbol,
+                    reduce_order_id,
+                )
+                .await
+                {
+                    report.realized_pnl_usdt += pnl;
                 }
             }
 
@@ -1721,10 +1682,12 @@ pub async fn execute_workflow_management_action(
                 &snapshot.side,
                 exec_config.hedge_mode,
             );
-            let cancel_candidates = collect_exit_orders_for_side(
+            let just_created_reduce_order_ids = report.reduce_order_ids.iter().copied().collect();
+            let cancel_candidates = collect_exit_orders_for_side_excluding(
                 &refreshed_state.open_orders,
                 target_position_side,
                 exec_config.hedge_mode,
+                &just_created_reduce_order_ids,
             );
             report.canceled_open_orders = cancel_tracked_exit_orders(
                 http_client,
@@ -1980,6 +1943,18 @@ fn collect_exit_orders_for_side(
     collect_tracked_orders_for_position_side(open_orders, position_side, hedge_mode, false, true)
 }
 
+fn collect_exit_orders_for_side_excluding(
+    open_orders: &[OpenOrderSnapshot],
+    position_side: &str,
+    hedge_mode: bool,
+    excluded_order_ids: &HashSet<i64>,
+) -> Vec<TrackedExitOrder> {
+    collect_exit_orders_for_side(open_orders, position_side, hedge_mode)
+        .into_iter()
+        .filter(|order| !excluded_order_ids.contains(&order.order_id))
+        .collect()
+}
+
 fn collect_exit_orders_for_side_and_kind(
     open_orders: &[OpenOrderSnapshot],
     position_side: &str,
@@ -2071,49 +2046,6 @@ async fn place_workflow_exit_for_position(
         &trigger_price,
     )
     .await
-}
-
-async fn place_workflow_reduce_exit_for_position(
-    http_client: &Client,
-    api_config: &BinanceApiConfig,
-    exec_config: &LlmExecutionConfig,
-    symbol: &str,
-    position: &ActivePositionSnapshot,
-    trigger_price: f64,
-    reduce_qty: f64,
-    symbol_filters: &SymbolFilters,
-) -> Result<Option<i64>> {
-    let position_side = effective_active_position_side(position, exec_config.hedge_mode);
-    if reduce_qty < symbol_filters.min_qty {
-        return Ok(None);
-    }
-    let quantity = format_decimal(reduce_qty, symbol_filters.qty_precision);
-    let decision = ExecutionSide::from_position_amt(position.position_amt);
-    let quantized_price = quantize_exit_price(
-        trigger_price,
-        symbol_filters.tick_size,
-        symbol_filters.price_precision,
-        decision,
-        false,
-    );
-    let trigger_price = format_decimal(
-        quantized_price.max(symbol_filters.tick_size),
-        symbol_filters.price_precision,
-    );
-    let exit_side = decision.exit_order_side();
-    place_close_order(
-        http_client,
-        api_config,
-        exec_config,
-        symbol,
-        exit_side,
-        position_side,
-        "STOP_MARKET",
-        &quantity,
-        &trigger_price,
-    )
-    .await
-    .map(Some)
 }
 
 pub(crate) async fn cleanup_orphan_exit_orders_for_symbol(
@@ -4805,6 +4737,65 @@ mod tests {
         assert!(!orphan_orders[0].is_algo_order);
         assert_eq!(orphan_orders[1].order_id, 202);
         assert!(orphan_orders[1].is_algo_order);
+    }
+
+    #[test]
+    fn collect_exit_orders_for_side_excluding_skips_newly_created_reduce_order_ids() {
+        let open_orders = vec![
+            OpenOrderSnapshot {
+                order_id: 601,
+                side: "BUY".to_string(),
+                position_side: "SHORT".to_string(),
+                order_type: "TAKE_PROFIT_MARKET".to_string(),
+                status: "NEW".to_string(),
+                orig_qty: 0.18,
+                executed_qty: 0.0,
+                price: 0.0,
+                stop_price: 2010.0,
+                close_position: true,
+                reduce_only: true,
+                is_algo_order: false,
+            },
+            OpenOrderSnapshot {
+                order_id: 602,
+                side: "BUY".to_string(),
+                position_side: "SHORT".to_string(),
+                order_type: "STOP_MARKET".to_string(),
+                status: "NEW".to_string(),
+                orig_qty: 0.18,
+                executed_qty: 0.0,
+                price: 0.0,
+                stop_price: 2050.0,
+                close_position: true,
+                reduce_only: true,
+                is_algo_order: true,
+            },
+            OpenOrderSnapshot {
+                order_id: 603,
+                side: "BUY".to_string(),
+                position_side: "SHORT".to_string(),
+                order_type: "STOP_MARKET".to_string(),
+                status: "NEW".to_string(),
+                orig_qty: 0.09,
+                executed_qty: 0.0,
+                price: 0.0,
+                stop_price: 2045.2,
+                close_position: false,
+                reduce_only: true,
+                is_algo_order: true,
+            },
+        ];
+
+        let filtered = collect_exit_orders_for_side_excluding(
+            &open_orders,
+            "SHORT",
+            true,
+            &HashSet::from([603]),
+        );
+
+        assert_eq!(filtered.len(), 2);
+        assert_eq!(filtered[0].order_id, 601);
+        assert_eq!(filtered[1].order_id, 602);
     }
 
     #[test]

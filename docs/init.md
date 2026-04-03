@@ -108,3 +108,25 @@ sudo systemctl enable orderflow-api
 cd /data
 PGPASSWORD=your_password bash sql/rebuild_all_databases.sh
 ```
+
+
+
+
+1.请帮我从这个库https://github.com/uniteonline/OrderFlow-Indicator-AI-Trading下载代码到/data下，并把目录下的所有代码放到/data,不要根目录：OrderFlow-Indicator-AI-Trading
+
+2.我现在需要你按/data/docs/init.md 的说明和/data/docs/mq_topology.md，帮我下载rabbitmq，并创建vhost，队列，以及队列的ttl，要求与config.yaml和配置严格一致
+
+3.我现在需要你按/data/docs/init.md 的说明和/data/sql/rebuild_all_databases.sh以及/data/sql/README_rebuild.md，帮我下载postgresql并安装timescaledb插件，然后按要求创建表，索引，触发器
+
+4.请帮我把/data/codex-proxy-20260402-105732.tar.gz 解包到/home/tools/codex-proxy目录下，把目录下的所有代码放到/home/tools/codex-proxy.
+
+5.帮我把/home/tools/codex-proxy目录下的代码Npm install一下
+
+6.帮我在本机创建一个ssh的key，我要加到github后台，便于后续对仓库直接管理
+
+7.帮我创建一个16GB的swap
+
+8.帮我安装shadowshock，在本机启动1080的转发，配置在/data/docs/init.md里
+
+9.我需要你按init.md的服务配置，帮我在系统内创建好4个服务，并编译和启动以下2个orderflow-market-data-ingestor和orderflow-indicator-engine服务
+
