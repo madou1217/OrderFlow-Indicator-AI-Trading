@@ -1425,7 +1425,8 @@ AS $$
 DECLARE
     ref_meta jsonb;
     chunk_meta jsonb;
-    blob_hash text;
+    target_blob_hash text;
+    chunk_blob_hash text;
     hydrated jsonb;
     child_key text;
     child_value jsonb;
@@ -1439,13 +1440,13 @@ BEGIN
     IF jsonb_typeof(payload) = 'object' THEN
         ref_meta := payload -> '__snapshot_blob_ref_v1';
         IF jsonb_typeof(ref_meta) = 'object' AND (ref_meta ? 'hash') THEN
-            blob_hash := ref_meta ->> 'hash';
+            target_blob_hash := ref_meta ->> 'hash';
             SELECT b.payload_json
               INTO hydrated
               FROM feat.indicator_snapshot_blob b
-             WHERE b.blob_hash = blob_hash;
+             WHERE b.blob_hash = target_blob_hash;
             IF hydrated IS NULL THEN
-                RAISE EXCEPTION 'missing indicator snapshot blob hash=%', blob_hash;
+                RAISE EXCEPTION 'missing indicator snapshot blob hash=%', target_blob_hash;
             END IF;
             RETURN feat.hydrate_indicator_snapshot_payload(hydrated);
         END IF;
@@ -1453,19 +1454,19 @@ BEGIN
         chunk_meta := payload -> '__snapshot_blob_chunks_v1';
         IF jsonb_typeof(chunk_meta) = 'object' AND jsonb_typeof(chunk_meta -> 'chunk_hashes') = 'array' THEN
             out_arr := '[]'::jsonb;
-            FOR blob_hash IN
+            FOR chunk_blob_hash IN
                 SELECT value
                 FROM jsonb_array_elements_text(chunk_meta -> 'chunk_hashes')
             LOOP
                 SELECT b.payload_json
                   INTO hydrated
                   FROM feat.indicator_snapshot_blob b
-                 WHERE b.blob_hash = blob_hash;
+                 WHERE b.blob_hash = chunk_blob_hash;
                 IF hydrated IS NULL THEN
-                    RAISE EXCEPTION 'missing indicator snapshot chunk hash=%', blob_hash;
+                    RAISE EXCEPTION 'missing indicator snapshot chunk hash=%', chunk_blob_hash;
                 END IF;
                 IF jsonb_typeof(hydrated) <> 'array' THEN
-                    RAISE EXCEPTION 'indicator snapshot chunk blob is not an array hash=%', blob_hash;
+                    RAISE EXCEPTION 'indicator snapshot chunk blob is not an array hash=%', chunk_blob_hash;
                 END IF;
                 FOR child_value IN
                     SELECT value

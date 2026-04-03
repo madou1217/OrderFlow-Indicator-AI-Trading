@@ -1,12 +1,3 @@
-CREATE TABLE IF NOT EXISTS feat.indicator_snapshot_blob (
-    blob_hash TEXT PRIMARY KEY,
-    payload_json JSONB NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-COMMENT ON TABLE feat.indicator_snapshot_blob IS
-'Deduplicated large indicator snapshot subtrees referenced from feat.indicator_snapshot.payload_json.';
-
 CREATE OR REPLACE FUNCTION feat.hydrate_indicator_snapshot_payload(payload jsonb)
 RETURNS jsonb
 LANGUAGE plpgsql
@@ -97,20 +88,3 @@ BEGIN
     RETURN payload;
 END
 $$;
-
-CREATE OR REPLACE VIEW feat.v_indicator_snapshot_hydrated AS
-SELECT
-    ts_snapshot,
-    bar_interval,
-    venue,
-    symbol,
-    market_scope,
-    indicator_code,
-    window_code,
-    primary_market,
-    param_set_id,
-    calc_version,
-    feat.hydrate_indicator_snapshot_payload(payload_json) AS payload_json,
-    tags,
-    created_at
-FROM feat.indicator_snapshot;
