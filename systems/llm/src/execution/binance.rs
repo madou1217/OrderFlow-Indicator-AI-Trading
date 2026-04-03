@@ -167,6 +167,15 @@ pub struct ManagementExecutionReport {
     pub realized_pnl_usdt: f64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OrphanExitCleanupResult {
+    pub canceled_any: bool,
+    pub active_position_count: usize,
+    pub open_order_count: usize,
+    pub open_algo_order_count: usize,
+    pub orphan_exit_order_count: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct WorkflowReducePlan {
     quantity: f64,
@@ -786,11 +795,15 @@ async fn run_account_ws_listener_loop(
                             )
                             .await
                             {
-                                Ok(true) => info!(
+                                Ok(result) => info!(
                                     symbol = %symbol,
-                                    "account_update_cleanup: canceled orphan exit orders after flatten"
+                                    active_position_count = result.active_position_count,
+                                    open_order_count = result.open_order_count,
+                                    open_algo_order_count = result.open_algo_order_count,
+                                    orphan_exit_order_count = result.orphan_exit_order_count,
+                                    canceled_orphan_exit_orders = result.canceled_any,
+                                    "account_update_cleanup: orphan exit cleanup completed after flatten"
                                 ),
-                                Ok(false) => {}
                                 Err(err) => warn!(
                                     symbol = %symbol,
                                     error = %err,
@@ -2053,10 +2066,27 @@ pub(crate) async fn cleanup_orphan_exit_orders_for_symbol(
     api_config: &BinanceApiConfig,
     exec_config: &LlmExecutionConfig,
     symbol: &str,
-) -> Result<bool> {
+) -> Result<OrphanExitCleanupResult> {
     let state = fetch_symbol_trading_state(http_client, api_config, exec_config, symbol).await?;
     let orphan_orders = collect_orphan_exit_orders_to_cancel(&state, exec_config.hedge_mode);
-    cancel_tracked_exit_orders(http_client, api_config, exec_config, symbol, &orphan_orders).await
+    let open_algo_order_count = state
+        .open_orders
+        .iter()
+        .filter(|order| order.is_algo_order)
+        .count();
+    let canceled_any =
+        cancel_tracked_exit_orders(http_client, api_config, exec_config, symbol, &orphan_orders)
+            .await?;
+    Ok(OrphanExitCleanupResult {
+        canceled_any,
+        active_position_count: state.active_positions.len(),
+        open_order_count: state
+            .open_orders
+            .len()
+            .saturating_sub(open_algo_order_count),
+        open_algo_order_count,
+        orphan_exit_order_count: orphan_orders.len(),
+    })
 }
 
 fn parse_numeric_id(value: &Value, keys: &[&str], label: &str) -> Result<i64> {

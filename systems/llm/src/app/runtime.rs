@@ -3,10 +3,11 @@ use crate::app::config::RootConfig;
 use crate::app::telegram::{TelegramOperator, TradeSignalNotification};
 use crate::app::x::XOperator;
 use crate::execution::binance::{
-    cancel_workflow_pending_entry_orders, ensure_account_trading_ws_started,
-    execute_workflow_execution_intent, execute_workflow_management_action,
-    fetch_symbol_trading_state, fetch_symbol_trading_state_for_fast_path, ActivePositionSnapshot,
-    ExecutionReport, ManagementExecutionReport, OpenOrderSnapshot,
+    cancel_workflow_pending_entry_orders, cleanup_orphan_exit_orders_for_symbol,
+    ensure_account_trading_ws_started, execute_workflow_execution_intent,
+    execute_workflow_management_action, fetch_symbol_trading_state,
+    fetch_symbol_trading_state_for_fast_path, ActivePositionSnapshot, ExecutionReport,
+    ManagementExecutionReport, OpenOrderSnapshot,
     TradeExecutionBlockedByCurrentPriceBeyondStopLoss, TradingStateSnapshot,
 };
 use crate::execution::intent_adapter::{adapt_execution_intent, adapt_management_action};
@@ -309,6 +310,29 @@ pub async fn run(ctx: AppContext) -> Result<()> {
         &ctx.config.api.binance,
         &ctx.config.llm.execution,
     );
+    match cleanup_orphan_exit_orders_for_symbol(
+        &ctx.http_client,
+        &ctx.config.api.binance,
+        &ctx.config.llm.execution,
+        &ctx.config.llm.symbol,
+    )
+    .await
+    {
+        Ok(result) => info!(
+            symbol = %ctx.config.llm.symbol,
+            active_position_count = result.active_position_count,
+            open_order_count = result.open_order_count,
+            open_algo_order_count = result.open_algo_order_count,
+            orphan_exit_order_count = result.orphan_exit_order_count,
+            canceled_orphan_exit_orders = result.canceled_any,
+            "llm startup orphan-exit cleanup completed"
+        ),
+        Err(err) => warn!(
+            symbol = %ctx.config.llm.symbol,
+            error = %err,
+            "llm startup orphan-exit cleanup failed"
+        ),
+    }
 
     if ctx.config.llm.purge_queue_on_start {
         let purged = ctx
