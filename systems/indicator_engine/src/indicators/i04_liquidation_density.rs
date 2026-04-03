@@ -13,12 +13,14 @@ use std::collections::{BTreeMap, HashSet};
 
 const LONG_PEAK_PROMINENCE_FRACTION: f64 = 0.03;
 const SHORT_PEAK_PROMINENCE_FRACTION: f64 = 0.03;
-const WINDOW_SPECS: [(&str, i64); 5] = [
+const WINDOW_SPECS: [(&str, i64); 7] = [
     ("15m", 15),
     ("1h", 60),
     ("4h", 240),
     ("1d", 1440),
     ("3d", 4320),
+    ("7d", 10_080),
+    ("30d", 43_200),
 ];
 const RAW_AUDIT_TOP_LONG_LEVELS: usize = 16;
 const RAW_AUDIT_TOP_SHORT_LEVELS: usize = 16;

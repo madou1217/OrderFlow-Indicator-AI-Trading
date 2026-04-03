@@ -1,8 +1,11 @@
 use crate::indicators::context::{
-    clip01, IndicatorComputation, IndicatorContext, IndicatorLevelRow, IndicatorSnapshotRow,
+    clip01, daily_window_days, window_code_minutes as shared_window_code_minutes,
+    IndicatorComputation, IndicatorContext, IndicatorLevelRow, IndicatorSnapshotRow,
     KlineHistoryBar,
 };
-use crate::indicators::i19_kline_history::build_interval_bar_records;
+use crate::indicators::i19_kline_history::{
+    build_interval_bar_records, build_interval_bar_records_from_records,
+};
 use crate::indicators::indicator_trait::Indicator;
 use chrono::{DateTime, Duration, Utc};
 use serde_json::{json, Map, Value};
@@ -165,27 +168,37 @@ fn closed_htf_bars(
     tf: &'static str,
     current_minute_close: DateTime<Utc>,
 ) -> Vec<KlineHistoryBar> {
-    let tf_minutes = match tf {
-        "15m" => 15,
-        "4h" => 240,
-        "1d" => 1440,
-        "3d" => 4320,
-        _ => return Vec::new(),
+    let Some(tf_minutes) = shared_window_code_minutes(tf) else {
+        return Vec::new();
     };
-    let mut merged = BTreeMap::new();
-    for bar in fvg_db_bars(ctx, tf) {
-        merged.insert(bar.open_time, bar.clone());
-    }
-    for bar in build_interval_bar_records(
-        &ctx.history_futures,
-        tf_minutes,
-        usize::MAX,
-        current_minute_close,
-    ) {
-        merged.insert(bar.open_time, bar);
-    }
-    merged
-        .into_values()
+    let bars = if daily_window_days(tf).unwrap_or(0) > 1 {
+        let merged_daily = merge_bars(
+            build_interval_bar_records(
+                &ctx.history_futures,
+                1440,
+                usize::MAX,
+                current_minute_close,
+            ),
+            &ctx.kline_history_futures_1d_db,
+        );
+        build_interval_bar_records_from_records(
+            &merged_daily,
+            tf_minutes,
+            usize::MAX,
+            current_minute_close,
+        )
+    } else {
+        merge_bars(
+            build_interval_bar_records(
+                &ctx.history_futures,
+                tf_minutes,
+                usize::MAX,
+                current_minute_close,
+            ),
+            fvg_db_bars(ctx, tf),
+        )
+    };
+    bars.into_iter()
         .filter(|bar| {
             bar.is_closed
                 && bar.open.is_some()
@@ -194,6 +207,20 @@ fn closed_htf_bars(
                 && bar.close.is_some()
         })
         .collect()
+}
+
+fn merge_bars(
+    mut in_mem: Vec<KlineHistoryBar>,
+    db_rows: &[KlineHistoryBar],
+) -> Vec<KlineHistoryBar> {
+    let mut merged = BTreeMap::new();
+    for bar in db_rows {
+        merged.insert(bar.open_time, bar.clone());
+    }
+    for bar in in_mem.drain(..) {
+        merged.insert(bar.open_time, bar);
+    }
+    merged.into_values().collect()
 }
 
 fn fvg_db_bars<'a>(ctx: &'a IndicatorContext, tf: &str) -> &'a [KlineHistoryBar] {
@@ -511,6 +538,8 @@ fn as_fvg_window(code: &str) -> Option<&'static str> {
         "4h" => Some("4h"),
         "1d" => Some("1d"),
         "3d" => Some("3d"),
+        "7d" => Some("7d"),
+        "30d" => Some("30d"),
         _ => None,
     }
 }

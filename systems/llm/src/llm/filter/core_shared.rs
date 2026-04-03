@@ -26,17 +26,6 @@ pub(super) enum FootprintMode {
     Defensive,
 }
 
-pub(super) fn insert_full_indicator(
-    target: &mut Map<String, Value>,
-    source: &Map<String, Value>,
-    code: &str,
-) {
-    if let Some(indicator) = source.get(code) {
-        let payload = indicator.get("payload").cloned().unwrap_or(Value::Null);
-        target.insert(code.to_string(), rebuild_indicator(indicator, payload));
-    }
-}
-
 pub(super) fn insert_filtered_indicator<F>(
     target: &mut Map<String, Value>,
     source: &Map<String, Value>,
@@ -215,50 +204,42 @@ pub(super) fn filter_avwap(payload: &Value, limits: &[(&str, usize)]) -> Value {
         return Value::Null;
     };
     let mut result = Map::new();
-    copy_fields(
-        &mut result,
-        payload,
-        &[
-            "anchor_ts",
-            "avwap_fut",
-            "avwap_spot",
-            "fut_last_price",
-            "fut_mark_price",
-            "lookback",
-            "price_minus_avwap_fut",
-            "price_minus_spot_avwap_fut",
-            "price_minus_spot_avwap_futmark",
-            "xmk_avwap_gap_f_minus_s",
-            "zavwap_gap",
-        ],
-    );
+    let Some(by_window) = payload.get("by_window").and_then(Value::as_object) else {
+        return Value::Object(result);
+    };
 
-    if let Some(series_by_window) = payload.get("series_by_window").and_then(Value::as_object) {
-        let mut filtered_series = Map::new();
-        for (window, limit) in limits {
-            let Some(series) = series_by_window.get(*window).and_then(Value::as_array) else {
-                continue;
-            };
-            let filtered = take_last_n(series, *limit)
-                .into_iter()
-                .filter_map(|entry| entry.as_object().cloned())
-                .map(|entry| {
-                    let mut filtered_entry = Map::new();
-                    copy_fields(
-                        &mut filtered_entry,
-                        &entry,
-                        &["ts", "avwap_fut", "avwap_spot", "xmk_avwap_gap_f_minus_s"],
-                    );
-                    Value::Object(filtered_entry)
-                })
-                .collect::<Vec<_>>();
-            filtered_series.insert((*window).to_string(), Value::Array(filtered));
-        }
-        result.insert(
-            "series_by_window".to_string(),
-            Value::Object(filtered_series),
+    let mut filtered_windows = Map::new();
+    for (window, _) in limits {
+        let Some(window_value) = by_window.get(*window).and_then(Value::as_object) else {
+            continue;
+        };
+        let mut filtered_window = Map::new();
+        copy_fields(
+            &mut filtered_window,
+            window_value,
+            &[
+                "window_code",
+                "lookback",
+                "lookback_minutes",
+                "anchor_ts",
+                "window_semantics",
+                "observed_minutes",
+                "missing_minutes",
+                "is_ready",
+                "avwap_fut",
+                "avwap_spot",
+                "fut_last_price",
+                "fut_mark_price",
+                "price_minus_avwap_fut",
+                "price_minus_spot_avwap_fut",
+                "price_minus_spot_avwap_futmark",
+                "xmk_avwap_gap_f_minus_s",
+                "zavwap_gap",
+            ],
         );
+        filtered_windows.insert((*window).to_string(), Value::Object(filtered_window));
     }
+    result.insert("by_window".to_string(), Value::Object(filtered_windows));
 
     Value::Object(result)
 }
@@ -532,34 +513,119 @@ pub(super) fn filter_cvd_pack_entry_v3(payload: &Value, limits: &[(&str, usize)]
 
     if let Some(by_window) = payload.get("by_window").and_then(Value::as_object) {
         let mut filtered_windows = Map::new();
-        for (window, limit) in limits {
+        for (window, _) in limits {
             let Some(window_value) = by_window.get(*window).and_then(Value::as_object) else {
                 continue;
             };
-            let series = window_value
-                .get("series")
-                .and_then(Value::as_array)
-                .map(|series| take_last_n(series, *limit))
-                .unwrap_or_default()
-                .into_iter()
-                .filter_map(|entry| entry.as_object().cloned())
-                .map(|entry| {
-                    let mut filtered_entry = Map::new();
+            let mut filtered_window = Map::new();
+            copy_fields(
+                &mut filtered_window,
+                window_value,
+                &["window", "window_semantics", "requested_minutes"],
+            );
+
+            if let Some(current_window) = window_value
+                .get("current_window")
+                .and_then(Value::as_object)
+            {
+                let mut filtered_current_window = Map::new();
+                copy_fields(
+                    &mut filtered_current_window,
+                    current_window,
+                    &[
+                        "window_start",
+                        "window_end",
+                        "requested_minutes",
+                        "window_semantics",
+                        "observed_minutes_fut",
+                        "observed_minutes_spot",
+                        "missing_minutes_fut",
+                        "missing_minutes_spot",
+                        "is_ready",
+                        "compact_series_policy",
+                        "compact_series_point_count",
+                        "compact_series_minute_point_count",
+                        "compact_series_day_point_count",
+                    ],
+                );
+
+                if let Some(point) = current_window.get("point").and_then(Value::as_object) {
+                    let mut filtered_point = Map::new();
                     copy_fields(
-                        &mut filtered_entry,
-                        &entry,
+                        &mut filtered_point,
+                        point,
                         &[
                             "ts",
                             "delta_fut",
                             "delta_spot",
-                            "cvd_7d_fut",
-                            "xmk_delta_gap_s_minus_f",
+                            "relative_delta_fut",
+                            "relative_delta_spot",
+                            "cvd_window_fut",
+                            "cvd_window_spot",
                         ],
                     );
-                    Value::Object(filtered_entry)
-                })
-                .collect::<Vec<_>>();
-            filtered_windows.insert((*window).to_string(), json!({ "series": series }));
+                    let delta_gap = point
+                        .get("delta_spot")
+                        .and_then(Value::as_f64)
+                        .zip(point.get("delta_fut").and_then(Value::as_f64))
+                        .map(|(spot, fut)| spot - fut);
+                    if let Some(delta_gap) = delta_gap {
+                        filtered_point
+                            .insert("xmk_delta_gap_s_minus_f".to_string(), json!(delta_gap));
+                    }
+                    filtered_current_window
+                        .insert("point".to_string(), Value::Object(filtered_point));
+                }
+
+                filtered_window.insert(
+                    "current_window".to_string(),
+                    Value::Object(filtered_current_window),
+                );
+            }
+            filtered_windows.insert((*window).to_string(), Value::Object(filtered_window));
+        }
+        result.insert("by_window".to_string(), Value::Object(filtered_windows));
+    }
+
+    Value::Object(result)
+}
+
+pub(super) fn filter_whale_trades_recent_windows(payload: &Value) -> Value {
+    let Some(payload) = payload.as_object() else {
+        return Value::Null;
+    };
+    let mut result = Map::new();
+    copy_fields(&mut result, payload, &["threshold_usdt"]);
+
+    if let Some(by_window) = payload.get("by_window").and_then(Value::as_object) {
+        let mut filtered_windows = Map::new();
+        for window in ["15m", "1h", "4h", "1d", "3d"] {
+            let Some(window_value) = by_window.get(window).and_then(Value::as_object) else {
+                continue;
+            };
+            let mut filtered_window = Map::new();
+            copy_fields(
+                &mut filtered_window,
+                window_value,
+                &[
+                    "window",
+                    "fut_count",
+                    "fut_buy_count",
+                    "fut_sell_count",
+                    "fut_notional_sum_usd",
+                    "fut_whale_delta_notional",
+                    "fut_whale_delta_qty",
+                    "spot_count",
+                    "spot_buy_count",
+                    "spot_sell_count",
+                    "spot_notional_sum_usd",
+                    "spot_whale_delta_notional",
+                    "spot_whale_delta_qty",
+                    "xmk_whale_delta_notional_gap_s_minus_f",
+                    "spot_whale_dominance",
+                ],
+            );
+            filtered_windows.insert(window.to_string(), Value::Object(filtered_window));
         }
         result.insert("by_window".to_string(), Value::Object(filtered_windows));
     }

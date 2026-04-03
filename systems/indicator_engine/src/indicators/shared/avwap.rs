@@ -1,10 +1,37 @@
 use crate::runtime::state_store::MinuteHistory;
 use chrono::{DateTime, Duration, Utc};
+use serde_json::{json, Value};
 
 pub const AVWAP_LOOKBACK_DAYS: i64 = 7;
+pub const AVWAP_LOOKBACK_MINUTES: i64 = AVWAP_LOOKBACK_DAYS * 24 * 60;
+
+pub fn avwap_window_start(ts_bucket: DateTime<Utc>, lookback_minutes: i64) -> DateTime<Utc> {
+    ts_bucket - Duration::minutes(lookback_minutes.max(1))
+}
+
+pub fn avwap_window_slices<'a>(
+    fut_history: &'a [MinuteHistory],
+    spot_history: &'a [MinuteHistory],
+    ts_bucket: DateTime<Utc>,
+    lookback_minutes: i64,
+) -> (&'a [MinuteHistory], &'a [MinuteHistory]) {
+    let lookback_start = avwap_window_start(ts_bucket, lookback_minutes);
+    (
+        history_window_slice(fut_history, lookback_start, ts_bucket),
+        history_window_slice(spot_history, lookback_start, ts_bucket),
+    )
+}
 
 pub fn avwap_lookback_start(ts_bucket: DateTime<Utc>) -> DateTime<Utc> {
-    ts_bucket - Duration::days(AVWAP_LOOKBACK_DAYS)
+    avwap_window_start(ts_bucket, AVWAP_LOOKBACK_MINUTES)
+}
+
+pub fn avwap_lookback_window_slices<'a>(
+    fut_history: &'a [MinuteHistory],
+    spot_history: &'a [MinuteHistory],
+    ts_bucket: DateTime<Utc>,
+) -> (&'a [MinuteHistory], &'a [MinuteHistory]) {
+    avwap_window_slices(fut_history, spot_history, ts_bucket, AVWAP_LOOKBACK_MINUTES)
 }
 
 pub fn avwap_7d_window_slices<'a>(
@@ -12,11 +39,61 @@ pub fn avwap_7d_window_slices<'a>(
     spot_history: &'a [MinuteHistory],
     ts_bucket: DateTime<Utc>,
 ) -> (&'a [MinuteHistory], &'a [MinuteHistory]) {
-    let lookback_start = avwap_lookback_start(ts_bucket);
-    (
-        history_window_slice(fut_history, lookback_start, ts_bucket),
-        history_window_slice(spot_history, lookback_start, ts_bucket),
-    )
+    avwap_lookback_window_slices(fut_history, spot_history, ts_bucket)
+}
+
+pub fn avwap_window_code(lookback_minutes: i64) -> String {
+    match lookback_minutes.max(1) {
+        1 => "1m".to_string(),
+        5 => "5m".to_string(),
+        15 => "15m".to_string(),
+        60 => "1h".to_string(),
+        240 => "4h".to_string(),
+        1440 => "1d".to_string(),
+        4320 => "3d".to_string(),
+        10_080 => "7d".to_string(),
+        43_200 => "30d".to_string(),
+        mins => format!("{mins}m"),
+    }
+}
+
+pub fn avwap_window_snapshot_json(
+    window_code: &str,
+    lookback_minutes: i64,
+    anchor_ts: DateTime<Utc>,
+    observed_minutes: usize,
+    fut_last_price: Option<f64>,
+    fut_mark_price: Option<f64>,
+    avwap_fut: Option<f64>,
+    avwap_spot: Option<f64>,
+    gap: Option<f64>,
+    gap_zscore: Option<f64>,
+) -> Value {
+    let lookback_minutes = lookback_minutes.max(1);
+    let missing_minutes = lookback_minutes.saturating_sub(observed_minutes as i64);
+    let price_minus_avwap_fut = fut_last_price.zip(avwap_fut).map(|(p, a)| p - a);
+    let price_minus_spot_avwap_fut = fut_last_price.zip(avwap_spot).map(|(p, a)| p - a);
+    let price_minus_spot_avwap_futmark = fut_mark_price.zip(avwap_spot).map(|(p, a)| p - a);
+
+    json!({
+        "window_code": window_code,
+        "lookback": window_code,
+        "lookback_minutes": lookback_minutes,
+        "anchor_ts": anchor_ts.to_rfc3339(),
+        "window_semantics": "recent_n_window",
+        "observed_minutes": observed_minutes,
+        "missing_minutes": missing_minutes,
+        "is_ready": missing_minutes == 0,
+        "avwap_fut": avwap_fut,
+        "avwap_spot": avwap_spot,
+        "fut_last_price": fut_last_price,
+        "fut_mark_price": fut_mark_price,
+        "price_minus_avwap_fut": price_minus_avwap_fut,
+        "price_minus_spot_avwap_fut": price_minus_spot_avwap_fut,
+        "price_minus_spot_avwap_futmark": price_minus_spot_avwap_futmark,
+        "xmk_avwap_gap_f_minus_s": gap,
+        "zavwap_gap": gap_zscore,
+    })
 }
 
 pub fn avwap_of_slice(history: &[MinuteHistory]) -> Option<f64> {
@@ -117,10 +194,14 @@ fn upper_bound_history_ts(history: &[MinuteHistory], target: DateTime<Utc>) -> u
 
 #[cfg(test)]
 mod tests {
-    use super::{avwap_7d_window_slices, avwap_gap_zscore};
+    use super::{
+        avwap_gap_zscore, avwap_lookback_window_slices, avwap_window_code, avwap_window_slices,
+        avwap_window_snapshot_json, AVWAP_LOOKBACK_DAYS,
+    };
     use crate::ingest::decoder::MarketKind;
     use crate::runtime::state_store::{LiqAgg, MinuteHistory};
     use chrono::{Duration, TimeZone, Utc};
+    use serde_json::json;
     use std::collections::BTreeMap;
 
     fn history_row(ts: chrono::DateTime<Utc>, price: f64, qty: f64) -> MinuteHistory {
@@ -172,7 +253,7 @@ mod tests {
     }
 
     #[test]
-    fn avwap_window_slice_excludes_older_than_7d() {
+    fn avwap_default_window_slice_tracks_configured_lookback_days() {
         let end = Utc.with_ymd_and_hms(2026, 3, 29, 12, 0, 0).unwrap();
         let fut = vec![
             history_row(end - Duration::days(8), 100.0, 1.0),
@@ -181,7 +262,7 @@ mod tests {
             history_row(end, 103.0, 1.0),
         ];
         let spot = fut.clone();
-        let (fut_slice, spot_slice) = avwap_7d_window_slices(&fut, &spot, end);
+        let (fut_slice, spot_slice) = avwap_lookback_window_slices(&fut, &spot, end);
         assert_eq!(fut_slice.len(), 2);
         assert_eq!(spot_slice.len(), 2);
         assert_eq!(
@@ -189,6 +270,61 @@ mod tests {
             end - Duration::days(6)
         );
         assert_eq!(fut_slice.last().unwrap().ts_bucket, end);
+        assert_eq!(AVWAP_LOOKBACK_DAYS, 7);
+    }
+
+    #[test]
+    fn avwap_window_slices_use_requested_lookback_minutes() {
+        let end = Utc.with_ymd_and_hms(2026, 3, 29, 12, 0, 0).unwrap();
+        let fut = vec![
+            history_row(end - Duration::days(31), 100.0, 1.0),
+            history_row(end - Duration::days(29), 101.0, 1.0),
+            history_row(end - Duration::days(2), 102.0, 1.0),
+            history_row(end - Duration::hours(12), 103.0, 1.0),
+            history_row(end, 104.0, 1.0),
+        ];
+        let spot = fut.clone();
+
+        let (fut_1d, _) = avwap_window_slices(&fut, &spot, end, 1440);
+        assert_eq!(fut_1d.len(), 2);
+        assert_eq!(fut_1d.first().unwrap().ts_bucket, end - Duration::hours(12));
+
+        let (fut_30d, _) = avwap_window_slices(&fut, &spot, end, 43_200);
+        assert_eq!(fut_30d.len(), 4);
+        assert_eq!(fut_30d.first().unwrap().ts_bucket, end - Duration::days(29));
+    }
+
+    #[test]
+    fn avwap_window_code_formats_supported_lookbacks() {
+        assert_eq!(avwap_window_code(15), "15m");
+        assert_eq!(avwap_window_code(1440), "1d");
+        assert_eq!(avwap_window_code(43_200), "30d");
+    }
+
+    #[test]
+    fn avwap_window_snapshot_marks_recent_n_coverage() {
+        let end = Utc.with_ymd_and_hms(2026, 3, 29, 12, 0, 0).unwrap();
+        let payload = avwap_window_snapshot_json(
+            "30d",
+            43_200,
+            end - Duration::days(30),
+            128,
+            Some(105.0),
+            Some(104.5),
+            Some(100.0),
+            Some(99.0),
+            Some(1.0),
+            Some(0.5),
+        );
+
+        assert_eq!(payload["window_code"], json!("30d"));
+        assert_eq!(payload["lookback"], json!("30d"));
+        assert_eq!(payload["window_semantics"], json!("recent_n_window"));
+        assert_eq!(payload["observed_minutes"], json!(128));
+        assert_eq!(payload["missing_minutes"], json!(43_072));
+        assert_eq!(payload["is_ready"], json!(false));
+        assert_eq!(payload["price_minus_avwap_fut"], json!(5.0));
+        assert_eq!(payload["price_minus_spot_avwap_futmark"], json!(5.5));
     }
 
     #[test]

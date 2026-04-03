@@ -1177,7 +1177,7 @@ CREATE TABLE IF NOT EXISTS feat.cvd_pack (
     param_set_id       UUID,
     calc_version       TEXT,
     created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
-    CHECK (window_code IN ('1m','15m','1h','4h','1d','3d')),
+    CHECK (window_code IN ('1m','15m','1h','4h','1d','3d','7d','30d')),
     UNIQUE (symbol, window_code, ts_bucket)
 );
 SELECT create_hypertable('feat.cvd_pack', 'ts_bucket', if_not_exists => TRUE);

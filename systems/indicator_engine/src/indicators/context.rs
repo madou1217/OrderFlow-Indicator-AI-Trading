@@ -43,11 +43,14 @@ pub struct IndicatorRuntimeOptions {
     pub kline_history_bars_4h: usize,
     pub kline_history_bars_1d: usize,
     pub kline_history_bars_3d: usize,
+    pub kline_history_bars_7d: usize,
+    pub kline_history_bars_30d: usize,
     pub kline_history_fill_1d_from_db: bool,
     pub fvg_windows: Vec<String>,
     pub fvg_fill_from_db: bool,
     pub fvg_db_bars_4h: usize,
     pub fvg_db_bars_1d: usize,
+    pub fvg_db_bars_3d: usize,
     pub fvg_epsilon_gap_ticks: i64,
     pub fvg_atr_lookback: usize,
     pub fvg_min_body_ratio: f64,
@@ -115,11 +118,14 @@ pub struct IndicatorContext {
     pub kline_history_bars_4h: usize,
     pub kline_history_bars_1d: usize,
     pub kline_history_bars_3d: usize,
+    pub kline_history_bars_7d: usize,
+    pub kline_history_bars_30d: usize,
     pub kline_history_fill_1d_from_db: bool,
     pub fvg_windows: Vec<String>,
     pub fvg_fill_from_db: bool,
     pub fvg_db_bars_4h: usize,
     pub fvg_db_bars_1d: usize,
+    pub fvg_db_bars_3d: usize,
     pub fvg_epsilon_gap_ticks: i64,
     pub fvg_atr_lookback: usize,
     pub fvg_min_body_ratio: f64,
@@ -276,6 +282,31 @@ pub struct KlineHistorySupplement {
     pub options_surface_5m: Vec<OptionsSurfacePoint>,
 }
 
+pub fn window_code_minutes(code: &str) -> Option<i64> {
+    match code {
+        "1m" => Some(1),
+        "5m" => Some(5),
+        "15m" => Some(15),
+        "1h" => Some(60),
+        "4h" => Some(240),
+        "1d" => Some(1440),
+        "3d" => Some(4320),
+        "7d" => Some(10_080),
+        "30d" => Some(43_200),
+        _ => None,
+    }
+}
+
+pub fn daily_window_days(code: &str) -> Option<usize> {
+    match code {
+        "1d" => Some(1),
+        "3d" => Some(3),
+        "7d" => Some(7),
+        "30d" => Some(30),
+        _ => None,
+    }
+}
+
 impl IndicatorContext {
     pub fn from_bundle(
         bundle: WindowBundle,
@@ -367,11 +398,14 @@ impl IndicatorContext {
             kline_history_bars_4h: options.kline_history_bars_4h,
             kline_history_bars_1d: options.kline_history_bars_1d,
             kline_history_bars_3d: options.kline_history_bars_3d,
+            kline_history_bars_7d: options.kline_history_bars_7d,
+            kline_history_bars_30d: options.kline_history_bars_30d,
             kline_history_fill_1d_from_db: options.kline_history_fill_1d_from_db,
             fvg_windows: options.fvg_windows.clone(),
             fvg_fill_from_db: options.fvg_fill_from_db,
             fvg_db_bars_4h: options.fvg_db_bars_4h,
             fvg_db_bars_1d: options.fvg_db_bars_1d,
+            fvg_db_bars_3d: options.fvg_db_bars_3d,
             fvg_epsilon_gap_ticks: options.fvg_epsilon_gap_ticks,
             fvg_atr_lookback: options.fvg_atr_lookback,
             fvg_min_body_ratio: options.fvg_min_body_ratio,
@@ -493,23 +527,10 @@ impl IndicatorContext {
     }
 
     pub fn enabled_windows(&self) -> Vec<(String, i64)> {
-        fn window_to_minutes(code: &str) -> Option<i64> {
-            match code {
-                "1m" => Some(1),
-                "5m" => Some(5),
-                "15m" => Some(15),
-                "1h" => Some(60),
-                "4h" => Some(240),
-                "1d" => Some(1440),
-                "3d" => Some(4320),
-                _ => None,
-            }
-        }
-
         let mut out = self
             .window_codes
             .iter()
-            .filter_map(|w| window_to_minutes(w.as_str()).map(|m| (w.clone(), m)))
+            .filter_map(|w| window_code_minutes(w.as_str()).map(|m| (w.clone(), m)))
             .collect::<Vec<_>>();
         if out.is_empty() {
             out.push(("1m".to_string(), 1));

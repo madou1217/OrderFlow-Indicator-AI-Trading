@@ -601,7 +601,7 @@ def validate_sample(dsn: str, symbol: str, ts: str) -> tuple[dict[str, Any], lis
         "feat.avwap_feature",
         symbol,
         ts,
-        "AND bar_interval = '00:01:00'",
+        "AND bar_interval = '7 days'",
         [
             "anchor_ts",
             "avwap_fut",
@@ -631,7 +631,7 @@ def validate_sample(dsn: str, symbol: str, ts: str) -> tuple[dict[str, Any], lis
         check_fields(
             failures,
             ts,
-            "avwap.feature_1m",
+            "avwap.feature_7d",
             avwap_actual,
             avwap_feature,
             [
@@ -650,7 +650,7 @@ def validate_sample(dsn: str, symbol: str, ts: str) -> tuple[dict[str, Any], lis
             failures.append(
                 {
                     "ts": ts,
-                    "check": "avwap.feature_1m",
+                    "check": "avwap.feature_7d",
                     "field": "anchor_ts",
                     "expected": avwap_feature["anchor_ts"],
                     "actual": avwap_actual["anchor_ts"],

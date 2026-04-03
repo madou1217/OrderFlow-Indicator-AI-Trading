@@ -20,7 +20,14 @@ const RAW_AUDIT_HVN_CAP: usize = 24;
 const RAW_AUDIT_LVN_CAP: usize = 24;
 
 /// Multi-window specs: (window_code, bar_count).
-const MULTI_WINDOWS: &[(&str, usize)] = &[("15m", 15), ("4h", 240), ("1d", 1440), ("3d", 4320)];
+const MULTI_WINDOWS: &[(&str, usize)] = &[
+    ("15m", 15),
+    ("4h", 240),
+    ("1d", 1440),
+    ("3d", 4320),
+    ("7d", 10_080),
+    ("30d", 43_200),
+];
 
 #[derive(Clone, Copy)]
 struct PvsV2WindowConfig {
@@ -373,6 +380,20 @@ fn pvs_v2_window_config(window_code: &str) -> Option<PvsV2WindowConfig> {
             hvn_pct_of_poc: 0.68,
             lvn_pct_of_poc: 0.32,
             strength: 16,
+            min_zone_width_bins: 1,
+        }),
+        "7d" => Some(PvsV2WindowConfig {
+            rows: 12,
+            hvn_pct_of_poc: 0.64,
+            lvn_pct_of_poc: 0.36,
+            strength: 18,
+            min_zone_width_bins: 1,
+        }),
+        "30d" => Some(PvsV2WindowConfig {
+            rows: 10,
+            hvn_pct_of_poc: 0.60,
+            lvn_pct_of_poc: 0.40,
+            strength: 20,
             min_zone_width_bins: 1,
         }),
         _ => None,
@@ -981,15 +1002,22 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
-    fn pvs_multi_windows_are_exactly_15m_4h_1d_3d() {
+    fn pvs_multi_windows_include_7d_and_30d() {
         assert_eq!(
             MULTI_WINDOWS,
-            &[("15m", 15), ("4h", 240), ("1d", 1440), ("3d", 4320)]
+            &[
+                ("15m", 15),
+                ("4h", 240),
+                ("1d", 1440),
+                ("3d", 4320),
+                ("7d", 10_080),
+                ("30d", 43_200),
+            ]
         );
     }
 
     #[test]
-    fn pvs_output_contains_exact_multi_windows() {
+    fn pvs_output_contains_all_configured_multi_windows() {
         let ts_bucket = Utc
             .with_ymd_and_hms(2026, 3, 4, 0, 0, 0)
             .single()
@@ -1040,6 +1068,8 @@ mod tests {
             kline_history_bars_4h: 120,
             kline_history_bars_1d: 120,
             kline_history_bars_3d: 120,
+            kline_history_bars_7d: 120,
+            kline_history_bars_30d: 120,
             kline_history_fill_1d_from_db: true,
             fvg_windows: vec![
                 "15m".to_string(),
@@ -1050,6 +1080,7 @@ mod tests {
             fvg_fill_from_db: true,
             fvg_db_bars_4h: 256,
             fvg_db_bars_1d: 256,
+            fvg_db_bars_3d: 256,
             fvg_epsilon_gap_ticks: 2,
             fvg_atr_lookback: 14,
             fvg_min_body_ratio: 0.60,
@@ -1101,14 +1132,16 @@ mod tests {
             .and_then(|v| v.as_object())
             .expect("by_window must exist");
 
-        assert_eq!(by_window.len(), 4);
+        assert_eq!(by_window.len(), 6);
         assert!(by_window.contains_key("15m"));
         assert!(by_window.contains_key("4h"));
         assert!(by_window.contains_key("1d"));
         assert!(by_window.contains_key("3d"));
+        assert!(by_window.contains_key("7d"));
+        assert!(by_window.contains_key("30d"));
         assert!(!by_window.contains_key("1h"));
 
-        for window in ["15m", "4h", "1d"] {
+        for window in ["15m", "4h", "1d", "3d", "7d", "30d"] {
             let window_payload = by_window
                 .get(window)
                 .and_then(|v| v.as_object())
@@ -1282,6 +1315,8 @@ mod tests {
             kline_history_bars_4h: 120,
             kline_history_bars_1d: 120,
             kline_history_bars_3d: 120,
+            kline_history_bars_7d: 120,
+            kline_history_bars_30d: 120,
             kline_history_fill_1d_from_db: true,
             fvg_windows: vec![
                 "15m".to_string(),
@@ -1292,6 +1327,7 @@ mod tests {
             fvg_fill_from_db: true,
             fvg_db_bars_4h: 256,
             fvg_db_bars_1d: 256,
+            fvg_db_bars_3d: 256,
             fvg_epsilon_gap_ticks: 2,
             fvg_atr_lookback: 14,
             fvg_min_body_ratio: 0.60,
@@ -1416,6 +1452,8 @@ mod tests {
             kline_history_bars_4h: 120,
             kline_history_bars_1d: 120,
             kline_history_bars_3d: 120,
+            kline_history_bars_7d: 120,
+            kline_history_bars_30d: 120,
             kline_history_fill_1d_from_db: true,
             fvg_windows: vec![
                 "15m".to_string(),
@@ -1426,6 +1464,7 @@ mod tests {
             fvg_fill_from_db: true,
             fvg_db_bars_4h: 256,
             fvg_db_bars_1d: 256,
+            fvg_db_bars_3d: 256,
             fvg_epsilon_gap_ticks: 2,
             fvg_atr_lookback: 14,
             fvg_min_body_ratio: 0.60,
@@ -1619,6 +1658,8 @@ mod tests {
             kline_history_bars_4h: 120,
             kline_history_bars_1d: 120,
             kline_history_bars_3d: 120,
+            kline_history_bars_7d: 120,
+            kline_history_bars_30d: 120,
             kline_history_fill_1d_from_db: true,
             fvg_windows: vec![
                 "15m".to_string(),
@@ -1629,6 +1670,7 @@ mod tests {
             fvg_fill_from_db: true,
             fvg_db_bars_4h: 256,
             fvg_db_bars_1d: 256,
+            fvg_db_bars_3d: 256,
             fvg_epsilon_gap_ticks: 2,
             fvg_atr_lookback: 14,
             fvg_min_body_ratio: 0.60,

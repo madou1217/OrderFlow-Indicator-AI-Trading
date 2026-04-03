@@ -5,12 +5,14 @@ use crate::indicators::indicator_trait::Indicator;
 use chrono::{DateTime, Utc};
 use serde_json::{json, Map, Value};
 
-pub const OI_WINDOWS: [(&str, i64, usize); 5] = [
+pub const OI_WINDOWS: [(&str, i64, usize); 7] = [
     ("5m", 5, 1),
     ("15m", 15, 3),
     ("4h", 240, 48),
     ("1d", 1440, 288),
     ("3d", 4320, 864),
+    ("7d", 10_080, 2016),
+    ("30d", 43_200, 8640),
 ];
 
 const ZSCORE_LOOKBACK: usize = 60;

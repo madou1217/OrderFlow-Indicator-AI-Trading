@@ -1,4 +1,7 @@
-use crate::indicators::context::{IndicatorContext, KlineHistoryBar};
+use crate::indicators::context::{
+    daily_window_days, window_code_minutes as shared_window_code_minutes, IndicatorContext,
+    KlineHistoryBar,
+};
 use crate::indicators::i19_kline_history::{
     build_interval_bar_records, build_interval_bar_records_from_records,
 };
@@ -172,39 +175,39 @@ fn build_htf_input_bars(
     tf_code: &str,
     current_minute_close: DateTime<Utc>,
 ) -> Vec<KlineHistoryBar> {
-    match tf_code {
-        "3d" => {
-            let merged_daily = merge_htf_bars(
-                build_interval_bar_records(
-                    &ctx.history_futures,
-                    1440,
-                    usize::MAX,
-                    current_minute_close,
-                ),
-                &ctx.kline_history_futures_1d_db,
-            );
-            build_interval_bar_records_from_records(
-                &merged_daily,
-                4320,
+    if daily_window_days(tf_code).unwrap_or(0) > 1 {
+        let Some(tf_minutes) = window_to_minutes(tf_code) else {
+            return Vec::new();
+        };
+        let merged_daily = merge_htf_bars(
+            build_interval_bar_records(
+                &ctx.history_futures,
+                1440,
                 usize::MAX,
                 current_minute_close,
-            )
-        }
-        _ => {
-            let Some(tf_minutes) = window_to_minutes(tf_code) else {
-                return Vec::new();
-            };
-            merge_htf_bars(
-                build_interval_bar_records(
-                    &ctx.history_futures,
-                    tf_minutes,
-                    usize::MAX,
-                    current_minute_close,
-                ),
-                htf_db_bars(ctx, tf_code),
-            )
-        }
+            ),
+            &ctx.kline_history_futures_1d_db,
+        );
+        return build_interval_bar_records_from_records(
+            &merged_daily,
+            tf_minutes,
+            usize::MAX,
+            current_minute_close,
+        );
     }
+
+    let Some(tf_minutes) = window_to_minutes(tf_code) else {
+        return Vec::new();
+    };
+    merge_htf_bars(
+        build_interval_bar_records(
+            &ctx.history_futures,
+            tf_minutes,
+            usize::MAX,
+            current_minute_close,
+        ),
+        htf_db_bars(ctx, tf_code),
+    )
 }
 
 fn collect_1m_closes(ctx: &IndicatorContext) -> Vec<(DateTime<Utc>, f64)> {
@@ -326,14 +329,7 @@ fn combine_regimes(regimes: &[&str]) -> &'static str {
 }
 
 fn window_to_minutes(code: &str) -> Option<i64> {
-    match code {
-        "15m" => Some(15),
-        "1h" => Some(60),
-        "4h" => Some(240),
-        "1d" => Some(1440),
-        "3d" => Some(4320),
-        _ => None,
-    }
+    shared_window_code_minutes(code)
 }
 
 #[cfg(test)]
@@ -393,7 +389,7 @@ mod tests {
     }
 
     #[test]
-    fn window_to_minutes_supports_3d() {
-        assert_eq!(window_to_minutes("3d"), Some(4320));
+    fn window_to_minutes_supports_30d() {
+        assert_eq!(window_to_minutes("30d"), Some(43_200));
     }
 }

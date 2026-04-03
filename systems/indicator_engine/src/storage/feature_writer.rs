@@ -3,7 +3,7 @@ use crate::indicators::i25_open_interest::build_open_interest_view;
 use crate::indicators::i26_long_short_ratios::build_long_short_ratio_view;
 use crate::indicators::i27_options_surface::build_options_surface_view;
 use crate::indicators::shared::avwap::{
-    avwap_7d_window_slices, avwap_gap_zscore, avwap_lookback_start, avwap_of_slice,
+    avwap_gap_zscore, avwap_of_slice, avwap_window_code, avwap_window_slices, avwap_window_start,
 };
 use crate::indicators::shared::funding::compute_funding_window_metrics;
 use crate::ingest::decoder::MarketKind;
@@ -411,9 +411,10 @@ impl FeatureWriter {
             return Ok(());
         };
 
-        let fut_cvd_7d =
-            rolling_cvd_7d(&ctx.history_futures, ctx.ts_bucket).unwrap_or(fut.cvd_last);
-        let spot_cvd_7d = rolling_cvd_7d(&ctx.history_spot, ctx.ts_bucket).unwrap_or(spot.cvd_last);
+        let fut_cvd_window =
+            rolling_cvd_window(&ctx.history_futures, ctx.ts_bucket, mins).unwrap_or(fut.cvd_last);
+        let spot_cvd_window =
+            rolling_cvd_window(&ctx.history_spot, ctx.ts_bucket, mins).unwrap_or(spot.cvd_last);
         let fut_delta_slant = delta_slant(fut.delta, fut.high_price, fut.low_price);
         let spot_delta_slant = delta_slant(spot.delta, spot.high_price, spot.low_price);
         let spot_lead_score = spot.delta.abs() / (spot.delta.abs() + fut.delta.abs() + 1e-12);
@@ -469,20 +470,26 @@ impl FeatureWriter {
         .bind(fut.delta)
         .bind(fut.relative_delta)
         .bind(fut.cvd_last)
-        .bind(fut_cvd_7d)
+        .bind(fut_cvd_window)
         .bind(fut.cvd_slope)
         .bind(fut_delta_slant)
         .bind(spot.delta)
         .bind(spot.relative_delta)
         .bind(spot.cvd_last)
-        .bind(spot_cvd_7d)
+        .bind(spot_cvd_window)
         .bind(spot.cvd_slope)
         .bind(spot_delta_slant)
         .bind(fut.cvd_last - spot.cvd_last)
         .bind(fut.cvd_slope.unwrap_or(0.0) - spot.cvd_slope.unwrap_or(0.0))
         .bind(spot_lead_score)
         .bind(likely_driver)
-        .bind(json!({ "window_minutes": mins }))
+        .bind(json!({
+            "window_minutes": mins,
+            "cvd_rolling_window_minutes": mins,
+            "cvd_rolling_window_code": window_code,
+            "cvd_rolling_window_semantics": "recent_n_window",
+            "legacy_field_alias": "cvd_rolling_7d_*"
+        }))
         .execute(&self.pool)
         .await
         .with_context(|| format!("insert cvd_pack {}", window_code))?;
@@ -491,38 +498,24 @@ impl FeatureWriter {
     }
 
     async fn insert_avwap_feature_window(&self, ctx: &IndicatorContext, mins: i64) -> Result<()> {
-        let incremental = ctx.incremental_outputs.avwap_feature.as_ref();
-        let lookback_start = avwap_lookback_start(ctx.ts_bucket);
-        let (fut_window, spot_window) =
-            avwap_7d_window_slices(&ctx.history_futures, &ctx.history_spot, ctx.ts_bucket);
-        let fut_avwap = incremental
-            .and_then(|value| value.avwap_fut)
-            .or_else(|| avwap_of_slice(fut_window));
-        let spot_avwap = incremental
-            .and_then(|value| value.avwap_spot)
-            .or_else(|| avwap_of_slice(spot_window));
-        let fut_last = incremental
-            .and_then(|value| value.fut_last_price)
-            .or(ctx.futures.last_price);
-        let fut_mark = incremental
-            .and_then(|value| value.fut_mark_price)
-            .or_else(|| ctx.latest_mark.as_ref().and_then(|m| m.mark_price));
-
-        let price_minus_fut = incremental
-            .and_then(|value| value.price_minus_avwap_fut)
-            .or_else(|| fut_last.zip(fut_avwap).map(|(p, a)| p - a));
-        let price_minus_spot = incremental
-            .and_then(|value| value.price_minus_spot_avwap_fut)
-            .or_else(|| fut_last.zip(spot_avwap).map(|(p, a)| p - a));
-        let mark_minus_spot = incremental
-            .and_then(|value| value.price_minus_spot_avwap_futmark)
-            .or_else(|| fut_mark.zip(spot_avwap).map(|(p, a)| p - a));
-        let avwap_gap = incremental
-            .and_then(|value| value.avwap_gap_fs)
-            .or_else(|| fut_avwap.zip(spot_avwap).map(|(f, s)| f - s));
-        let anchor_ts = incremental
-            .and_then(|value| value.anchor_ts)
-            .or(Some(lookback_start));
+        let lookback_minutes = mins.max(1);
+        let lookback_start = avwap_window_start(ctx.ts_bucket, lookback_minutes);
+        let (fut_window, spot_window) = avwap_window_slices(
+            &ctx.history_futures,
+            &ctx.history_spot,
+            ctx.ts_bucket,
+            lookback_minutes,
+        );
+        let fut_avwap = avwap_of_slice(fut_window);
+        let spot_avwap = avwap_of_slice(spot_window);
+        let fut_last = ctx.futures.last_price;
+        let fut_mark = ctx.latest_mark.as_ref().and_then(|m| m.mark_price);
+        let price_minus_fut = fut_last.zip(fut_avwap).map(|(p, a)| p - a);
+        let price_minus_spot = fut_last.zip(spot_avwap).map(|(p, a)| p - a);
+        let mark_minus_spot = fut_mark.zip(spot_avwap).map(|(p, a)| p - a);
+        let avwap_gap = fut_avwap.zip(spot_avwap).map(|(f, s)| f - s);
+        let anchor_ts = Some(lookback_start);
+        let anchor_label = avwap_anchor_label(lookback_minutes);
         let bar_interval = interval_text(mins);
 
         sqlx::query(
@@ -542,16 +535,16 @@ impl FeatureWriter {
             )
             VALUES (
                 $1, $2::interval, $3,
-                $4, 'rolling_7d',
-                $5, $6,
-                $7, $8,
-                $9,
+                $4, $5,
+                $6, $7,
+                $8, $9,
                 $10,
                 $11,
                 $12,
                 $13,
                 $14,
-                'indicator_engine.v1', $15
+                $15,
+                'indicator_engine.v1', $16
             )
             ON CONFLICT (venue, symbol, anchor_ts, bar_interval, ts_bucket)
             DO UPDATE SET
@@ -573,6 +566,7 @@ impl FeatureWriter {
         .bind(bar_interval)
         .bind(&ctx.symbol)
         .bind(anchor_ts)
+        .bind(anchor_label)
         .bind(fut_avwap)
         .bind(spot_avwap)
         .bind(fut_last)
@@ -582,12 +576,12 @@ impl FeatureWriter {
         .bind(mark_minus_spot)
         .bind(avwap_gap)
         .bind(avwap_gap)
-        .bind(
-            incremental
-                .and_then(|value| value.zavwap_gap)
-                .or_else(|| avwap_gap_zscore(fut_window, spot_window, avwap_gap)),
-        )
-        .bind(json!({ "window_minutes": mins }))
+        .bind(avwap_gap_zscore(fut_window, spot_window, avwap_gap))
+        .bind(json!({
+            "lookback_code": avwap_window_code(lookback_minutes),
+            "lookback_minutes": lookback_minutes,
+            "window_minutes": mins
+        }))
         .execute(&self.pool)
         .await
         .with_context(|| format!("insert avwap_feature mins={}", mins))?;
@@ -1042,6 +1036,10 @@ fn interval_text(mins: i64) -> String {
     }
 }
 
+fn avwap_anchor_label(lookback_minutes: i64) -> String {
+    format!("rolling_{}", avwap_window_code(lookback_minutes))
+}
+
 fn aggregate_window(
     history: &[MinuteHistory],
     ts_bucket: DateTime<Utc>,
@@ -1137,24 +1135,33 @@ fn total_trade_count(history: &[MinuteHistory], ts_bucket: DateTime<Utc>, mins: 
         .sum()
 }
 
-fn rolling_cvd_7d(history: &[MinuteHistory], ts_bucket: DateTime<Utc>) -> Option<f64> {
+fn rolling_cvd_window(
+    history: &[MinuteHistory],
+    ts_bucket: DateTime<Utc>,
+    lookback_minutes: i64,
+) -> Option<f64> {
     let end_cvd = history
         .iter()
         .rev()
         .find(|h| h.ts_bucket <= ts_bucket)
         .map(|h| h.cvd)?;
-    let start = ts_bucket - Duration::days(7);
-    let start_cvd = history
+    let start = ts_bucket - Duration::minutes(lookback_minutes.max(1));
+    let baseline_cvd = history
         .iter()
-        .find(|h| h.ts_bucket > start)
+        .rev()
+        .find(|h| h.ts_bucket <= start)
         .map(|h| h.cvd)
         .unwrap_or(0.0);
-    Some(end_cvd - start_cvd)
+    Some(end_cvd - baseline_cvd)
+}
+
+fn rolling_cvd_7d(history: &[MinuteHistory], ts_bucket: DateTime<Utc>) -> Option<f64> {
+    rolling_cvd_window(history, ts_bucket, 7 * 24 * 60)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::aggregate_window;
+    use super::{aggregate_window, avwap_anchor_label, rolling_cvd_window};
     use crate::ingest::decoder::MarketKind;
     use crate::runtime::state_store::MinuteHistory;
     use chrono::{TimeZone, Utc};
@@ -1221,6 +1228,38 @@ mod tests {
 
         let agg = aggregate_window(&history, ts, 1).expect("window agg");
         assert_eq!(agg.whale.max_single_notional, 725_000.0);
+    }
+
+    #[test]
+    fn avwap_anchor_label_tracks_requested_window_code() {
+        assert_eq!(avwap_anchor_label(15), "rolling_15m");
+        assert_eq!(avwap_anchor_label(43_200), "rolling_30d");
+    }
+
+    #[test]
+    fn rolling_cvd_window_uses_requested_minutes() {
+        let base = Utc
+            .with_ymd_and_hms(2026, 3, 1, 0, 0, 0)
+            .single()
+            .expect("valid ts");
+        let mut history = Vec::new();
+        let mut cvd = 0.0;
+        for day in 0..31 {
+            cvd += 1.0;
+            let mut row = history_minute(base + chrono::Duration::days(day), 0.0);
+            row.cvd = cvd;
+            history.push(row);
+        }
+
+        let ts_bucket = base + chrono::Duration::days(30);
+        assert_eq!(
+            rolling_cvd_window(&history, ts_bucket, 3 * 24 * 60),
+            Some(3.0)
+        );
+        assert_eq!(
+            rolling_cvd_window(&history, ts_bucket, 30 * 24 * 60),
+            Some(30.0)
+        );
     }
 }
 

@@ -308,6 +308,10 @@ pub struct KlineHistoryConfig {
     pub bars_1d: usize,
     #[serde(default = "default_kline_history_bars_3d")]
     pub bars_3d: usize,
+    #[serde(default = "default_kline_history_bars_7d")]
+    pub bars_7d: usize,
+    #[serde(default = "default_kline_history_bars_30d")]
+    pub bars_30d: usize,
     #[serde(default = "default_kline_history_fill_1d_from_db")]
     pub fill_1d_from_db: bool,
 }
@@ -320,6 +324,8 @@ impl Default for KlineHistoryConfig {
             bars_4h: default_kline_history_bars_4h(),
             bars_1d: default_kline_history_bars_1d(),
             bars_3d: default_kline_history_bars_3d(),
+            bars_7d: default_kline_history_bars_7d(),
+            bars_30d: default_kline_history_bars_30d(),
             fill_1d_from_db: default_kline_history_fill_1d_from_db(),
         }
     }
@@ -436,6 +442,8 @@ pub struct FvgConfig {
     pub db_bars_4h: usize,
     #[serde(default = "default_fvg_db_bars_1d")]
     pub db_bars_1d: usize,
+    #[serde(default = "default_fvg_db_bars_3d")]
+    pub db_bars_3d: usize,
     #[serde(default = "default_fvg_epsilon_gap_ticks")]
     pub epsilon_gap_ticks: i64,
     #[serde(default = "default_fvg_atr_lookback")]
@@ -461,6 +469,7 @@ impl Default for FvgConfig {
             fill_from_db: default_fvg_fill_from_db(),
             db_bars_4h: default_fvg_db_bars_4h(),
             db_bars_1d: default_fvg_db_bars_1d(),
+            db_bars_3d: default_fvg_db_bars_3d(),
             epsilon_gap_ticks: default_fvg_epsilon_gap_ticks(),
             atr_lookback: default_fvg_atr_lookback(),
             min_body_ratio: default_fvg_min_body_ratio(),
@@ -536,6 +545,14 @@ fn default_kline_history_bars_3d() -> usize {
     120
 }
 
+fn default_kline_history_bars_7d() -> usize {
+    120
+}
+
+fn default_kline_history_bars_30d() -> usize {
+    120
+}
+
 fn default_kline_history_fill_1d_from_db() -> bool {
     true
 }
@@ -549,7 +566,13 @@ fn default_tpo_value_area_pct() -> f64 {
 }
 
 fn default_tpo_session_windows() -> Vec<String> {
-    vec!["4h".to_string(), "1d".to_string(), "3d".to_string()]
+    vec![
+        "4h".to_string(),
+        "1d".to_string(),
+        "3d".to_string(),
+        "7d".to_string(),
+        "30d".to_string(),
+    ]
 }
 
 fn default_tpo_ib_minutes() -> i64 {
@@ -566,6 +589,8 @@ fn default_rvwap_windows() -> Vec<String> {
         "4h".to_string(),
         "1d".to_string(),
         "3d".to_string(),
+        "7d".to_string(),
+        "30d".to_string(),
     ]
 }
 
@@ -583,6 +608,8 @@ fn default_high_volume_pulse_z_windows() -> Vec<String> {
         "4h".to_string(),
         "1d".to_string(),
         "3d".to_string(),
+        "7d".to_string(),
+        "30d".to_string(),
     ]
 }
 
@@ -603,7 +630,13 @@ fn default_ema_htf_periods() -> Vec<usize> {
 }
 
 fn default_ema_htf_windows() -> Vec<String> {
-    vec!["4h".to_string(), "1d".to_string(), "3d".to_string()]
+    vec![
+        "4h".to_string(),
+        "1d".to_string(),
+        "3d".to_string(),
+        "7d".to_string(),
+        "30d".to_string(),
+    ]
 }
 
 fn default_ema_output_windows() -> Vec<String> {
@@ -632,6 +665,8 @@ fn default_fvg_windows() -> Vec<String> {
         "4h".to_string(),
         "1d".to_string(),
         "3d".to_string(),
+        "7d".to_string(),
+        "30d".to_string(),
     ]
 }
 
@@ -644,6 +679,10 @@ fn default_fvg_db_bars_4h() -> usize {
 }
 
 fn default_fvg_db_bars_1d() -> usize {
+    256
+}
+
+fn default_fvg_db_bars_3d() -> usize {
     256
 }
 
@@ -688,6 +727,8 @@ fn default_window_codes() -> Vec<String> {
         "4h".to_string(),
         "1d".to_string(),
         "3d".to_string(),
+        "7d".to_string(),
+        "30d".to_string(),
     ]
 }
 
@@ -867,6 +908,8 @@ pub async fn bootstrap() -> Result<AppContext> {
         kline_history_bars_4h = config.indicator.kline_history.bars_4h,
         kline_history_bars_1d = config.indicator.kline_history.bars_1d,
         kline_history_bars_3d = config.indicator.kline_history.bars_3d,
+        kline_history_bars_7d = config.indicator.kline_history.bars_7d,
+        kline_history_bars_30d = config.indicator.kline_history.bars_30d,
         kline_history_fill_1d_from_db = config.indicator.kline_history.fill_1d_from_db,
         tpo_rows_nb = config.indicator.tpo_market_profile.rows_nb,
         tpo_value_area_pct = config.indicator.tpo_market_profile.value_area_pct,
@@ -891,6 +934,7 @@ pub async fn bootstrap() -> Result<AppContext> {
         fvg_fill_from_db = config.indicator.fvg.fill_from_db,
         fvg_db_bars_4h = config.indicator.fvg.db_bars_4h,
         fvg_db_bars_1d = config.indicator.fvg.db_bars_1d,
+        fvg_db_bars_3d = config.indicator.fvg.db_bars_3d,
         fvg_epsilon_gap_ticks = config.indicator.fvg.epsilon_gap_ticks,
         fvg_atr_lookback = config.indicator.fvg.atr_lookback,
         fvg_min_body_ratio = config.indicator.fvg.min_body_ratio,
@@ -1352,6 +1396,12 @@ fn validate_config(cfg: &RootConfig) -> Result<()> {
     if cfg.indicator.kline_history.bars_3d == 0 {
         return Err(anyhow!("indicator.kline_history.bars_3d must be > 0"));
     }
+    if cfg.indicator.kline_history.bars_7d == 0 {
+        return Err(anyhow!("indicator.kline_history.bars_7d must be > 0"));
+    }
+    if cfg.indicator.kline_history.bars_30d == 0 {
+        return Err(anyhow!("indicator.kline_history.bars_30d must be > 0"));
+    }
     if cfg.indicator.tpo_market_profile.rows_nb == 0 {
         return Err(anyhow!("indicator.tpo_market_profile.rows_nb must be > 0"));
     }
@@ -1374,7 +1424,7 @@ fn validate_config(cfg: &RootConfig) -> Result<()> {
     }
     for code in &cfg.indicator.tpo_market_profile.session_windows {
         match code.as_str() {
-            "4h" | "1d" | "3d" => {}
+            "4h" | "1d" | "3d" | "7d" | "30d" => {}
             other => {
                 return Err(anyhow!(
                     "unsupported indicator.tpo_market_profile.session_windows value: {}",
@@ -1411,7 +1461,7 @@ fn validate_config(cfg: &RootConfig) -> Result<()> {
     }
     for code in &cfg.indicator.rvwap_sigma_bands.windows {
         match code.as_str() {
-            "15m" | "4h" | "1d" | "3d" => {}
+            "15m" | "4h" | "1d" | "3d" | "7d" | "30d" => {}
             other => {
                 return Err(anyhow!(
                     "unsupported indicator.rvwap_sigma_bands.windows value: {}",
@@ -1448,7 +1498,7 @@ fn validate_config(cfg: &RootConfig) -> Result<()> {
     }
     for code in &cfg.indicator.high_volume_pulse.z_windows {
         match code.as_str() {
-            "1h" | "4h" | "1d" | "3d" => {}
+            "1h" | "4h" | "1d" | "3d" | "7d" | "30d" => {}
             other => {
                 return Err(anyhow!(
                     "unsupported indicator.high_volume_pulse.z_windows value: {}",
@@ -1517,7 +1567,7 @@ fn validate_config(cfg: &RootConfig) -> Result<()> {
     }
     for code in &cfg.indicator.ema_trend_regime.htf_windows {
         match code.as_str() {
-            "4h" | "1d" | "3d" => {}
+            "4h" | "1d" | "3d" | "7d" | "30d" => {}
             other => {
                 return Err(anyhow!(
                     "unsupported indicator.ema_trend_regime.htf_windows value: {}",
@@ -1556,7 +1606,7 @@ fn validate_config(cfg: &RootConfig) -> Result<()> {
     }
     for code in &cfg.indicator.fvg.windows {
         match code.as_str() {
-            "15m" | "4h" | "1d" | "3d" => {}
+            "15m" | "4h" | "1d" | "3d" | "7d" | "30d" => {}
             other => {
                 return Err(anyhow!(
                     "unsupported indicator.fvg.windows value: {}",
@@ -1570,6 +1620,9 @@ fn validate_config(cfg: &RootConfig) -> Result<()> {
     }
     if cfg.indicator.fvg.db_bars_1d == 0 {
         return Err(anyhow!("indicator.fvg.db_bars_1d must be > 0"));
+    }
+    if cfg.indicator.fvg.db_bars_3d == 0 {
+        return Err(anyhow!("indicator.fvg.db_bars_3d must be > 0"));
     }
     if cfg.indicator.fvg.epsilon_gap_ticks < 0 {
         return Err(anyhow!("indicator.fvg.epsilon_gap_ticks must be >= 0"));
@@ -1623,7 +1676,7 @@ fn validate_config(cfg: &RootConfig) -> Result<()> {
     }
     for code in &cfg.indicator.window_codes {
         match code.as_str() {
-            "1m" | "5m" | "15m" | "1h" | "4h" | "1d" | "3d" => {}
+            "1m" | "5m" | "15m" | "1h" | "4h" | "1d" | "3d" | "7d" | "30d" => {}
             other => {
                 return Err(anyhow!(
                     "unsupported indicator.window_codes value: {}",

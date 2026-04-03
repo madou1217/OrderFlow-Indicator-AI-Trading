@@ -13,6 +13,8 @@ const MULTI_WINDOWS: &[(&str, usize)] = &[
     ("4h", 240),
     ("1d", 1440),
     ("3d", 4320),
+    ("7d", 10_080),
+    ("30d", 43_200),
 ];
 const RAW_AUDIT_TOP_TOTAL_LEVELS: usize = 64;
 const RAW_AUDIT_TOP_ABS_DELTA_LEVELS: usize = 32;

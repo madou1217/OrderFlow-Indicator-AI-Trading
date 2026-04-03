@@ -4,15 +4,15 @@ use super::core_shared::{
     filter_funding_rate_entry_v3, filter_fvg, filter_kline_history,
     filter_liquidation_density_entry_v3, filter_orderbook_depth_entry_v3,
     filter_price_volume_structure_entry_v3, filter_rvwap_sigma_bands, filter_tpo_market_profile,
-    resolve_reference_mark_price, CORE_WINDOWS_WITH_3D,
+    filter_whale_trades_recent_windows, resolve_reference_mark_price, CORE_WINDOWS_WITH_3D,
 };
 use chrono::{DateTime, Utc};
 use serde_json::{json, Map, Value};
 use std::cmp::Ordering;
 
-const AVWAP_LIMITS: &[(&str, usize)] = &[("15m", 5), ("4h", 3), ("1d", 2), ("3d", 2)];
+const AVWAP_LIMITS: &[(&str, usize)] = &[("15m", 5), ("4h", 3), ("1d", 2), ("3d", 2), ("7d", 1)];
 const KLINE_LIMITS: &[(&str, usize)] = &[("15m", 20), ("4h", 12), ("1d", 8)];
-const CVD_LIMITS: &[(&str, usize)] = &[("15m", 15), ("4h", 8), ("1d", 5)];
+const CVD_LIMITS: &[(&str, usize)] = &[("5m", 12), ("15m", 15), ("4h", 8), ("1d", 5)];
 const ENTRY_TOP_LIQUIDITY_LEVELS_LIMIT: usize = 20;
 const FVG_KEEP_FIELDS: &[&str] = &[
     "fvg_bottom",
@@ -50,7 +50,9 @@ pub(crate) fn filter_indicators(
     let current_price = resolve_reference_mark_price(source);
 
     core_shared::insert_filtered_indicator(&mut indicators, source, "vpin", filter_vpin_entry_v4);
-    core_shared::insert_full_indicator(&mut indicators, source, "whale_trades");
+    core_shared::insert_filtered_indicator(&mut indicators, source, "whale_trades", |payload| {
+        prune_nulls(filter_whale_trades_recent_windows(payload))
+    });
     core_shared::insert_filtered_indicator(
         &mut indicators,
         source,
@@ -242,16 +244,9 @@ fn filter_vpin_entry_v4(payload: &Value) -> Value {
         &[
             "vpin_bucket_size_base",
             "vpin_bucket_size_eth",
-            "vpin_fut",
             "vpin_model",
-            "vpin_ratio_s_over_f",
             "vpin_rolling_bucket_count",
-            "vpin_spot",
             "vpin_unit",
-            "xmk_vpin_gap_s_minus_f",
-            "z_vpin_fut",
-            "z_vpin_gap_s_minus_f",
-            "z_vpin_spot",
         ],
     );
 

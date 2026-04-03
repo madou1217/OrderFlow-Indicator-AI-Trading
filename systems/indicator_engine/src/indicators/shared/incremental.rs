@@ -1,3 +1,6 @@
+use crate::indicators::shared::avwap::{
+    avwap_window_snapshot_json, AVWAP_LOOKBACK_DAYS, AVWAP_LOOKBACK_MINUTES,
+};
 use crate::indicators::shared::funding::funding_change_json;
 use crate::runtime::state_store::{
     tick_to_price, FundingChange, LatestFundingState, LatestMarkState, LevelAgg, MinuteHistory,
@@ -9,23 +12,26 @@ use std::sync::Arc;
 
 const EPS: f64 = 1e-12;
 const HISTORY_LIMIT_MINUTES_I64: i64 = crate::runtime::state_store::HISTORY_LIMIT_MINUTES as i64;
-const AVWAP_LOOKBACK_DAYS: i64 = 7;
-const AVWAP_LOOKBACK_MINUTES: i64 = AVWAP_LOOKBACK_DAYS * 24 * 60;
-const AVWAP_WINDOWS: [(&str, i64); 5] = [
+const AVWAP_WINDOWS: [(&str, i64); 7] = [
     ("15m", 15),
     ("1h", 60),
     ("4h", 240),
     ("1d", 1440),
     ("3d", 4320),
+    ("7d", 10_080),
+    ("30d", 43_200),
 ];
-const FUNDING_WINDOWS: [(&str, i64); 5] = [
+const AVWAP_MAX_LOOKBACK_MINUTES: i64 = 43_200;
+const FUNDING_WINDOWS: [(&str, i64); 7] = [
     ("15m", 15),
     ("1h", 60),
     ("4h", 240),
     ("1d", 1440),
     ("3d", 4320),
+    ("7d", 10_080),
+    ("30d", 43_200),
 ];
-const FUNDING_ALL_WINDOWS: [i64; 6] = [1, 15, 60, 240, 1440, 4320];
+const FUNDING_ALL_WINDOWS: [i64; 8] = [1, 15, 60, 240, 1440, 4320, 10_080, 43_200];
 
 #[derive(Debug, Clone, Default)]
 pub struct IncrementalIndicatorOutputs {
@@ -589,21 +595,20 @@ struct AvwapMinuteContribution {
 #[derive(Debug, Clone)]
 struct AvwapSeriesRow {
     ts_bucket: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct AvwapWindowMetrics {
+    observed_minutes: usize,
     avwap_fut: Option<f64>,
     avwap_spot: Option<f64>,
     gap: Option<f64>,
+    gap_zscore: Option<f64>,
 }
 
 #[derive(Default)]
 struct AvwapState {
     contributions: VecDeque<AvwapMinuteContribution>,
-    sum_fut_notional: f64,
-    sum_fut_qty: f64,
-    sum_spot_notional: f64,
-    sum_spot_qty: f64,
-    gap_values: VecDeque<(DateTime<Utc>, f64)>,
-    gap_sum: f64,
-    gap_sumsq: f64,
     series_by_window: BTreeMap<String, VecDeque<AvwapSeriesRow>>,
     series_json_by_window: BTreeMap<String, VecDeque<Value>>,
     last_ts: Option<DateTime<Utc>>,
@@ -661,76 +666,42 @@ impl AvwapState {
 
     fn append_minute(&mut self, fut: &MinuteHistory, spot: &MinuteHistory) {
         let ts_bucket = fut.ts_bucket;
-        let gap_minute = minute_gap(fut, spot);
-        let row = AvwapMinuteContribution {
+        self.contributions.push_back(AvwapMinuteContribution {
             ts_bucket,
             fut_notional: fut.total_notional,
             fut_qty: fut.total_qty,
             spot_notional: spot.total_notional,
             spot_qty: spot.total_qty,
-            gap_minute,
-        };
-        self.sum_fut_notional += row.fut_notional;
-        self.sum_fut_qty += row.fut_qty;
-        self.sum_spot_notional += row.spot_notional;
-        self.sum_spot_qty += row.spot_qty;
-        if let Some(gap) = row.gap_minute {
-            self.gap_values.push_back((ts_bucket, gap));
-            self.gap_sum += gap;
-            self.gap_sumsq += gap * gap;
-        }
-        self.contributions.push_back(row);
+            gap_minute: minute_gap(fut, spot),
+        });
 
-        let cutoff = ts_bucket - Duration::days(AVWAP_LOOKBACK_DAYS);
+        let cutoff = ts_bucket - Duration::minutes(AVWAP_MAX_LOOKBACK_MINUTES);
         while self
             .contributions
             .front()
             .map(|row| row.ts_bucket <= cutoff)
             .unwrap_or(false)
         {
-            if let Some(front) = self.contributions.pop_front() {
-                self.sum_fut_notional -= front.fut_notional;
-                self.sum_fut_qty -= front.fut_qty;
-                self.sum_spot_notional -= front.spot_notional;
-                self.sum_spot_qty -= front.spot_qty;
-            }
-        }
-        while self
-            .gap_values
-            .front()
-            .map(|(ts, _)| *ts <= cutoff)
-            .unwrap_or(false)
-        {
-            if let Some((_, gap)) = self.gap_values.pop_front() {
-                self.gap_sum -= gap;
-                self.gap_sumsq -= gap * gap;
-            }
+            self.contributions.pop_front();
         }
 
-        let current_fut = divide_or_none(self.sum_fut_notional, self.sum_fut_qty);
-        let current_spot = divide_or_none(self.sum_spot_notional, self.sum_spot_qty);
-        let current_gap = current_fut.zip(current_spot).map(|(f, s)| f - s);
         for (code, interval_mins) in AVWAP_WINDOWS {
             if ts_bucket.timestamp().rem_euclid(interval_mins * 60) != 0 {
                 continue;
             }
+            let metrics = self.window_metrics(ts_bucket, interval_mins);
             self.series_by_window
                 .entry(code.to_string())
                 .or_default()
-                .push_back(AvwapSeriesRow {
-                    ts_bucket,
-                    avwap_fut: current_fut,
-                    avwap_spot: current_spot,
-                    gap: current_gap,
-                });
+                .push_back(AvwapSeriesRow { ts_bucket });
             self.series_json_by_window
                 .entry(code.to_string())
                 .or_default()
                 .push_back(json!({
                     "ts": ts_bucket.to_rfc3339(),
-                    "avwap_fut": current_fut,
-                    "avwap_spot": current_spot,
-                    "xmk_avwap_gap_f_minus_s": current_gap,
+                    "avwap_fut": metrics.avwap_fut,
+                    "avwap_spot": metrics.avwap_spot,
+                    "xmk_avwap_gap_f_minus_s": metrics.gap,
                 }));
             if let Some(series) = self.series_by_window.get_mut(code) {
                 while series
@@ -766,16 +737,49 @@ impl AvwapState {
             return (None, None);
         }
 
-        let avwap_fut = divide_or_none(self.sum_fut_notional, self.sum_fut_qty);
-        let avwap_spot = divide_or_none(self.sum_spot_notional, self.sum_spot_qty);
+        let metrics = self.window_metrics(ts_bucket, AVWAP_LOOKBACK_MINUTES);
+        let avwap_fut = metrics.avwap_fut;
+        let avwap_spot = metrics.avwap_spot;
         let fut_last_price = latest_futures.and_then(|row| row.last_price);
         let fut_mark_price = latest_mark.and_then(|mark| mark.mark_price);
         let price_minus_avwap_fut = fut_last_price.zip(avwap_fut).map(|(p, a)| p - a);
         let price_minus_spot_avwap_fut = fut_last_price.zip(avwap_spot).map(|(p, a)| p - a);
         let price_minus_spot_avwap_futmark = fut_mark_price.zip(avwap_spot).map(|(p, a)| p - a);
-        let avwap_gap = avwap_fut.zip(avwap_spot).map(|(f, s)| f - s);
-        let zavwap_gap = gap_zscore(&self.gap_values, avwap_gap);
-        let lookback_start = ts_bucket - Duration::days(AVWAP_LOOKBACK_DAYS);
+        let avwap_gap = metrics.gap;
+        let zavwap_gap = metrics.gap_zscore;
+        let lookback_start = ts_bucket - Duration::minutes(AVWAP_LOOKBACK_MINUTES);
+        let primary_window_payload = avwap_window_snapshot_json(
+            "7d",
+            AVWAP_LOOKBACK_MINUTES,
+            lookback_start,
+            metrics.observed_minutes,
+            fut_last_price,
+            fut_mark_price,
+            avwap_fut,
+            avwap_spot,
+            avwap_gap,
+            zavwap_gap,
+        );
+
+        let mut by_window = Map::new();
+        for (code, lookback_minutes) in AVWAP_WINDOWS {
+            let metrics = self.window_metrics(ts_bucket, lookback_minutes);
+            by_window.insert(
+                code.to_string(),
+                avwap_window_snapshot_json(
+                    code,
+                    lookback_minutes,
+                    ts_bucket - Duration::minutes(lookback_minutes.max(1)),
+                    metrics.observed_minutes,
+                    fut_last_price,
+                    fut_mark_price,
+                    metrics.avwap_fut,
+                    metrics.avwap_spot,
+                    metrics.gap,
+                    metrics.gap_zscore,
+                ),
+            );
+        }
 
         let mut series_by_window = Map::new();
         for (code, _) in AVWAP_WINDOWS {
@@ -789,18 +793,49 @@ impl AvwapState {
 
         let snapshot = json!({
             "indicator": "avwap_dual_market",
-            "anchor_ts": lookback_start.to_rfc3339(),
-            "lookback": "7d",
+            "anchor_ts": primary_window_payload.get("anchor_ts").cloned().unwrap_or(Value::Null),
+            "lookback": primary_window_payload
+                .get("lookback")
+                .cloned()
+                .unwrap_or(json!(format!("{}d", AVWAP_LOOKBACK_DAYS))),
             "window": "1m",
-            "avwap_fut": avwap_fut,
-            "avwap_spot": avwap_spot,
-            "fut_last_price": fut_last_price,
-            "fut_mark_price": fut_mark_price,
-            "price_minus_avwap_fut": price_minus_avwap_fut,
-            "price_minus_spot_avwap_fut": price_minus_spot_avwap_fut,
-            "price_minus_spot_avwap_futmark": price_minus_spot_avwap_futmark,
-            "xmk_avwap_gap_f_minus_s": avwap_gap,
-            "zavwap_gap": zavwap_gap,
+            "avwap_fut": primary_window_payload.get("avwap_fut").cloned().unwrap_or(Value::Null),
+            "avwap_spot": primary_window_payload.get("avwap_spot").cloned().unwrap_or(Value::Null),
+            "fut_last_price": primary_window_payload
+                .get("fut_last_price")
+                .cloned()
+                .unwrap_or(Value::Null),
+            "fut_mark_price": primary_window_payload
+                .get("fut_mark_price")
+                .cloned()
+                .unwrap_or(Value::Null),
+            "price_minus_avwap_fut": primary_window_payload
+                .get("price_minus_avwap_fut")
+                .cloned()
+                .unwrap_or(Value::Null),
+            "price_minus_spot_avwap_fut": primary_window_payload
+                .get("price_minus_spot_avwap_fut")
+                .cloned()
+                .unwrap_or(Value::Null),
+            "price_minus_spot_avwap_futmark": primary_window_payload
+                .get("price_minus_spot_avwap_futmark")
+                .cloned()
+                .unwrap_or(Value::Null),
+            "xmk_avwap_gap_f_minus_s": primary_window_payload
+                .get("xmk_avwap_gap_f_minus_s")
+                .cloned()
+                .unwrap_or(Value::Null),
+            "zavwap_gap": primary_window_payload.get("zavwap_gap").cloned().unwrap_or(Value::Null),
+            "observed_minutes": primary_window_payload
+                .get("observed_minutes")
+                .cloned()
+                .unwrap_or(Value::Null),
+            "missing_minutes": primary_window_payload
+                .get("missing_minutes")
+                .cloned()
+                .unwrap_or(Value::Null),
+            "is_ready": primary_window_payload.get("is_ready").cloned().unwrap_or(Value::Null),
+            "by_window": by_window,
             "series_by_window": series_by_window,
         });
 
@@ -820,6 +855,42 @@ impl AvwapState {
 
         (Some(snapshot), Some(feature))
     }
+
+    fn window_metrics(&self, end_ts: DateTime<Utc>, lookback_minutes: i64) -> AvwapWindowMetrics {
+        let start_exclusive = end_ts - Duration::minutes(lookback_minutes.max(1));
+        let mut fut_notional = 0.0;
+        let mut fut_qty = 0.0;
+        let mut spot_notional = 0.0;
+        let mut spot_qty = 0.0;
+        let mut minute_gaps = Vec::new();
+        let mut observed_minutes = 0usize;
+
+        for row in self.contributions.iter() {
+            if row.ts_bucket <= start_exclusive || row.ts_bucket > end_ts {
+                continue;
+            }
+            observed_minutes += 1;
+            fut_notional += row.fut_notional;
+            fut_qty += row.fut_qty;
+            spot_notional += row.spot_notional;
+            spot_qty += row.spot_qty;
+            if let Some(gap) = row.gap_minute {
+                minute_gaps.push(gap);
+            }
+        }
+
+        let avwap_fut = divide_or_none(fut_notional, fut_qty);
+        let avwap_spot = divide_or_none(spot_notional, spot_qty);
+        let gap = avwap_fut.zip(avwap_spot).map(|(f, s)| f - s);
+
+        AvwapWindowMetrics {
+            observed_minutes,
+            avwap_fut,
+            avwap_spot,
+            gap,
+            gap_zscore: gap_zscore(&minute_gaps, gap),
+        }
+    }
 }
 
 fn minute_gap(fut: &MinuteHistory, spot: &MinuteHistory) -> Option<f64> {
@@ -828,28 +899,20 @@ fn minute_gap(fut: &MinuteHistory, spot: &MinuteHistory) -> Option<f64> {
     Some(fut_price - spot_price)
 }
 
-fn gap_zscore(gap_values: &VecDeque<(DateTime<Utc>, f64)>, current: Option<f64>) -> Option<f64> {
+fn gap_zscore(gap_values: &[f64], current: Option<f64>) -> Option<f64> {
     let current = current?;
     if gap_values.len() < 10 {
         return None;
     }
-    let gaps = gap_values
-        .iter()
-        .rev()
-        .map(|(_, gap)| *gap)
-        .collect::<Vec<_>>();
-    if gaps.len() < 10 {
-        return None;
-    }
-    let mean = gaps.iter().sum::<f64>() / gaps.len() as f64;
-    let variance = gaps
+    let mean = gap_values.iter().sum::<f64>() / gap_values.len() as f64;
+    let variance = gap_values
         .iter()
         .map(|value| {
             let delta = *value - mean;
             delta * delta
         })
         .sum::<f64>()
-        / gaps.len() as f64;
+        / gap_values.len() as f64;
     let sd = variance.sqrt();
     if sd <= EPS {
         Some(0.0)
@@ -1517,6 +1580,10 @@ impl RvwapState {
         let start_ts = end_ts - Duration::minutes(window_minutes.max(1));
         let start_idx = lower_bound_points_ts(&self.points, start_ts + Duration::minutes(1));
         if start_idx > end_idx {
+            return None;
+        }
+        let observed_points = end_idx + 1 - start_idx;
+        if observed_points < window_minutes.max(1) as usize {
             return None;
         }
         let end_point = &self.points[end_idx];
@@ -2573,7 +2640,7 @@ fn lower_bound_history_ts(history: &[MinuteHistory], target: DateTime<Utc>) -> u
 
 #[cfg(test)]
 mod tests {
-    use super::{IncrementalIndicatorConfig, IncrementalIndicatorState};
+    use super::{IncrementalIndicatorConfig, IncrementalIndicatorState, RvwapState};
     use crate::indicators::context::{
         DivergenceSigTestMode, IndicatorContext, IndicatorRuntimeOptions, KlineHistorySupplement,
         OpenInterestCurrentSidecar,
@@ -2833,9 +2900,7 @@ mod tests {
         ];
 
         for (code, legacy, incremental) in pairs {
-            if legacy != incremental {
-                let path = first_value_diff_path(&legacy, &incremental)
-                    .unwrap_or_else(|| "<unknown>".to_string());
+            if let Some(path) = first_value_diff_path(&legacy, &incremental) {
                 panic!(
                     "incremental payload diverged for {code} at {path}\nlegacy={legacy}\nincremental={incremental}"
                 );
@@ -2843,7 +2908,45 @@ mod tests {
         }
     }
 
+    #[test]
+    fn incremental_rvwap_requires_full_window_coverage() {
+        let ts_start = Utc
+            .with_ymd_and_hms(2026, 3, 20, 0, 0, 0)
+            .single()
+            .expect("valid ts");
+        let history = vec![
+            history_row(ts_start, MarketKind::Futures, 100.0, 1.0),
+            history_row(
+                ts_start + Duration::minutes(1),
+                MarketKind::Futures,
+                101.0,
+                1.0,
+            ),
+            history_row(
+                ts_start + Duration::minutes(2),
+                MarketKind::Futures,
+                102.0,
+                1.0,
+            ),
+        ];
+
+        let mut rvwap = RvwapState::new(vec![("5m".to_string(), 5)], Vec::new(), 2);
+        rvwap.rebuild(&history);
+
+        assert!(rvwap.compute_stats_at(2, 5).is_none());
+    }
+
     fn first_value_diff_path(left: &Value, right: &Value) -> Option<String> {
+        fn values_equivalent(left: &Value, right: &Value) -> bool {
+            match (left.as_f64(), right.as_f64()) {
+                (Some(lv), Some(rv)) => {
+                    let scale = lv.abs().max(rv.abs()).max(1.0);
+                    (lv - rv).abs() <= scale * 1e-9
+                }
+                _ => left == right,
+            }
+        }
+
         fn walk(left: &Value, right: &Value, path: &mut Vec<String>) -> Option<String> {
             match (left, right) {
                 (Value::Object(left_map), Value::Object(right_map)) => {
@@ -2857,18 +2960,22 @@ mod tests {
                     for key in keys {
                         let in_left = left_map.get(&key);
                         let in_right = right_map.get(&key);
-                        if in_left == in_right {
+                        if in_left
+                            .zip(in_right)
+                            .map(|(lv, rv)| values_equivalent(lv, rv))
+                            .unwrap_or(in_left == in_right)
+                        {
                             continue;
                         }
                         path.push(key);
                         let result = match (in_left, in_right) {
-                            (Some(lv), Some(rv)) => {
-                                walk(lv, rv, path).or_else(|| Some(path.join(".")))
-                            }
+                            (Some(lv), Some(rv)) => walk(lv, rv, path),
                             _ => Some(path.join(".")),
                         };
                         path.pop();
-                        return result;
+                        if result.is_some() {
+                            return result;
+                        }
                     }
                     None
                 }
@@ -2877,23 +2984,27 @@ mod tests {
                     for idx in 0..len {
                         let in_left = left_arr.get(idx);
                         let in_right = right_arr.get(idx);
-                        if in_left == in_right {
+                        if in_left
+                            .zip(in_right)
+                            .map(|(lv, rv)| values_equivalent(lv, rv))
+                            .unwrap_or(in_left == in_right)
+                        {
                             continue;
                         }
                         path.push(format!("[{idx}]"));
                         let result = match (in_left, in_right) {
-                            (Some(lv), Some(rv)) => {
-                                walk(lv, rv, path).or_else(|| Some(path.join(".")))
-                            }
+                            (Some(lv), Some(rv)) => walk(lv, rv, path),
                             _ => Some(path.join(".")),
                         };
                         path.pop();
-                        return result;
+                        if result.is_some() {
+                            return result;
+                        }
                     }
                     None
                 }
                 _ => {
-                    if left == right {
+                    if values_equivalent(left, right) {
                         None
                     } else {
                         Some(path.join("."))
@@ -2940,6 +3051,8 @@ mod tests {
             kline_history_bars_4h: 120,
             kline_history_bars_1d: 120,
             kline_history_bars_3d: 120,
+            kline_history_bars_7d: 120,
+            kline_history_bars_30d: 120,
             kline_history_fill_1d_from_db: true,
             fvg_windows: vec![
                 "15m".to_string(),
@@ -2950,6 +3063,7 @@ mod tests {
             fvg_fill_from_db: true,
             fvg_db_bars_4h: 256,
             fvg_db_bars_1d: 256,
+            fvg_db_bars_3d: 256,
             fvg_epsilon_gap_ticks: 2,
             fvg_atr_lookback: 14,
             fvg_min_body_ratio: 0.60,
