@@ -1063,6 +1063,29 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                     }
                 }
 
+                let next_minute_before_ready = scheduler.next_minute_to_emit();
+                let leading_gap_recovery = {
+                    let mut state_store = state_store.lock().await;
+                    maybe_recover_from_leading_canonical_gap(
+                        &mut state_store,
+                        &mut scheduler,
+                        next_minute_before_ready,
+                    )
+                    .await
+                };
+                if let Some(plan) = leading_gap_recovery {
+                    info!(
+                        blocked_minute = ?plan.blocked_minute,
+                        history_floor_ts = %plan.history_floor_ts,
+                        warm_end_ts = ?plan.warm_end_ts,
+                        replay_start_ts = %plan.replay_start_ts,
+                        continuity_end_ts = %plan.continuity_end_ts,
+                        warmed_minutes = plan.warmed_minutes,
+                        next_minute_after = ?scheduler.next_minute_to_emit(),
+                        "recovered live runtime from leading canonical gap by seeding the latest continuous segment"
+                    );
+                }
+
                 let next_minute = scheduler.next_minute_to_emit();
                 let (ready_through_ts, frontier_snapshot, next_minute_presence, has_pending_oi_ratio_patch) =
                     {
@@ -2871,6 +2894,81 @@ fn live_tail_reconcile_start_ts(
     effective_history_floor_ts
         .map(|floor| lookback_start.max(floor))
         .unwrap_or(lookback_start)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LeadingGapRecoveryPlan {
+    blocked_minute: Option<DateTime<Utc>>,
+    history_floor_ts: DateTime<Utc>,
+    warm_end_ts: Option<DateTime<Utc>>,
+    replay_start_ts: DateTime<Utc>,
+    continuity_end_ts: DateTime<Utc>,
+    warmed_minutes: usize,
+}
+
+fn leading_gap_history_floor_ts(
+    state_store: &StateStore,
+    replay_start_ts: DateTime<Utc>,
+    continuity_end_ts: DateTime<Utc>,
+) -> DateTime<Utc> {
+    match state_store.latest_continuous_trade_history_segment() {
+        Some((history_start_ts, history_end_ts))
+            if history_start_ts <= replay_start_ts && history_end_ts >= replay_start_ts =>
+        {
+            history_start_ts
+        }
+        _ => replay_start_ts.min(continuity_end_ts),
+    }
+}
+
+async fn maybe_recover_from_leading_canonical_gap(
+    state_store: &mut StateStore,
+    scheduler: &mut WindowScheduler,
+    next_minute: Option<DateTime<Utc>>,
+) -> Option<LeadingGapRecoveryPlan> {
+    if state_store.last_finalized_minute().is_some() {
+        return None;
+    }
+
+    let (replay_start_ts, continuity_end_ts) = state_store.latest_continuous_canonical_segment()?;
+    if let Some(blocked_minute) = next_minute {
+        let blocked_presence = state_store.canonical_minute_presence(blocked_minute);
+        if blocked_presence.complete_under_current_policy() || replay_start_ts <= blocked_minute {
+            return None;
+        }
+    }
+
+    let history_floor_ts =
+        leading_gap_history_floor_ts(state_store, replay_start_ts, continuity_end_ts);
+    state_store.set_effective_history_floor(Some(history_floor_ts));
+
+    let warm_end_candidate = replay_start_ts - ChronoDuration::minutes(1);
+    let mut warmed_minutes = 0usize;
+    let warm_end_ts = if history_floor_ts <= warm_end_candidate {
+        let mut minute = history_floor_ts;
+        while minute <= warm_end_candidate {
+            state_store.advance_finalized_state(minute);
+            warmed_minutes += 1;
+            if warmed_minutes % STARTUP_BACKFILL_YIELD_EVERY_MINUTES == 0 {
+                tokio::task::yield_now().await;
+            }
+            minute += ChronoDuration::minutes(1);
+        }
+        Some(warm_end_candidate)
+    } else {
+        None
+    };
+
+    scheduler.mark_emitted_through(warm_end_candidate);
+
+    Some(LeadingGapRecoveryPlan {
+        blocked_minute: next_minute,
+        history_floor_ts,
+        warm_end_ts,
+        replay_start_ts,
+        continuity_end_ts,
+        warmed_minutes,
+    })
 }
 
 fn shutdown_ready_through_candidate(
@@ -6457,7 +6555,9 @@ mod tests {
         TRADE_BACKFILL_WINDOW_SQL,
     };
     use crate::ingest::decoder::{
-        AggHeatmapLevel, AggOrderbook1mEvent, EngineEvent, MarketKind, MdData, TradeEvent,
+        AggFundingMark1mEvent, AggFundingPoint, AggHeatmapLevel, AggLiq1mEvent, AggLiqLevel,
+        AggMarkPoint, AggOrderbook1mEvent, AggTrade1mEvent, AggVpinSnapshot, AggWhaleStats,
+        EngineEvent, MarketKind, MdData, TradeEvent,
     };
     use crate::observability::metrics::AppMetrics;
     use crate::runtime::state_store::{
@@ -6591,6 +6691,156 @@ mod tests {
                 heatmap_loaded,
             }),
         )
+    }
+
+    fn agg_orderbook_event_spot(
+        ts_bucket: chrono::DateTime<Utc>,
+        heatmap_loaded: bool,
+        bid_liquidity: f64,
+    ) -> EngineEvent {
+        let mut event = agg_orderbook_event(ts_bucket, heatmap_loaded, bid_liquidity);
+        event.market = MarketKind::Spot;
+        event.routing_key = "md.agg.spot.orderbook.1m.testusdt".to_string();
+        event
+    }
+
+    fn agg_trade_event(
+        ts_bucket: chrono::DateTime<Utc>,
+        buy_qty: f64,
+        sell_qty: f64,
+        last_vpin: f64,
+    ) -> EngineEvent {
+        EngineEvent {
+            schema_version: 1,
+            msg_type: "md.agg.trade.1m".to_string(),
+            message_id: Uuid::new_v4(),
+            trace_id: Uuid::new_v4(),
+            routing_key: "md.agg.futures.trade.1m.testusdt".to_string(),
+            market: MarketKind::Futures,
+            symbol: "TESTUSDT".to_string(),
+            source_kind: "test".to_string(),
+            backfill_in_progress: false,
+            event_ts: ts_bucket + ChronoDuration::seconds(59),
+            published_at: ts_bucket + ChronoDuration::seconds(59),
+            data: MdData::AggTrade1m(AggTrade1mEvent {
+                ts_bucket,
+                chunk_start_ts: ts_bucket,
+                chunk_end_ts: ts_bucket + ChronoDuration::seconds(59),
+                source_event_count: 1,
+                trade_count: 1,
+                buy_qty,
+                sell_qty,
+                buy_notional: buy_qty * 2000.0,
+                sell_notional: sell_qty * 2000.0,
+                first_price: Some(2000.0),
+                last_price: Some(2000.0),
+                high_price: Some(2000.0),
+                low_price: Some(2000.0),
+                profile_levels: Vec::new(),
+                whale: AggWhaleStats {
+                    trade_count: 0,
+                    buy_count: 0,
+                    sell_count: 0,
+                    notional_total: 0.0,
+                    notional_buy: 0.0,
+                    notional_sell: 0.0,
+                    qty_eth_total: 0.0,
+                    qty_eth_buy: 0.0,
+                    qty_eth_sell: 0.0,
+                    max_single_notional: 0.0,
+                },
+                vpin_snapshot: Some(AggVpinSnapshot {
+                    current_buy: 0.0,
+                    current_sell: 0.0,
+                    current_fill: 0.0,
+                    imbalances: Vec::new(),
+                    imbalance_sum: 0.0,
+                    last_vpin,
+                }),
+            }),
+        }
+    }
+
+    fn agg_trade_event_spot(
+        ts_bucket: chrono::DateTime<Utc>,
+        buy_qty: f64,
+        sell_qty: f64,
+        last_vpin: f64,
+    ) -> EngineEvent {
+        let mut event = agg_trade_event(ts_bucket, buy_qty, sell_qty, last_vpin);
+        event.market = MarketKind::Spot;
+        event.routing_key = "md.agg.spot.trade.1m.testusdt".to_string();
+        event
+    }
+
+    fn agg_liq_event(ts_bucket: chrono::DateTime<Utc>, notional: f64) -> EngineEvent {
+        EngineEvent {
+            schema_version: 1,
+            msg_type: "md.agg.liq.1m".to_string(),
+            message_id: Uuid::new_v4(),
+            trace_id: Uuid::new_v4(),
+            routing_key: "md.agg.futures.liq.1m.testusdt".to_string(),
+            market: MarketKind::Futures,
+            symbol: "TESTUSDT".to_string(),
+            source_kind: "test".to_string(),
+            backfill_in_progress: false,
+            event_ts: ts_bucket + ChronoDuration::seconds(59),
+            published_at: ts_bucket + ChronoDuration::seconds(59),
+            data: MdData::AggLiq1m(AggLiq1mEvent {
+                ts_bucket,
+                chunk_start_ts: ts_bucket,
+                chunk_end_ts: ts_bucket + ChronoDuration::seconds(59),
+                source_event_count: 1,
+                levels: vec![AggLiqLevel {
+                    price: 2000.0,
+                    long_liq: notional,
+                    short_liq: notional / 2.0,
+                }],
+            }),
+        }
+    }
+
+    fn agg_funding_mark_event(
+        ts_bucket: chrono::DateTime<Utc>,
+        point_offset_secs: i64,
+        mark_price: f64,
+        funding_rate: f64,
+    ) -> EngineEvent {
+        let point_ts = ts_bucket + ChronoDuration::seconds(point_offset_secs);
+        EngineEvent {
+            schema_version: 1,
+            msg_type: "md.agg.funding_mark.1m".to_string(),
+            message_id: Uuid::new_v4(),
+            trace_id: Uuid::new_v4(),
+            routing_key: "md.agg.futures.funding_mark.1m.testusdt".to_string(),
+            market: MarketKind::Futures,
+            symbol: "TESTUSDT".to_string(),
+            source_kind: "test".to_string(),
+            backfill_in_progress: false,
+            event_ts: ts_bucket + ChronoDuration::seconds(59),
+            published_at: ts_bucket + ChronoDuration::seconds(59),
+            data: MdData::AggFundingMark1m(AggFundingMark1mEvent {
+                ts_bucket,
+                chunk_start_ts: ts_bucket,
+                chunk_end_ts: ts_bucket + ChronoDuration::seconds(59),
+                source_event_count: 1,
+                mark_points: vec![AggMarkPoint {
+                    ts: point_ts,
+                    mark_price: Some(mark_price),
+                    index_price: Some(mark_price + 1.0),
+                    estimated_settle_price: None,
+                    funding_rate: Some(funding_rate),
+                    next_funding_time: None,
+                }],
+                funding_points: vec![AggFundingPoint {
+                    ts: point_ts,
+                    funding_time: Some(point_ts),
+                    funding_rate,
+                    mark_price: Some(mark_price),
+                    next_funding_time: None,
+                }],
+            }),
+        }
     }
 
     fn snapshot_fixture(
@@ -7177,6 +7427,111 @@ mod tests {
         controller.mark_gap_repair_attempt(blocking_minute);
         assert!(!controller.gap_repair_due(blocking_minute));
         assert!(controller.gap_repair_due(next_minute));
+    }
+
+    #[tokio::test]
+    async fn leading_gap_recovery_skips_to_latest_continuous_segment() {
+        let blocking_minute = Utc
+            .with_ymd_and_hms(2026, 3, 23, 12, 0, 0)
+            .single()
+            .unwrap();
+        let replay_start_ts = blocking_minute + ChronoDuration::minutes(2);
+        let continuity_end_ts = replay_start_ts + ChronoDuration::minutes(1);
+        let mut state_store =
+            crate::runtime::state_store::StateStore::new("TESTUSDT".to_string(), 1_000.0);
+        let mut scheduler = WindowScheduler::new(0);
+        scheduler.prime_start_from(blocking_minute);
+
+        state_store.ingest(agg_funding_mark_event(blocking_minute, 45, 2000.0, 0.01));
+
+        for ts in [replay_start_ts, continuity_end_ts] {
+            state_store.ingest(agg_trade_event(ts, 1.0, 0.5, 0.2));
+            state_store.ingest(agg_orderbook_event(ts, true, 4.0));
+            state_store.ingest(agg_liq_event(ts, 10.0));
+            state_store.ingest(agg_funding_mark_event(ts, 45, 2000.0, 0.01));
+            state_store.ingest(agg_trade_event_spot(ts, 1.0, 0.5, 0.2));
+            state_store.ingest(agg_orderbook_event_spot(ts, true, 4.0));
+        }
+
+        let next_minute = scheduler.next_minute_to_emit();
+        let plan = super::maybe_recover_from_leading_canonical_gap(
+            &mut state_store,
+            &mut scheduler,
+            next_minute,
+        )
+        .await
+        .expect("expected leading-gap recovery plan");
+
+        assert_eq!(plan.blocked_minute, Some(blocking_minute));
+        assert_eq!(plan.history_floor_ts, replay_start_ts);
+        assert_eq!(plan.warm_end_ts, None);
+        assert_eq!(plan.replay_start_ts, replay_start_ts);
+        assert_eq!(plan.continuity_end_ts, continuity_end_ts);
+        assert_eq!(plan.warmed_minutes, 0);
+        assert_eq!(scheduler.next_minute_to_emit(), Some(replay_start_ts));
+        assert_eq!(state_store.last_finalized_minute(), None);
+        assert_eq!(
+            state_store
+                .canonical_frontier_snapshot()
+                .effective_history_floor_ts,
+            Some(replay_start_ts)
+        );
+    }
+
+    #[tokio::test]
+    async fn leading_gap_recovery_warms_trade_history_before_first_complete_minute() {
+        let blocking_minute = Utc
+            .with_ymd_and_hms(2026, 3, 23, 12, 0, 0)
+            .single()
+            .unwrap();
+        let warm_history_minute = blocking_minute + ChronoDuration::minutes(1);
+        let replay_start_ts = blocking_minute + ChronoDuration::minutes(2);
+        let continuity_end_ts = replay_start_ts + ChronoDuration::minutes(1);
+        let mut state_store =
+            crate::runtime::state_store::StateStore::new("TESTUSDT".to_string(), 1_000.0);
+        let mut scheduler = WindowScheduler::new(0);
+        scheduler.prime_start_from(blocking_minute);
+
+        state_store.ingest(agg_funding_mark_event(blocking_minute, 45, 2000.0, 0.01));
+
+        for ts in [warm_history_minute, replay_start_ts, continuity_end_ts] {
+            state_store.ingest(agg_trade_event(ts, 1.0, 0.5, 0.2));
+            state_store.ingest(agg_trade_event_spot(ts, 1.0, 0.5, 0.2));
+        }
+        for ts in [replay_start_ts, continuity_end_ts] {
+            state_store.ingest(agg_orderbook_event(ts, true, 4.0));
+            state_store.ingest(agg_liq_event(ts, 10.0));
+            state_store.ingest(agg_funding_mark_event(ts, 45, 2000.0, 0.01));
+            state_store.ingest(agg_orderbook_event_spot(ts, true, 4.0));
+        }
+
+        let next_minute = scheduler.next_minute_to_emit();
+        let plan = super::maybe_recover_from_leading_canonical_gap(
+            &mut state_store,
+            &mut scheduler,
+            next_minute,
+        )
+        .await
+        .expect("expected leading-gap recovery plan");
+
+        assert_eq!(plan.blocked_minute, Some(blocking_minute));
+        assert_eq!(plan.history_floor_ts, warm_history_minute);
+        assert_eq!(plan.warm_end_ts, Some(warm_history_minute));
+        assert_eq!(plan.replay_start_ts, replay_start_ts);
+        assert_eq!(plan.continuity_end_ts, continuity_end_ts);
+        assert_eq!(plan.warmed_minutes, 1);
+        assert_eq!(scheduler.next_minute_to_emit(), Some(replay_start_ts));
+        assert_eq!(
+            state_store.last_finalized_minute(),
+            Some(warm_history_minute)
+        );
+        assert_eq!(state_store.history_futures_len(), 1);
+        assert_eq!(
+            state_store
+                .canonical_frontier_snapshot()
+                .effective_history_floor_ts,
+            Some(warm_history_minute)
+        );
     }
 
     #[test]
