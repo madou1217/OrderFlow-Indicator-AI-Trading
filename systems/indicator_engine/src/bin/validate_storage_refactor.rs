@@ -1395,6 +1395,8 @@ async fn compute_snapshots(
         runtime_options.kline_history_bars_4h,
         runtime_options.kline_history_bars_1d,
         runtime_options.kline_history_bars_3d,
+        runtime_options.kline_history_bars_7d,
+        runtime_options.kline_history_bars_30d,
         runtime_options.kline_history_fill_1d_from_db,
         runtime_options.ema_fill_from_db,
         &runtime_options.ema_htf_windows,
@@ -1405,6 +1407,7 @@ async fn compute_snapshots(
         &runtime_options.fvg_windows,
         runtime_options.fvg_db_bars_4h,
         runtime_options.fvg_db_bars_1d,
+        runtime_options.fvg_db_bars_3d,
         bundle.ts_bucket + ChronoDuration::minutes(1),
     )
     .await;

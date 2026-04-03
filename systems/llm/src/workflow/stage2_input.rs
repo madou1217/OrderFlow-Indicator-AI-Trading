@@ -63,14 +63,29 @@ fn raw_indicator_payload<'a>(input: &'a ModelInvocationInput, key: &str) -> &'a 
         .unwrap_or(&Value::Null)
 }
 
-fn latest_series_entry(value: &Value, key: &str, window: &str) -> Value {
+fn recent_window_entry(value: &Value, key: &str, window: &str) -> Value {
     value
         .get(key)
-        .and_then(|series| series.get(window))
-        .and_then(Value::as_array)
-        .and_then(|items| items.last())
+        .and_then(|windows| windows.get(window))
         .cloned()
         .unwrap_or(Value::Null)
+}
+
+fn avwap_recent_window_code(window: &str) -> &str {
+    match window {
+        "7d_lookback" => "7d",
+        other => other,
+    }
+}
+
+fn cvd_recent_window_view(value: &Value, window: &str) -> Value {
+    let window_value = recent_window_entry(value, "by_window", window);
+    if let Some(current_window) = window_value.get("current_window") {
+        if value_present(current_window) {
+            return current_window.clone();
+        }
+    }
+    window_value
 }
 
 fn price_within_envelope(price: f64, envelope: (f64, f64)) -> bool {
@@ -148,12 +163,7 @@ fn reference_windows_for_timeframe_hint(timeframe: &str) -> Vec<&'static str> {
 fn primary_avwap_reference_window(timeframe: &str, avwap: &Value) -> &'static str {
     reference_windows_for_timeframe_hint(timeframe)
         .into_iter()
-        .find(|window| {
-            if *window == "7d_lookback" {
-                return value_present(&avwap_reference_for_window(avwap, window));
-            }
-            value_present(&latest_series_entry(avwap, "series_by_window", window))
-        })
+        .find(|window| value_present(&avwap_reference_for_window(avwap, window)))
         .unwrap_or("7d_lookback")
 }
 
@@ -181,26 +191,7 @@ fn zone_state_for_zone_id<'a>(
 }
 
 fn avwap_reference_for_window(avwap: &Value, window: &str) -> Value {
-    match window {
-        "15m" | "4h" | "1d" => latest_series_entry(avwap, "series_by_window", window),
-        "3d" => {
-            let reference = latest_series_entry(avwap, "series_by_window", "3d");
-            if value_present(&reference) {
-                reference
-            } else {
-                latest_series_entry(avwap, "series_by_window", "1d")
-            }
-        }
-        "7d_lookback" => json!({
-            "lookback": avwap.get("lookback").cloned().unwrap_or(Value::Null),
-            "anchor_ts": avwap.get("anchor_ts").cloned().unwrap_or(Value::Null),
-            "avwap_fut": avwap.get("avwap_fut").cloned().unwrap_or(Value::Null),
-            "avwap_spot": avwap.get("avwap_spot").cloned().unwrap_or(Value::Null),
-            "price_minus_avwap_fut": avwap.get("price_minus_avwap_fut").cloned().unwrap_or(Value::Null),
-            "price_minus_spot_avwap_fut": avwap.get("price_minus_spot_avwap_fut").cloned().unwrap_or(Value::Null),
-        }),
-        _ => Value::Null,
-    }
+    recent_window_entry(avwap, "by_window", avwap_recent_window_code(window))
 }
 
 fn build_selected_avwap_anchors(
@@ -561,12 +552,33 @@ fn build_local_price_location_summary(
 
 fn latest_window_metric(window_payload: &Value, field: &str) -> Option<f64> {
     window_payload
-        .get("series")
-        .and_then(Value::as_array)
-        .and_then(|items| items.last())
+        .get("current_window")
+        .and_then(|value| value.get("point"))
         .and_then(|item| item.get(field))
         .and_then(Value::as_f64)
-        .or_else(|| window_payload.get(field).and_then(Value::as_f64))
+        .or_else(|| {
+            window_payload
+                .get("current_window")
+                .and_then(|value| value.get("compact_series"))
+                .and_then(Value::as_array)
+                .and_then(|items| items.last())
+                .and_then(|item| item.get(field))
+                .and_then(Value::as_f64)
+        })
+        .or_else(|| {
+            window_payload
+                .get("point")
+                .and_then(|item| item.get(field))
+                .and_then(Value::as_f64)
+        })
+        .or_else(|| {
+            window_payload
+                .get("compact_series")
+                .and_then(Value::as_array)
+                .and_then(|items| items.last())
+                .and_then(|item| item.get(field))
+                .and_then(Value::as_f64)
+        })
 }
 
 fn build_local_flow_summary(summary: &StrategicIndicatorSummary) -> Value {
@@ -908,12 +920,7 @@ fn build_strategic_context_frozen(
             .and_then(|value| value.get("1d"))
             .cloned()
             .unwrap_or(Value::Null),
-        "avwap_reference_7d": json!({
-            "lookback": avwap.get("lookback").cloned().unwrap_or(Value::Null),
-            "anchor_ts": avwap.get("anchor_ts").cloned().unwrap_or(Value::Null),
-            "avwap_fut": avwap.get("avwap_fut").cloned().unwrap_or(Value::Null),
-            "avwap_spot": avwap.get("avwap_spot").cloned().unwrap_or(Value::Null),
-        }),
+        "avwap_reference_7d": avwap_reference_for_window(avwap, "7d_lookback"),
     })
 }
 
@@ -954,11 +961,7 @@ fn build_continuity_confirmation_context_5m(
             .and_then(|value| value.get("5m"))
             .cloned()
             .unwrap_or(Value::Null),
-        "cvd_pack_5m": raw_indicator_payload(input, "cvd_pack")
-            .get("by_window")
-            .and_then(|value| value.get("5m"))
-            .cloned()
-            .unwrap_or(Value::Null),
+        "cvd_pack_5m": cvd_recent_window_view(raw_indicator_payload(input, "cvd_pack"), "5m"),
         "open_interest_5m": context_child(state_layer, "open_interest")
             .get("by_window")
             .and_then(|value| value.get("5m"))
@@ -1651,17 +1654,52 @@ mod tests {
                 },
                 "avwap": {
                     "payload": {
-                        "anchor_ts": "2026-03-23T00:00:00Z",
-                        "lookback": "7d",
-                        "avwap_fut": 103.4,
-                        "avwap_spot": 103.1,
-                        "price_minus_avwap_fut": 6.8,
-                        "price_minus_spot_avwap_fut": 7.1,
-                        "series_by_window": {
-                            "15m": [{"ts": "2026-03-30T06:15:00Z", "avwap_fut": 105.1, "avwap_spot": 104.8}],
-                            "4h": [{"ts": "2026-03-30T04:00:00Z", "avwap_fut": 101.2, "avwap_spot": 100.9}],
-                            "1d": [{"ts": "2026-03-30T00:00:00Z", "avwap_fut": 104.8, "avwap_spot": 104.3}],
-                            "3d": [{"ts": "2026-03-30T00:00:00Z", "avwap_fut": 108.7, "avwap_spot": 108.1}]
+                        "by_window": {
+                            "15m": {
+                                "lookback": "15m",
+                                "anchor_ts": "2026-03-30T06:00:00Z",
+                                "avwap_fut": 105.4,
+                                "avwap_spot": 105.0,
+                                "price_minus_avwap_fut": 3.8,
+                                "price_minus_spot_avwap_fut": 4.2,
+                                "window_semantics": "recent_n_window"
+                            },
+                            "4h": {
+                                "lookback": "4h",
+                                "anchor_ts": "2026-03-30T02:15:00Z",
+                                "avwap_fut": 101.6,
+                                "avwap_spot": 101.1,
+                                "price_minus_avwap_fut": 7.6,
+                                "price_minus_spot_avwap_fut": 8.1,
+                                "window_semantics": "recent_n_window"
+                            },
+                            "1d": {
+                                "lookback": "1d",
+                                "anchor_ts": "2026-03-29T06:15:00Z",
+                                "avwap_fut": 105.0,
+                                "avwap_spot": 104.4,
+                                "price_minus_avwap_fut": 4.2,
+                                "price_minus_spot_avwap_fut": 4.8,
+                                "window_semantics": "recent_n_window"
+                            },
+                            "3d": {
+                                "lookback": "3d",
+                                "anchor_ts": "2026-03-27T06:15:00Z",
+                                "avwap_fut": 109.1,
+                                "avwap_spot": 108.5,
+                                "price_minus_avwap_fut": 0.1,
+                                "price_minus_spot_avwap_fut": 0.7,
+                                "window_semantics": "recent_n_window"
+                            },
+                            "7d": {
+                                "lookback": "7d",
+                                "anchor_ts": "2026-03-23T06:15:00Z",
+                                "avwap_fut": 103.8,
+                                "avwap_spot": 103.3,
+                                "price_minus_avwap_fut": 5.4,
+                                "price_minus_spot_avwap_fut": 5.9,
+                                "window_semantics": "recent_n_window"
+                            }
                         }
                     }
                 },
@@ -1741,10 +1779,30 @@ mod tests {
                 "cvd_pack": {
                     "payload": {
                         "by_window": {
-                            "5m": {"delta_fut": 10.0},
-                            "15m": {"delta_fut": 20.0, "delta_spot": 12.0},
-                            "4h": {"delta_fut": 50.0},
-                            "1d": {"delta_fut": 80.0}
+                            "5m": {
+                                "current_window": {
+                                    "window_semantics": "recent_n_window",
+                                    "point": {"ts": "2026-03-30T06:15:00Z", "delta_fut": 13.0, "delta_spot": 8.0, "cvd_window_fut": 130.0}
+                                }
+                            },
+                            "15m": {
+                                "current_window": {
+                                    "window_semantics": "recent_n_window",
+                                    "point": {"ts": "2026-03-30T06:15:00Z", "delta_fut": 26.0, "delta_spot": 18.0, "cvd_window_fut": 260.0}
+                                }
+                            },
+                            "4h": {
+                                "current_window": {
+                                    "window_semantics": "recent_n_window",
+                                    "point": {"ts": "2026-03-30T06:15:00Z", "delta_fut": 54.0, "delta_spot": 37.0, "cvd_window_fut": 540.0}
+                                }
+                            },
+                            "1d": {
+                                "current_window": {
+                                    "window_semantics": "recent_n_window",
+                                    "point": {"ts": "2026-03-30T06:15:00Z", "delta_fut": 84.0, "delta_spot": 59.0, "cvd_window_fut": 840.0}
+                                }
+                            }
                         }
                     }
                 },
@@ -2356,6 +2414,16 @@ mod tests {
             .tracked_zones
             .clone();
         let summary = build_indicator_summary(&input, &tracked_zones).expect("indicator summary");
+        assert!(summary.position_layer["avwap"].get("avwap_fut").is_none());
+        assert!(summary.position_layer["avwap"]
+            .get("series_by_window")
+            .is_none());
+        assert!(summary.driver_layer["cvd_pack"]["by_window"]["15m"]
+            .get("delta_fut")
+            .is_none());
+        assert!(summary.driver_layer["cvd_pack"]["by_window"]["15m"]
+            .get("series")
+            .is_none());
         let prompt = build_stage2a_prompt_input(&input, &summary, &stage1_output);
         let encoded = serde_json::to_value(&prompt).expect("encode prompt");
 
@@ -2395,7 +2463,15 @@ mod tests {
         assert_eq!(next_target_anchor["mapped_reference_window"], json!("3d"));
         assert_eq!(
             next_target_anchor["mapped_avwap_reference"]["avwap_fut"],
-            json!(108.7)
+            json!(109.1)
+        );
+        assert_eq!(
+            next_target_anchor["mapped_avwap_reference"]["window_semantics"],
+            json!("recent_n_window")
+        );
+        assert_eq!(
+            encoded["strategic_context_frozen"]["avwap_reference_7d"]["avwap_fut"],
+            json!(103.8)
         );
         assert_eq!(
             encoded["strategic_context_frozen"]["ema_trend_regime_4h_1d"]["trend_regime_by_tf"]
@@ -2424,7 +2500,15 @@ mod tests {
             ["selected_anchor_distances"][2]["distance_to_mapped_avwap_fut"]
             .as_f64()
             .expect("mapped avwap distance");
-        assert!((mapped_distance - 0.5).abs() < 1e-9);
+        assert!((mapped_distance - 0.1).abs() < 1e-9);
+        assert_eq!(
+            encoded["entry_location_context_15m"]["local_flow_summary"]["delta_fut_15m"],
+            json!(26.0)
+        );
+        assert_eq!(
+            encoded["entry_location_context_15m"]["local_flow_summary"]["delta_spot_15m"],
+            json!(18.0)
+        );
         assert_eq!(
             selected_anchors[0]["zone_state"]["acceptance_state"],
             json!("accepted_above")
@@ -2466,6 +2550,10 @@ mod tests {
             .tracked_zones
             .clone();
         let summary = build_indicator_summary(&input, &tracked_zones).expect("indicator summary");
+        assert!(summary.position_layer["avwap"].get("avwap_fut").is_none());
+        assert!(summary.driver_layer["cvd_pack"]["by_window"]["5m"]
+            .get("delta_fut")
+            .is_none());
         let trading_state = sample_trading_state();
 
         let stage2b_prompt = build_stage2b_prompt_input(
@@ -2488,6 +2576,11 @@ mod tests {
             stage2b_encoded["strategic_context_frozen"]["ema_trend_regime_4h_1d"]
                 ["trend_regime_by_tf"]["1d"],
             json!("bullish_supportive")
+        );
+        assert_eq!(
+            stage2b_encoded["continuity_confirmation_context_5m"]["cvd_pack_5m"]["point"]
+                ["delta_fut"],
+            json!(13.0)
         );
 
         let stage2c_prompt = build_stage2c_prompt_input(
@@ -2513,6 +2606,11 @@ mod tests {
             stage2c_encoded["entry_location_context_15m"]["avwap_anchor_distances"]
                 ["selected_anchor_distances"][0]["mapped_reference_window"],
             json!("4h")
+        );
+        assert_eq!(
+            stage2c_encoded["continuity_confirmation_context_5m"]["cvd_pack_5m"]["point"]
+                ["delta_spot"],
+            json!(8.0)
         );
     }
 }

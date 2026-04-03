@@ -118,6 +118,10 @@ fn preferred_indicator_payload(
     }
 }
 
+fn filtered_indicator_payload(filtered_indicators: &Value, key: &str) -> Value {
+    indicator_payload(filtered_indicators, key)
+}
+
 fn wrap_filtered_payload(payload: Value) -> Value {
     json!({ "payload": payload })
 }
@@ -354,22 +358,22 @@ pub fn build_indicator_summary(
 
     let position_layer = json!({
         "price_volume_structure": preferred_indicator_payload(&filtered_indicators, &input.indicators, "price_volume_structure"),
-        "rvwap_sigma_bands": preferred_indicator_payload(&filtered_indicators, &input.indicators, "rvwap_sigma_bands"),
-        "avwap": preferred_indicator_payload(&filtered_indicators, &input.indicators, "avwap"),
+        "rvwap_sigma_bands": filtered_indicator_payload(&filtered_indicators, "rvwap_sigma_bands"),
+        "avwap": filtered_indicator_payload(&filtered_indicators, "avwap"),
         "tpo_market_profile": preferred_indicator_payload(&filtered_indicators, &input.indicators, "tpo_market_profile"),
         "fvg": preferred_indicator_payload(&filtered_indicators, &input.indicators, "fvg"),
-        "liquidation_density": preferred_indicator_payload(&filtered_indicators, &input.indicators, "liquidation_density"),
+        "liquidation_density": filtered_indicator_payload(&filtered_indicators, "liquidation_density"),
         "ema_trend_regime": preferred_indicator_payload(&filtered_indicators, &input.indicators, "ema_trend_regime")
     });
     let state_layer = json!({
         "open_interest": indicator_payload(&input.indicators, "open_interest"),
         "long_short_ratios": indicator_payload(&input.indicators, "long_short_ratios"),
         "funding_rate": preferred_indicator_payload(&filtered_indicators, &input.indicators, "funding_rate"),
-        "vpin": preferred_indicator_payload(&filtered_indicators, &input.indicators, "vpin")
+        "vpin": filtered_indicator_payload(&filtered_indicators, "vpin")
     });
     let driver_layer = json!({
-        "whale_trades": preferred_indicator_payload(&filtered_indicators, &input.indicators, "whale_trades"),
-        "cvd_pack": preferred_indicator_payload(&filtered_indicators, &input.indicators, "cvd_pack"),
+        "whale_trades": filtered_indicator_payload(&filtered_indicators, "whale_trades"),
+        "cvd_pack": filtered_indicator_payload(&filtered_indicators, "cvd_pack"),
         "divergence": preferred_indicator_payload(&filtered_indicators, &input.indicators, "divergence")
     });
     let trigger_layer = json!({
@@ -622,5 +626,103 @@ mod tests {
         );
         assert!(summary.position_layer.get("options_surface").is_none());
         assert!(summary.aux_context.get("raw_indicators").is_none());
+    }
+
+    #[test]
+    fn code_layer_does_not_fallback_to_raw_for_recent_n_indicators() {
+        let now = Utc::now();
+        let input = ModelInvocationInput {
+            symbol: "ETHUSDT".to_string(),
+            ts_bucket: now,
+            window_code: "15m".to_string(),
+            indicator_count: 6,
+            source_routing_key: "test".to_string(),
+            source_published_at: None,
+            received_at: now,
+            indicators: json!({
+                "avwap": {
+                    "payload": {
+                        "anchor_ts": "2026-03-27T12:00:00Z",
+                        "avwap_fut": 2000.0,
+                        "avwap_spot": 1999.0,
+                        "lookback": "7d"
+                    }
+                },
+                "rvwap_sigma_bands": {
+                    "payload": {
+                        "legacy_field": "raw_rvwap_should_not_leak"
+                    }
+                },
+                "liquidation_density": {
+                    "payload": {
+                        "legacy_field": "raw_liq_should_not_leak"
+                    }
+                },
+                "vpin": {
+                    "payload": {
+                        "vpin_fut": 0.62
+                    }
+                },
+                "whale_trades": {
+                    "payload": {
+                        "fut_count": 9
+                    }
+                },
+                "cvd_pack": {
+                    "payload": {
+                        "delta_fut": 111.0,
+                        "delta_spot": 77.0,
+                        "by_window": {
+                            "15m": {
+                                "series": [{
+                                    "ts": "2026-03-27T12:00:00Z",
+                                    "delta_fut": 10.0
+                                }]
+                            }
+                        }
+                    }
+                },
+                "kline_history": {
+                    "payload": {
+                        "intervals": {
+                            "15m": {
+                                "markets": {
+                                    "futures": {
+                                        "bars": [{
+                                            "open_time": "2026-03-27T11:45:00Z",
+                                            "close_time": "2026-03-27T12:00:00Z",
+                                            "open": 1998.0,
+                                            "high": 2002.0,
+                                            "low": 1997.5,
+                                            "close": 2000.5,
+                                            "is_closed": true
+                                        }]
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }),
+            missing_indicator_codes: vec![],
+            trading_state: None,
+            management_snapshot: None,
+        };
+
+        let summary = build_indicator_summary(&input, &[]).expect("build indicator summary");
+        assert_eq!(summary.position_layer["avwap"], json!({}));
+        assert!(summary.position_layer["rvwap_sigma_bands"]
+            .get("legacy_field")
+            .is_none());
+        assert!(summary.position_layer["liquidation_density"]
+            .get("legacy_field")
+            .is_none());
+        assert_eq!(summary.state_layer["vpin"], json!({}));
+        assert_eq!(summary.driver_layer["whale_trades"], json!({}));
+        assert!(summary.driver_layer["cvd_pack"]
+            .pointer("/by_window/15m/series")
+            .is_none());
+        assert_eq!(summary.driver_layer["cvd_pack"]["delta_fut"], json!(111.0));
+        assert_eq!(summary.driver_layer["cvd_pack"]["delta_spot"], json!(77.0));
     }
 }

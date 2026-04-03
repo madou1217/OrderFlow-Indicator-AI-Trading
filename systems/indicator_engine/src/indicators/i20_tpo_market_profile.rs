@@ -1,4 +1,6 @@
-use crate::indicators::context::IndicatorContext;
+use crate::indicators::context::{
+    window_code_minutes as shared_window_code_minutes, IndicatorContext,
+};
 use crate::indicators::indicator_trait::Indicator;
 use crate::indicators::shared::output_mapper::snapshot_only;
 use chrono::{DateTime, Duration, TimeZone, Utc};
@@ -415,12 +417,7 @@ fn floor_to_interval(ts: DateTime<Utc>, interval_minutes: i64) -> DateTime<Utc> 
 }
 
 fn session_window_minutes(code: &str) -> Option<i64> {
-    match code {
-        "4h" => Some(240),
-        "1d" => Some(1440),
-        "3d" => Some(4320),
-        _ => None,
-    }
+    shared_window_code_minutes(code)
 }
 
 fn output_window_minutes(code: &str) -> Option<i64> {
@@ -523,7 +520,7 @@ mod tests {
     }
 
     #[test]
-    fn session_window_minutes_supports_3d() {
-        assert_eq!(session_window_minutes("3d"), Some(4320));
+    fn session_window_minutes_supports_30d() {
+        assert_eq!(session_window_minutes("30d"), Some(43_200));
     }
 }

@@ -1,4 +1,6 @@
-use crate::indicators::context::{IndicatorContext, KlineHistoryBar};
+use crate::indicators::context::{
+    daily_window_days, window_code_minutes, IndicatorContext, KlineHistoryBar,
+};
 use crate::indicators::indicator_trait::Indicator;
 use crate::indicators::shared::output_mapper::snapshot_only;
 use crate::runtime::state_store::MinuteHistory;
@@ -16,11 +18,13 @@ impl Indicator for I19KlineHistory {
     fn evaluate(&self, ctx: &IndicatorContext) -> crate::indicators::context::IndicatorComputation {
         let current_minute_close = ctx.ts_bucket + Duration::minutes(1);
         let interval_specs = [
-            ("1m", 1, ctx.kline_history_bars_1m),
-            ("15m", 15, ctx.kline_history_bars_15m),
-            ("4h", 240, ctx.kline_history_bars_4h),
-            ("1d", 1440, ctx.kline_history_bars_1d),
-            ("3d", 4320, ctx.kline_history_bars_3d),
+            ("1m", ctx.kline_history_bars_1m),
+            ("15m", ctx.kline_history_bars_15m),
+            ("4h", ctx.kline_history_bars_4h),
+            ("1d", ctx.kline_history_bars_1d),
+            ("3d", ctx.kline_history_bars_3d),
+            ("7d", ctx.kline_history_bars_7d),
+            ("30d", ctx.kline_history_bars_30d),
         ];
 
         let futures_1d_records = merge_interval_bar_records(
@@ -38,14 +42,19 @@ impl Indicator for I19KlineHistory {
         );
 
         let mut intervals = serde_json::Map::new();
-        for (interval_code, interval_minutes, limit) in interval_specs {
+        for (interval_code, limit) in interval_specs {
+            let Some(interval_minutes) = window_code_minutes(interval_code) else {
+                continue;
+            };
             let futures_bars = match interval_code {
-                "3d" => build_interval_bars_from_records(
-                    &futures_1d_records,
-                    interval_minutes,
-                    limit,
-                    current_minute_close,
-                ),
+                code if daily_window_days(code).unwrap_or(0) > 1 => {
+                    build_interval_bars_from_records(
+                        &futures_1d_records,
+                        interval_minutes,
+                        limit,
+                        current_minute_close,
+                    )
+                }
                 "4h" => build_interval_bars_with_db(
                     &ctx.history_futures,
                     &ctx.kline_history_futures_4h_db,
@@ -68,12 +77,14 @@ impl Indicator for I19KlineHistory {
                 ),
             };
             let spot_bars = match interval_code {
-                "3d" => build_interval_bars_from_records(
-                    &spot_1d_records,
-                    interval_minutes,
-                    limit,
-                    current_minute_close,
-                ),
+                code if daily_window_days(code).unwrap_or(0) > 1 => {
+                    build_interval_bars_from_records(
+                        &spot_1d_records,
+                        interval_minutes,
+                        limit,
+                        current_minute_close,
+                    )
+                }
                 "4h" => build_interval_bars_with_db(
                     &ctx.history_spot,
                     &ctx.kline_history_spot_4h_db,
@@ -190,6 +201,12 @@ impl BarAccumulator {
     }
 
     fn to_bar(self, current_minute_close: DateTime<Utc>) -> KlineHistoryBar {
+        let is_closed = bar_is_closed(
+            self.close_time,
+            current_minute_close,
+            self.covered_minutes,
+            self.expected_minutes,
+        );
         KlineHistoryBar {
             open_time: self.open_time,
             close_time: self.close_time,
@@ -199,7 +216,7 @@ impl BarAccumulator {
             close: self.close,
             volume_base: self.volume_base,
             volume_quote: self.volume_quote,
-            is_closed: self.close_time <= current_minute_close,
+            is_closed,
             minutes_covered: self.covered_minutes,
             expected_minutes: self.expected_minutes,
         }
@@ -301,7 +318,12 @@ pub fn build_interval_bar_records_from_records(
 
     let mut records = grouped.into_values().collect::<Vec<_>>();
     for record in &mut records {
-        record.is_closed = record.close_time <= current_minute_close;
+        record.is_closed = bar_is_closed(
+            record.close_time,
+            current_minute_close,
+            record.minutes_covered,
+            record.expected_minutes,
+        );
     }
     if records.len() > limit {
         records = records.split_off(records.len() - limit);
@@ -337,7 +359,7 @@ fn build_interval_bars_with_db(
     {
         let preserve_existing_db_bar = merged
             .get(&bar.open_time)
-            .map(|existing| !bar_has_any_price(&bar) && bar_has_any_price(existing))
+            .map(|existing| should_preserve_existing_bar(existing, &bar))
             .unwrap_or(false);
         if !preserve_existing_db_bar {
             merged.insert(bar.open_time, bar);
@@ -362,7 +384,7 @@ fn merge_interval_bar_records(
     for bar in in_mem_bars {
         let preserve_existing_db_bar = merged
             .get(&bar.open_time)
-            .map(|existing| !bar_has_any_price(bar) && bar_has_any_price(existing))
+            .map(|existing| should_preserve_existing_bar(existing, bar))
             .unwrap_or(false);
         if !preserve_existing_db_bar {
             merged.insert(bar.open_time, bar.clone());
@@ -399,6 +421,29 @@ fn minute_bar_to_record(bar: &MinuteHistory) -> KlineHistoryBar {
 
 fn bar_has_any_price(bar: &KlineHistoryBar) -> bool {
     bar.open.is_some() || bar.high.is_some() || bar.low.is_some() || bar.close.is_some()
+}
+
+fn bar_has_full_coverage(bar: &KlineHistoryBar) -> bool {
+    bar.minutes_covered >= bar.expected_minutes.max(1)
+}
+
+fn bar_is_closed(
+    close_time: DateTime<Utc>,
+    current_minute_close: DateTime<Utc>,
+    minutes_covered: i64,
+    expected_minutes: i64,
+) -> bool {
+    close_time <= current_minute_close && minutes_covered >= expected_minutes.max(1)
+}
+
+fn should_preserve_existing_bar(existing: &KlineHistoryBar, candidate: &KlineHistoryBar) -> bool {
+    if !bar_has_any_price(existing) {
+        return false;
+    }
+    let existing_complete = bar_has_full_coverage(existing);
+    let candidate_complete = bar_has_full_coverage(candidate);
+    (!candidate_complete && existing_complete)
+        || existing.minutes_covered > candidate.minutes_covered
 }
 
 fn apply_record_to_bar(target: &mut KlineHistoryBar, source: &KlineHistoryBar) {
@@ -444,7 +489,8 @@ fn floor_to_interval(ts: DateTime<Utc>, interval_minutes: i64) -> DateTime<Utc> 
 #[cfg(test)]
 mod tests {
     use super::{
-        build_interval_bar_records_from_records, build_interval_bars_with_db, floor_to_interval,
+        build_interval_bar_records, build_interval_bar_records_from_records,
+        build_interval_bars_with_db, floor_to_interval,
     };
     use crate::indicators::context::KlineHistoryBar;
     use crate::ingest::decoder::MarketKind;
@@ -556,7 +602,7 @@ mod tests {
     }
 
     #[test]
-    fn priced_in_memory_bar_still_overrides_db_bar() {
+    fn incomplete_priced_in_memory_bar_does_not_override_complete_db_bar() {
         let minute = Utc
             .with_ymd_and_hms(2026, 3, 10, 16, 5, 0)
             .single()
@@ -571,9 +617,31 @@ mod tests {
         );
 
         assert_eq!(bars.len(), 1);
-        assert_eq!(bars[0]["open"], json!(2100.0));
-        assert_eq!(bars[0]["close"], json!(2100.0));
-        assert_eq!(bars[0]["minutes_covered"], json!(1));
+        assert_eq!(bars[0]["open"], json!(2000.0));
+        assert_eq!(bars[0]["close"], json!(2001.0));
+        assert_eq!(bars[0]["minutes_covered"], json!(240));
+    }
+
+    #[test]
+    fn truncated_in_memory_interval_is_not_marked_closed() {
+        let start = Utc
+            .with_ymd_and_hms(2026, 3, 10, 16, 0, 0)
+            .single()
+            .unwrap();
+        let bars = build_interval_bar_records(
+            &[
+                priced_minute(start, 100.0),
+                priced_minute(start + Duration::minutes(1), 101.0),
+            ],
+            240,
+            10,
+            start + Duration::minutes(240),
+        );
+
+        assert_eq!(bars.len(), 1);
+        assert!(!bars[0].is_closed);
+        assert_eq!(bars[0].minutes_covered, 2);
+        assert_eq!(bars[0].expected_minutes, 240);
     }
 
     #[test]
@@ -595,8 +663,28 @@ mod tests {
         assert_eq!(aggregated[0].open, Some(100.0));
         assert_eq!(aggregated[0].close, Some(121.0));
         assert_eq!(aggregated[0].minutes_covered, 4320);
+        assert!(aggregated[0].is_closed);
         assert_eq!(aggregated[1].open, Some(90.0));
         assert_eq!(aggregated[1].close, Some(71.0));
         assert_eq!(aggregated[1].minutes_covered, 4320);
+        assert!(aggregated[1].is_closed);
+    }
+
+    #[test]
+    fn incomplete_daily_records_do_not_produce_closed_multiday_bar() {
+        let current_close = Utc.with_ymd_and_hms(2026, 3, 10, 0, 0, 0).single().unwrap();
+        let start = floor_to_interval(current_close - Duration::days(6), 10_080);
+        let bars = vec![
+            db_bar(start, 100.0, 1440),
+            db_bar(start + Duration::days(1), 110.0, 1440),
+            db_bar(start + Duration::days(2), 120.0, 1440),
+        ];
+
+        let aggregated = build_interval_bar_records_from_records(&bars, 10_080, 10, current_close);
+
+        assert_eq!(aggregated.len(), 1);
+        assert!(!aggregated[0].is_closed);
+        assert_eq!(aggregated[0].minutes_covered, 4320);
+        assert_eq!(aggregated[0].expected_minutes, 10_080);
     }
 }

@@ -5,12 +5,14 @@ use crate::indicators::shared::output_mapper::snapshot_only;
 use chrono::Duration;
 use serde_json::{json, Value};
 
-const WINDOWS: [(&str, i64); 5] = [
+const WINDOWS: [(&str, i64); 7] = [
     ("15m", 15),
     ("1h", 60),
     ("4h", 240),
     ("1d", 1440),
     ("3d", 4320),
+    ("7d", 10_080),
+    ("30d", 43_200),
 ];
 
 pub struct I16FundingRate;

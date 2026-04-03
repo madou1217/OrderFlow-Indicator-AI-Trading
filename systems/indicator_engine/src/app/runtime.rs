@@ -1,7 +1,8 @@
 use crate::app::bootstrap::{build_db_pool, AppContext, DbPoolConfig, RootConfig};
 use crate::indicators::context::{
-    DivergenceSigTestMode, IndicatorContext, IndicatorRuntimeOptions, IndicatorSnapshotRow,
-    KlineHistoryBar, KlineHistorySupplement, OptionsSurfacePoint,
+    daily_window_days, window_code_minutes as context_window_code_minutes, DivergenceSigTestMode,
+    IndicatorContext, IndicatorRuntimeOptions, IndicatorSnapshotRow, KlineHistoryBar,
+    KlineHistorySupplement, OptionsSurfacePoint,
 };
 use crate::indicators::i19_kline_history::build_interval_bar_records;
 use crate::indicators::i27_options_surface::OPTIONS_SURFACE_WINDOWS;
@@ -42,7 +43,7 @@ use uuid::Uuid;
 
 const STARTUP_BACKFILL_FALLBACK_LOOKBACK_MINUTES: i64 = 30;
 const STARTUP_BACKFILL_OVERLAP_MINUTES: i64 = 30;
-const MIN_REUSABLE_SNAPSHOT_HISTORY_MINUTES: i64 = 7 * 24 * 60;
+const MIN_REUSABLE_SNAPSHOT_HISTORY_MINUTES: i64 = 30 * 24 * 60;
 const STARTUP_BACKFILL_SAFETY_LAG_SECS: i64 = 10;
 const STARTUP_BACKFILL_MARKET: &str = "all";
 const STALE_DROP_REPORT_INTERVAL_SECS: u64 = 10;
@@ -356,11 +357,14 @@ pub fn build_indicator_runtime_options(
         kline_history_bars_4h: config.indicator.kline_history.bars_4h,
         kline_history_bars_1d: config.indicator.kline_history.bars_1d,
         kline_history_bars_3d: config.indicator.kline_history.bars_3d,
+        kline_history_bars_7d: config.indicator.kline_history.bars_7d,
+        kline_history_bars_30d: config.indicator.kline_history.bars_30d,
         kline_history_fill_1d_from_db: config.indicator.kline_history.fill_1d_from_db,
         fvg_windows: config.indicator.fvg.windows.clone(),
         fvg_fill_from_db: config.indicator.fvg.fill_from_db,
         fvg_db_bars_4h: config.indicator.fvg.db_bars_4h,
         fvg_db_bars_1d: config.indicator.fvg.db_bars_1d,
+        fvg_db_bars_3d: config.indicator.fvg.db_bars_3d,
         fvg_epsilon_gap_ticks: config.indicator.fvg.epsilon_gap_ticks,
         fvg_atr_lookback: config.indicator.fvg.atr_lookback,
         fvg_min_body_ratio: config.indicator.fvg.min_body_ratio,
@@ -415,22 +419,13 @@ fn build_incremental_indicator_config(
         tpo_session_windows: runtime_options
             .tpo_session_windows
             .iter()
-            .filter_map(|code| match code.as_str() {
-                "4h" => Some((code.clone(), 240)),
-                "1d" => Some((code.clone(), 1440)),
-                "3d" => Some((code.clone(), 4320)),
-                _ => None,
-            })
+            .filter_map(|code| window_code_minutes(code).map(|minutes| (code.clone(), minutes)))
             .collect(),
         tpo_ib_minutes: runtime_options.tpo_ib_minutes,
         tpo_dev_output_windows: runtime_options
             .tpo_dev_output_windows
             .iter()
-            .filter_map(|code| match code.as_str() {
-                "15m" => Some((code.clone(), 15)),
-                "1h" => Some((code.clone(), 60)),
-                _ => None,
-            })
+            .filter_map(|code| window_code_minutes(code).map(|minutes| (code.clone(), minutes)))
             .collect(),
         rvwap_windows: runtime_options
             .rvwap_windows
@@ -458,14 +453,7 @@ fn build_incremental_indicator_config(
 }
 
 fn window_code_minutes(code: &str) -> Option<i64> {
-    match code {
-        "15m" => Some(15),
-        "1h" => Some(60),
-        "4h" => Some(240),
-        "1d" => Some(1440),
-        "3d" => Some(4320),
-        _ => None,
-    }
+    context_window_code_minutes(code)
 }
 
 fn decrement_ingest_pending(
@@ -2120,6 +2108,8 @@ pub async fn load_kline_history_supplement(
     bars_4h: usize,
     bars_1d: usize,
     bars_3d: usize,
+    bars_7d: usize,
+    bars_30d: usize,
     fill_1d_from_db: bool,
     ema_fill_from_db: bool,
     ema_htf_windows: &[String],
@@ -2130,15 +2120,32 @@ pub async fn load_kline_history_supplement(
     fvg_windows: &[String],
     fvg_db_bars_4h: usize,
     fvg_db_bars_1d: usize,
+    fvg_db_bars_3d: usize,
     current_minute_close: DateTime<Utc>,
 ) -> KlineHistorySupplement {
-    if !fill_1d_from_db && !ema_fill_from_db && !fvg_fill_from_db && bars_4h == 0 && bars_3d == 0 {
+    if !fill_1d_from_db && !ema_fill_from_db && !fvg_fill_from_db && bars_4h == 0 {
         return KlineHistorySupplement::default();
     }
 
     let fvg_needs_4h = fvg_fill_from_db && fvg_windows.iter().any(|code| code == "4h");
-    let fvg_needs_1d = fvg_fill_from_db && fvg_windows.iter().any(|code| code == "1d");
-    let ema_needs_3d = ema_fill_from_db && ema_htf_windows.iter().any(|code| code == "3d");
+    let max_fvg_daily_span = if fvg_fill_from_db {
+        fvg_windows
+            .iter()
+            .filter_map(|code| daily_window_days(code))
+            .max()
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    let max_ema_daily_span = if ema_fill_from_db {
+        ema_htf_windows
+            .iter()
+            .filter_map(|code| daily_window_days(code))
+            .max()
+            .unwrap_or(0)
+    } else {
+        0
+    };
 
     let in_mem_futures_1d =
         build_interval_bar_records(history_futures, 1440, usize::MAX, current_minute_close);
@@ -2149,16 +2156,31 @@ pub async fn load_kline_history_supplement(
     let in_mem_spot_4h =
         build_interval_bar_records(history_spot, 240, usize::MAX, current_minute_close);
 
-    let required_futures_1d = if fill_1d_from_db { bars_1d } else { 0 }
-        .max(bars_3d.saturating_mul(3))
+    let required_daily_bars = if fill_1d_from_db {
+        bars_1d
+            .max(bars_3d.saturating_mul(3))
+            .max(bars_7d.saturating_mul(7))
+            .max(bars_30d.saturating_mul(30))
+    } else {
+        0
+    };
+    let required_futures_1d = required_daily_bars
         .max(if ema_fill_from_db { ema_db_bars_1d } else { 0 })
-        .max(if ema_needs_3d {
-            ema_db_bars_3d.saturating_mul(3)
+        .max(if max_ema_daily_span > 1 {
+            ema_db_bars_3d.saturating_mul(max_ema_daily_span)
         } else {
             0
         })
-        .max(if fvg_needs_1d { fvg_db_bars_1d } else { 0 });
-    let required_spot_1d = if fill_1d_from_db { bars_1d } else { 0 }.max(bars_3d.saturating_mul(3));
+        .max(if max_fvg_daily_span > 0 {
+            if max_fvg_daily_span > 1 {
+                fvg_db_bars_3d.saturating_mul(max_fvg_daily_span)
+            } else {
+                fvg_db_bars_1d
+            }
+        } else {
+            0
+        });
+    let required_spot_1d = required_daily_bars;
     let required_futures_4h = bars_4h
         .max(if ema_fill_from_db { ema_db_bars_4h } else { 0 })
         .max(if fvg_needs_4h { fvg_db_bars_4h } else { 0 });
@@ -2544,12 +2566,7 @@ async fn fetch_older_interval_bars(
 }
 
 fn interval_code_to_minutes(interval_code: &str) -> i64 {
-    match interval_code {
-        "1h" => 60,
-        "4h" => 240,
-        "1d" => 1440,
-        _ => 1,
-    }
+    context_window_code_minutes(interval_code).unwrap_or(1)
 }
 
 fn minute_exclusive_upper_bound(ts: DateTime<Utc>) -> DateTime<Utc> {
@@ -4123,6 +4140,8 @@ async fn compute_window_bundle_artifacts(
         runtime_options.kline_history_bars_4h,
         runtime_options.kline_history_bars_1d,
         runtime_options.kline_history_bars_3d,
+        runtime_options.kline_history_bars_7d,
+        runtime_options.kline_history_bars_30d,
         runtime_options.kline_history_fill_1d_from_db,
         runtime_options.ema_fill_from_db,
         &runtime_options.ema_htf_windows,
@@ -4133,6 +4152,7 @@ async fn compute_window_bundle_artifacts(
         &runtime_options.fvg_windows,
         runtime_options.fvg_db_bars_4h,
         runtime_options.fvg_db_bars_1d,
+        runtime_options.fvg_db_bars_3d,
         minute + ChronoDuration::minutes(1),
     )
     .await;
@@ -4254,7 +4274,7 @@ async fn run_startup_backfill(
         warn!(
             configured_startup_max_catchup_minutes = startup_max_catchup_minutes,
             enforced_startup_max_catchup_minutes = MIN_REUSABLE_SNAPSHOT_HISTORY_MINUTES,
-            "startup catch-up window raised to 7d to satisfy rolling-7d indicators"
+            "startup catch-up window raised to 30d to satisfy long-window indicators"
         );
         startup_max_catchup_minutes = MIN_REUSABLE_SNAPSHOT_HISTORY_MINUTES;
     }

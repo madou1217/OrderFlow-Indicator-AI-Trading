@@ -4,17 +4,17 @@ use super::core_shared::{
     filter_funding_rate_entry_v3, filter_fvg, filter_kline_history,
     filter_liquidation_density_entry_v3, filter_orderbook_depth_entry_v3,
     filter_price_volume_structure_entry_v3, filter_rvwap_sigma_bands, filter_stack_field_v4,
-    filter_tpo_market_profile, parse_rfc3339_utc, prune_nulls, recompute_max_stack_len_v4,
-    resolve_reference_mark_price, sanitize_fvg_array_field_v4, sanitize_fvg_object_field_v4,
-    truncate_tpo_dev_series_v4, FootprintMode, FOOTPRINT_MIN_STACK_LENGTHS,
-    MGMT_EVENT_INDICATOR_RULES,
+    filter_tpo_market_profile, filter_whale_trades_recent_windows, parse_rfc3339_utc, prune_nulls,
+    recompute_max_stack_len_v4, resolve_reference_mark_price, sanitize_fvg_array_field_v4,
+    sanitize_fvg_object_field_v4, truncate_tpo_dev_series_v4, FootprintMode,
+    FOOTPRINT_MIN_STACK_LENGTHS, MGMT_EVENT_INDICATOR_RULES,
 };
 use chrono::{DateTime, Utc};
 use serde_json::{Map, Value};
 
-const AVWAP_LIMITS: &[(&str, usize)] = &[("15m", 3), ("4h", 2), ("1d", 2), ("3d", 2)];
+const AVWAP_LIMITS: &[(&str, usize)] = &[("15m", 3), ("4h", 2), ("1d", 2), ("3d", 2), ("7d", 1)];
 const KLINE_LIMITS: &[(&str, usize)] = &[("15m", 16), ("4h", 15), ("1d", 10)];
-const CVD_LIMITS: &[(&str, usize)] = &[("15m", 12), ("4h", 10), ("1d", 6)];
+const CVD_LIMITS: &[(&str, usize)] = &[("5m", 10), ("15m", 12), ("4h", 10), ("1d", 6)];
 const MGMT_TOP_LIQUIDITY_LEVELS_LIMIT: usize = 60;
 
 pub(crate) fn filter_indicators(
@@ -32,7 +32,9 @@ pub(crate) fn filter_indicators(
         "vpin",
         filter_vpin_management_v4,
     );
-    core_shared::insert_full_indicator(&mut indicators, source, "whale_trades");
+    core_shared::insert_filtered_indicator(&mut indicators, source, "whale_trades", |payload| {
+        prune_nulls(filter_whale_trades_recent_windows(payload))
+    });
     core_shared::insert_filtered_indicator(
         &mut indicators,
         source,
@@ -228,16 +230,9 @@ fn filter_vpin_management_v4(payload: &Value) -> Value {
         &[
             "vpin_bucket_size_base",
             "vpin_bucket_size_eth",
-            "vpin_fut",
             "vpin_model",
-            "vpin_ratio_s_over_f",
             "vpin_rolling_bucket_count",
-            "vpin_spot",
             "vpin_unit",
-            "xmk_vpin_gap_s_minus_f",
-            "z_vpin_fut",
-            "z_vpin_gap_s_minus_f",
-            "z_vpin_spot",
         ],
     );
 

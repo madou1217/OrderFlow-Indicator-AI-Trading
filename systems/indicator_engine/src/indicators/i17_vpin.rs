@@ -9,12 +9,14 @@ use serde_json::{json, Value};
 const VPIN_Z_LOOKBACK: usize = 120;
 const VPIN_BUCKET_SIZE_BASE: f64 = 50.0;
 const VPIN_ROLLING_BUCKET_COUNT: usize = 50;
-const WINDOWS: [(&str, i64); 5] = [
+const WINDOWS: [(&str, i64); 7] = [
     ("15m", 15),
     ("1h", 60),
     ("4h", 240),
     ("1d", 1440),
     ("3d", 4320),
+    ("7d", 10_080),
+    ("30d", 43_200),
 ];
 
 pub struct I17Vpin;

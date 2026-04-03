@@ -959,6 +959,8 @@ fn interval_text_by_window(window_code: &str) -> String {
         "4h" => "4 hours".to_string(),
         "1d" => "1 day".to_string(),
         "3d" => "3 days".to_string(),
+        "7d" => "7 days".to_string(),
+        "30d" => "30 days".to_string(),
         _ => "1 minute".to_string(),
     }
 }
@@ -972,6 +974,8 @@ fn snapshot_window_rank(window_code: &str) -> usize {
         "4h" => 4,
         "1d" => 5,
         "3d" => 6,
+        "7d" => 7,
+        "30d" => 8,
         _ => usize::MAX,
     }
 }
@@ -1200,7 +1204,7 @@ fn compact_array_field(parent_key: Option<&str>, key: &str, value: &Value) -> Op
             ),
         ]));
     }
-    if matches!(key, "series" | "changes") {
+    if matches!(key, "series" | "changes" | "compact_series") {
         return Some(CompactField::Expand(vec![
             (format!("{key}_count"), json!(arr.len())),
             (
@@ -1248,6 +1252,7 @@ fn singularize_array_key(key: &str) -> &'static str {
     match key {
         "series" => "point",
         "changes" => "change",
+        "compact_series" => "point",
         _ => "item",
     }
 }
@@ -1277,7 +1282,8 @@ fn assemble_bundle_indicators_json(mut rows: Vec<SnapshotBundleRow>) -> Value {
 mod tests {
     use super::{
         assemble_bundle_indicators_json, collect_snapshot_blob_hashes, compact_snapshot_payload,
-        hydrate_snapshot_payload_value, refize_snapshot_payload, SnapshotBundleRow,
+        hydrate_snapshot_payload_value, interval_text_by_window, refize_snapshot_payload,
+        snapshot_window_rank, SnapshotBundleRow,
     };
     use serde_json::json;
     use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -1356,6 +1362,9 @@ mod tests {
     fn compacts_series_and_changes_for_other_indicators() {
         let payload = json!({
             "changes": [{"ts": "a"}, {"ts": "b"}],
+            "current_window": {
+                "compact_series": [{"ts": "cw-1"}, {"ts": "cw-2"}]
+            },
             "series_by_window": {
                 "15m": [{"ts": "1"}, {"ts": "2"}]
             },
@@ -1373,6 +1382,14 @@ mod tests {
         let compacted = compact_snapshot_payload("avwap", &payload);
         assert_eq!(compacted["changes_count"], json!(2));
         assert_eq!(compacted["latest_change"]["ts"], json!("b"));
+        assert_eq!(
+            compacted["current_window"]["compact_series_count"],
+            json!(2)
+        );
+        assert_eq!(
+            compacted["current_window"]["latest_point"]["ts"],
+            json!("cw-2")
+        );
         assert_eq!(compacted["series_by_window"]["15m"]["count"], json!(2));
         assert_eq!(
             compacted["series_by_window"]["15m"]["latest_point"]["ts"],
@@ -1430,6 +1447,18 @@ mod tests {
 
         assert_eq!(indicators["open_interest"]["window_code"], json!("5m"));
         assert_eq!(indicators["long_short_ratios"]["window_code"], json!("5m"));
+    }
+
+    #[test]
+    fn snapshot_interval_text_supports_long_windows() {
+        assert_eq!(interval_text_by_window("7d"), "7 days");
+        assert_eq!(interval_text_by_window("30d"), "30 days");
+    }
+
+    #[test]
+    fn snapshot_window_rank_supports_long_windows() {
+        assert!(snapshot_window_rank("7d") > snapshot_window_rank("3d"));
+        assert!(snapshot_window_rank("30d") > snapshot_window_rank("7d"));
     }
 
     #[test]

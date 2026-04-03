@@ -26,7 +26,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
 use tracing::debug;
 
-pub const HISTORY_LIMIT_MINUTES: usize = 60 * 24 * 9; // keep 9 days
+pub const HISTORY_LIMIT_MINUTES: usize = 60 * 24 * 32; // keep 32 days
 const PRICE_SCALE: f64 = 100.0; // 0.01 tick bin for level-based outputs
 const DEPTH_CONFLATION_ENABLED: bool = false;
 const DEPTH_CONFLATION_MS: i64 = 100;
@@ -45,9 +45,9 @@ const MATERIAL_CHANGE_EPS: f64 = 1e-9;
 // This retention also keeps the paired VPIN snapshots long enough to restore the
 // correct trade-state when reopening an older finalized minute.
 const CANONICAL_REPLAY_KEEP_MINUTES: i64 = 60 * 24;
-const OI_RATIO_HISTORY_KEEP_5M_BUCKETS: usize = 12 * 24 * 10; // 10 days
+const OI_RATIO_HISTORY_KEEP_5M_BUCKETS: usize = 12 * 24 * 32; // 32 days
 const OI_CURRENT_HISTORY_KEEP_MINUTES: usize = 60 * 24;
-const OPTIONS_SURFACE_HISTORY_KEEP_5M_BUCKETS: usize = 12 * 24 * 5; // 5 days
+const OPTIONS_SURFACE_HISTORY_KEEP_5M_BUCKETS: usize = 12 * 24 * 32; // 32 days
 const OPTIONS_SURFACE_BUCKET_SPAN_MINUTES: i64 = 5;
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]

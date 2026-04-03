@@ -1,4 +1,6 @@
-use crate::indicators::context::IndicatorContext;
+use crate::indicators::context::{
+    window_code_minutes as shared_window_code_minutes, IndicatorContext,
+};
 use crate::indicators::indicator_trait::Indicator;
 use crate::indicators::shared::output_mapper::snapshot_only;
 use chrono::Duration;
@@ -179,6 +181,10 @@ fn compute_stats_at(
     if start_idx > end_idx {
         return None;
     }
+    let observed_points = end_idx + 1 - start_idx;
+    if observed_points < window_minutes.max(1) as usize {
+        return None;
+    }
 
     let prefix_at = |values: &[f64], idx: usize| values.get(idx).copied().unwrap_or(0.0);
     let prefix_count_at = |values: &[usize], idx: usize| values.get(idx).copied().unwrap_or(0usize);
@@ -265,14 +271,7 @@ fn null_stats_json(window_minutes: i64) -> Value {
 }
 
 fn window_to_minutes(code: &str) -> Option<i64> {
-    match code {
-        "15m" => Some(15),
-        "1h" => Some(60),
-        "4h" => Some(240),
-        "1d" => Some(1440),
-        "3d" => Some(4320),
-        _ => None,
-    }
+    shared_window_code_minutes(code)
 }
 
 #[cfg(test)]
@@ -299,7 +298,7 @@ mod tests {
             prefix_positive_samples: vec![1, 2, 3],
         };
 
-        let stats = compute_stats_at(&points, 2, 15, 2).expect("stats");
+        let stats = compute_stats_at(&points, 2, 3, 2).expect("stats");
         assert!((stats.rvwap - 102.5).abs() < 1e-9);
         assert!(stats.sigma > 0.0);
     }
@@ -312,7 +311,29 @@ mod tests {
     }
 
     #[test]
-    fn rvwap_window_to_minutes_supports_3d() {
-        assert_eq!(window_to_minutes("3d"), Some(4320));
+    fn rvwap_window_to_minutes_supports_30d() {
+        assert_eq!(window_to_minutes("30d"), Some(43_200));
+    }
+
+    #[test]
+    fn rvwap_requires_full_window_coverage() {
+        let ts = Utc
+            .with_ymd_and_hms(2026, 3, 5, 0, 0, 0)
+            .single()
+            .expect("valid ts");
+        let points = WeightedSeries {
+            ts_bucket: vec![
+                ts,
+                ts + chrono::Duration::minutes(1),
+                ts + chrono::Duration::minutes(2),
+            ],
+            price: vec![100.0, 102.0, 104.0],
+            prefix_weight: vec![1.0, 2.0, 3.0],
+            prefix_price_weight: vec![100.0, 202.0, 306.0],
+            prefix_price_sq_weight: vec![10_000.0, 20_404.0, 31_220.0],
+            prefix_positive_samples: vec![1, 2, 3],
+        };
+
+        assert!(compute_stats_at(&points, 2, 5, 2).is_none());
     }
 }

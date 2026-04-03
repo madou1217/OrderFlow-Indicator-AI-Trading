@@ -1,4 +1,6 @@
-use crate::indicators::context::IndicatorContext;
+use crate::indicators::context::{
+    window_code_minutes as shared_window_code_minutes, IndicatorContext,
+};
 use crate::indicators::indicator_trait::Indicator;
 use crate::indicators::shared::output_mapper::snapshot_only;
 use crate::runtime::state_store::tick_to_price;
@@ -271,14 +273,7 @@ fn lower_bound_ts(points: &MinutePulseSeries, target: chrono::DateTime<chrono::U
 }
 
 fn window_to_minutes(code: &str) -> Option<i64> {
-    match code {
-        "15m" => Some(15),
-        "1h" => Some(60),
-        "4h" => Some(240),
-        "1d" => Some(1440),
-        "3d" => Some(4320),
-        _ => None,
-    }
+    shared_window_code_minutes(code)
 }
 
 #[cfg(test)]
@@ -311,7 +306,7 @@ mod tests {
     }
 
     #[test]
-    fn high_volume_pulse_window_to_minutes_supports_3d() {
-        assert_eq!(window_to_minutes("3d"), Some(4320));
+    fn high_volume_pulse_window_to_minutes_supports_30d() {
+        assert_eq!(window_to_minutes("30d"), Some(43_200));
     }
 }
