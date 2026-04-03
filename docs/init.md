@@ -110,7 +110,7 @@ PGPASSWORD=your_password bash sql/rebuild_all_databases.sh
 ```
 
 
-
+迁移指南：
 
 1.请帮我从这个库https://github.com/uniteonline/OrderFlow-Indicator-AI-Trading下载代码到/data下，并把目录下的所有代码放到/data,不要根目录：OrderFlow-Indicator-AI-Trading
 
@@ -126,7 +126,7 @@ PGPASSWORD=your_password bash sql/rebuild_all_databases.sh
 
 7.帮我创建一个16GB的swap
 
-8.帮我安装shadowshock，在本机启动1080的转发，配置在/data/docs/init.md里
+8.帮我安装shadowshock，在本机启动1080的转发，配置在/data/config/shadowsocks-libev.json里
 
 9.我需要你按init.md的服务配置，帮我在系统内创建好4个服务，并编译和启动以下2个orderflow-market-data-ingestor和orderflow-indicator-engine服务
 
