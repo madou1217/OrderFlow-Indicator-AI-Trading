@@ -130,3 +130,5 @@ PGPASSWORD=your_password bash sql/rebuild_all_databases.sh
 
 9.我需要你按init.md的服务配置，帮我在系统内创建好4个服务，并编译和启动以下2个orderflow-market-data-ingestor和orderflow-indicator-engine服务
 
+10.帮我限制一下几个服务的日志大小，不要超过256M
+
