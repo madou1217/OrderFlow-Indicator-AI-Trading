@@ -128,7 +128,7 @@ PGPASSWORD=your_password bash sql/rebuild_all_databases.sh
 
 8.帮我安装shadowshock，在本机启动1080的转发，配置在/data/config/shadowsocks-libev.json里
 
-9.我需要你按init.md的服务配置，帮我在系统内创建好4个服务，并编译和启动以下2个orderflow-market-data-ingestor和orderflow-indicator-engine服务
+9.我需要你按init.md的服务配置，帮我在系统内创建好4个服务，并编译和启动以下3个orderflow-market-data-ingestor和orderflow-indicator-engine以及orderflow-llm服务
 
 10.帮我限制一下几个服务的日志大小，不要超过256M
 
