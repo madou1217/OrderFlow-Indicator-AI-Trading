@@ -116,7 +116,7 @@ PGPASSWORD=your_password bash sql/rebuild_all_databases.sh
 
 2.我现在需要你按/data/docs/init.md 的说明和/data/docs/mq_topology.md，帮我下载rabbitmq，并创建vhost，队列，以及队列的ttl，要求与config.yaml和配置严格一致
 
-3.我现在需要你按/data/docs/init.md 的说明和/data/sql/rebuild_all_databases.sh以及/data/sql/README_rebuild.md，帮我下载postgresql并安装timescaledb插件，然后按要求创建表，索引，触发器
+3.我现在需要你按/data/docs/init.md 的说明和/data/sql/rebuild_all_databases.sh以及/data/sql/README_rebuild.md，帮我下载postgresql并安装timescaledb插件，然后按要求创建表，索引，触发器.特别注意：/data/sql/migrations/20260402_indicator_catalog_canonical_shared.sql，/data/sql/migrations/20260403_feat_cvd_pack_window_code_7d_30d.sql，/data/sql/migrations/20260403_fix_indicator_snapshot_hydrator_blob_hash.sql这三个数据库补丁要打
 
 4.请帮我把/data/codex-proxy-20260402-105732.tar.gz 解包到/home/tools/codex-proxy目录下，把目录下的所有代码放到/home/tools/codex-proxy.
 
