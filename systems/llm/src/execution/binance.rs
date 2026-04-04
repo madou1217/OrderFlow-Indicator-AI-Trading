@@ -3856,8 +3856,32 @@ fn sign_query(secret: &str, query: &str) -> Result<String> {
 }
 
 fn build_client_order_id(prefix: &str) -> String {
+    const BINANCE_CLIENT_ORDER_ID_MAX_LEN: usize = 36;
+    const RANDOM_SUFFIX_LEN: usize = 18;
+    const FIXED_PREFIX: &str = "llm";
+
     let random = Uuid::new_v4().simple().to_string();
-    format!("llm_{}_{}", prefix, &random[..18])
+    let mut sanitized_prefix: String = prefix
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+        .collect();
+    if sanitized_prefix.is_empty() {
+        sanitized_prefix.push_str("ord");
+    }
+
+    // Binance rejects client-provided order ids longer than 36 chars.
+    let reserved_len = FIXED_PREFIX.len() + 2 + RANDOM_SUFFIX_LEN;
+    let max_prefix_len = BINANCE_CLIENT_ORDER_ID_MAX_LEN.saturating_sub(reserved_len);
+    if sanitized_prefix.len() > max_prefix_len {
+        sanitized_prefix.truncate(max_prefix_len);
+    }
+
+    format!(
+        "{}_{}_{}",
+        FIXED_PREFIX,
+        sanitized_prefix,
+        &random[..RANDOM_SUFFIX_LEN]
+    )
 }
 
 fn round_down_to_step(value: f64, step: f64) -> f64 {
@@ -4192,6 +4216,19 @@ mod tests {
 
         assert!(plan.promoted_to_full_close);
         assert!((plan.quantity - 0.023).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn build_client_order_id_caps_length_for_long_workflow_prefixes() {
+        let client_order_id = build_client_order_id("workflow_reduce");
+
+        assert!(
+            client_order_id.len() <= 36,
+            "client order id exceeded Binance max length: {} ({})",
+            client_order_id,
+            client_order_id.len()
+        );
+        assert!(client_order_id.starts_with("llm_"));
     }
 
     #[test]
