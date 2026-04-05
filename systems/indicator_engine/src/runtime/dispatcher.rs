@@ -231,19 +231,8 @@ impl Dispatcher {
             })
         });
 
-        let mut indicators_json = Map::new();
-        for s in &snapshots {
-            indicators_json
-                .entry(s.indicator_code.to_string())
-                .or_insert_with(|| {
-                    json!({
-                        "window_code": s.window_code,
-                        "payload": s.payload_json.clone(),
-                    })
-                });
-        }
         let live_messages = if mode.publish_outputs() {
-            let indicators_json_value = Value::Object(indicators_json.clone());
+            let indicators_json_value = assemble_live_indicators_json(&snapshots);
             let mut messages = Vec::with_capacity(1);
             messages.push(self.publisher.build_minute_bundle_outbox_message(
                 ctx.ts_bucket,
@@ -593,6 +582,21 @@ fn merge_group_output(
     liq_rows.extend(group.liq_rows);
 }
 
+fn assemble_live_indicators_json(snapshots: &[IndicatorSnapshotRow]) -> Value {
+    let mut indicators_json = Map::new();
+    for snapshot in snapshots {
+        indicators_json
+            .entry(snapshot.indicator_code.to_string())
+            .or_insert_with(|| {
+                json!({
+                    "window_code": snapshot.window_code,
+                    "payload": snapshot.payload_json.clone(),
+                })
+            });
+    }
+    Value::Object(indicators_json)
+}
+
 fn snapshot_window_rank(window_code: &str) -> usize {
     match window_code {
         "5m" => 0,
@@ -608,7 +612,9 @@ fn snapshot_window_rank(window_code: &str) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{flow_group_name_for_indicator, DispatchMode};
+    use super::{assemble_live_indicators_json, flow_group_name_for_indicator, DispatchMode};
+    use crate::indicators::context::IndicatorSnapshotRow;
+    use serde_json::json;
 
     #[test]
     fn shutdown_flush_still_persists_and_publishes_outputs() {
@@ -636,5 +642,71 @@ mod tests {
             Some("flow_core")
         );
         assert_eq!(flow_group_name_for_indicator("funding_rate"), None);
+    }
+
+    #[test]
+    fn live_bundle_assembly_preserves_avwap_by_window_payload() {
+        let snapshots = vec![
+            IndicatorSnapshotRow {
+                indicator_code: "avwap",
+                window_code: "1m",
+                payload_json: json!({
+                    "indicator": "avwap_dual_market",
+                    "window": "1m",
+                    "by_window": {
+                        "4h": {
+                            "window_code": "4h",
+                            "is_ready": true,
+                            "avwap_fut": 2050.5
+                        },
+                        "1d": {
+                            "window_code": "1d",
+                            "is_ready": false,
+                            "avwap_fut": 2060.5
+                        },
+                        "3d": {
+                            "window_code": "3d",
+                            "is_ready": false,
+                            "avwap_fut": 2070.5
+                        },
+                        "7d": {
+                            "window_code": "7d",
+                            "is_ready": false,
+                            "avwap_fut": 2080.5
+                        }
+                    }
+                }),
+            },
+            IndicatorSnapshotRow {
+                indicator_code: "price_volume_structure",
+                window_code: "1m",
+                payload_json: json!({
+                    "window": "1m",
+                    "by_window": {
+                        "4h": {
+                            "poc_price": 2052.0
+                        }
+                    }
+                }),
+            },
+        ];
+
+        let indicators_json = assemble_live_indicators_json(&snapshots);
+        assert_eq!(
+            indicators_json["avwap"]["payload"]["by_window"]["4h"]["window_code"],
+            json!("4h")
+        );
+        assert_eq!(
+            indicators_json["avwap"]["payload"]["by_window"]["1d"]["avwap_fut"],
+            json!(2060.5)
+        );
+        assert_eq!(
+            indicators_json["avwap"]["payload"]["by_window"]["3d"]["avwap_fut"],
+            json!(2070.5)
+        );
+        assert_eq!(
+            indicators_json["avwap"]["payload"]["by_window"]["7d"]["avwap_fut"],
+            json!(2080.5)
+        );
     }
 }

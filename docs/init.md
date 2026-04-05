@@ -132,3 +132,5 @@ PGPASSWORD=your_password bash sql/rebuild_all_databases.sh
 
 10.帮我限制一下几个服务的日志大小，不要超过256M
 
+
+如果需要则执行streamlit run /data/demo/streamlit_app.py
