@@ -72,6 +72,7 @@ const CANONICAL_REPLAY_FETCH_WINDOW_MINUTES: i64 = 360;
 const STARTUP_BACKFILL_YIELD_EVERY_MINUTES: usize = 64;
 const STARTUP_BACKFILL_PROGRESS_LOG_INTERVAL_SECS: u64 = 15;
 const BACKFILL_PAGED_FETCH_DEFAULT_LIMIT: i64 = 1_000;
+const OPTIONS_SURFACE_BUCKET_MINUTES: i64 = 5;
 const PERIODIC_RUNTIME_SNAPSHOT_POLL_SECS: u64 = 60;
 const PERIODIC_RUNTIME_SNAPSHOT_INTERVAL_SECS: u64 = 15 * 60;
 const PERIODIC_RUNTIME_SNAPSHOT_MIN_ADVANCE_MINUTES: i64 = 100;
@@ -1688,7 +1689,9 @@ fn try_load_state_snapshot(path: &str, symbol: &str, max_age_hours: u64) -> Snap
         Err(_) => return SnapshotLoadOutcome::Rejected,
     };
     // Version check
-    if snap.version != STATE_SNAPSHOT_VERSION {
+    let supports_previous_version =
+        STATE_SNAPSHOT_VERSION > 1 && snap.version == STATE_SNAPSHOT_VERSION.saturating_sub(1);
+    if snap.version != STATE_SNAPSHOT_VERSION && !supports_previous_version {
         warn!(
             found = snap.version,
             expected = STATE_SNAPSHOT_VERSION,
@@ -2494,6 +2497,203 @@ async fn load_options_surface_history_supplement(
             .or_else(|| existing_points.last().map(|point| point.ts_bucket)),
         points,
     )
+}
+
+fn floor_timestamp_to_interval_minutes(ts: DateTime<Utc>, interval_minutes: i64) -> DateTime<Utc> {
+    let interval_secs = interval_minutes.saturating_mul(60).max(60);
+    let ts_secs = ts.timestamp();
+    let floored = ts_secs - ts_secs.rem_euclid(interval_secs);
+    Utc.timestamp_opt(floored, 0).single().unwrap_or(ts)
+}
+
+fn merge_time_ranges(
+    mut ranges: Vec<(DateTime<Utc>, DateTime<Utc>)>,
+) -> Vec<(DateTime<Utc>, DateTime<Utc>)> {
+    ranges.retain(|(start, end)| start < end);
+    if ranges.is_empty() {
+        return ranges;
+    }
+
+    ranges.sort_by_key(|(start, _)| *start);
+    let mut merged = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges {
+        if let Some((_, current_end)) = merged.last_mut() {
+            if start <= *current_end {
+                *current_end = (*current_end).max(end);
+                continue;
+            }
+        }
+        merged.push((start, end));
+    }
+    merged
+}
+
+async fn load_options_surface_feature_recovery_seed(
+    pool: &PgPool,
+    symbol: &str,
+    from_ts: DateTime<Utc>,
+    to_ts_exclusive: DateTime<Utc>,
+) -> Vec<OptionsSurfacePoint> {
+    if from_ts >= to_ts_exclusive {
+        return Vec::new();
+    }
+
+    let rows_result: Result<Vec<OptionsSurfaceFeatureRow>> = sqlx::query_as(
+        r#"
+        SELECT
+            ts_bucket,
+            front_expiry_ts,
+            second_expiry_ts,
+            atm_strike_front,
+            atm_iv_front,
+            atm_iv_second,
+            atm_iv_30d_proxy,
+            rr_25d_front,
+            rr_25d_second,
+            skew_state,
+            term_structure_state
+        FROM feat.options_surface_feature
+        WHERE symbol = $1
+          AND bar_interval = interval '5 minutes'
+          AND calc_version = 'indicator_engine.v1'
+          AND ts_bucket >= $2
+          AND ts_bucket < $3
+        ORDER BY ts_bucket ASC
+        "#,
+    )
+    .bind(symbol.to_uppercase())
+    .bind(from_ts)
+    .bind(to_ts_exclusive)
+    .fetch_all(pool)
+    .await
+    .context("query options surface recovery seed rows");
+
+    let rows = match rows_result {
+        Ok(rows) => rows,
+        Err(err) => {
+            warn!(
+                error = %err,
+                symbol = %symbol,
+                from_ts = %from_ts,
+                to_ts_exclusive = %to_ts_exclusive,
+                "load options surface recovery seed from DB failed"
+            );
+            return Vec::new();
+        }
+    };
+
+    rows.into_iter()
+        .map(|row| OptionsSurfacePoint {
+            ts_bucket: row.ts_bucket,
+            front_expiry_ts: row.front_expiry_ts,
+            second_expiry_ts: row.second_expiry_ts,
+            atm_strike_front: row.atm_strike_front,
+            atm_iv_front: row.atm_iv_front,
+            atm_iv_second: row.atm_iv_second,
+            atm_iv_30d_proxy: row.atm_iv_30d_proxy,
+            rr_25d_front: row.rr_25d_front,
+            rr_25d_second: row.rr_25d_second,
+            skew_state: row.skew_state,
+            term_structure_state: row.term_structure_state,
+        })
+        .collect()
+}
+
+async fn replay_option_mark_greeks_recovery_ranges(
+    pool: &PgPool,
+    symbol: &str,
+    state_store: &mut StateStore,
+    ranges: Vec<(DateTime<Utc>, DateTime<Utc>)>,
+    reason: &'static str,
+) -> Result<usize> {
+    let merged_ranges = merge_time_ranges(ranges);
+    if merged_ranges.is_empty() {
+        return Ok(0);
+    }
+
+    let symbol_upper = symbol.to_uppercase();
+    let mut replayed_rows = 0usize;
+    for (range_from_ts, range_to_ts_exclusive) in merged_ranges {
+        let rows = fetch_backfill_source_rows(
+            pool,
+            OPTION_MARK_GREEKS_5M_BACKFILL_WINDOW_SQL,
+            "option_mark_greeks_5m",
+            range_from_ts,
+            range_to_ts_exclusive,
+            &symbol_upper,
+            "futures",
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "{reason} fetch option_mark_greeks recovery rows from_ts={range_from_ts} to_ts_exclusive={range_to_ts_exclusive}"
+            )
+        })?;
+
+        for row in rows {
+            let event = replay_row_to_engine_event(row).with_context(|| {
+                format!(
+                    "{reason} decode option_mark_greeks recovery row from_ts={range_from_ts} to_ts_exclusive={range_to_ts_exclusive}"
+                )
+            })?;
+            state_store.ingest(event);
+            replayed_rows += 1;
+        }
+    }
+
+    Ok(replayed_rows)
+}
+
+async fn hydrate_options_surface_startup_recovery(
+    pool: &PgPool,
+    symbol: &str,
+    state_store: &mut StateStore,
+    feature_seed_from_ts: DateTime<Utc>,
+    repair_start_ts: DateTime<Utc>,
+    replay_end_ts: DateTime<Utc>,
+) -> Result<(usize, usize, usize)> {
+    let options_repair_bucket_start =
+        floor_timestamp_to_interval_minutes(repair_start_ts, OPTIONS_SURFACE_BUCKET_MINUTES);
+    let options_replay_to_ts_exclusive = replay_end_ts + ChronoDuration::minutes(1);
+    let feature_seed_to_ts_exclusive =
+        options_repair_bucket_start.min(options_replay_to_ts_exclusive);
+
+    let seeded_points = if feature_seed_from_ts < feature_seed_to_ts_exclusive {
+        let feature_points = load_options_surface_feature_recovery_seed(
+            pool,
+            symbol,
+            feature_seed_from_ts,
+            feature_seed_to_ts_exclusive,
+        )
+        .await;
+        state_store.seed_options_surface_history(feature_points)
+    } else {
+        0
+    };
+
+    let mut raw_ranges = if feature_seed_from_ts < feature_seed_to_ts_exclusive {
+        state_store.missing_options_surface_bucket_ranges(
+            feature_seed_from_ts,
+            feature_seed_to_ts_exclusive,
+        )
+    } else {
+        Vec::new()
+    };
+    if options_repair_bucket_start < options_replay_to_ts_exclusive {
+        raw_ranges.push((options_repair_bucket_start, options_replay_to_ts_exclusive));
+    }
+    let merged_raw_ranges = merge_time_ranges(raw_ranges);
+    let raw_range_count = merged_raw_ranges.len();
+    let replayed_rows = replay_option_mark_greeks_recovery_ranges(
+        pool,
+        symbol,
+        state_store,
+        merged_raw_ranges,
+        "startup options surface recovery",
+    )
+    .await?;
+
+    Ok((seeded_points, raw_range_count, replayed_rows))
 }
 
 async fn fetch_older_interval_bars(
@@ -4398,7 +4598,7 @@ async fn run_startup_backfill(
         overlap_minutes = STARTUP_BACKFILL_OVERLAP_MINUTES,
         startup_max_catchup_minutes = startup_max_catchup_minutes,
         startup_backfill_batch_size = ctx.config.indicator.startup_backfill_batch_size.max(100),
-        backfill_source = "md.agg.*.1m",
+        backfill_source = "startup canonical replay without option_mark_greeks_5m",
         "startup historical backfill begin"
     );
 
@@ -4433,7 +4633,7 @@ async fn run_startup_backfill(
         let mut cursor: Option<BackfillCursor> = None;
 
         loop {
-            let rows = fetch_backfill_batch(
+            let rows = fetch_backfill_batch_excluding_option_mark_greeks(
                 &ctx.db_pool,
                 window_from_ts,
                 window_to_ts,
@@ -4598,6 +4798,22 @@ async fn run_startup_backfill(
     };
     let repair_start_ts = replay_start_ts.max(repair_start_candidate);
     let warm_end_ts = repair_start_ts - ChronoDuration::minutes(1);
+    let can_reuse_persisted_options_surface_history =
+        snapshot_was_loaded || persisted_frontier_ts.is_some();
+    let options_feature_lookback_minutes = (required_options_surface_history_points()
+        .saturating_sub(1) as i64)
+        * OPTIONS_SURFACE_BUCKET_MINUTES;
+    let options_feature_seed_from_ts = if can_reuse_persisted_options_surface_history {
+        floor_timestamp_to_interval_minutes(
+            repair_start_ts - ChronoDuration::minutes(options_feature_lookback_minutes),
+            OPTIONS_SURFACE_BUCKET_MINUTES,
+        )
+    } else {
+        floor_timestamp_to_interval_minutes(history_replay_start_ts, OPTIONS_SURFACE_BUCKET_MINUTES)
+    };
+    let options_repair_bucket_start =
+        floor_timestamp_to_interval_minutes(repair_start_ts, OPTIONS_SURFACE_BUCKET_MINUTES);
+    let options_replay_to_ts_exclusive = replay_end_ts + ChronoDuration::minutes(1);
 
     if persisted_frontier_ts
         .map(|frontier| repair_start_ts <= frontier)
@@ -4660,6 +4876,27 @@ async fn run_startup_backfill(
             "startup warm-state replay completed"
         );
     }
+
+    let (options_feature_seeded_points, options_raw_range_count, options_raw_replayed_rows) =
+        hydrate_options_surface_startup_recovery(
+            &ctx.db_pool,
+            &ctx.config.indicator.symbol,
+            state_store,
+            options_feature_seed_from_ts,
+            repair_start_ts,
+            replay_end_ts,
+        )
+        .await?;
+    info!(
+        options_feature_seed_from_ts = %options_feature_seed_from_ts,
+        options_repair_bucket_start = %options_repair_bucket_start,
+        options_replay_to_ts_exclusive = %options_replay_to_ts_exclusive,
+        can_reuse_persisted_options_surface_history,
+        options_feature_seeded_points,
+        options_raw_range_count,
+        options_raw_replayed_rows,
+        "startup options surface recovery prepared"
+    );
 
     let mut materialized_windows = 0usize;
     let mut last_computed: Vec<String> = Vec::new();
@@ -5209,7 +5446,11 @@ __OUTER_WHERE__
         .replace("__LIMIT_PARAM__", &limit_param.to_string())
 }
 
-fn build_paged_backfill_sql(filter_market: bool, with_cursor: bool) -> String {
+fn build_paged_backfill_sql_internal(
+    filter_market: bool,
+    with_cursor: bool,
+    include_option_mark_greeks: bool,
+) -> String {
     const SQL_TEMPLATE: &str = r#"
     WITH events AS (
         (
@@ -5432,6 +5673,43 @@ __LONG_SHORT_RATIO_CURSOR_FILTER__
             ORDER BY event_ts ASC, market ASC, symbol ASC, routing_key ASC, row_tid_text ASC
             LIMIT $__LIMIT_PARAM__
         )
+__OPTION_MARK_GREEKS_UNION__
+    )
+    SELECT row_tid_text, event_ts, msg_type, market, symbol, routing_key, data_json
+    FROM events
+    ORDER BY event_ts ASC, msg_type ASC, market ASC, symbol ASC, routing_key ASC, row_tid_text ASC
+    LIMIT $__LIMIT_PARAM__
+    "#;
+
+    let market_param = 4usize;
+    let limit_param = if filter_market { 5usize } else { 4usize };
+    let cursor_ts_param = if filter_market { 6usize } else { 5usize };
+    let cursor_msg_type_param = cursor_ts_param + 1;
+    let cursor_market_param = cursor_ts_param + 2;
+    let cursor_symbol_param = cursor_ts_param + 3;
+    let cursor_routing_key_param = cursor_ts_param + 4;
+    let cursor_row_tid_param = cursor_ts_param + 5;
+
+    let mk_market_filter = |alias: &str| -> String {
+        if filter_market {
+            format!("              AND {alias}.market::text = ${market_param}")
+        } else {
+            String::new()
+        }
+    };
+
+    let mk_cursor_filter = |alias: &str, msg_type_expr: &str, routing_key_expr: &str| -> String {
+        if with_cursor {
+            format!(
+                "              AND ({alias}.ts_event, {msg_type_expr}, {alias}.market::text, {alias}.symbol, {routing_key_expr}, {alias}.ctid::text)\n                  > (${cursor_ts_param}::timestamptz, ${cursor_msg_type_param}::text, ${cursor_market_param}::text, ${cursor_symbol_param}::text, ${cursor_routing_key_param}::text, ${cursor_row_tid_param}::text)"
+            )
+        } else {
+            String::new()
+        }
+    };
+
+    let option_union = if include_option_mark_greeks {
+        r#"
 
         UNION ALL
 
@@ -5471,39 +5749,19 @@ __OPTION_MARKET_FILTER__
 __OPTION_CURSOR_FILTER__
             ORDER BY event_ts ASC, market ASC, symbol ASC, routing_key ASC, row_tid_text ASC
             LIMIT $__LIMIT_PARAM__
+        )"#
+        .replace("__OPTION_MARKET_FILTER__", &mk_market_filter("opt"))
+        .replace(
+            "__OPTION_CURSOR_FILTER__",
+            &mk_cursor_filter(
+                "opt",
+                "'md.option_mark_greeks_5m'::text",
+                "format('md.futures.option_mark_greeks.5m.%s', lower(opt.symbol))",
+            ),
         )
-    )
-    SELECT row_tid_text, event_ts, msg_type, market, symbol, routing_key, data_json
-    FROM events
-    ORDER BY event_ts ASC, msg_type ASC, market ASC, symbol ASC, routing_key ASC, row_tid_text ASC
-    LIMIT $__LIMIT_PARAM__
-    "#;
-
-    let market_param = 4usize;
-    let limit_param = if filter_market { 5usize } else { 4usize };
-    let cursor_ts_param = if filter_market { 6usize } else { 5usize };
-    let cursor_msg_type_param = cursor_ts_param + 1;
-    let cursor_market_param = cursor_ts_param + 2;
-    let cursor_symbol_param = cursor_ts_param + 3;
-    let cursor_routing_key_param = cursor_ts_param + 4;
-    let cursor_row_tid_param = cursor_ts_param + 5;
-
-    let mk_market_filter = |alias: &str| -> String {
-        if filter_market {
-            format!("              AND {alias}.market::text = ${market_param}")
-        } else {
-            String::new()
-        }
-    };
-
-    let mk_cursor_filter = |alias: &str, msg_type_expr: &str, routing_key_expr: &str| -> String {
-        if with_cursor {
-            format!(
-                "              AND ({alias}.ts_event, {msg_type_expr}, {alias}.market::text, {alias}.symbol, {routing_key_expr}, {alias}.ctid::text)\n                  > (${cursor_ts_param}::timestamptz, ${cursor_msg_type_param}::text, ${cursor_market_param}::text, ${cursor_symbol_param}::text, ${cursor_routing_key_param}::text, ${cursor_row_tid_param}::text)"
-            )
-        } else {
-            String::new()
-        }
+        .replace("__LIMIT_PARAM__", &limit_param.to_string())
+    } else {
+        String::new()
     };
 
     SQL_TEMPLATE
@@ -5570,16 +5828,12 @@ __OPTION_CURSOR_FILTER__
                 "format('md.%s.long_short_ratio.%s.5m.%s', lsr.market::text, lsr.ratio_type, lower(lsr.symbol))",
             ),
         )
-        .replace("__OPTION_MARKET_FILTER__", &mk_market_filter("opt"))
-        .replace(
-            "__OPTION_CURSOR_FILTER__",
-            &mk_cursor_filter(
-                "opt",
-                "'md.option_mark_greeks_5m'::text",
-                "format('md.futures.option_mark_greeks.5m.%s', lower(opt.symbol))",
-            ),
-        )
+        .replace("__OPTION_MARK_GREEKS_UNION__", &option_union)
         .replace("__LIMIT_PARAM__", &limit_param.to_string())
+}
+
+fn build_paged_backfill_sql(filter_market: bool, with_cursor: bool) -> String {
+    build_paged_backfill_sql_internal(filter_market, with_cursor, true)
 }
 
 fn require_backfill_field<T>(src: &str, field: &'static str, value: Option<T>) -> Result<T> {
@@ -6252,7 +6506,7 @@ const OPTION_MARK_GREEKS_5M_BACKFILL_WINDOW_SQL: &str = r#"
     ORDER BY ts_event ASC, symbol ASC, option_symbol ASC
 "#;
 
-pub async fn fetch_backfill_batch(
+async fn fetch_backfill_batch_internal(
     pool: &PgPool,
     from_ts: DateTime<Utc>,
     to_ts: DateTime<Utc>,
@@ -6260,6 +6514,7 @@ pub async fn fetch_backfill_batch(
     market: &str,
     limit: i64,
     cursor: Option<&BackfillCursor>,
+    include_option_mark_greeks: bool,
 ) -> Result<Vec<ReplayRow>> {
     if from_ts >= to_ts {
         return Ok(Vec::new());
@@ -6267,7 +6522,8 @@ pub async fn fetch_backfill_batch(
 
     let filter_market = !market.eq_ignore_ascii_case("all");
     let with_cursor = cursor.is_some();
-    let sql = build_paged_backfill_sql(filter_market, with_cursor);
+    let sql =
+        build_paged_backfill_sql_internal(filter_market, with_cursor, include_option_mark_greeks);
     let symbol_upper = symbol.to_uppercase();
     let market_lower = market.to_lowercase();
     let effective_limit = limit.max(1);
@@ -6308,6 +6564,30 @@ pub async fn fetch_backfill_batch(
         });
     }
     Ok(out)
+}
+
+pub async fn fetch_backfill_batch(
+    pool: &PgPool,
+    from_ts: DateTime<Utc>,
+    to_ts: DateTime<Utc>,
+    symbol: &str,
+    market: &str,
+    limit: i64,
+    cursor: Option<&BackfillCursor>,
+) -> Result<Vec<ReplayRow>> {
+    fetch_backfill_batch_internal(pool, from_ts, to_ts, symbol, market, limit, cursor, true).await
+}
+
+async fn fetch_backfill_batch_excluding_option_mark_greeks(
+    pool: &PgPool,
+    from_ts: DateTime<Utc>,
+    to_ts: DateTime<Utc>,
+    symbol: &str,
+    market: &str,
+    limit: i64,
+    cursor: Option<&BackfillCursor>,
+) -> Result<Vec<ReplayRow>> {
+    fetch_backfill_batch_internal(pool, from_ts, to_ts, symbol, market, limit, cursor, false).await
 }
 
 fn replay_row_after_cursor(row: &ReplayRow, cursor: &BackfillCursor) -> bool {
@@ -6561,18 +6841,18 @@ async fn export_snapshots(
 mod tests {
     use super::{
         allow_live_tail_reconcile, allow_oi_ratio_patch_processing, build_backfill_sql,
-        build_paged_backfill_sql, expand_startup_backfill_to_minimum_recovery_window,
-        find_long_null_price_run, handle_ingest_event,
-        hydrate_futures_orderbook_heatmaps_for_range_with_fetch, live_tail_reconcile_start_ts,
-        minimum_startup_recovery_history_floor, minute_exclusive_upper_bound,
-        minute_history_is_strictly_contiguous, replay_heatmap_hydration_batch_end,
-        replay_row_after_cursor, save_state_snapshot, shutdown_ready_through_candidate,
-        snapshot_has_required_history, snapshot_null_price_run_reaches_recent_tail,
-        try_load_state_snapshot, BackfillCursor, LiveCanonicalRepairController, ReplayRow,
-        SnapshotLoadOutcome, FUNDING_BACKFILL_WINDOW_SQL, LIQ_BACKFILL_WINDOW_SQL,
-        LIVE_CANONICAL_TAIL_RECONCILE_LOOKBACK_MINUTES, MIN_REUSABLE_SNAPSHOT_HISTORY_MINUTES,
-        ORDERBOOK_BACKFILL_WINDOW_SQL_SCALAR, ORDERBOOK_BACKFILL_WINDOW_SQL_WITH_HEATMAP,
-        TRADE_BACKFILL_WINDOW_SQL,
+        build_paged_backfill_sql, build_paged_backfill_sql_internal,
+        expand_startup_backfill_to_minimum_recovery_window, find_long_null_price_run,
+        handle_ingest_event, hydrate_futures_orderbook_heatmaps_for_range_with_fetch,
+        live_tail_reconcile_start_ts, minimum_startup_recovery_history_floor,
+        minute_exclusive_upper_bound, minute_history_is_strictly_contiguous,
+        replay_heatmap_hydration_batch_end, replay_row_after_cursor, save_state_snapshot,
+        shutdown_ready_through_candidate, snapshot_has_required_history,
+        snapshot_null_price_run_reaches_recent_tail, try_load_state_snapshot, BackfillCursor,
+        LiveCanonicalRepairController, ReplayRow, SnapshotLoadOutcome, FUNDING_BACKFILL_WINDOW_SQL,
+        LIQ_BACKFILL_WINDOW_SQL, LIVE_CANONICAL_TAIL_RECONCILE_LOOKBACK_MINUTES,
+        MIN_REUSABLE_SNAPSHOT_HISTORY_MINUTES, ORDERBOOK_BACKFILL_WINDOW_SQL_SCALAR,
+        ORDERBOOK_BACKFILL_WINDOW_SQL_WITH_HEATMAP, TRADE_BACKFILL_WINDOW_SQL,
     };
     use crate::ingest::decoder::{
         AggFundingMark1mEvent, AggFundingPoint, AggHeatmapLevel, AggLiq1mEvent, AggLiqLevel,
@@ -6894,6 +7174,8 @@ mod tests {
             top_account_ratio_5m: Vec::new(),
             top_position_ratio_5m: Vec::new(),
             option_mark_greeks_5m: Vec::new(),
+            option_mark_greeks_5m_buckets: Vec::new(),
+            options_surface_5m: Vec::new(),
         }
     }
 
@@ -7003,6 +7285,14 @@ mod tests {
         assert!(sql.contains("FROM md.option_mark_greeks_5m opt"));
         assert!(sql.contains("row_tid_text"));
         assert!(sql.contains("ctid::text"));
+    }
+
+    #[test]
+    fn paged_backfill_sql_can_exclude_option_mark_greeks_for_startup_seed_mode() {
+        let sql = build_paged_backfill_sql_internal(false, true, false);
+        assert!(sql.contains("FROM md.agg_trade_1m t"));
+        assert!(sql.contains("FROM md.long_short_ratio_5m lsr"));
+        assert!(!sql.contains("FROM md.option_mark_greeks_5m opt"));
     }
 
     #[test]

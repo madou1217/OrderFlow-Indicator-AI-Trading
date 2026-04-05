@@ -22,7 +22,7 @@ use crate::ingest::decoder::{
 };
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use serde_json::Value;
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use tracing::debug;
 
@@ -1282,7 +1282,8 @@ pub struct StateStore {
     global_account_ratio_5m: VecDeque<LongShortRatioPoint>,
     top_account_ratio_5m: VecDeque<LongShortRatioPoint>,
     top_position_ratio_5m: VecDeque<LongShortRatioPoint>,
-    option_mark_greeks_5m: VecDeque<OptionMarkGreeksPoint>,
+    option_mark_greeks_by_bucket_5m: BTreeMap<DateTime<Utc>, Vec<OptionMarkGreeksPoint>>,
+    options_surface_5m_history: VecDeque<OptionsSurfacePoint>,
     incremental_indicator_state: IncrementalIndicatorState,
     dirty_recompute_from: Option<DateTime<Utc>>,
     // Fixed target end for the current dirty-recompute batch series.
@@ -1347,7 +1348,8 @@ impl StateStore {
             global_account_ratio_5m: VecDeque::new(),
             top_account_ratio_5m: VecDeque::new(),
             top_position_ratio_5m: VecDeque::new(),
-            option_mark_greeks_5m: VecDeque::new(),
+            option_mark_greeks_by_bucket_5m: BTreeMap::new(),
+            options_surface_5m_history: VecDeque::new(),
             incremental_indicator_state: IncrementalIndicatorState::default(),
             dirty_recompute_from: None,
             dirty_recompute_end: None,
@@ -1421,7 +1423,8 @@ impl StateStore {
         self.global_account_ratio_5m.clear();
         self.top_account_ratio_5m.clear();
         self.top_position_ratio_5m.clear();
-        self.option_mark_greeks_5m.clear();
+        self.option_mark_greeks_by_bucket_5m.clear();
+        self.options_surface_5m_history.clear();
         self.dirty_recompute_from = None;
         self.dirty_recompute_end = None;
         self.dirty_recompute_truncated = false;
@@ -2399,15 +2402,69 @@ impl StateStore {
             theta: event.theta,
             risk_free_interest: event.risk_free_interest,
         };
-        // Retain a fixed number of 5m buckets instead of assuming a fixed
-        // contract count per bucket, so universe growth does not shrink history.
-        upsert_sorted_point_by_bucket(
-            &mut self.option_mark_greeks_5m,
-            point,
-            OPTIONS_SURFACE_HISTORY_KEEP_5M_BUCKETS,
-            |item| (item.ts_bucket, item.option_symbol.clone()),
-            |item| item.ts_bucket,
-        )
+        let ts_bucket = point.ts_bucket;
+        let bucket_rows = self
+            .option_mark_greeks_by_bucket_5m
+            .entry(ts_bucket)
+            .or_default();
+        let raw_changed = upsert_option_bucket_point(bucket_rows, point);
+        let surface_changed = self.refresh_options_surface_bucket(ts_bucket);
+        self.trim_options_surface_state();
+        raw_changed || surface_changed
+    }
+
+    fn refresh_options_surface_bucket(&mut self, ts_bucket: DateTime<Utc>) -> bool {
+        let next_point = self
+            .option_mark_greeks_by_bucket_5m
+            .get(&ts_bucket)
+            .and_then(|rows| {
+                aggregate_options_surface_bucket(ts_bucket, &rows.iter().collect::<Vec<_>>())
+            });
+
+        match next_point {
+            Some(point) => upsert_sorted_point(
+                &mut self.options_surface_5m_history,
+                ts_bucket,
+                point,
+                OPTIONS_SURFACE_HISTORY_KEEP_5M_BUCKETS,
+                |item| item.ts_bucket,
+            ),
+            None => remove_sorted_point(&mut self.options_surface_5m_history, ts_bucket, |item| {
+                item.ts_bucket
+            }),
+        }
+    }
+
+    fn trim_options_surface_state(&mut self) {
+        let Some(newest_bucket) = self
+            .option_mark_greeks_by_bucket_5m
+            .keys()
+            .next_back()
+            .cloned()
+        else {
+            self.options_surface_5m_history.clear();
+            return;
+        };
+        let keep_span_minutes = OPTIONS_SURFACE_HISTORY_KEEP_5M_BUCKETS.saturating_sub(1) as i64
+            * OPTIONS_SURFACE_BUCKET_SPAN_MINUTES;
+        let earliest_bucket = newest_bucket - Duration::minutes(keep_span_minutes);
+
+        while let Some(oldest_bucket) = self.option_mark_greeks_by_bucket_5m.keys().next().cloned()
+        {
+            if oldest_bucket >= earliest_bucket {
+                break;
+            }
+            self.option_mark_greeks_by_bucket_5m.remove(&oldest_bucket);
+        }
+
+        while self
+            .options_surface_5m_history
+            .front()
+            .map(|point| point.ts_bucket < earliest_bucket)
+            .unwrap_or(false)
+        {
+            self.options_surface_5m_history.pop_front();
+        }
     }
 
     fn mark_oi_ratio_patch_if_finalized(
@@ -2892,24 +2949,81 @@ impl StateStore {
         ts_bucket: DateTime<Utc>,
     ) -> OptionsSurfaceWindowView {
         let as_of_ts = ts_bucket + Duration::minutes(1);
-        let mut by_bucket = BTreeMap::<DateTime<Utc>, Vec<&OptionMarkGreeksPoint>>::new();
-        for point in &self.option_mark_greeks_5m {
-            if point.ts_bucket <= as_of_ts {
-                by_bucket.entry(point.ts_bucket).or_default().push(point);
-            }
-        }
-
-        let mut points = Vec::with_capacity(by_bucket.len());
-        for (bucket, rows) in by_bucket {
-            if let Some(point) = aggregate_options_surface_bucket(bucket, &rows) {
-                points.push(point);
-            }
-        }
+        let points = self
+            .options_surface_5m_history
+            .iter()
+            .filter(|point| point.ts_bucket <= as_of_ts)
+            .cloned()
+            .collect::<Vec<_>>();
         let latest_bucket = points.last().map(|point| point.ts_bucket);
         OptionsSurfaceWindowView {
             latest_bucket,
             points,
         }
+    }
+
+    pub fn seed_options_surface_history(&mut self, points: Vec<OptionsSurfacePoint>) -> usize {
+        let mut present = self
+            .options_surface_5m_history
+            .iter()
+            .map(|point| point.ts_bucket)
+            .collect::<HashSet<_>>();
+        let mut inserted = 0usize;
+
+        for point in points {
+            if present.contains(&point.ts_bucket) {
+                continue;
+            }
+            let bucket = point.ts_bucket;
+            if upsert_sorted_point(
+                &mut self.options_surface_5m_history,
+                bucket,
+                point,
+                OPTIONS_SURFACE_HISTORY_KEEP_5M_BUCKETS,
+                |item| item.ts_bucket,
+            ) {
+                present.insert(bucket);
+                inserted += 1;
+            }
+        }
+
+        inserted
+    }
+
+    pub fn missing_options_surface_bucket_ranges(
+        &self,
+        from_ts: DateTime<Utc>,
+        to_ts_exclusive: DateTime<Utc>,
+    ) -> Vec<(DateTime<Utc>, DateTime<Utc>)> {
+        if from_ts >= to_ts_exclusive {
+            return Vec::new();
+        }
+
+        let present = self
+            .options_surface_5m_history
+            .iter()
+            .map(|point| point.ts_bucket)
+            .collect::<HashSet<_>>();
+        let mut ranges = Vec::new();
+        let mut current_gap_start: Option<DateTime<Utc>> = None;
+        let mut bucket = from_ts;
+
+        while bucket < to_ts_exclusive {
+            if present.contains(&bucket) {
+                if let Some(gap_start) = current_gap_start.take() {
+                    ranges.push((gap_start, bucket));
+                }
+            } else if current_gap_start.is_none() {
+                current_gap_start = Some(bucket);
+            }
+            bucket += Duration::minutes(OPTIONS_SURFACE_BUCKET_SPAN_MINUTES);
+        }
+
+        if let Some(gap_start) = current_gap_start {
+            ranges.push((gap_start, to_ts_exclusive));
+        }
+
+        ranges
     }
 
     fn build_trade_history_with_canonical_backfill(
@@ -3380,7 +3494,16 @@ impl StateStore {
             global_account_ratio_5m: self.global_account_ratio_5m.iter().cloned().collect(),
             top_account_ratio_5m: self.top_account_ratio_5m.iter().cloned().collect(),
             top_position_ratio_5m: self.top_position_ratio_5m.iter().cloned().collect(),
-            option_mark_greeks_5m: self.option_mark_greeks_5m.iter().cloned().collect(),
+            option_mark_greeks_5m: Vec::new(),
+            option_mark_greeks_5m_buckets: self
+                .option_mark_greeks_by_bucket_5m
+                .iter()
+                .map(|(ts_bucket, points)| OptionGreeksBucketSnapshot {
+                    ts_bucket: ts_bucket.clone(),
+                    points: points.clone(),
+                })
+                .collect(),
+            options_surface_5m: self.options_surface_5m_history.iter().cloned().collect(),
         }
     }
 
@@ -3404,6 +3527,8 @@ impl StateStore {
             top_account_ratio_5m,
             top_position_ratio_5m,
             option_mark_greeks_5m,
+            option_mark_greeks_5m_buckets,
+            options_surface_5m,
             ..
         } = snap;
 
@@ -3435,7 +3560,20 @@ impl StateStore {
         self.global_account_ratio_5m = global_account_ratio_5m.into_iter().collect();
         self.top_account_ratio_5m = top_account_ratio_5m.into_iter().collect();
         self.top_position_ratio_5m = top_position_ratio_5m.into_iter().collect();
-        self.option_mark_greeks_5m = option_mark_greeks_5m.into_iter().collect();
+        self.option_mark_greeks_by_bucket_5m = if !option_mark_greeks_5m_buckets.is_empty() {
+            option_mark_greeks_5m_buckets
+                .into_iter()
+                .map(|bucket| (bucket.ts_bucket, bucket.points))
+                .collect()
+        } else {
+            group_option_mark_points_by_bucket(option_mark_greeks_5m)
+        };
+        self.options_surface_5m_history = if !options_surface_5m.is_empty() {
+            options_surface_5m.into_iter().collect()
+        } else {
+            rebuild_options_surface_history(&self.option_mark_greeks_by_bucket_5m)
+        };
+        self.trim_options_surface_state();
         self.rebuild_incremental_recent_7d_payloads();
         // CVD must be derived from history tail (not stored value) to ensure accuracy.
         self.cvd_futures = self.history_futures.back().map(|h| h.cvd).unwrap_or(0.0);
@@ -3689,7 +3827,13 @@ fn classify_term_structure_state(front_iv: Option<f64>, second_iv: Option<f64>) 
     }
 }
 
-pub const STATE_SNAPSHOT_VERSION: u32 = 3;
+pub const STATE_SNAPSHOT_VERSION: u32 = 4;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct OptionGreeksBucketSnapshot {
+    pub ts_bucket: DateTime<Utc>,
+    pub points: Vec<OptionMarkGreeksPoint>,
+}
 
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct StateSnapshot {
@@ -3726,6 +3870,10 @@ pub struct StateSnapshot {
     pub top_position_ratio_5m: Vec<LongShortRatioPoint>,
     #[serde(default)]
     pub option_mark_greeks_5m: Vec<OptionMarkGreeksPoint>,
+    #[serde(default)]
+    pub option_mark_greeks_5m_buckets: Vec<OptionGreeksBucketSnapshot>,
+    #[serde(default)]
+    pub options_surface_5m: Vec<OptionsSurfacePoint>,
 }
 
 pub fn floor_minute(ts: DateTime<Utc>) -> DateTime<Utc> {
@@ -3788,6 +3936,59 @@ where
         deque.pop_front();
     }
     true
+}
+
+fn remove_sorted_point<T, F>(deque: &mut VecDeque<T>, point_ts: DateTime<Utc>, ts_of: F) -> bool
+where
+    F: Fn(&T) -> DateTime<Utc>,
+{
+    if let Some(existing_idx) = deque.iter().position(|item| ts_of(item) == point_ts) {
+        deque.remove(existing_idx);
+        return true;
+    }
+    false
+}
+
+fn upsert_option_bucket_point(
+    rows: &mut Vec<OptionMarkGreeksPoint>,
+    point: OptionMarkGreeksPoint,
+) -> bool {
+    if let Some(existing_idx) = rows
+        .iter()
+        .position(|item| item.option_symbol == point.option_symbol)
+    {
+        if rows[existing_idx] == point {
+            return false;
+        }
+        rows[existing_idx] = point;
+        return true;
+    }
+
+    rows.push(point);
+    true
+}
+
+fn group_option_mark_points_by_bucket(
+    points: Vec<OptionMarkGreeksPoint>,
+) -> BTreeMap<DateTime<Utc>, Vec<OptionMarkGreeksPoint>> {
+    let mut grouped = BTreeMap::<DateTime<Utc>, Vec<OptionMarkGreeksPoint>>::new();
+    for point in points {
+        upsert_option_bucket_point(grouped.entry(point.ts_bucket).or_default(), point);
+    }
+    grouped
+}
+
+fn rebuild_options_surface_history(
+    buckets: &BTreeMap<DateTime<Utc>, Vec<OptionMarkGreeksPoint>>,
+) -> VecDeque<OptionsSurfacePoint> {
+    let mut out = VecDeque::new();
+    for (ts_bucket, rows) in buckets {
+        let refs = rows.iter().collect::<Vec<_>>();
+        if let Some(point) = aggregate_options_surface_bucket(ts_bucket.clone(), &refs) {
+            out.push_back(point);
+        }
+    }
+    out
 }
 
 fn materially_equal_f64(lhs: f64, rhs: f64) -> bool {
@@ -3954,49 +4155,6 @@ fn long_short_ratio_point_materially_eq(
         && materially_equal_f64(lhs.long_short_ratio, rhs.long_short_ratio)
         && materially_equal_option_f64(lhs.long_account_ratio, rhs.long_account_ratio)
         && materially_equal_option_f64(lhs.short_account_ratio, rhs.short_account_ratio)
-}
-
-fn upsert_sorted_point_by_bucket<T, K, FK, FB>(
-    deque: &mut VecDeque<T>,
-    point: T,
-    keep_buckets: usize,
-    key_of: FK,
-    bucket_of: FB,
-) -> bool
-where
-    T: Clone + PartialEq,
-    K: Ord,
-    FK: Fn(&T) -> K,
-    FB: Fn(&T) -> DateTime<Utc>,
-{
-    let point_key = key_of(&point);
-    if let Some(existing_idx) = deque.iter().position(|item| key_of(item) == point_key) {
-        if deque[existing_idx] == point {
-            return false;
-        }
-        deque[existing_idx] = point;
-    } else {
-        let insert_idx = deque
-            .iter()
-            .position(|item| key_of(item) > point_key)
-            .unwrap_or(deque.len());
-        deque.insert(insert_idx, point);
-    }
-
-    let Some(newest_bucket) = deque.back().map(&bucket_of) else {
-        return true;
-    };
-    let keep_span_minutes =
-        keep_buckets.saturating_sub(1) as i64 * OPTIONS_SURFACE_BUCKET_SPAN_MINUTES;
-    let earliest_bucket = newest_bucket - Duration::minutes(keep_span_minutes);
-    while deque
-        .front()
-        .map(|item| bucket_of(item) < earliest_bucket)
-        .unwrap_or(false)
-    {
-        deque.pop_front();
-    }
-    true
 }
 
 pub fn price_to_tick(price: f64) -> i64 {
@@ -4198,8 +4356,8 @@ mod tests {
         aggregate_options_surface_bucket, choose_nearest_strike,
         OPTIONS_SURFACE_HISTORY_KEEP_5M_BUCKETS,
     };
-    use super::{minute_window_from_history_row, MinuteWindowData, StateStore};
-    use crate::indicators::context::OptionMarkGreeksPoint;
+    use super::{minute_window_from_history_row, MinuteWindowData, StateSnapshot, StateStore};
+    use crate::indicators::context::{OptionMarkGreeksPoint, OptionsSurfacePoint};
     use crate::ingest::decoder::{
         AggFundingMark1mEvent, AggFundingPoint, AggHeatmapLevel, AggLiq1mEvent, AggLiqLevel,
         AggMarkPoint, AggOrderbook1mEvent, AggProfileLevel, AggTrade1mEvent, AggVpinSnapshot,
@@ -5428,7 +5586,7 @@ mod tests {
     fn option_mark_greeks_retention_keeps_full_5m_buckets() {
         let mut store = StateStore::new("TESTUSDT".to_string(), 1_000.0);
         let start = Utc.with_ymd_and_hms(2026, 3, 1, 0, 0, 0).single().unwrap();
-        let expiry = start + ChronoDuration::days(30);
+        let expiry = start + ChronoDuration::days(60);
 
         for offset in 0..=OPTIONS_SURFACE_HISTORY_KEEP_5M_BUCKETS {
             let bucket = start + ChronoDuration::minutes((offset as i64) * 5);
@@ -5452,30 +5610,248 @@ mod tests {
         let expected_latest =
             start + ChronoDuration::minutes((OPTIONS_SURFACE_HISTORY_KEEP_5M_BUCKETS as i64) * 5);
         assert_eq!(
-            store
-                .option_mark_greeks_5m
-                .front()
-                .map(|point| point.ts_bucket),
+            store.option_mark_greeks_by_bucket_5m.keys().next().cloned(),
             Some(expected_oldest)
         );
         assert_eq!(
             store
-                .option_mark_greeks_5m
-                .back()
-                .map(|point| point.ts_bucket),
+                .option_mark_greeks_by_bucket_5m
+                .keys()
+                .next_back()
+                .cloned(),
             Some(expected_latest)
         );
         assert_eq!(
-            store.option_mark_greeks_5m.len(),
-            OPTIONS_SURFACE_HISTORY_KEEP_5M_BUCKETS * 2
+            store.option_mark_greeks_by_bucket_5m.len(),
+            OPTIONS_SURFACE_HISTORY_KEEP_5M_BUCKETS
         );
         assert_eq!(
             store
-                .option_mark_greeks_5m
-                .iter()
-                .filter(|point| point.ts_bucket == start)
-                .count(),
-            0
+                .option_mark_greeks_by_bucket_5m
+                .values()
+                .map(|rows| rows.len())
+                .sum::<usize>(),
+            OPTIONS_SURFACE_HISTORY_KEEP_5M_BUCKETS * 2
+        );
+        assert_eq!(
+            store.options_surface_5m_history.len(),
+            OPTIONS_SURFACE_HISTORY_KEEP_5M_BUCKETS
+        );
+        assert!(!store.option_mark_greeks_by_bucket_5m.contains_key(&start));
+    }
+
+    #[test]
+    fn options_surface_seed_fills_missing_buckets_without_overwriting_existing_points() {
+        let mut store = StateStore::new("TESTUSDT".to_string(), 1_000.0);
+        let start = Utc.with_ymd_and_hms(2026, 3, 27, 6, 0, 0).single().unwrap();
+        let mid = start + ChronoDuration::minutes(5);
+        let end = mid + ChronoDuration::minutes(5);
+
+        let inserted = store.seed_options_surface_history(vec![
+            OptionsSurfacePoint {
+                ts_bucket: start,
+                front_expiry_ts: None,
+                second_expiry_ts: None,
+                atm_strike_front: Some(100.0),
+                atm_iv_front: Some(0.50),
+                atm_iv_second: Some(0.55),
+                atm_iv_30d_proxy: Some(0.52),
+                rr_25d_front: Some(0.01),
+                rr_25d_second: Some(0.02),
+                skew_state: "neutral".to_string(),
+                term_structure_state: "flat".to_string(),
+            },
+            OptionsSurfacePoint {
+                ts_bucket: end,
+                front_expiry_ts: None,
+                second_expiry_ts: None,
+                atm_strike_front: Some(100.0),
+                atm_iv_front: Some(0.60),
+                atm_iv_second: Some(0.65),
+                atm_iv_30d_proxy: Some(0.62),
+                rr_25d_front: Some(0.03),
+                rr_25d_second: Some(0.04),
+                skew_state: "call_skewed".to_string(),
+                term_structure_state: "back_rich".to_string(),
+            },
+        ]);
+        assert_eq!(inserted, 2);
+
+        let inserted = store.seed_options_surface_history(vec![
+            OptionsSurfacePoint {
+                ts_bucket: start,
+                front_expiry_ts: None,
+                second_expiry_ts: None,
+                atm_strike_front: Some(999.0),
+                atm_iv_front: Some(9.99),
+                atm_iv_second: Some(9.99),
+                atm_iv_30d_proxy: Some(9.99),
+                rr_25d_front: Some(9.99),
+                rr_25d_second: Some(9.99),
+                skew_state: "should_not_replace".to_string(),
+                term_structure_state: "should_not_replace".to_string(),
+            },
+            OptionsSurfacePoint {
+                ts_bucket: mid,
+                front_expiry_ts: None,
+                second_expiry_ts: None,
+                atm_strike_front: Some(100.0),
+                atm_iv_front: Some(0.55),
+                atm_iv_second: Some(0.60),
+                atm_iv_30d_proxy: Some(0.57),
+                rr_25d_front: Some(0.02),
+                rr_25d_second: Some(0.03),
+                skew_state: "put_skewed".to_string(),
+                term_structure_state: "flat".to_string(),
+            },
+        ]);
+        assert_eq!(inserted, 1);
+        assert!(store
+            .missing_options_surface_bucket_ranges(start, end + ChronoDuration::minutes(5))
+            .is_empty());
+        assert_eq!(store.options_surface_5m_history.len(), 3);
+        assert_eq!(
+            store
+                .options_surface_5m_history
+                .front()
+                .and_then(|point| point.atm_iv_front),
+            Some(0.50)
+        );
+    }
+
+    #[test]
+    fn options_surface_history_round_trips_through_snapshot_restore() {
+        let mut store = StateStore::new("TESTUSDT".to_string(), 1_000.0);
+        let ts_0 = Utc
+            .with_ymd_and_hms(2026, 3, 27, 6, 20, 0)
+            .single()
+            .unwrap();
+        let ts_1 = ts_0 + ChronoDuration::minutes(5);
+        let expiry = ts_0 + ChronoDuration::days(14);
+
+        for (bucket, front_iv) in [(ts_0, 0.50), (ts_1, 0.55)] {
+            store.store_option_mark_greeks_5m(option_mark_event(
+                bucket,
+                &format!("TEST-{}-CALL", bucket.timestamp()),
+                expiry,
+                100.0,
+                "CALL",
+                100.0,
+                Some(front_iv),
+                None,
+                None,
+                Some(0.25),
+            ));
+            store.store_option_mark_greeks_5m(option_mark_event(
+                bucket,
+                &format!("TEST-{}-PUT", bucket.timestamp()),
+                expiry,
+                100.0,
+                "PUT",
+                100.0,
+                Some(front_iv),
+                None,
+                None,
+                Some(-0.25),
+            ));
+        }
+
+        let expected_bundle = store.build_window_bundle(
+            ts_1,
+            MinuteWindowData::empty(MarketKind::Futures, ts_1),
+            MinuteWindowData::empty(MarketKind::Spot, ts_1),
+        );
+
+        let snapshot = store.extract_snapshot();
+        let mut restored = StateStore::new("TESTUSDT".to_string(), 1_000.0);
+        restored.restore_from_snapshot(snapshot);
+        let restored_bundle = restored.build_window_bundle(
+            ts_1,
+            MinuteWindowData::empty(MarketKind::Futures, ts_1),
+            MinuteWindowData::empty(MarketKind::Spot, ts_1),
+        );
+
+        assert_eq!(
+            restored_bundle.options_surface_5m,
+            expected_bundle.options_surface_5m
+        );
+        assert_eq!(
+            restored_bundle.latest_options_surface_bucket,
+            expected_bundle.latest_options_surface_bucket
+        );
+    }
+
+    #[test]
+    fn legacy_option_snapshot_restores_surface_history() {
+        let mut store = StateStore::new("TESTUSDT".to_string(), 1_000.0);
+        let ts_0 = Utc
+            .with_ymd_and_hms(2026, 3, 27, 6, 20, 0)
+            .single()
+            .unwrap();
+        let ts_1 = ts_0 + ChronoDuration::minutes(5);
+        let expiry = ts_0 + ChronoDuration::days(14);
+
+        for (bucket, front_iv) in [(ts_0, 0.50), (ts_1, 0.55)] {
+            store.store_option_mark_greeks_5m(option_mark_event(
+                bucket,
+                &format!("LEGACY-{}-CALL", bucket.timestamp()),
+                expiry,
+                100.0,
+                "CALL",
+                100.0,
+                Some(front_iv),
+                None,
+                None,
+                Some(0.25),
+            ));
+            store.store_option_mark_greeks_5m(option_mark_event(
+                bucket,
+                &format!("LEGACY-{}-PUT", bucket.timestamp()),
+                expiry,
+                100.0,
+                "PUT",
+                100.0,
+                Some(front_iv),
+                None,
+                None,
+                Some(-0.25),
+            ));
+        }
+
+        let expected_bundle = store.build_window_bundle(
+            ts_1,
+            MinuteWindowData::empty(MarketKind::Futures, ts_1),
+            MinuteWindowData::empty(MarketKind::Spot, ts_1),
+        );
+        let snapshot = store.extract_snapshot();
+        let legacy_points = snapshot
+            .option_mark_greeks_5m_buckets
+            .iter()
+            .flat_map(|bucket| bucket.points.iter().cloned())
+            .collect::<Vec<_>>();
+        let legacy_snapshot = StateSnapshot {
+            version: 3,
+            option_mark_greeks_5m: legacy_points,
+            option_mark_greeks_5m_buckets: Vec::new(),
+            options_surface_5m: Vec::new(),
+            ..snapshot
+        };
+
+        let mut restored = StateStore::new("TESTUSDT".to_string(), 1_000.0);
+        restored.restore_from_snapshot(legacy_snapshot);
+        let restored_bundle = restored.build_window_bundle(
+            ts_1,
+            MinuteWindowData::empty(MarketKind::Futures, ts_1),
+            MinuteWindowData::empty(MarketKind::Spot, ts_1),
+        );
+
+        assert_eq!(
+            restored_bundle.options_surface_5m,
+            expected_bundle.options_surface_5m
+        );
+        assert_eq!(
+            restored_bundle.latest_options_surface_bucket,
+            expected_bundle.latest_options_surface_bucket
         );
     }
 
