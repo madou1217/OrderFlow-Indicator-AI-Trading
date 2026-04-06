@@ -33,6 +33,10 @@ impl DispatchMode {
         !matches!(self, Self::WarmStateOnly)
     }
 
+    fn persist_snapshots(self) -> bool {
+        matches!(self, Self::Live | Self::ShutdownFlush)
+    }
+
     fn publish_outputs(self) -> bool {
         matches!(self, Self::Live | Self::ShutdownFlush)
     }
@@ -303,11 +307,15 @@ impl Dispatcher {
         } = artifacts;
 
         if mode.persist_outputs() {
-            let snapshot_started_at = Instant::now();
-            self.snapshot_writer
-                .write_snapshots(ctx.ts_bucket, &ctx.symbol, &snapshots)
-                .await?;
-            let snapshot_write_ms = snapshot_started_at.elapsed().as_millis();
+            let snapshot_write_ms = if mode.persist_snapshots() {
+                let snapshot_started_at = Instant::now();
+                self.snapshot_writer
+                    .write_snapshots(ctx.ts_bucket, &ctx.symbol, &snapshots)
+                    .await?;
+                snapshot_started_at.elapsed().as_millis()
+            } else {
+                0
+            };
             let level_started_at = Instant::now();
             self.level_writer
                 .write_indicator_levels(ctx.ts_bucket, &ctx.symbol, &levels)
@@ -619,7 +627,15 @@ mod tests {
     #[test]
     fn shutdown_flush_still_persists_and_publishes_outputs() {
         assert!(DispatchMode::ShutdownFlush.persist_outputs());
+        assert!(DispatchMode::ShutdownFlush.persist_snapshots());
         assert!(DispatchMode::ShutdownFlush.publish_outputs());
+    }
+
+    #[test]
+    fn replay_materialize_skips_snapshot_side_effects() {
+        assert!(DispatchMode::ReplayMaterialize.persist_outputs());
+        assert!(!DispatchMode::ReplayMaterialize.persist_snapshots());
+        assert!(!DispatchMode::ReplayMaterialize.publish_outputs());
     }
 
     #[test]
