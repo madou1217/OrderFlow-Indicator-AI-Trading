@@ -314,7 +314,7 @@ pub struct WindowBundle {
     pub incremental_outputs: Arc<IncrementalIndicatorOutputs>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 struct CanonicalMinuteInputs {
     trade: Option<AggTrade1mEvent>,
     orderbook: Option<AggOrderbook1mEvent>,
@@ -328,8 +328,8 @@ struct TimedJsonPayload {
     payload_json: Value,
 }
 
-#[derive(Debug, Clone, Default)]
-struct CanonicalMinuteByMarket {
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct CanonicalMinuteByMarket {
     futures: CanonicalMinuteInputs,
     spot: CanonicalMinuteInputs,
 }
@@ -348,6 +348,12 @@ impl CanonicalMinuteByMarket {
             MarketKind::Spot => &mut self.spot,
         }
     }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CanonicalMinuteSnapshot {
+    pub ts_bucket: DateTime<Utc>,
+    pub inputs: CanonicalMinuteByMarket,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -3504,6 +3510,14 @@ impl StateStore {
                 })
                 .collect(),
             options_surface_5m: self.options_surface_5m_history.iter().cloned().collect(),
+            canonical_minutes: self
+                .canonical_minutes
+                .iter()
+                .map(|(minute_sec, inputs)| CanonicalMinuteSnapshot {
+                    ts_bucket: Utc.timestamp_opt(*minute_sec, 0).single().unwrap(),
+                    inputs: inputs.clone(),
+                })
+                .collect(),
         }
     }
 
@@ -3529,8 +3543,22 @@ impl StateStore {
             option_mark_greeks_5m,
             option_mark_greeks_5m_buckets,
             options_surface_5m,
+            canonical_minutes,
             ..
         } = snap;
+
+        self.buckets.clear();
+        self.canonical_minutes.clear();
+        self.depth_conflation.clear();
+        self.orderbooks.clear();
+        self.orderbooks
+            .insert(MarketKind::Spot, OrderbookState::default());
+        self.orderbooks
+            .insert(MarketKind::Futures, OrderbookState::default());
+        self.clear_dirty_recompute_state();
+        self.clear_oi_ratio_patch_state();
+        self.oi_ratio_patch_mark_total = 0;
+        self.oi_ratio_patch_extends_backward_total = 0;
 
         self.effective_history_floor_ts = effective_history_floor_ts;
         self.vpin_futures = vpin_futures;
@@ -3573,6 +3601,10 @@ impl StateStore {
         } else {
             rebuild_options_surface_history(&self.option_mark_greeks_by_bucket_5m)
         };
+        self.canonical_minutes = canonical_minutes
+            .into_iter()
+            .map(|minute| (minute.ts_bucket.timestamp(), minute.inputs))
+            .collect();
         self.trim_options_surface_state();
         self.rebuild_incremental_recent_7d_payloads();
         // CVD must be derived from history tail (not stored value) to ensure accuracy.
@@ -3827,7 +3859,7 @@ fn classify_term_structure_state(front_iv: Option<f64>, second_iv: Option<f64>) 
     }
 }
 
-pub const STATE_SNAPSHOT_VERSION: u32 = 4;
+pub const STATE_SNAPSHOT_VERSION: u32 = 5;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct OptionGreeksBucketSnapshot {
@@ -3835,7 +3867,7 @@ pub struct OptionGreeksBucketSnapshot {
     pub points: Vec<OptionMarkGreeksPoint>,
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct StateSnapshot {
     pub version: u32,
     pub symbol: String,
@@ -3874,6 +3906,8 @@ pub struct StateSnapshot {
     pub option_mark_greeks_5m_buckets: Vec<OptionGreeksBucketSnapshot>,
     #[serde(default)]
     pub options_surface_5m: Vec<OptionsSurfacePoint>,
+    #[serde(default)]
+    pub canonical_minutes: Vec<CanonicalMinuteSnapshot>,
 }
 
 pub fn floor_minute(ts: DateTime<Utc>) -> DateTime<Utc> {
@@ -5852,6 +5886,44 @@ mod tests {
         assert_eq!(
             restored_bundle.latest_options_surface_bucket,
             expected_bundle.latest_options_surface_bucket
+        );
+    }
+
+    #[test]
+    fn canonical_minutes_round_trip_through_snapshot_restore() {
+        let mut store = StateStore::new("TESTUSDT".to_string(), 1_000.0);
+        let ts_0 = Utc.with_ymd_and_hms(2026, 3, 29, 3, 0, 0).single().unwrap();
+        let ts_1 = ts_0 + ChronoDuration::minutes(1);
+
+        for ts in [ts_0, ts_1] {
+            store.ingest(agg_trade_event(ts, 2.0, 1.0, 0.15));
+            store.ingest(agg_trade_event_spot(ts, 1.5, 0.5, 0.10));
+            store.ingest(agg_orderbook_event(ts, 4, 4, 0.1));
+            store.ingest(agg_orderbook_event_spot(ts, 4, 4, 0.1));
+            store.ingest(agg_liq_event(ts, 10.0));
+            store.ingest(agg_funding_mark_event(ts, 30, 2000.0, -0.0010));
+        }
+
+        let expected_segment = store.latest_continuous_canonical_segment();
+        let snapshot = store.extract_snapshot();
+
+        let mut restored = StateStore::new("TESTUSDT".to_string(), 1_000.0);
+        restored.restore_from_snapshot(snapshot);
+
+        assert_eq!(
+            restored.latest_continuous_canonical_segment(),
+            expected_segment
+        );
+
+        let restored_window = restored.finalize_minute(ts_1);
+        assert_eq!(restored_window.futures.trade_count, 1);
+        assert_eq!(restored_window.spot.trade_count, 1);
+        assert_eq!(
+            restored_window
+                .latest_mark
+                .as_ref()
+                .and_then(|m| m.mark_price),
+            Some(2000.0)
         );
     }
 

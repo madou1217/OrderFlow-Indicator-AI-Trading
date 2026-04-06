@@ -144,7 +144,7 @@ pub struct ForceOrderEvent {
     pub liq_side: String,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AggWhaleStats {
     pub trade_count: i64,
     pub buy_count: i64,
@@ -168,14 +168,14 @@ pub struct AggVpinSnapshot {
     pub last_vpin: f64,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AggProfileLevel {
     pub price: f64,
     pub buy_qty: f64,
     pub sell_qty: f64,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AggTrade1mEvent {
     pub ts_bucket: DateTime<Utc>,
     pub chunk_start_ts: DateTime<Utc>,
@@ -195,14 +195,14 @@ pub struct AggTrade1mEvent {
     pub vpin_snapshot: Option<AggVpinSnapshot>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AggHeatmapLevel {
     pub price: f64,
     pub bid_liquidity: f64,
     pub ask_liquidity: f64,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AggOrderbook1mEvent {
     pub ts_bucket: DateTime<Utc>,
     pub chunk_start_ts: DateTime<Utc>,
@@ -253,14 +253,14 @@ impl AggOrderbook1mEvent {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AggLiqLevel {
     pub price: f64,
     pub long_liq: f64,
     pub short_liq: f64,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AggLiq1mEvent {
     pub ts_bucket: DateTime<Utc>,
     pub chunk_start_ts: DateTime<Utc>,
@@ -269,7 +269,7 @@ pub struct AggLiq1mEvent {
     pub levels: Vec<AggLiqLevel>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AggMarkPoint {
     pub ts: DateTime<Utc>,
     pub mark_price: Option<f64>,
@@ -279,7 +279,7 @@ pub struct AggMarkPoint {
     pub next_funding_time: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AggFundingPoint {
     pub ts: DateTime<Utc>,
     pub funding_time: Option<DateTime<Utc>>,
@@ -288,7 +288,7 @@ pub struct AggFundingPoint {
     pub next_funding_time: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AggFundingMark1mEvent {
     pub ts_bucket: DateTime<Utc>,
     pub chunk_start_ts: DateTime<Utc>,

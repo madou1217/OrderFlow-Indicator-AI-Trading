@@ -78,11 +78,69 @@ const PERIODIC_RUNTIME_SNAPSHOT_INTERVAL_SECS: u64 = 15 * 60;
 const PERIODIC_RUNTIME_SNAPSHOT_MIN_ADVANCE_MINUTES: i64 = 100;
 const MAX_CONSECUTIVE_NULL_PRICE_MINUTES_IN_SNAPSHOT: usize = 60;
 const MIN_RECENT_BARS_AFTER_NULL_RUN_IN_SNAPSHOT: usize = 1440;
+const STARTUP_BACKFILL_CHECKPOINT_VERSION: u32 = 1;
 
 enum SnapshotLoadOutcome {
     Fresh(StateSnapshot),
     StaleRecoverySeed { snap: StateSnapshot, age_hours: i64 },
     Rejected,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct StartupBackfillCheckpoint {
+    version: u32,
+    symbol: String,
+    saved_at: DateTime<Utc>,
+    from_ts: DateTime<Utc>,
+    to_ts_exclusive: DateTime<Utc>,
+    next_canonical_window_from_ts: Option<DateTime<Utc>>,
+    snapshot_was_loaded: bool,
+    persisted_frontier_ts: Option<DateTime<Utc>>,
+    snapshot: StateSnapshot,
+}
+
+#[derive(Debug, Clone, Default)]
+struct StartupBackfillProgress {
+    from_ts: Option<DateTime<Utc>>,
+    to_ts_exclusive: Option<DateTime<Utc>>,
+    next_canonical_window_from_ts: Option<DateTime<Utc>>,
+    snapshot_was_loaded: bool,
+    persisted_frontier_ts: Option<DateTime<Utc>>,
+}
+
+impl StartupBackfillProgress {
+    fn record(
+        &mut self,
+        from_ts: DateTime<Utc>,
+        to_ts_exclusive: DateTime<Utc>,
+        next_canonical_window_from_ts: Option<DateTime<Utc>>,
+        snapshot_was_loaded: bool,
+        persisted_frontier_ts: Option<DateTime<Utc>>,
+    ) {
+        self.from_ts = Some(from_ts);
+        self.to_ts_exclusive = Some(to_ts_exclusive);
+        self.next_canonical_window_from_ts = next_canonical_window_from_ts;
+        self.snapshot_was_loaded = snapshot_was_loaded;
+        self.persisted_frontier_ts = persisted_frontier_ts;
+    }
+
+    fn to_checkpoint(
+        &self,
+        symbol: &str,
+        snapshot: StateSnapshot,
+    ) -> Option<StartupBackfillCheckpoint> {
+        Some(StartupBackfillCheckpoint {
+            version: STARTUP_BACKFILL_CHECKPOINT_VERSION,
+            symbol: symbol.to_string(),
+            saved_at: Utc::now(),
+            from_ts: self.from_ts?,
+            to_ts_exclusive: self.to_ts_exclusive?,
+            next_canonical_window_from_ts: self.next_canonical_window_from_ts,
+            snapshot_was_loaded: self.snapshot_was_loaded,
+            persisted_frontier_ts: self.persisted_frontier_ts,
+            snapshot,
+        })
+    }
 }
 
 async fn build_publish_db_pool(config: &Arc<RootConfig>) -> Result<PgPool> {
@@ -499,6 +557,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
         .indicator
         .snapshot_file_path
         .replace("{symbol}", &ctx.config.indicator.symbol);
+    let startup_checkpoint_path = startup_backfill_checkpoint_path(&snapshot_path);
     let startup_backfill_batch_size = ctx.config.indicator.startup_backfill_batch_size.max(100);
 
     let metrics = Arc::new(AppMetrics::default());
@@ -606,6 +665,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
     // save the partial snapshot (valid — next start gap-fills missing minutes) and exit.
     let mut got_signal_before_live = false;
     metrics.set_backfill_mode(true);
+    let startup_backfill_progress = Arc::new(Mutex::new(StartupBackfillProgress::default()));
     let startup_replay_cutoff_bucket = tokio::select! {
         biased;
         _ = tokio::signal::ctrl_c() => {
@@ -625,6 +685,9 @@ pub async fn run(ctx: AppContext) -> Result<()> {
             &mut state_store,
             &mut scheduler,
             &runtime_options,
+            &snapshot_path,
+            startup_checkpoint_path.as_deref(),
+            startup_backfill_progress.clone(),
         ) => {
             match result {
                 Ok(v) => v,
@@ -638,6 +701,24 @@ pub async fn run(ctx: AppContext) -> Result<()> {
     if got_signal_before_live {
         let snap = state_store.extract_snapshot();
         let history_len = snap.history_futures.len();
+        let checkpoint_progress = startup_backfill_progress.lock().await.clone();
+        if let (Some(path), Some(checkpoint)) = (
+            startup_checkpoint_path.as_deref(),
+            checkpoint_progress.to_checkpoint(&ctx.config.indicator.symbol, snap.clone()),
+        ) {
+            match save_startup_backfill_checkpoint(&checkpoint, path).await {
+                Ok(()) => info!(
+                    path = %path,
+                    from_ts = %checkpoint.from_ts,
+                    to_ts_exclusive = %checkpoint.to_ts_exclusive,
+                    next_canonical_window_from_ts = ?checkpoint.next_canonical_window_from_ts,
+                    "startup backfill checkpoint saved"
+                ),
+                Err(err) => {
+                    warn!(error = %err, path = %path, "failed to save startup backfill checkpoint")
+                }
+            }
+        }
         if !snapshot_path.is_empty() && snapshot_is_reusable_recovery_seed(&snap) {
             info!(
                 history_bars = history_len,
@@ -645,6 +726,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
             );
             match save_state_snapshot(&snap, &snapshot_path).await {
                 Ok(()) => {
+                    remove_startup_backfill_checkpoint(startup_checkpoint_path.as_deref());
                     info!(path = %snapshot_path, history_bars = history_len, "State snapshot saved (mid-backfill)")
                 }
                 Err(e) => warn!(error = %e, "Failed to save state snapshot"),
@@ -662,6 +744,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
         }
         return Ok(());
     }
+    remove_startup_backfill_checkpoint(startup_checkpoint_path.as_deref());
     metrics.set_backfill_mode(false);
 
     let state_store = Arc::new(Mutex::new(state_store));
@@ -1673,20 +1756,34 @@ fn format_stale_msg_type_distribution(counter: &HashMap<String, u64>) -> String 
         .join(",")
 }
 
-fn try_load_state_snapshot(path: &str, symbol: &str, max_age_hours: u64) -> SnapshotLoadOutcome {
+fn startup_backfill_checkpoint_path(snapshot_path: &str) -> Option<String> {
+    if snapshot_path.is_empty() {
+        return None;
+    }
+    if let Some(base) = snapshot_path.strip_suffix(".json.gz") {
+        return Some(format!("{base}.startup_backfill.json.gz"));
+    }
+    if let Some(base) = snapshot_path.strip_suffix(".gz") {
+        return Some(format!("{base}.startup_backfill.gz"));
+    }
+    Some(format!("{snapshot_path}.startup_backfill"))
+}
+
+fn load_gzip_json<T: serde::de::DeserializeOwned>(path: &str) -> Option<T> {
     use flate2::read::GzDecoder;
     use std::fs::File;
 
+    let file = File::open(path).ok()?;
+    let gz = GzDecoder::new(file);
+    serde_json::from_reader(gz).ok()
+}
+
+fn try_load_state_snapshot(path: &str, symbol: &str, max_age_hours: u64) -> SnapshotLoadOutcome {
     if path.is_empty() {
         return SnapshotLoadOutcome::Rejected;
     }
-    let Ok(file) = File::open(path) else {
+    let Some(snap) = load_gzip_json::<StateSnapshot>(path) else {
         return SnapshotLoadOutcome::Rejected;
-    };
-    let gz = GzDecoder::new(file);
-    let snap: StateSnapshot = match serde_json::from_reader(gz) {
-        Ok(snap) => snap,
-        Err(_) => return SnapshotLoadOutcome::Rejected,
     };
     // Version check
     let supports_previous_version =
@@ -1785,6 +1882,42 @@ fn try_load_state_snapshot(path: &str, symbol: &str, max_age_hours: u64) -> Snap
     } else {
         SnapshotLoadOutcome::Fresh(snap)
     }
+}
+
+fn try_load_startup_backfill_checkpoint(
+    path: Option<&str>,
+    symbol: &str,
+) -> Option<StartupBackfillCheckpoint> {
+    let path = path?;
+    let checkpoint = load_gzip_json::<StartupBackfillCheckpoint>(path)?;
+    if checkpoint.version != STARTUP_BACKFILL_CHECKPOINT_VERSION {
+        warn!(
+            found = checkpoint.version,
+            expected = STARTUP_BACKFILL_CHECKPOINT_VERSION,
+            path = %path,
+            "startup backfill checkpoint version mismatch, ignoring"
+        );
+        return None;
+    }
+    if checkpoint.symbol != symbol {
+        warn!(
+            checkpoint_symbol = %checkpoint.symbol,
+            symbol = %symbol,
+            path = %path,
+            "startup backfill checkpoint symbol mismatch, ignoring"
+        );
+        return None;
+    }
+    if checkpoint.next_canonical_window_from_ts.is_some()
+        && checkpoint.snapshot.canonical_minutes.is_empty()
+    {
+        warn!(
+            path = %path,
+            "startup backfill checkpoint has no canonical replay state, ignoring"
+        );
+        return None;
+    }
+    Some(checkpoint)
 }
 
 fn minute_history_is_strictly_contiguous(
@@ -1985,11 +2118,10 @@ fn snapshot_is_reusable_recovery_seed(snap: &StateSnapshot) -> bool {
     true
 }
 
-async fn save_state_snapshot(snap: &StateSnapshot, path: &str) -> anyhow::Result<()> {
+async fn save_gzip_json_atomic<T: serde::Serialize>(value: &T, path: &str) -> anyhow::Result<()> {
     use flate2::write::GzEncoder;
     use flate2::Compression;
     use std::fs::File;
-    use std::path::Path;
 
     if path.is_empty() {
         return Ok(());
@@ -2003,9 +2135,33 @@ async fn save_state_snapshot(snap: &StateSnapshot, path: &str) -> anyhow::Result
     let tmp_path = format!("{}.tmp", path);
     let file = File::create(&tmp_path)?;
     let gz = GzEncoder::new(file, Compression::fast());
-    serde_json::to_writer(gz, snap)?;
+    serde_json::to_writer(gz, value)?;
     std::fs::rename(&tmp_path, path)?;
     Ok(())
+}
+
+async fn save_state_snapshot(snap: &StateSnapshot, path: &str) -> anyhow::Result<()> {
+    save_gzip_json_atomic(snap, path).await
+}
+
+async fn save_startup_backfill_checkpoint(
+    checkpoint: &StartupBackfillCheckpoint,
+    path: &str,
+) -> anyhow::Result<()> {
+    save_gzip_json_atomic(checkpoint, path).await
+}
+
+fn remove_startup_backfill_checkpoint(path: Option<&str>) {
+    let Some(path) = path else {
+        return;
+    };
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            warn!(error = %err, path = %path, "failed to remove startup backfill checkpoint")
+        }
+    }
 }
 
 async fn run_periodic_runtime_snapshot_loop(
@@ -4445,6 +4601,9 @@ async fn run_startup_backfill(
     state_store: &mut StateStore,
     scheduler: &mut WindowScheduler,
     runtime_options: &IndicatorRuntimeOptions,
+    snapshot_path: &str,
+    startup_checkpoint_path: Option<&str>,
+    startup_backfill_progress: Arc<Mutex<StartupBackfillProgress>>,
 ) -> Result<Option<DateTime<Utc>>> {
     let now = Utc::now();
     let latest_progress_ts =
@@ -4455,7 +4614,7 @@ async fn run_startup_backfill(
         latest_indicator_snapshot_ts(&ctx.db_pool, &ctx.config.indicator.symbol)
             .await
             .context("query latest indicator snapshot ts")?;
-    let persisted_frontier_ts = latest_progress_ts.or(latest_snapshot_table_ts);
+    let mut persisted_frontier_ts = latest_progress_ts.or(latest_snapshot_table_ts);
     metrics.set_last_persisted_ts(persisted_frontier_ts.map(|ts| ts.timestamp_millis()));
     let mut from_ts = match persisted_frontier_ts {
         Some(ts) => ts - ChronoDuration::minutes(STARTUP_BACKFILL_OVERLAP_MINUTES),
@@ -4492,17 +4651,32 @@ async fn run_startup_backfill(
         }
     }
 
-    // Try to load state snapshot for fast startup
-    // Support {symbol} placeholder in path (e.g. "/tmp/indicator_engine_{symbol}.json.gz")
-    let snapshot_file_path = ctx
-        .config
-        .indicator
-        .snapshot_file_path
-        .replace("{symbol}", &ctx.config.indicator.symbol);
     let mut snapshot_was_loaded = false;
-    if !snapshot_file_path.is_empty() {
+    let mut checkpoint_resume_from_ts = None;
+    if let Some(checkpoint) =
+        try_load_startup_backfill_checkpoint(startup_checkpoint_path, &ctx.config.indicator.symbol)
+    {
+        from_ts = checkpoint.from_ts;
+        checkpoint_resume_from_ts = Some(
+            checkpoint
+                .next_canonical_window_from_ts
+                .unwrap_or(checkpoint.to_ts_exclusive),
+        );
+        persisted_frontier_ts = checkpoint.persisted_frontier_ts.or(persisted_frontier_ts);
+        snapshot_was_loaded = checkpoint.snapshot_was_loaded;
+        state_store.restore_from_snapshot(checkpoint.snapshot);
+        info!(
+            checkpoint_saved_at = %checkpoint.saved_at,
+            checkpoint_from_ts = %checkpoint.from_ts,
+            checkpoint_to_ts_exclusive = %checkpoint.to_ts_exclusive,
+            checkpoint_resume_from_ts = ?checkpoint_resume_from_ts,
+            snapshot_was_loaded,
+            persisted_frontier_ts = ?persisted_frontier_ts,
+            "startup backfill checkpoint loaded; resuming in-memory canonical replay state"
+        );
+    } else if !snapshot_path.is_empty() {
         match try_load_state_snapshot(
-            &snapshot_file_path,
+            snapshot_path,
             &ctx.config.indicator.symbol,
             ctx.config.indicator.snapshot_max_age_hours,
         ) {
@@ -4565,10 +4739,23 @@ async fn run_startup_backfill(
             from_ts = minimum_recovery_floor;
         }
     }
+    metrics.set_last_persisted_ts(persisted_frontier_ts.map(|ts| ts.timestamp_millis()));
     // Startup replay is bucket-based for canonical 1m rows. Floor the lower bound so
     // we never drop a completed ts_bucket just because the resume timestamp carried
     // non-zero seconds.
     from_ts = floor_minute(from_ts);
+    let mut window_from_ts = checkpoint_resume_from_ts.unwrap_or(from_ts);
+    window_from_ts = floor_minute(window_from_ts.max(from_ts));
+    {
+        let mut progress = startup_backfill_progress.lock().await;
+        progress.record(
+            from_ts,
+            to_ts,
+            Some(window_from_ts),
+            snapshot_was_loaded,
+            persisted_frontier_ts,
+        );
+    }
     if from_ts >= to_ts {
         if let Some(last_finalized_ts) = state_store.last_finalized_minute() {
             scheduler.mark_emitted_through(last_finalized_ts);
@@ -4610,15 +4797,29 @@ async fn run_startup_backfill(
         ((total_minutes + CANONICAL_REPLAY_FETCH_WINDOW_MINUTES - 1)
             / CANONICAL_REPLAY_FETCH_WINDOW_MINUTES) as usize
     };
-    let mut window_from_ts = from_ts;
     let startup_backfill_started_at = Instant::now();
     let mut last_progress_log_at = Instant::now();
-    let mut completed_windows = 0usize;
+    let mut completed_windows = if window_from_ts > from_ts {
+        ((window_from_ts - from_ts).num_minutes() / CANONICAL_REPLAY_FETCH_WINDOW_MINUTES).max(0)
+            as usize
+    } else {
+        0
+    };
     let backfill_batch_size = ctx.config.indicator.startup_backfill_batch_size.max(100);
     while window_from_ts < to_ts {
         let window_to_ts = (window_from_ts
             + ChronoDuration::minutes(CANONICAL_REPLAY_FETCH_WINDOW_MINUTES))
         .min(to_ts);
+        {
+            let mut progress = startup_backfill_progress.lock().await;
+            progress.record(
+                from_ts,
+                to_ts,
+                Some(window_from_ts),
+                snapshot_was_loaded,
+                persisted_frontier_ts,
+            );
+        }
         let window_started_at = Instant::now();
         info!(
             window_index = completed_windows + 1,
@@ -4728,9 +4929,46 @@ async fn run_startup_backfill(
             "startup backfill replay ingest window complete"
         );
         window_from_ts = window_to_ts;
+        {
+            let mut progress = startup_backfill_progress.lock().await;
+            progress.record(
+                from_ts,
+                to_ts,
+                Some(window_from_ts),
+                snapshot_was_loaded,
+                persisted_frontier_ts,
+            );
+            if let (Some(path), Some(checkpoint)) = (
+                startup_checkpoint_path,
+                progress
+                    .to_checkpoint(&ctx.config.indicator.symbol, state_store.extract_snapshot()),
+            ) {
+                save_startup_backfill_checkpoint(&checkpoint, path)
+                    .await
+                    .with_context(|| format!("save startup backfill checkpoint path={path}"))?;
+            }
+        }
+    }
+    {
+        let mut progress = startup_backfill_progress.lock().await;
+        progress.record(
+            from_ts,
+            to_ts,
+            None,
+            snapshot_was_loaded,
+            persisted_frontier_ts,
+        );
+        if let (Some(path), Some(checkpoint)) = (
+            startup_checkpoint_path,
+            progress.to_checkpoint(&ctx.config.indicator.symbol, state_store.extract_snapshot()),
+        ) {
+            save_startup_backfill_checkpoint(&checkpoint, path)
+                .await
+                .with_context(|| format!("save startup backfill checkpoint path={path}"))?;
+        }
     }
 
-    if total_rows == 0 {
+    if total_rows == 0 && state_store.latest_continuous_canonical_segment().is_none() {
         if let Some(last_finalized_ts) = state_store.last_finalized_minute() {
             scheduler.mark_emitted_through(last_finalized_ts);
             return Ok(Some(last_finalized_ts + ChronoDuration::minutes(1)));
@@ -6846,13 +7084,16 @@ mod tests {
         handle_ingest_event, hydrate_futures_orderbook_heatmaps_for_range_with_fetch,
         live_tail_reconcile_start_ts, minimum_startup_recovery_history_floor,
         minute_exclusive_upper_bound, minute_history_is_strictly_contiguous,
-        replay_heatmap_hydration_batch_end, replay_row_after_cursor, save_state_snapshot,
-        shutdown_ready_through_candidate, snapshot_has_required_history,
-        snapshot_null_price_run_reaches_recent_tail, try_load_state_snapshot, BackfillCursor,
-        LiveCanonicalRepairController, ReplayRow, SnapshotLoadOutcome, FUNDING_BACKFILL_WINDOW_SQL,
+        replay_heatmap_hydration_batch_end, replay_row_after_cursor,
+        save_startup_backfill_checkpoint, save_state_snapshot, shutdown_ready_through_candidate,
+        snapshot_has_required_history, snapshot_null_price_run_reaches_recent_tail,
+        startup_backfill_checkpoint_path, try_load_startup_backfill_checkpoint,
+        try_load_state_snapshot, BackfillCursor, LiveCanonicalRepairController, ReplayRow,
+        SnapshotLoadOutcome, StartupBackfillCheckpoint, FUNDING_BACKFILL_WINDOW_SQL,
         LIQ_BACKFILL_WINDOW_SQL, LIVE_CANONICAL_TAIL_RECONCILE_LOOKBACK_MINUTES,
         MIN_REUSABLE_SNAPSHOT_HISTORY_MINUTES, ORDERBOOK_BACKFILL_WINDOW_SQL_SCALAR,
-        ORDERBOOK_BACKFILL_WINDOW_SQL_WITH_HEATMAP, TRADE_BACKFILL_WINDOW_SQL,
+        ORDERBOOK_BACKFILL_WINDOW_SQL_WITH_HEATMAP, STARTUP_BACKFILL_CHECKPOINT_VERSION,
+        TRADE_BACKFILL_WINDOW_SQL,
     };
     use crate::ingest::decoder::{
         AggFundingMark1mEvent, AggFundingPoint, AggHeatmapLevel, AggLiq1mEvent, AggLiqLevel,
@@ -7176,6 +7417,7 @@ mod tests {
             option_mark_greeks_5m: Vec::new(),
             option_mark_greeks_5m_buckets: Vec::new(),
             options_surface_5m: Vec::new(),
+            canonical_minutes: Vec::new(),
         }
     }
 
@@ -7585,6 +7827,15 @@ mod tests {
         );
     }
 
+    #[test]
+    fn startup_backfill_checkpoint_path_rewrites_snapshot_suffix() {
+        assert_eq!(
+            startup_backfill_checkpoint_path("/tmp/indicator_engine_TESTUSDT.json.gz"),
+            Some("/tmp/indicator_engine_TESTUSDT.startup_backfill.json.gz".to_string())
+        );
+        assert_eq!(startup_backfill_checkpoint_path(""), None);
+    }
+
     #[tokio::test]
     async fn stale_snapshot_is_accepted_as_recovery_seed() {
         let last_finalized_ts = Utc::now() - ChronoDuration::hours(30);
@@ -7624,6 +7875,57 @@ mod tests {
             SnapshotLoadOutcome::Fresh(_) => panic!("expected stale recovery seed, got fresh"),
             SnapshotLoadOutcome::Rejected => panic!("expected stale recovery seed, got rejected"),
         }
+    }
+
+    #[tokio::test]
+    async fn startup_backfill_checkpoint_round_trips() {
+        let last_finalized_ts = Utc::now() - ChronoDuration::minutes(10);
+        let history_start_ts = last_finalized_ts - ChronoDuration::minutes(120);
+        let history = (0..=120)
+            .map(|offset| {
+                priced_history_row(history_start_ts + ChronoDuration::minutes(offset), 2000.0)
+            })
+            .collect::<Vec<_>>();
+        let snap = snapshot_fixture(
+            last_finalized_ts,
+            history.clone(),
+            history,
+            Some(history_start_ts),
+        );
+        let checkpoint = StartupBackfillCheckpoint {
+            version: STARTUP_BACKFILL_CHECKPOINT_VERSION,
+            symbol: "TESTUSDT".to_string(),
+            saved_at: last_finalized_ts,
+            from_ts: history_start_ts,
+            to_ts_exclusive: last_finalized_ts + ChronoDuration::minutes(1),
+            next_canonical_window_from_ts: None,
+            snapshot_was_loaded: true,
+            persisted_frontier_ts: Some(last_finalized_ts),
+            snapshot: snap,
+        };
+        let temp_path = std::env::temp_dir().join(format!(
+            "indicator_engine_startup_checkpoint_{}.json.gz",
+            Uuid::new_v4()
+        ));
+
+        save_startup_backfill_checkpoint(&checkpoint, temp_path.to_str().unwrap())
+            .await
+            .expect("save startup checkpoint");
+        let loaded = try_load_startup_backfill_checkpoint(temp_path.to_str(), "TESTUSDT")
+            .expect("load startup checkpoint");
+        let _ = std::fs::remove_file(&temp_path);
+
+        assert_eq!(loaded.from_ts, checkpoint.from_ts);
+        assert_eq!(loaded.to_ts_exclusive, checkpoint.to_ts_exclusive);
+        assert_eq!(loaded.snapshot_was_loaded, checkpoint.snapshot_was_loaded);
+        assert_eq!(
+            loaded.persisted_frontier_ts,
+            checkpoint.persisted_frontier_ts
+        );
+        assert_eq!(
+            loaded.snapshot.history_futures.len(),
+            checkpoint.snapshot.history_futures.len()
+        );
     }
 
     #[test]
