@@ -357,7 +357,7 @@ pub fn build_indicator_summary(
         .collect();
 
     let position_layer = json!({
-        "price_volume_structure": preferred_indicator_payload(&filtered_indicators, &input.indicators, "price_volume_structure"),
+        "price_volume_structure": filtered_indicator_payload(&filtered_indicators, "price_volume_structure"),
         "rvwap_sigma_bands": filtered_indicator_payload(&filtered_indicators, "rvwap_sigma_bands"),
         "avwap": filtered_indicator_payload(&filtered_indicators, "avwap"),
         "tpo_market_profile": preferred_indicator_payload(&filtered_indicators, &input.indicators, "tpo_market_profile"),
@@ -553,6 +553,26 @@ mod tests {
                                 "poc_price": 2000.0,
                                 "value_area_levels": [{"price": 2000.0, "volume": 50.0}],
                                 "window_bars_used": 4
+                            },
+                            "4h": {
+                                "poc_price": 1995.0,
+                                "value_area_levels": [{"price": 1995.0, "volume": 80.0}],
+                                "window_bars_used": 240
+                            },
+                            "1d": {
+                                "poc_price": 1988.0,
+                                "value_area_levels": [{"price": 1988.0, "volume": 120.0}],
+                                "window_bars_used": 1440
+                            },
+                            "3d": {
+                                "poc_price": 1979.0,
+                                "value_area_levels": [{"price": 1979.0, "volume": 160.0}],
+                                "window_bars_used": 4320
+                            },
+                            "7d": {
+                                "poc_price": 1966.0,
+                                "value_area_levels": [{"price": 1966.0, "volume": 200.0}],
+                                "window_bars_used": 10080
                             }
                         }
                     }
@@ -613,8 +633,37 @@ mod tests {
         let summary = build_indicator_summary(&input, &[]).expect("build indicator summary");
         assert!(summary
             .position_layer
+            .pointer("/price_volume_structure/poc_price")
+            .is_none());
+        assert!(summary
+            .position_layer
             .pointer("/price_volume_structure/value_area_levels")
             .is_none());
+        assert!(
+            summary.position_layer["price_volume_structure"]["by_window"]
+                .get("15m")
+                .is_none()
+        );
+        assert!(
+            summary.position_layer["price_volume_structure"]["by_window"]
+                .get("4h")
+                .is_some()
+        );
+        assert!(
+            summary.position_layer["price_volume_structure"]["by_window"]
+                .get("1d")
+                .is_some()
+        );
+        assert!(
+            summary.position_layer["price_volume_structure"]["by_window"]
+                .get("3d")
+                .is_some()
+        );
+        assert!(
+            summary.position_layer["price_volume_structure"]["by_window"]
+                .get("7d")
+                .is_some()
+        );
         assert_eq!(
             summary.aux_context["options_surface"]["strategic_summary"]["windows"]["4h"]
                 ["atm_iv_regime"],

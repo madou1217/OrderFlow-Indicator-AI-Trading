@@ -14,7 +14,6 @@ const ENTRY_ORDERBOOK_TOP_LEVEL_MIN_COUNT: usize = 10;
 const DETAILED_TOP_VOLUME_LEVELS: usize = 10;
 const DETAILED_IMBALANCE_LEVELS_PER_SIDE: usize = 20;
 const DEFENSIVE_IMBALANCE_LEVELS_PER_SIDE: usize = 10;
-const ENTRY_TOP_LEVEL_VA_TOP_LEVELS: usize = 15;
 const ENTRY_15M_VA_TOP_LEVELS: usize = 15;
 const ENTRY_HTF_VA_TOP_LEVELS: usize = 10;
 const ENTRY_FUNDING_TREND_HOURLY_LIMIT: usize = 24;
@@ -68,37 +67,14 @@ pub(super) fn filter_tpo_market_profile(payload: &Value) -> Value {
     payload
 }
 
-pub(super) fn filter_price_volume_structure(payload: &Value) -> Value {
+pub(super) fn filter_price_volume_structure(payload: &Value, windows: &[&str]) -> Value {
     let Some(payload) = payload.as_object() else {
         return Value::Null;
     };
     let mut result = Map::new();
-    copy_fields(
-        &mut result,
-        payload,
-        &[
-            "poc_price",
-            "poc_volume",
-            "vah",
-            "val",
-            "hvn_levels",
-            "lvn_levels",
-            "bar_volume",
-            "volume_zscore",
-            "volume_dryup",
-        ],
-    );
-    result.insert(
-        "va_top_levels".to_string(),
-        Value::Array(build_va_top_levels(
-            payload.get("value_area_levels").and_then(Value::as_array),
-            ENTRY_TOP_LEVEL_VA_TOP_LEVELS,
-        )),
-    );
-
     if let Some(by_window) = payload.get("by_window").and_then(Value::as_object) {
         let mut filtered_windows = Map::new();
-        for window in CORE_WINDOWS_WITH_3D {
+        for window in windows {
             let Some(window_value) = by_window.get(*window).and_then(Value::as_object) else {
                 continue;
             };
@@ -115,7 +91,6 @@ pub(super) fn filter_price_volume_structure(payload: &Value) -> Value {
                     "lvn_levels",
                     "bar_volume",
                     "volume_zscore",
-                    "volume_dryup",
                     "window_bars_used",
                 ],
             );
@@ -139,10 +114,6 @@ pub(super) fn filter_price_volume_structure(payload: &Value) -> Value {
     }
 
     Value::Object(result)
-}
-
-pub(super) fn filter_price_volume_structure_entry_v3(payload: &Value) -> Value {
-    filter_price_volume_structure(payload)
 }
 
 pub(super) fn filter_fvg(payload: &Value, windows: &[&str], keep_recent: usize) -> Value {
@@ -199,7 +170,7 @@ pub(super) fn filter_fvg(payload: &Value, windows: &[&str], keep_recent: usize) 
     Value::Object(result)
 }
 
-pub(super) fn filter_avwap(payload: &Value, limits: &[(&str, usize)]) -> Value {
+pub(super) fn filter_avwap(payload: &Value, windows: &[&str]) -> Value {
     let Some(payload) = payload.as_object() else {
         return Value::Null;
     };
@@ -209,10 +180,17 @@ pub(super) fn filter_avwap(payload: &Value, limits: &[(&str, usize)]) -> Value {
     };
 
     let mut filtered_windows = Map::new();
-    for (window, _) in limits {
+    for window in windows {
         let Some(window_value) = by_window.get(*window).and_then(Value::as_object) else {
             continue;
         };
+        let is_ready = window_value
+            .get("is_ready")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if !is_ready {
+            continue;
+        }
         let mut filtered_window = Map::new();
         copy_fields(
             &mut filtered_window,

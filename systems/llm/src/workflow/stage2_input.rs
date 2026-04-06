@@ -73,6 +73,7 @@ fn recent_window_entry(value: &Value, key: &str, window: &str) -> Value {
 
 fn avwap_recent_window_code(window: &str) -> &str {
     match window {
+        "30d_lookback" => "30d",
         "7d_lookback" => "7d",
         other => other,
     }
@@ -259,6 +260,7 @@ fn build_selected_avwap_anchors(
                 "distance_to_zone_midpoint": current_price - zone.midpoint(),
                 "mapped_reference_window": mapped_reference_window,
                 "mapped_avwap_reference": avwap_reference_for_window(avwap, mapped_reference_window),
+                "strategic_reference_30d": avwap_reference_for_window(avwap, "30d_lookback"),
                 "strategic_reference_7d": avwap_reference_for_window(avwap, "7d_lookback"),
                 "avwap_references": avwap_references,
             })
@@ -864,7 +866,7 @@ fn build_strategic_context_frozen(
         "price_volume_structure_4h": window_slice(
             context_child(position_layer, "price_volume_structure"),
             "by_window",
-            &["4h", "1d"]
+            &["3d", "4h", "1d"]
         ),
         "liquidation_density_4h": window_slice(
             context_child(position_layer, "liquidation_density"),
@@ -920,6 +922,7 @@ fn build_strategic_context_frozen(
             .and_then(|value| value.get("1d"))
             .cloned()
             .unwrap_or(Value::Null),
+        "avwap_reference_30d": avwap_reference_for_window(avwap, "30d_lookback"),
         "avwap_reference_7d": avwap_reference_for_window(avwap, "7d_lookback"),
     })
 }
@@ -1638,6 +1641,7 @@ mod tests {
                     "payload": {
                         "by_window": {
                             "15m": {"poc_price": 104.0, "vah": 105.0, "val": 103.0, "value_area_levels": [{"price": 104.0, "volume": 40.0}]},
+                            "3d": {"poc_price": 97.5, "vah": 101.0, "val": 94.0, "value_area_levels": [{"price": 97.5, "volume": 260.0}]},
                             "4h": {"poc_price": 101.0, "vah": 102.0, "val": 99.5, "value_area_levels": [{"price": 101.0, "volume": 200.0}]},
                             "1d": {"poc_price": 99.0, "vah": 103.0, "val": 96.0, "value_area_levels": [{"price": 99.0, "volume": 320.0}]}
                         }
@@ -1658,6 +1662,7 @@ mod tests {
                             "15m": {
                                 "lookback": "15m",
                                 "anchor_ts": "2026-03-30T06:00:00Z",
+                                "is_ready": true,
                                 "avwap_fut": 105.4,
                                 "avwap_spot": 105.0,
                                 "price_minus_avwap_fut": 3.8,
@@ -1667,6 +1672,7 @@ mod tests {
                             "4h": {
                                 "lookback": "4h",
                                 "anchor_ts": "2026-03-30T02:15:00Z",
+                                "is_ready": true,
                                 "avwap_fut": 101.6,
                                 "avwap_spot": 101.1,
                                 "price_minus_avwap_fut": 7.6,
@@ -1676,6 +1682,7 @@ mod tests {
                             "1d": {
                                 "lookback": "1d",
                                 "anchor_ts": "2026-03-29T06:15:00Z",
+                                "is_ready": true,
                                 "avwap_fut": 105.0,
                                 "avwap_spot": 104.4,
                                 "price_minus_avwap_fut": 4.2,
@@ -1685,6 +1692,7 @@ mod tests {
                             "3d": {
                                 "lookback": "3d",
                                 "anchor_ts": "2026-03-27T06:15:00Z",
+                                "is_ready": true,
                                 "avwap_fut": 109.1,
                                 "avwap_spot": 108.5,
                                 "price_minus_avwap_fut": 0.1,
@@ -1694,10 +1702,21 @@ mod tests {
                             "7d": {
                                 "lookback": "7d",
                                 "anchor_ts": "2026-03-23T06:15:00Z",
+                                "is_ready": true,
                                 "avwap_fut": 103.8,
                                 "avwap_spot": 103.3,
                                 "price_minus_avwap_fut": 5.4,
                                 "price_minus_spot_avwap_fut": 5.9,
+                                "window_semantics": "recent_n_window"
+                            },
+                            "30d": {
+                                "lookback": "30d",
+                                "anchor_ts": "2026-02-29T06:15:00Z",
+                                "is_ready": true,
+                                "avwap_fut": 100.9,
+                                "avwap_spot": 100.3,
+                                "price_minus_avwap_fut": 8.3,
+                                "price_minus_spot_avwap_fut": 8.9,
                                 "window_semantics": "recent_n_window"
                             }
                         }
@@ -2405,7 +2424,7 @@ mod tests {
 
     #[test]
     fn stage2a_prompt_input_contract_uses_abc_layers_and_anchor_mapped_avwap() {
-        let input = sample_stage2_input(false);
+        let input = sample_stage2_input(true);
         let stage1_output = sample_stage1_output();
         let tracked_zones = stage1_output
             .current_path
@@ -2418,6 +2437,29 @@ mod tests {
         assert!(summary.position_layer["avwap"]
             .get("series_by_window")
             .is_none());
+        assert!(summary.position_layer["avwap"]["by_window"]
+            .get("15m")
+            .is_none());
+        assert_eq!(
+            summary.position_layer["avwap"]["by_window"]["30d"]["avwap_fut"],
+            json!(100.9)
+        );
+        assert!(summary.position_layer["price_volume_structure"]
+            .get("poc_price")
+            .is_none());
+        assert!(
+            summary.position_layer["price_volume_structure"]["by_window"]
+                .get("7d")
+                .is_none()
+        );
+        assert_eq!(
+            summary.position_layer["price_volume_structure"]["by_window"]["15m"]["poc_price"],
+            json!(104.0)
+        );
+        assert_eq!(
+            summary.position_layer["price_volume_structure"]["by_window"]["3d"]["poc_price"],
+            json!(97.5)
+        );
         assert!(summary.driver_layer["cvd_pack"]["by_window"]["15m"]
             .get("delta_fut")
             .is_none());
@@ -2474,9 +2516,21 @@ mod tests {
             json!(103.8)
         );
         assert_eq!(
+            encoded["strategic_context_frozen"]["avwap_reference_30d"]["avwap_fut"],
+            json!(100.9)
+        );
+        assert_eq!(
+            next_target_anchor["strategic_reference_30d"]["avwap_fut"],
+            json!(100.9)
+        );
+        assert_eq!(
             encoded["strategic_context_frozen"]["ema_trend_regime_4h_1d"]["trend_regime_by_tf"]
                 ["4h"],
             json!("bullish_supportive")
+        );
+        assert_eq!(
+            encoded["strategic_context_frozen"]["price_volume_structure_4h"]["3d"]["poc_price"],
+            json!(97.5)
         );
         assert_eq!(
             encoded["strategic_context_frozen"]["price_volume_structure_4h"]["1d"]["poc_price"],
@@ -2551,6 +2605,25 @@ mod tests {
             .clone();
         let summary = build_indicator_summary(&input, &tracked_zones).expect("indicator summary");
         assert!(summary.position_layer["avwap"].get("avwap_fut").is_none());
+        assert!(summary.position_layer["avwap"]["by_window"]
+            .get("15m")
+            .is_none());
+        assert_eq!(
+            summary.position_layer["avwap"]["by_window"]["30d"]["avwap_fut"],
+            json!(100.9)
+        );
+        assert!(summary.position_layer["price_volume_structure"]
+            .get("poc_price")
+            .is_none());
+        assert!(
+            summary.position_layer["price_volume_structure"]["by_window"]
+                .get("7d")
+                .is_none()
+        );
+        assert_eq!(
+            summary.position_layer["price_volume_structure"]["by_window"]["15m"]["poc_price"],
+            json!(104.0)
+        );
         assert!(summary.driver_layer["cvd_pack"]["by_window"]["5m"]
             .get("delta_fut")
             .is_none());

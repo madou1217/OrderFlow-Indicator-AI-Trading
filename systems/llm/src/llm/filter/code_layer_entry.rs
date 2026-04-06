@@ -3,14 +3,15 @@ use super::core_shared::{
     filter_ema_trend_regime, filter_event_indicator_entry_v3, filter_footprint_entry_v3,
     filter_funding_rate_entry_v3, filter_fvg, filter_kline_history,
     filter_liquidation_density_entry_v3, filter_orderbook_depth_entry_v3,
-    filter_price_volume_structure_entry_v3, filter_rvwap_sigma_bands, filter_tpo_market_profile,
+    filter_price_volume_structure, filter_rvwap_sigma_bands, filter_tpo_market_profile,
     filter_whale_trades_recent_windows, resolve_reference_mark_price, CORE_WINDOWS_WITH_3D,
 };
 use chrono::{DateTime, Utc};
 use serde_json::{json, Map, Value};
 use std::cmp::Ordering;
 
-const AVWAP_LIMITS: &[(&str, usize)] = &[("15m", 5), ("4h", 3), ("1d", 2), ("3d", 2), ("7d", 1)];
+const AVWAP_WINDOWS: &[&str] = &["30d", "7d", "3d", "1d", "4h"];
+const PRICE_VOLUME_STRUCTURE_WINDOWS: &[&str] = &["7d", "3d", "1d", "4h"];
 const KLINE_LIMITS: &[(&str, usize)] = &[("15m", 20), ("4h", 12), ("1d", 8)];
 const CVD_LIMITS: &[(&str, usize)] = &[("5m", 12), ("15m", 15), ("4h", 8), ("1d", 5)];
 const ENTRY_TOP_LIQUIDITY_LEVELS_LIMIT: usize = 20;
@@ -76,7 +77,7 @@ pub(crate) fn filter_indicators(
         filter_fvg_entry_v4(payload)
     });
     core_shared::insert_filtered_indicator(&mut indicators, source, "avwap", |payload| {
-        prune_nulls(filter_avwap(payload, AVWAP_LIMITS))
+        prune_nulls(filter_avwap(payload, AVWAP_WINDOWS))
     });
     core_shared::insert_filtered_indicator(
         &mut indicators,
@@ -164,7 +165,10 @@ fn filter_tpo_market_profile_entry_v4(payload: &Value) -> Value {
 }
 
 fn filter_price_volume_structure_entry_v4(payload: &Value) -> Value {
-    prune_nulls(filter_price_volume_structure_entry_v3(payload))
+    prune_nulls(filter_price_volume_structure(
+        payload,
+        PRICE_VOLUME_STRUCTURE_WINDOWS,
+    ))
 }
 
 fn filter_fvg_entry_v4(payload: &Value) -> Value {
