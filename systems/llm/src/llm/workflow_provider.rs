@@ -292,6 +292,33 @@ fn driver_attribution_schema() -> Value {
     })
 }
 
+fn realization_plan_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "tp1_price",
+            "tp1_close_ratio",
+            "tp2_price",
+            "after_tp1_stop_policy",
+            "near_tp1_failure_policy"
+        ],
+        "properties": {
+            "tp1_price": {"type": "number"},
+            "tp1_close_ratio": {"type": "number", "exclusiveMinimum": 0.0, "maximum": 1.0},
+            "tp2_price": {"type": "number"},
+            "after_tp1_stop_policy": {
+                "type": "string",
+                "enum": ["breakeven", "lock_profit"]
+            },
+            "near_tp1_failure_policy": {
+                "type": "string",
+                "enum": ["reduce", "tighten_stop", "exit_full"]
+            }
+        }
+    })
+}
+
 fn current_path_schema() -> Value {
     json!({
         "type": "object",
@@ -300,43 +327,23 @@ fn current_path_schema() -> Value {
             "id",
             "side",
             "thesis",
-            "risk_grade",
-            "activation_anchor_id",
             "strategic_activation_level",
-            "first_path_target_anchor_id",
-            "first_path_target",
-            "next_path_target_anchor_id",
-            "next_path_target",
-            "failure_anchor_id",
+            "first_target_zone",
+            "second_target_zone",
             "failure_level",
-            "failure_switch",
-            "setup_type",
-            "reevaluation_trigger",
-            "tracked_zones"
+            "tracked_zones",
+            "realization_plan"
         ],
         "properties": {
             "id": {"type": "string"},
             "side": {"type": "string", "enum": ["LONG", "SHORT"]},
             "thesis": {"type": "string"},
-            "risk_grade": {
-                "type": "string",
-                "enum": ["aligned_trend", "countertrend_repair", "high_conflict_repair"]
-            },
-            "activation_anchor_id": {"type": ["string", "null"]},
             "strategic_activation_level": price_zone_schema(&["4h", "1d", "4h-1d"]),
-            "first_path_target_anchor_id": {"type": ["string", "null"]},
-            "first_path_target": price_zone_schema(&["4h", "1d", "4h-1d"]),
-            "next_path_target_anchor_id": {"type": ["string", "null"]},
-            "next_path_target": price_zone_schema(&["4h", "1d", "4h-1d"]),
-            "failure_anchor_id": {"type": ["string", "null"]},
+            "first_target_zone": price_zone_schema(&["4h", "1d", "4h-1d"]),
+            "second_target_zone": price_zone_schema(&["4h", "1d", "4h-1d"]),
             "failure_level": price_zone_schema(&["4h", "1d", "4h-1d"]),
-            "failure_switch": {"type": ["string", "null"]},
-            "setup_type": {
-                "type": "string",
-                "enum": ["A_continuation", "B_reversal", "C_value_return"]
-            },
-            "reevaluation_trigger": reevaluation_trigger_schema(),
-            "tracked_zones": {"type": "array", "items": tracked_zone_schema()}
+            "tracked_zones": {"type": "array", "items": tracked_zone_schema()},
+            "realization_plan": realization_plan_schema()
         }
     })
 }
@@ -556,6 +563,7 @@ fn post_fill_bracket_template_schema() -> Value {
         "properties": {
             "take_profit_1": {"type": "number"},
             "take_profit_2": {"type": "number"},
+            "tp1_close_ratio": {"type": "number", "minimum": 0.0, "maximum": 1.0},
             "stop_loss": {"type": "number"}
         }
     })

@@ -7,6 +7,26 @@ pub fn default_stage2a_leverage() -> u32 {
     1
 }
 
+pub fn default_risk_grade() -> String {
+    "aligned_trend".to_string()
+}
+
+pub fn default_setup_type() -> String {
+    "A_continuation".to_string()
+}
+
+pub fn default_tp1_close_ratio() -> f64 {
+    1.0
+}
+
+pub fn default_after_tp1_stop_policy() -> String {
+    "breakeven".to_string()
+}
+
+pub fn default_near_tp1_failure_policy() -> String {
+    "tighten_stop".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct PriceZone {
@@ -34,6 +54,14 @@ impl PriceZone {
             self.low
         } else {
             self.high
+        }
+    }
+
+    pub fn leading_edge(&self, side: &str) -> f64 {
+        if side.eq_ignore_ascii_case("SHORT") {
+            self.high
+        } else {
+            self.low
         }
     }
 
@@ -250,29 +278,61 @@ pub struct ReevaluationTrigger {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
+pub struct RealizationPlan {
+    pub tp1_price: f64,
+    #[serde(default = "default_tp1_close_ratio")]
+    pub tp1_close_ratio: f64,
+    pub tp2_price: f64,
+    #[serde(default = "default_after_tp1_stop_policy")]
+    pub after_tp1_stop_policy: String,
+    #[serde(default = "default_near_tp1_failure_policy")]
+    pub near_tp1_failure_policy: String,
+}
+
+impl Default for RealizationPlan {
+    fn default() -> Self {
+        Self {
+            tp1_price: 0.0,
+            tp1_close_ratio: default_tp1_close_ratio(),
+            tp2_price: 0.0,
+            after_tp1_stop_policy: default_after_tp1_stop_policy(),
+            near_tp1_failure_policy: default_near_tp1_failure_policy(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct CurrentPath {
     pub id: String,
     pub side: String,
     pub thesis: String,
-    pub risk_grade: String,
     #[serde(default)]
     pub activation_anchor_id: Option<String>,
     pub strategic_activation_level: PriceZone,
     #[serde(default)]
     pub first_path_target_anchor_id: Option<String>,
+    #[serde(rename = "first_target_zone", alias = "first_path_target")]
     pub first_path_target: PriceZone,
     #[serde(default)]
     pub next_path_target_anchor_id: Option<String>,
+    #[serde(rename = "second_target_zone", alias = "next_path_target")]
     pub next_path_target: PriceZone,
     #[serde(default)]
     pub failure_anchor_id: Option<String>,
     pub failure_level: PriceZone,
     #[serde(default)]
-    pub failure_switch: Option<String>,
-    pub setup_type: String,
-    pub reevaluation_trigger: ReevaluationTrigger,
-    #[serde(default)]
     pub tracked_zones: Vec<TrackedZone>,
+    #[serde(default)]
+    pub realization_plan: RealizationPlan,
+    #[serde(default = "default_risk_grade")]
+    pub risk_grade: String,
+    #[serde(default)]
+    pub failure_switch: Option<String>,
+    #[serde(default = "default_setup_type")]
+    pub setup_type: String,
+    #[serde(default)]
+    pub reevaluation_trigger: ReevaluationTrigger,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -307,6 +367,8 @@ pub struct EntrySnapshotRef {
 pub struct PostFillBracketTemplate {
     pub take_profit_1: f64,
     pub take_profit_2: f64,
+    #[serde(default = "default_tp1_close_ratio")]
+    pub tp1_close_ratio: f64,
     pub stop_loss: f64,
 }
 
@@ -327,6 +389,12 @@ pub struct ExecutionIntent {
     pub stop_loss: f64,
     pub take_profit_1: f64,
     pub take_profit_2: f64,
+    #[serde(default = "default_tp1_close_ratio")]
+    pub tp1_close_ratio: f64,
+    #[serde(default = "default_after_tp1_stop_policy")]
+    pub after_tp1_stop_policy: String,
+    #[serde(default = "default_near_tp1_failure_policy")]
+    pub near_tp1_failure_policy: String,
     pub ttl_minutes: u64,
     #[serde(default = "default_stage2a_leverage")]
     pub leverage: u32,
@@ -384,6 +452,12 @@ pub struct EntrySnapshot {
     pub stop_loss: f64,
     pub take_profit_1: f64,
     pub take_profit_2: f64,
+    #[serde(default = "default_tp1_close_ratio")]
+    pub tp1_close_ratio: f64,
+    #[serde(default = "default_after_tp1_stop_policy")]
+    pub after_tp1_stop_policy: String,
+    #[serde(default = "default_near_tp1_failure_policy")]
+    pub near_tp1_failure_policy: String,
     #[serde(default)]
     pub allowed_stop_loss_levels: Vec<f64>,
     #[serde(default)]
@@ -784,6 +858,9 @@ mod tests {
             stop_loss: 99.0,
             take_profit_1: 103.0,
             take_profit_2: 105.0,
+            tp1_close_ratio: 1.0,
+            after_tp1_stop_policy: "breakeven".to_string(),
+            near_tp1_failure_policy: "tighten_stop".to_string(),
             ttl_minutes: 15,
             leverage: 4,
             max_drift_pct: 0.2,

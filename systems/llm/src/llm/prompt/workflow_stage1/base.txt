@@ -7,9 +7,10 @@ Your job:
 - Choose exactly one current script or return no_edge.
 - When monitoring_status=active, output exactly one strategic path with:
   - strategic_activation_level
-  - strategic targets
-  - strategic failure_level
-  - reevaluation_trigger
+  - first_target_zone
+  - second_target_zone
+  - failure_level
+  - realization_plan
   - tracked_zones
 
 Strategic reasoning rules:
@@ -23,16 +24,20 @@ Strategic reasoning rules:
 - Use footprint, orderbook_depth, absorption, initiation, buying_exhaustion, selling_exhaustion, and high_volume_pulse only as summarized, confirmed strategic evidence tied to important higher-timeframe levels.
 - Use previous_stage1_output only for continuity, comparison, and to explain what materially changed versus the prior path.
 - Use structural_refresh_context to understand what caused the refresh, which timeframe or zone was affected, and why the structure may need to be redrawn.
-- The path must be honest about risk_grade, target distance, and structural quality.
+- The path must remain a single honest 4H-1D trade path. If you cannot defend both the path geometry and the profit-realization design, return no_edge.
 - map_summary must include location_3d, location_1d, and location_4h.
 
 Path rules:
-- activation_anchor_id, first_path_target_anchor_id, next_path_target_anchor_id, and failure_anchor_id must each point to tracked_zones[].zone_id.
-- strategic_activation_level, first_path_target, next_path_target, and failure_level must align with their corresponding anchor zones.
+- strategic_activation_level, first_target_zone, second_target_zone, and failure_level must each represent real 4H / 1D structure and must align with tracked_zones.
+- first_target_zone and second_target_zone are structural destination zones, not mechanically derived execution prices.
+- realization_plan is required. It must convert the strategic path into executable profit-taking.
+- realization_plan.tp1_price is the first realistic profit realization price, not the far edge of first_target_zone by default.
+- realization_plan.tp1_close_ratio is the portion of size that should be realized at TP1.
+- realization_plan.tp2_price is the runner objective for the remaining size after TP1.
+- realization_plan.after_tp1_stop_policy defines what Stage2B should do with the stop after TP1 is realized.
+- realization_plan.near_tp1_failure_policy defines what Stage2B should do when price approaches TP1 but shows rejection or decay before full realization.
 - failure_level means the strategic hard invalidation of the current 4H / 1D path.
 - failure_level.timeframe must be one of 4h, 1d, or 4h-1d.
-- reevaluation_trigger defines the confirmed higher-timeframe conditions that should send the current path back for strategic review.
-- reevaluation_trigger.extreme_location.timeframe and reevaluation_trigger.reverse_confirmation.timeframe must be one of 4h, 1d, or 4h-1d.
 
 Output contract:
 - Return exactly one JSON object that matches the Stage1 schema.

@@ -211,12 +211,12 @@ fn build_selected_avwap_anchors(
             &path.strategic_activation_level,
         ),
         (
-            "first_path_target",
+            "first_target_zone",
             path.first_path_target_anchor_id.as_deref(),
             &path.first_path_target,
         ),
         (
-            "next_path_target",
+            "second_target_zone",
             path.next_path_target_anchor_id.as_deref(),
             &path.next_path_target,
         ),
@@ -1259,6 +1259,7 @@ fn workflow_pending_order_for_open_order(
             PostFillBracketTemplate {
                 take_profit_1: snapshot.take_profit_1,
                 take_profit_2: snapshot.take_profit_2,
+                tp1_close_ratio: snapshot.tp1_close_ratio,
                 stop_loss: snapshot.stop_loss,
             }
         }),
@@ -1438,13 +1439,23 @@ mod tests {
     use crate::llm::input::ModelInvocationInput;
     use crate::workflow::code_layer::build_indicator_summary;
     use crate::workflow::schema::{
-        CurrentPath, EntrySnapshot, MapSummary, OpportunityAssessment, PriceZone,
+        CurrentPath, EntrySnapshot, MapSummary, OpportunityAssessment, PriceZone, RealizationPlan,
         ReevaluationTrigger, Stage1Meta, Stage1Output, TrackedZone, WorkflowPendingOrder,
         WorkflowPosition,
     };
     use chrono::{DateTime, Utc};
     use serde_json::json;
     use std::collections::HashMap;
+
+    fn sample_realization_plan(tp1_price: f64, tp2_price: f64) -> RealizationPlan {
+        RealizationPlan {
+            tp1_price,
+            tp1_close_ratio: 1.0,
+            tp2_price,
+            after_tp1_stop_policy: "breakeven".to_string(),
+            near_tp1_failure_policy: "tighten_stop".to_string(),
+        }
+    }
 
     #[test]
     fn aggregate_kline_history_5m_builds_complete_bars_from_1m() {
@@ -1553,6 +1564,7 @@ mod tests {
                     label: None,
                     reason: None,
                 },
+                realization_plan: sample_realization_plan(106.0, 109.0),
                 failure_switch: None,
                 setup_type: "pullback".to_string(),
                 reevaluation_trigger: ReevaluationTrigger::default(),
@@ -1988,6 +2000,9 @@ mod tests {
             stop_loss: 96.0,
             take_profit_1: 106.0,
             take_profit_2: 109.0,
+            tp1_close_ratio: 1.0,
+            after_tp1_stop_policy: "breakeven".to_string(),
+            near_tp1_failure_policy: "tighten_stop".to_string(),
             allowed_stop_loss_levels: vec![96.0],
             allowed_take_profit_levels: vec![106.0, 109.0],
             tp1_realized: false,
@@ -2014,6 +2029,9 @@ mod tests {
             stop_loss: 97.0,
             take_profit_1: 107.0,
             take_profit_2: 110.0,
+            tp1_close_ratio: 1.0,
+            after_tp1_stop_policy: "breakeven".to_string(),
+            near_tp1_failure_policy: "tighten_stop".to_string(),
             allowed_stop_loss_levels: vec![97.0],
             allowed_take_profit_levels: vec![107.0, 110.0],
             tp1_realized: false,
@@ -2112,6 +2130,9 @@ mod tests {
             stop_loss: 96.0,
             take_profit_1: 108.0,
             take_profit_2: 111.0,
+            tp1_close_ratio: 1.0,
+            after_tp1_stop_policy: "breakeven".to_string(),
+            near_tp1_failure_policy: "tighten_stop".to_string(),
             allowed_stop_loss_levels: vec![96.0],
             allowed_take_profit_levels: vec![108.0, 111.0],
             tp1_realized: false,
@@ -2189,6 +2210,9 @@ mod tests {
             stop_loss: 96.0,
             take_profit_1: 108.0,
             take_profit_2: 111.0,
+            tp1_close_ratio: 1.0,
+            after_tp1_stop_policy: "breakeven".to_string(),
+            near_tp1_failure_policy: "tighten_stop".to_string(),
             allowed_stop_loss_levels: vec![96.0],
             allowed_take_profit_levels: vec![108.0, 111.0],
             tp1_realized: false,
@@ -2256,6 +2280,9 @@ mod tests {
             stop_loss: 96.0,
             take_profit_1: 106.0,
             take_profit_2: 109.0,
+            tp1_close_ratio: 1.0,
+            after_tp1_stop_policy: "breakeven".to_string(),
+            near_tp1_failure_policy: "tighten_stop".to_string(),
             allowed_stop_loss_levels: vec![96.0],
             allowed_take_profit_levels: vec![106.0, 109.0],
             tp1_realized: false,
@@ -2282,6 +2309,9 @@ mod tests {
             stop_loss: 97.0,
             take_profit_1: 107.0,
             take_profit_2: 110.0,
+            tp1_close_ratio: 1.0,
+            after_tp1_stop_policy: "breakeven".to_string(),
+            near_tp1_failure_policy: "tighten_stop".to_string(),
             allowed_stop_loss_levels: vec![97.0],
             allowed_take_profit_levels: vec![107.0, 110.0],
             tp1_realized: false,
@@ -2358,6 +2388,9 @@ mod tests {
             stop_loss: 96.0,
             take_profit_1: 106.0,
             take_profit_2: 109.0,
+            tp1_close_ratio: 1.0,
+            after_tp1_stop_policy: "breakeven".to_string(),
+            near_tp1_failure_policy: "tighten_stop".to_string(),
             allowed_stop_loss_levels: vec![96.0],
             allowed_take_profit_levels: vec![106.0, 109.0],
             tp1_realized: false,
@@ -2384,6 +2417,9 @@ mod tests {
             stop_loss: 97.0,
             take_profit_1: 107.0,
             take_profit_2: 110.0,
+            tp1_close_ratio: 1.0,
+            after_tp1_stop_policy: "breakeven".to_string(),
+            near_tp1_failure_policy: "tighten_stop".to_string(),
             allowed_stop_loss_levels: vec![97.0],
             allowed_take_profit_levels: vec![107.0, 110.0],
             tp1_realized: false,

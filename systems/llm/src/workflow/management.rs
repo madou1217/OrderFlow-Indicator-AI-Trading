@@ -21,7 +21,7 @@ fn dedup_levels(levels: impl IntoIterator<Item = f64>) -> Vec<f64> {
 pub fn snapshot_from_execution_intent(
     symbol: &str,
     intent: &ExecutionIntent,
-    current_path: &CurrentPath,
+    _current_path: &CurrentPath,
     now: DateTime<Utc>,
 ) -> EntrySnapshot {
     EntrySnapshot {
@@ -39,17 +39,11 @@ pub fn snapshot_from_execution_intent(
         stop_loss: intent.stop_loss,
         take_profit_1: intent.take_profit_1,
         take_profit_2: intent.take_profit_2,
+        tp1_close_ratio: intent.tp1_close_ratio,
+        after_tp1_stop_policy: intent.after_tp1_stop_policy.clone(),
+        near_tp1_failure_policy: intent.near_tp1_failure_policy.clone(),
         allowed_stop_loss_levels: dedup_levels([intent.stop_loss]),
-        allowed_take_profit_levels: dedup_levels([
-            intent.take_profit_1,
-            intent.take_profit_2,
-            current_path
-                .first_path_target
-                .directional_target(&intent.side),
-            current_path
-                .next_path_target
-                .directional_target(&intent.side),
-        ]),
+        allowed_take_profit_levels: dedup_levels([intent.take_profit_1, intent.take_profit_2]),
         tp1_realized: false,
         applied_driver_deterioration_signals: Vec::new(),
         created_at: now,
@@ -61,9 +55,20 @@ pub fn snapshot_from_execution_intent(
 mod tests {
     use super::snapshot_from_execution_intent;
     use crate::workflow::schema::{
-        CurrentPath, EntrySnapshotRef, ExecutionIntent, PriceZone, ReevaluationTrigger,
+        CurrentPath, EntrySnapshotRef, ExecutionIntent, PriceZone, RealizationPlan,
+        ReevaluationTrigger,
     };
     use chrono::Utc;
+
+    fn sample_realization_plan(tp1_price: f64, tp2_price: f64) -> RealizationPlan {
+        RealizationPlan {
+            tp1_price,
+            tp1_close_ratio: 1.0,
+            tp2_price,
+            after_tp1_stop_policy: "breakeven".to_string(),
+            near_tp1_failure_policy: "tighten_stop".to_string(),
+        }
+    }
 
     #[test]
     fn snapshot_captures_allowed_management_levels_from_path_contract() {
@@ -96,6 +101,9 @@ mod tests {
             stop_loss: 99.0,
             take_profit_1: 103.0,
             take_profit_2: 105.0,
+            tp1_close_ratio: 1.0,
+            after_tp1_stop_policy: "breakeven".to_string(),
+            near_tp1_failure_policy: "tighten_stop".to_string(),
             ttl_minutes: 15,
             leverage: 6,
             max_drift_pct: 0.2,
@@ -144,6 +152,7 @@ mod tests {
                 label: None,
                 reason: None,
             },
+            realization_plan: sample_realization_plan(103.0, 105.0),
             failure_switch: Some("alt".to_string()),
             setup_type: "A_continuation".to_string(),
             reevaluation_trigger: ReevaluationTrigger::default(),
@@ -156,7 +165,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_uses_directional_target_edges_for_allowed_take_profit_levels() {
+    fn snapshot_keeps_executable_take_profit_levels_from_intent() {
         let intent = ExecutionIntent {
             side: "SHORT".to_string(),
             entry_profile: Some("reclaim_then_hold".to_string()),
@@ -174,6 +183,9 @@ mod tests {
             stop_loss: 102.0,
             take_profit_1: 97.0,
             take_profit_2: 94.0,
+            tp1_close_ratio: 1.0,
+            after_tp1_stop_policy: "breakeven".to_string(),
+            near_tp1_failure_policy: "tighten_stop".to_string(),
             ttl_minutes: 15,
             leverage: 3,
             max_drift_pct: 0.2,
@@ -222,6 +234,7 @@ mod tests {
                 label: None,
                 reason: None,
             },
+            realization_plan: sample_realization_plan(97.0, 94.0),
             failure_switch: Some("alt".to_string()),
             setup_type: "A_continuation".to_string(),
             reevaluation_trigger: ReevaluationTrigger::default(),

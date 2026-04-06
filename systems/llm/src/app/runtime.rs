@@ -2560,6 +2560,7 @@ async fn process_fast_position_management_actions(
                         let bracket_template = crate::workflow::schema::PostFillBracketTemplate {
                             take_profit_1: snapshot.take_profit_1,
                             take_profit_2: snapshot.take_profit_2,
+                            tp1_close_ratio: snapshot.tp1_close_ratio,
                             stop_loss: snapshot.stop_loss,
                         };
                         let mut intent = execution_intent_from_entry_plan(
@@ -2790,6 +2791,38 @@ async fn process_fast_position_management_actions(
                                                 workflow_state,
                                                 &plan_context_key,
                                             );
+                                        }
+                                        "reduce" => {
+                                            let mut next_snapshot = snapshot.clone();
+                                            if action_realizes_tp1(&snapshot, &action) {
+                                                next_snapshot.tp1_realized = true;
+                                            }
+                                            next_snapshot.updated_at = Utc::now();
+                                            crate::workflow::persistence::save_entry_snapshot(
+                                                state_dir,
+                                                &next_snapshot,
+                                            )?;
+                                            entry_snapshots.insert(
+                                                next_snapshot.context_key.clone(),
+                                                next_snapshot,
+                                            );
+                                            if let Some(next_plan) =
+                                                remove_position_management_action(
+                                                    &plan,
+                                                    action_index,
+                                                )
+                                            {
+                                                upsert_position_management_plan(
+                                                    workflow_state,
+                                                    &plan_context_key,
+                                                    next_plan,
+                                                );
+                                            } else {
+                                                remove_position_management_plan(
+                                                    workflow_state,
+                                                    &plan_context_key,
+                                                );
+                                            }
                                         }
                                         "move_stop" => {
                                             let next_snapshot = patch_entry_snapshot_levels(
@@ -3457,14 +3490,13 @@ fn execution_intent_from_entry_plan(
 ) -> crate::workflow::schema::ExecutionIntent {
     let take_profit_1 = bracket_override
         .map(|item| item.take_profit_1)
-        .unwrap_or_else(|| {
-            current_path
-                .first_path_target
-                .directional_target(&plan.side)
-        });
+        .unwrap_or(current_path.realization_plan.tp1_price);
     let take_profit_2 = bracket_override
         .map(|item| item.take_profit_2)
-        .unwrap_or_else(|| current_path.next_path_target.directional_target(&plan.side));
+        .unwrap_or(current_path.realization_plan.tp2_price);
+    let tp1_close_ratio = bracket_override
+        .map(|item| item.tp1_close_ratio)
+        .unwrap_or(current_path.realization_plan.tp1_close_ratio);
     let stop_loss = bracket_override
         .map(|item| item.stop_loss)
         .unwrap_or(plan.stop_loss);
@@ -3479,6 +3511,12 @@ fn execution_intent_from_entry_plan(
         stop_loss,
         take_profit_1,
         take_profit_2,
+        tp1_close_ratio,
+        after_tp1_stop_policy: current_path.realization_plan.after_tp1_stop_policy.clone(),
+        near_tp1_failure_policy: current_path
+            .realization_plan
+            .near_tp1_failure_policy
+            .clone(),
         ttl_minutes,
         leverage: plan.leverage,
         max_drift_pct: plan.max_drift_pct,
@@ -3514,6 +3552,9 @@ fn build_fallback_entry_snapshot(
     let stop_loss = bracket_override
         .map(|item| item.stop_loss)
         .or_else(|| fallback_plan.map(|plan| plan.stop_loss))?;
+    let tp1_close_ratio = bracket_override
+        .map(|item| item.tp1_close_ratio)
+        .unwrap_or(current_path.realization_plan.tp1_close_ratio);
     Some(crate::workflow::schema::EntrySnapshot {
         symbol: symbol.to_ascii_uppercase(),
         context_key: context_key.to_string(),
@@ -3531,18 +3572,16 @@ fn build_fallback_entry_snapshot(
         stop_loss,
         take_profit_1: bracket_override
             .map(|item| item.take_profit_1)
-            .unwrap_or_else(|| {
-                current_path
-                    .first_path_target
-                    .directional_target(&current_path.side)
-            }),
+            .unwrap_or(current_path.realization_plan.tp1_price),
         take_profit_2: bracket_override
             .map(|item| item.take_profit_2)
-            .unwrap_or_else(|| {
-                current_path
-                    .next_path_target
-                    .directional_target(&current_path.side)
-            }),
+            .unwrap_or(current_path.realization_plan.tp2_price),
+        tp1_close_ratio,
+        after_tp1_stop_policy: current_path.realization_plan.after_tp1_stop_policy.clone(),
+        near_tp1_failure_policy: current_path
+            .realization_plan
+            .near_tp1_failure_policy
+            .clone(),
         allowed_stop_loss_levels: vec![],
         allowed_take_profit_levels: vec![],
         tp1_realized: false,
@@ -3700,6 +3739,7 @@ fn build_stage2c_replace_execution_intent(
         .unwrap_or(crate::workflow::schema::PostFillBracketTemplate {
             take_profit_1: snapshot.take_profit_1,
             take_profit_2: snapshot.take_profit_2,
+            tp1_close_ratio: snapshot.tp1_close_ratio,
             stop_loss: snapshot.stop_loss,
         });
     if let Some(stop_loss) = action.replacement_stop_loss {
@@ -3736,6 +3776,36 @@ fn append_unique_level(levels: &mut Vec<f64>, level: f64) {
         return;
     }
     levels.push(level);
+}
+
+fn same_runtime_price_level(left: f64, right: f64) -> bool {
+    let scale = left.abs().max(right.abs()).max(1.0);
+    (left - right).abs() <= scale * 1e-8
+}
+
+fn action_realizes_tp1(
+    snapshot: &crate::workflow::schema::EntrySnapshot,
+    action: &crate::workflow::schema::PositionManagementAction,
+) -> bool {
+    if snapshot.tp1_realized || action.action_type != "reduce" {
+        return false;
+    }
+    let Some(reduce_ratio) = action.reduce_ratio else {
+        return false;
+    };
+    if reduce_ratio + f64::EPSILON < snapshot.tp1_close_ratio {
+        return false;
+    }
+    action
+        .trigger_condition
+        .as_ref()
+        .map(|trigger| same_runtime_price_level(trigger.trigger_price, snapshot.take_profit_1))
+        .or_else(|| {
+            action
+                .execution_price
+                .map(|price| same_runtime_price_level(price, snapshot.take_profit_1))
+        })
+        .unwrap_or(false)
 }
 
 fn patch_entry_snapshot_levels(
@@ -4518,7 +4588,7 @@ fn first_path_target_hit(
 ) -> bool {
     let target_price = current_path
         .first_path_target
-        .directional_target(&current_path.side);
+        .leading_edge(&current_path.side);
     match current_path.side.as_str() {
         "LONG" => latest_price >= target_price,
         "SHORT" => latest_price <= target_price,
@@ -4570,7 +4640,7 @@ impl Stage1PathBoundary {
             Self::FailureLevel => failure_level_touch_price(current_path),
             Self::FirstPathTarget => current_path
                 .first_path_target
-                .directional_target(&current_path.side),
+                .leading_edge(&current_path.side),
         }
     }
 
@@ -7021,8 +7091,8 @@ mod tests {
     use crate::workflow::schema::{
         CurrentPath, EntryPlan, EntrySnapshot, PendingOrderManagementAction,
         PendingOrderManagementPlan, PositionManagementAction, PositionManagementPlan,
-        PriceTriggerCondition, PriceZone, ReevaluationTrigger, Stage1Meta, Stage1Output,
-        TacticalEntryPlan,
+        PriceTriggerCondition, PriceZone, RealizationPlan, ReevaluationTrigger, Stage1Meta,
+        Stage1Output, TacticalEntryPlan,
     };
     use crate::workflow::state::WorkflowState;
     use chrono::Duration as ChronoDuration;
@@ -7054,6 +7124,16 @@ mod tests {
             entry_reason: "entry".to_string(),
             invalidation_reason: "invalidation".to_string(),
             stop_loss_reason: "stop".to_string(),
+        }
+    }
+
+    fn sample_realization_plan(tp1_price: f64, tp2_price: f64) -> RealizationPlan {
+        RealizationPlan {
+            tp1_price,
+            tp1_close_ratio: 1.0,
+            tp2_price,
+            after_tp1_stop_policy: "breakeven".to_string(),
+            near_tp1_failure_policy: "tighten_stop".to_string(),
         }
     }
 
@@ -7144,6 +7224,7 @@ mod tests {
                 next_path_target: sample_price_zone(107.0, 107.0, "1d"),
                 failure_anchor_id: None,
                 failure_level: sample_price_zone(98.0, 98.0, "4h"),
+                realization_plan: sample_realization_plan(104.0, 107.0),
                 failure_switch: Some("value_return".to_string()),
                 setup_type: "A_continuation".to_string(),
                 reevaluation_trigger: ReevaluationTrigger::default(),
@@ -7219,6 +7300,9 @@ mod tests {
             stop_loss: 98.8,
             take_profit_1: 104.0,
             take_profit_2: 107.0,
+            tp1_close_ratio: 1.0,
+            after_tp1_stop_policy: "breakeven".to_string(),
+            near_tp1_failure_policy: "tighten_stop".to_string(),
             allowed_stop_loss_levels: vec![98.8],
             allowed_take_profit_levels: vec![104.0, 107.0],
             tp1_realized: false,
@@ -7527,8 +7611,8 @@ mod tests {
     }
 
     #[test]
-    fn execution_intent_from_entry_plan_uses_directional_target_edges() {
-        let current_path = CurrentPath {
+    fn execution_intent_from_entry_plan_uses_stage1_realization_plan_levels() {
+        let long_path = CurrentPath {
             id: "path_a".to_string(),
             side: "LONG".to_string(),
             thesis: "continuation".to_string(),
@@ -7541,10 +7625,16 @@ mod tests {
             next_path_target: sample_price_zone(109.0, 112.0, "1d"),
             failure_anchor_id: None,
             failure_level: sample_price_zone(98.0, 99.0, "4h"),
+            realization_plan: sample_realization_plan(105.0, 110.5),
             failure_switch: Some("alt".to_string()),
             setup_type: "A_continuation".to_string(),
             reevaluation_trigger: ReevaluationTrigger::default(),
             tracked_zones: vec![],
+        };
+        let short_path = CurrentPath {
+            side: "SHORT".to_string(),
+            realization_plan: sample_realization_plan(97.0, 94.0),
+            ..long_path.clone()
         };
         let long_plan = crate::workflow::schema::EntryPlan {
             side: "LONG".to_string(),
@@ -7566,33 +7656,23 @@ mod tests {
         };
 
         let long_intent = execution_intent_from_entry_plan(
-            "ETHUSDT",
-            "path_a",
-            &long_plan,
-            &current_path,
-            None,
-            101.2,
-            15,
-            None,
+            "ETHUSDT", "path_a", &long_plan, &long_path, None, 101.2, 15, None,
         );
         let short_intent = execution_intent_from_entry_plan(
             "ETHUSDT",
             "path_a",
             &short_plan,
-            &CurrentPath {
-                side: "SHORT".to_string(),
-                ..current_path.clone()
-            },
+            &short_path,
             None,
             100.8,
             15,
             None,
         );
 
-        assert_eq!(long_intent.take_profit_1, 106.0);
-        assert_eq!(long_intent.take_profit_2, 112.0);
-        assert_eq!(short_intent.take_profit_1, 104.0);
-        assert_eq!(short_intent.take_profit_2, 109.0);
+        assert_eq!(long_intent.take_profit_1, 105.0);
+        assert_eq!(long_intent.take_profit_2, 110.5);
+        assert_eq!(short_intent.take_profit_1, 97.0);
+        assert_eq!(short_intent.take_profit_2, 94.0);
     }
 
     #[test]
@@ -7623,6 +7703,9 @@ mod tests {
                 stop_loss: 98.8,
                 take_profit_1: 104.0,
                 take_profit_2: 107.0,
+                tp1_close_ratio: 1.0,
+                after_tp1_stop_policy: "breakeven".to_string(),
+                near_tp1_failure_policy: "tighten_stop".to_string(),
                 allowed_stop_loss_levels: vec![98.8],
                 allowed_take_profit_levels: vec![104.0, 107.0],
                 tp1_realized: false,
@@ -7688,6 +7771,9 @@ mod tests {
                 stop_loss: 1980.0,
                 take_profit_1: 2040.0,
                 take_profit_2: 2080.0,
+                tp1_close_ratio: 1.0,
+                after_tp1_stop_policy: "breakeven".to_string(),
+                near_tp1_failure_policy: "tighten_stop".to_string(),
                 allowed_stop_loss_levels: vec![1980.0, 2010.0],
                 allowed_take_profit_levels: vec![2040.0, 2080.0],
                 tp1_realized: false,
@@ -7752,6 +7838,9 @@ mod tests {
             stop_loss: 98.5,
             take_profit_1: 104.0,
             take_profit_2: 107.0,
+            tp1_close_ratio: 1.0,
+            after_tp1_stop_policy: "breakeven".to_string(),
+            near_tp1_failure_policy: "tighten_stop".to_string(),
             allowed_stop_loss_levels: vec![98.5],
             allowed_take_profit_levels: vec![104.0, 107.0],
             tp1_realized: false,
@@ -7818,6 +7907,7 @@ mod tests {
                 crate::workflow::schema::PostFillBracketTemplate {
                     take_profit_1: 105.0,
                     take_profit_2: 108.0,
+                    tp1_close_ratio: 1.0,
                     stop_loss: 98.8,
                 },
             ),
@@ -7838,6 +7928,9 @@ mod tests {
             stop_loss: 98.8,
             take_profit_1: 104.0,
             take_profit_2: 107.0,
+            tp1_close_ratio: 1.0,
+            after_tp1_stop_policy: "breakeven".to_string(),
+            near_tp1_failure_policy: "tighten_stop".to_string(),
             allowed_stop_loss_levels: vec![98.8],
             allowed_take_profit_levels: vec![104.0, 107.0],
             tp1_realized: false,
@@ -9288,7 +9381,6 @@ mod tests {
             refresh_hints: vec![],
             map_summary: empty_map_summary(),
             opportunity_assessment: crate::workflow::schema::OpportunityAssessment::default(),
-            script_rejections: vec![],
             current_script: Some("script".to_string()),
             driver_attribution: None,
             current_path: Some(crate::workflow::schema::CurrentPath {
@@ -9328,18 +9420,10 @@ mod tests {
                     label: None,
                     reason: None,
                 },
+                realization_plan: sample_realization_plan(103.0, 105.0),
                 failure_switch: Some("reevaluate_short".to_string()),
                 setup_type: "continuation".to_string(),
                 reevaluation_trigger: crate::workflow::schema::ReevaluationTrigger::default(),
-                management_plan: crate::workflow::schema::ManagementPlan {
-                    take_profit_1_basis: "first_path_target".to_string(),
-                    take_profit_2_basis: "next_path_target".to_string(),
-                    take_profit_1_level: 103.0,
-                    take_profit_2_level: 105.0,
-                    stop_migration_rules: vec![],
-                    reduce_on_driver_deterioration: vec![],
-                    exit_full_on_driver_deterioration: vec![],
-                },
                 tracked_zones: vec![],
             }),
         };

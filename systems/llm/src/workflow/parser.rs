@@ -41,6 +41,8 @@ const ALLOWED_DRIVER_SIGNALS: &[&str] = &[
     "fake_order_risk_rising",
     "driver_flip_confirmed",
 ];
+const ALLOWED_AFTER_TP1_STOP_POLICIES: &[&str] = &["breakeven", "lock_profit"];
+const ALLOWED_NEAR_TP1_FAILURE_POLICIES: &[&str] = &["reduce", "tighten_stop", "exit_full"];
 const ALLOWED_PATH_LIVE_ASSESSMENTS: &[&str] = &["live", "degraded", "invalidated"];
 const ALLOWED_PENDING_ORDER_EXPOSURE_STATES: &[&str] = &[
     "flat_with_live_entry_orders",
@@ -303,6 +305,90 @@ fn validate_driver_reevaluation_trigger(
     Ok(())
 }
 
+fn hydrate_legacy_realization_plan(path: &mut CurrentPath) {
+    if !path.realization_plan.tp1_price.is_finite()
+        || path.realization_plan.tp1_price.abs() <= f64::EPSILON
+    {
+        path.realization_plan.tp1_price = path.first_path_target.directional_target(&path.side);
+    }
+    if !path.realization_plan.tp2_price.is_finite()
+        || path.realization_plan.tp2_price.abs() <= f64::EPSILON
+    {
+        path.realization_plan.tp2_price = path.next_path_target.directional_target(&path.side);
+    }
+    if !path.realization_plan.tp1_close_ratio.is_finite()
+        || !(0.0 < path.realization_plan.tp1_close_ratio
+            && path.realization_plan.tp1_close_ratio <= 1.0)
+    {
+        path.realization_plan.tp1_close_ratio = crate::workflow::schema::default_tp1_close_ratio();
+    }
+    if path
+        .realization_plan
+        .after_tp1_stop_policy
+        .trim()
+        .is_empty()
+    {
+        path.realization_plan.after_tp1_stop_policy =
+            crate::workflow::schema::default_after_tp1_stop_policy();
+    }
+    if path
+        .realization_plan
+        .near_tp1_failure_policy
+        .trim()
+        .is_empty()
+    {
+        path.realization_plan.near_tp1_failure_policy =
+            crate::workflow::schema::default_near_tp1_failure_policy();
+    }
+}
+
+fn validate_realization_plan(path: &CurrentPath) -> Result<()> {
+    let plan = &path.realization_plan;
+    if !plan.tp1_price.is_finite() {
+        return Err(anyhow!(
+            "current_path.realization_plan.tp1_price must be finite"
+        ));
+    }
+    if !plan.tp2_price.is_finite() {
+        return Err(anyhow!(
+            "current_path.realization_plan.tp2_price must be finite"
+        ));
+    }
+    if !(0.0 < plan.tp1_close_ratio && plan.tp1_close_ratio <= 1.0) {
+        return Err(anyhow!(
+            "current_path.realization_plan.tp1_close_ratio must be between 0 and 1"
+        ));
+    }
+    if !ALLOWED_AFTER_TP1_STOP_POLICIES.contains(&plan.after_tp1_stop_policy.as_str()) {
+        return Err(anyhow!(
+            "current_path.realization_plan.after_tp1_stop_policy must be one of [breakeven, lock_profit]"
+        ));
+    }
+    if !ALLOWED_NEAR_TP1_FAILURE_POLICIES.contains(&plan.near_tp1_failure_policy.as_str()) {
+        return Err(anyhow!(
+            "current_path.realization_plan.near_tp1_failure_policy must be one of [reduce, tighten_stop, exit_full]"
+        ));
+    }
+    match path.side.as_str() {
+        "LONG" => {
+            if plan.tp2_price + f64::EPSILON < plan.tp1_price {
+                return Err(anyhow!(
+                    "current_path.realization_plan.tp2_price must be >= tp1_price for LONG"
+                ));
+            }
+        }
+        "SHORT" => {
+            if plan.tp2_price - f64::EPSILON > plan.tp1_price {
+                return Err(anyhow!(
+                    "current_path.realization_plan.tp2_price must be <= tp1_price for SHORT"
+                ));
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 pub fn parse_stage1_output(value: Value) -> Result<Stage1Output> {
     let mut output: Stage1Output = serde_json::from_value(value)?;
     if !matches!(output.monitoring_status.as_str(), "active" | "no_edge") {
@@ -348,6 +434,7 @@ pub fn parse_stage1_output(value: Value) -> Result<Stage1Output> {
             if !matches!(path.side.as_str(), "LONG" | "SHORT") {
                 return Err(anyhow!("current_path.side must be LONG or SHORT"));
             }
+            hydrate_legacy_realization_plan(path);
             if !ALLOWED_RISK_GRADES.contains(&path.risk_grade.as_str()) {
                 return Err(anyhow!(
                     "risk_grade must be one of [aligned_trend, countertrend_repair, high_conflict_repair]"
@@ -371,13 +458,13 @@ pub fn parse_stage1_output(value: Value) -> Result<Stage1Output> {
                 true,
             )?;
             validate_zone_timeframe(
-                "current_path.first_path_target",
+                "current_path.first_target_zone",
                 &path.first_path_target,
                 ALLOWED_STRATEGIC_TIMEFRAMES,
                 true,
             )?;
             validate_zone_timeframe(
-                "current_path.next_path_target",
+                "current_path.second_target_zone",
                 &path.next_path_target,
                 ALLOWED_STRATEGIC_TIMEFRAMES,
                 true,
@@ -388,6 +475,7 @@ pub fn parse_stage1_output(value: Value) -> Result<Stage1Output> {
                 ALLOWED_STRATEGIC_TIMEFRAMES,
                 true,
             )?;
+            validate_realization_plan(path)?;
 
             if path.activation_anchor_id.is_none() {
                 path.activation_anchor_id = infer_anchor_id(path, &path.strategic_activation_level);
@@ -1221,7 +1309,7 @@ mod tests {
     };
     use crate::workflow::schema::{
         CurrentPath, DriverAttribution, MapSummary, OpportunityAssessment, PriceZone,
-        ReevaluationTrigger, Stage1Meta, Stage1Output,
+        RealizationPlan, ReevaluationTrigger, Stage1Meta, Stage1Output,
     };
     use chrono::Utc;
     use serde_json::json;
@@ -1287,6 +1375,13 @@ mod tests {
                     timeframe: Some("4h".to_string()),
                     label: Some("failure".to_string()),
                     reason: None,
+                },
+                realization_plan: RealizationPlan {
+                    tp1_price: 2022.0,
+                    tp1_close_ratio: 1.0,
+                    tp2_price: 2032.0,
+                    after_tp1_stop_policy: "breakeven".to_string(),
+                    near_tp1_failure_policy: "tighten_stop".to_string(),
                 },
                 failure_switch: Some("continuation".to_string()),
                 setup_type: "B_reversal".to_string(),
