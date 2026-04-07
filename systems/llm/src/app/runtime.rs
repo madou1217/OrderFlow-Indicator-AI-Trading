@@ -227,6 +227,8 @@ struct FastWatcherPlanState {
     last_event_ts: Option<DateTime<Utc>>,
     activation_seen_at: Option<DateTime<Utc>>,
     advanced_beyond_entry_after_activation: bool,
+    pullback_touch_seen_at: Option<DateTime<Utc>>,
+    pullback_reclaim_started_at: Option<DateTime<Utc>>,
     breakout_started_at: Option<DateTime<Utc>>,
     breakout_extreme_price: Option<f64>,
     invalidation_probe_seen_at: Option<DateTime<Utc>>,
@@ -1982,6 +1984,54 @@ fn pullback_dispatch_price_ok(plan: &crate::workflow::schema::EntryPlan, price: 
     }
 }
 
+fn pullback_overshoot_exceeded(
+    plan: &crate::workflow::schema::EntryPlan,
+    price: f64,
+    watcher_cfg: &crate::app::config::WorkflowWatcherConfig,
+) -> bool {
+    let max_overshoot_ratio = watcher_cfg
+        .price_predicates
+        .pullback_acceptance_confirmed
+        .max_overshoot_bps
+        / 10_000.0;
+    match plan.side.as_str() {
+        "LONG" => price < plan.entry_zone.low * (1.0 - max_overshoot_ratio),
+        "SHORT" => price > plan.entry_zone.high * (1.0 + max_overshoot_ratio),
+        _ => false,
+    }
+}
+
+fn pullback_touch_detected(
+    plan: &crate::workflow::schema::EntryPlan,
+    price: f64,
+    watcher_cfg: &crate::app::config::WorkflowWatcherConfig,
+) -> bool {
+    let pullback_cfg = &watcher_cfg.price_predicates.pullback_acceptance_confirmed;
+    let activation_zone = activation_or_entry_zone(plan);
+    let max_overshoot_ratio = pullback_cfg.max_overshoot_bps / 10_000.0;
+    match plan.side.as_str() {
+        "LONG" => {
+            let touch_floor = plan.entry_zone.low * (1.0 - max_overshoot_ratio);
+            let touch_ceiling = if pullback_cfg.require_touch_entry_zone {
+                plan.entry_zone.high
+            } else {
+                activation_zone.high.max(plan.entry_zone.high)
+            };
+            price >= touch_floor && price <= touch_ceiling
+        }
+        "SHORT" => {
+            let touch_ceiling = plan.entry_zone.high * (1.0 + max_overshoot_ratio);
+            let touch_floor = if pullback_cfg.require_touch_entry_zone {
+                plan.entry_zone.low
+            } else {
+                activation_zone.low.min(plan.entry_zone.low)
+            };
+            price >= touch_floor && price <= touch_ceiling
+        }
+        _ => false,
+    }
+}
+
 fn inside_or_beyond_activation(plan: &crate::workflow::schema::EntryPlan, price: f64) -> bool {
     let activation_zone = activation_or_entry_zone(plan);
     activation_zone.contains(price) || favorable_beyond_zone(&plan.side, price, activation_zone)
@@ -2073,7 +2123,47 @@ fn fast_watcher_entry_ready(
             if state.activation_seen_at.is_some() && breakout_crossed(plan, event.price) {
                 state.advanced_beyond_entry_after_activation = true;
             }
-            state.activation_seen_at.is_some() && pullback_dispatch_price_ok(plan, event.price)
+            if pullback_overshoot_exceeded(plan, event.price, watcher_cfg) {
+                state.advanced_beyond_entry_after_activation = false;
+                state.pullback_touch_seen_at = None;
+                state.pullback_reclaim_started_at = None;
+                return false;
+            }
+            if !state.advanced_beyond_entry_after_activation {
+                return false;
+            }
+            if pullback_touch_detected(plan, event.price, watcher_cfg) {
+                if state.pullback_touch_seen_at.is_none() {
+                    state.pullback_touch_seen_at = Some(event.event_ts);
+                    state.pullback_reclaim_started_at = None;
+                    return false;
+                }
+            }
+            let Some(touch_seen_at) = state.pullback_touch_seen_at else {
+                return false;
+            };
+            if event.event_ts <= touch_seen_at {
+                return false;
+            }
+            if !inside_or_beyond_activation(plan, event.price) {
+                state.pullback_reclaim_started_at = None;
+                return false;
+            }
+            let reclaim_started_at = *state
+                .pullback_reclaim_started_at
+                .get_or_insert(event.event_ts);
+            let reclaim_ms = fast_confirm_duration_ms(
+                watcher_cfg
+                    .price_predicates
+                    .pullback_acceptance_confirmed
+                    .confirm_bars,
+            );
+            event
+                .event_ts
+                .signed_duration_since(reclaim_started_at)
+                .num_milliseconds()
+                >= reclaim_ms
+                && pullback_dispatch_price_ok(plan, event.price)
         }
         "breakout" => {
             if !breakout_crossed(plan, event.price) {
@@ -8271,7 +8361,7 @@ mod tests {
     }
 
     #[test]
-    fn fast_watcher_pullback_arms_after_activation() {
+    fn fast_watcher_pullback_requires_retest_then_reclaim() {
         let watcher_cfg = sample_fast_watcher_config();
         let plan = sample_fast_entry_plan("pullback", "pullback_acceptance");
         let mut state = FastWatcherPlanState::default();
@@ -8282,10 +8372,78 @@ mod tests {
             &sample_fast_price_event("2026-03-30T09:35:00Z", 99.8),
             &watcher_cfg,
         ));
-        assert!(fast_watcher_entry_ready(
+        assert!(!fast_watcher_entry_ready(
             &mut state,
             &plan,
             &sample_fast_price_event("2026-03-30T09:35:01Z", 101.1),
+            &watcher_cfg,
+        ));
+        assert!(!fast_watcher_entry_ready(
+            &mut state,
+            &plan,
+            &sample_fast_price_event("2026-03-30T09:35:02Z", 100.6),
+            &watcher_cfg,
+        ));
+        assert!(!fast_watcher_entry_ready(
+            &mut state,
+            &plan,
+            &sample_fast_price_event("2026-03-30T09:35:03Z", 100.8),
+            &watcher_cfg,
+        ));
+        assert!(fast_watcher_entry_ready(
+            &mut state,
+            &plan,
+            &sample_fast_price_event("2026-03-30T09:35:04Z", 101.1),
+            &watcher_cfg,
+        ));
+    }
+
+    #[test]
+    fn fast_watcher_pullback_requires_fresh_breakout_after_deep_overshoot() {
+        let watcher_cfg = sample_fast_watcher_config();
+        let plan = sample_fast_entry_plan("pullback", "pullback_acceptance");
+        let mut state = FastWatcherPlanState::default();
+
+        assert!(!fast_watcher_entry_ready(
+            &mut state,
+            &plan,
+            &sample_fast_price_event("2026-03-30T09:35:00Z", 101.3),
+            &watcher_cfg,
+        ));
+        assert!(!fast_watcher_entry_ready(
+            &mut state,
+            &plan,
+            &sample_fast_price_event("2026-03-30T09:35:01Z", 99.8),
+            &watcher_cfg,
+        ));
+        assert!(!fast_watcher_entry_ready(
+            &mut state,
+            &plan,
+            &sample_fast_price_event("2026-03-30T09:35:02Z", 100.6),
+            &watcher_cfg,
+        ));
+        assert!(!fast_watcher_entry_ready(
+            &mut state,
+            &plan,
+            &sample_fast_price_event("2026-03-30T09:35:03Z", 101.3),
+            &watcher_cfg,
+        ));
+        assert!(!fast_watcher_entry_ready(
+            &mut state,
+            &plan,
+            &sample_fast_price_event("2026-03-30T09:35:04Z", 100.6),
+            &watcher_cfg,
+        ));
+        assert!(!fast_watcher_entry_ready(
+            &mut state,
+            &plan,
+            &sample_fast_price_event("2026-03-30T09:35:05Z", 100.8),
+            &watcher_cfg,
+        ));
+        assert!(fast_watcher_entry_ready(
+            &mut state,
+            &plan,
+            &sample_fast_price_event("2026-03-30T09:35:06Z", 101.0),
             &watcher_cfg,
         ));
     }

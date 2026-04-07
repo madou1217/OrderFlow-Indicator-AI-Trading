@@ -374,6 +374,16 @@ fn tracked_exit_order(order: &OpenOrderSnapshot) -> TrackedExitOrder {
     }
 }
 
+fn exit_order_kind_label(order: &OpenOrderSnapshot) -> &'static str {
+    if exact_order_type_matches_exit_kind(&order.order_type, ExitKind::TakeProfit) {
+        "take_profit"
+    } else if exact_order_type_matches_exit_kind(&order.order_type, ExitKind::StopLoss) {
+        "stop_loss"
+    } else {
+        "exit"
+    }
+}
+
 fn effective_order_position_side(
     order: &OpenOrderSnapshot,
     hedge_mode: bool,
@@ -1911,6 +1921,50 @@ fn collect_orphan_exit_orders_to_cancel(
     out
 }
 
+fn collect_staged_exit_cleanup_orders(
+    state: &TradingStateSnapshot,
+    hedge_mode: bool,
+    take_profit_order: Option<TrackedExitOrder>,
+    stop_loss_order: Option<TrackedExitOrder>,
+) -> Vec<(&'static str, TrackedExitOrder)> {
+    let mut seen = HashSet::new();
+    let orphan_orders = collect_orphan_exit_orders_to_cancel(state, hedge_mode);
+    if !orphan_orders.is_empty() {
+        let orphan_order_ids = orphan_orders
+            .iter()
+            .map(|order| order.order_id)
+            .collect::<HashSet<_>>();
+        return state
+            .open_orders
+            .iter()
+            .filter(|order| orphan_order_ids.contains(&order.order_id))
+            .filter_map(|order| {
+                seen.insert(order.order_id)
+                    .then_some((exit_order_kind_label(order), tracked_exit_order(order)))
+            })
+            .collect();
+    }
+
+    let mut out = Vec::new();
+    for (label, tracked_order) in [
+        ("take_profit", take_profit_order),
+        ("stop_loss", stop_loss_order),
+    ] {
+        let Some(tracked_order) = tracked_order else {
+            continue;
+        };
+        if state
+            .open_orders
+            .iter()
+            .any(|order| order.order_id == tracked_order.order_id)
+            && seen.insert(tracked_order.order_id)
+        {
+            out.push((label, tracked_order));
+        }
+    }
+    out
+}
+
 fn is_order_already_gone_error(err: &anyhow::Error) -> bool {
     let text = err.to_string();
     text.contains("\"code\":-2011")
@@ -3242,20 +3296,15 @@ async fn watch_staged_exit_orders(
             }
         };
 
-        for (label, order) in [
-            ("take_profit", take_profit_order),
-            ("stop_loss", stop_loss_order),
-        ] {
-            let Some(order) = order else {
-                continue;
-            };
-            if !state
-                .open_orders
-                .iter()
-                .any(|o| o.order_id == order.order_id)
-            {
-                continue;
-            }
+        let cleanup_orders = collect_staged_exit_cleanup_orders(
+            &state,
+            exec_config.hedge_mode,
+            take_profit_order,
+            stop_loss_order,
+        );
+        let cleanup_order_count = cleanup_orders.len();
+
+        for (label, order) in cleanup_orders {
             let cancel_result = if order.is_algo_order {
                 cancel_algo_order_by_id(
                     &http_client,
@@ -3309,6 +3358,7 @@ async fn watch_staged_exit_orders(
             symbol = %symbol,
             entry_order_id = entry_order_id,
             cleanup_confirmation = cleanup_confirmation,
+            cleanup_order_count = cleanup_order_count,
             "staged_exit_cleanup: entry_gone_and_flat"
         );
         return;
@@ -4814,6 +4864,51 @@ mod tests {
         assert!(!orphan_orders[0].is_algo_order);
         assert_eq!(orphan_orders[1].order_id, 202);
         assert!(orphan_orders[1].is_algo_order);
+    }
+
+    #[test]
+    fn staged_exit_cleanup_uses_current_orphan_exit_orders_when_tracked_ids_are_stale() {
+        let state = TradingStateSnapshot {
+            symbol: "TESTUSDT".to_string(),
+            has_active_context: true,
+            has_active_positions: false,
+            has_open_orders: true,
+            active_positions: Vec::new(),
+            open_orders: vec![OpenOrderSnapshot {
+                order_id: 701,
+                side: "SELL".to_string(),
+                position_side: "LONG".to_string(),
+                order_type: "TAKE_PROFIT_MARKET".to_string(),
+                status: "NEW".to_string(),
+                orig_qty: 0.05,
+                executed_qty: 0.0,
+                price: 0.0,
+                stop_price: 2142.8,
+                close_position: true,
+                reduce_only: true,
+                is_algo_order: true,
+            }],
+            total_wallet_balance: 100.0,
+            available_balance: 90.0,
+        };
+
+        let cleanup_orders = collect_staged_exit_cleanup_orders(
+            &state,
+            true,
+            Some(TrackedExitOrder {
+                order_id: 3000001168757969,
+                is_algo_order: true,
+            }),
+            Some(TrackedExitOrder {
+                order_id: 3000001168757966,
+                is_algo_order: true,
+            }),
+        );
+
+        assert_eq!(cleanup_orders.len(), 1);
+        assert_eq!(cleanup_orders[0].0, "take_profit");
+        assert_eq!(cleanup_orders[0].1.order_id, 701);
+        assert!(cleanup_orders[0].1.is_algo_order);
     }
 
     #[test]

@@ -5,7 +5,9 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use serde_json::{Map, Value};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::warn;
 
 fn ensure_state_dir(state_dir: &str) -> Result<PathBuf> {
@@ -163,7 +165,41 @@ fn migrate_legacy_plan_fields(
 fn write_json<T: serde::Serialize + ?Sized>(path: &Path, value: &T) -> Result<()> {
     let data = serde_json::to_vec_pretty(value)
         .with_context(|| format!("serialize workflow json {}", path.display()))?;
-    fs::write(path, data).with_context(|| format!("write workflow file {}", path.display()))?;
+    let parent = path
+        .parent()
+        .with_context(|| format!("resolve workflow parent dir {}", path.display()))?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .with_context(|| format!("resolve workflow file name {}", path.display()))?;
+    let unique_suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temp_path = parent.join(format!(
+        ".{file_name}.tmp.{}.{}",
+        std::process::id(),
+        unique_suffix
+    ));
+    let mut temp_file = fs::File::create(&temp_path)
+        .with_context(|| format!("create workflow temp file {}", temp_path.display()))?;
+    temp_file
+        .write_all(&data)
+        .with_context(|| format!("write workflow temp file {}", temp_path.display()))?;
+    temp_file
+        .sync_all()
+        .with_context(|| format!("sync workflow temp file {}", temp_path.display()))?;
+    drop(temp_file);
+    if let Err(err) = fs::rename(&temp_path, path) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(err).with_context(|| {
+            format!(
+                "replace workflow file {} from temp {}",
+                path.display(),
+                temp_path.display()
+            )
+        });
+    }
     Ok(())
 }
 
@@ -509,6 +545,47 @@ mod tests {
             .expect("load workflow state")
             .expect("workflow state exists");
         assert_eq!(loaded, state);
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn save_workflow_state_uses_atomic_replace_without_temp_leaks() {
+        let state_dir = format!("/tmp/workflow_test_state_atomic_{}", Uuid::new_v4());
+        let initial_state = WorkflowState {
+            symbol: "ETHUSDT".to_string(),
+            pending_stage1_refresh_reason: Some("initial".to_string()),
+            ..WorkflowState::default()
+        };
+        save_workflow_state(&state_dir, &initial_state).expect("save initial state");
+
+        let updated_state = WorkflowState {
+            symbol: "ETHUSDT".to_string(),
+            pending_stage1_refresh_reason: Some("updated".to_string()),
+            ..WorkflowState::default()
+        };
+        save_workflow_state(&state_dir, &updated_state).expect("save updated state");
+
+        let loaded = load_workflow_state(&state_dir, "ETHUSDT")
+            .expect("load workflow state")
+            .expect("workflow state exists");
+        assert_eq!(
+            loaded.pending_stage1_refresh_reason.as_deref(),
+            Some("updated")
+        );
+
+        let mut entries = fs::read_dir(&state_dir)
+            .expect("read state dir")
+            .map(|entry| {
+                entry
+                    .expect("dir entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect::<Vec<_>>();
+        entries.sort();
+        assert_eq!(entries, vec!["ETHUSDT.workflow_state.json".to_string()]);
+
         let _ = fs::remove_dir_all(&state_dir);
     }
 
