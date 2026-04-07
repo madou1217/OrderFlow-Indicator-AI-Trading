@@ -1427,6 +1427,34 @@ fn build_persist_only_input(bundle: &LatestBundle) -> ModelInvocationInput {
     }
 }
 
+fn select_stage2a_context_bundle(
+    current_bundle: &LatestBundle,
+    latest_persisted_bundle: Option<LatestBundle>,
+) -> LatestBundle {
+    match latest_persisted_bundle {
+        Some(latest) if latest.raw.ts_bucket > current_bundle.raw.ts_bucket => latest,
+        _ => current_bundle.clone(),
+    }
+}
+
+async fn build_latest_stage2a_model_input(
+    pool: &PgPool,
+    symbol: &str,
+    current_bundle: &LatestBundle,
+    trading_state: &TradingStateSnapshot,
+    entry_snapshots: &HashMap<String, crate::workflow::schema::EntrySnapshot>,
+) -> Result<(LatestBundle, ModelInvocationInput)> {
+    let latest_persisted_bundle = load_persisted_latest_bundle_for_symbol(symbol)?;
+    let stage2a_context_bundle =
+        select_stage2a_context_bundle(current_bundle, latest_persisted_bundle);
+    let mut stage2a_input = build_persist_only_input(&stage2a_context_bundle);
+    patch_input_kline_history_from_db(pool, &mut stage2a_input, "stage2a:latest_context").await?;
+    stage2a_input.trading_state = Some(trading_state.clone());
+    stage2a_input.management_snapshot =
+        build_workflow_management_snapshot(trading_state, symbol, entry_snapshots);
+    Ok((stage2a_context_bundle, stage2a_input))
+}
+
 fn queue_latest_bundle_invoke(
     ctx: &AppContext,
     latest_bundle: &Option<LatestBundle>,
@@ -5929,16 +5957,30 @@ async fn invoke_workflow_bundle_models(
                 }
 
                 if should_run_stage2a {
+                    let (stage2a_context_bundle, stage2a_input) = build_latest_stage2a_model_input(
+                        &db_pool,
+                        &symbol,
+                        &bundle,
+                        &trading_state,
+                        &entry_snapshots,
+                    )
+                    .await?;
+                    let stage2a_context_ts_bucket = stage2a_context_bundle.raw.ts_bucket;
+                    let stage2a_indicator_summary =
+                        crate::workflow::code_layer::build_indicator_summary(
+                            &stage2a_input,
+                            &tracked_zones,
+                        )?;
                     let prompt_input = crate::workflow::stage2_input::build_stage2a_prompt_input(
-                        &input,
-                        &indicator_summary,
+                        &stage2a_input,
+                        &stage2a_indicator_summary,
                         &stage1_output,
                     );
                     let prompt_value = serde_json::to_value(&prompt_input)
                         .context("serialize workflow stage2a prompt input")?;
                     if config.llm.workflow.persist_prompt_inputs {
                         let _ = persist_workflow_prompt_input_to_disk(
-                            &bundle.raw,
+                            &stage2a_context_bundle.raw,
                             "workflow_stage2a",
                             &prompt_value,
                             retention_minutes,
@@ -5947,9 +5989,10 @@ async fn invoke_workflow_bundle_models(
                     }
                     info!(
                         symbol = %symbol,
-                        ts_bucket = %bundle.raw.ts_bucket,
+                        ts_bucket = %stage2a_context_ts_bucket,
                         trigger = &*trigger,
                         path_id = %current_path_id,
+                        stage1_source_ts_bucket = %bundle.raw.ts_bucket,
                         "invoking workflow stage2a models"
                     );
                     for out in crate::llm::workflow_provider::invoke_stage2a_models(
@@ -5964,6 +6007,8 @@ async fn invoke_workflow_bundle_models(
                         let payload = json!({
                             "trigger": &*trigger,
                             "stage": "stage2a",
+                            "source_ts_bucket": stage2a_context_ts_bucket,
+                            "stage1_source_ts_bucket": bundle.raw.ts_bucket,
                             "model_name": out.model_name,
                             "provider": out.provider,
                             "model_id": out.model,
@@ -5975,13 +6020,13 @@ async fn invoke_workflow_bundle_models(
                         append_workflow_journal_event(
                             "workflow_stage2a_response",
                             &symbol,
-                            bundle.raw.ts_bucket,
+                            stage2a_context_ts_bucket,
                             payload.clone(),
                         );
                         if print_response {
                             println!(
                                 "WORKFLOW_STAGE2A_RESPONSE ts_bucket={} trigger={} symbol={} payload={}",
-                                bundle.raw.ts_bucket,
+                                stage2a_context_ts_bucket,
                                 &*trigger,
                                 symbol,
                                 render_pretty_json_value(&payload)
@@ -6002,9 +6047,11 @@ async fn invoke_workflow_bundle_models(
                                 append_workflow_journal_event(
                                     "workflow_stage2a_parse_error",
                                     &symbol,
-                                    bundle.raw.ts_bucket,
+                                    stage2a_context_ts_bucket,
                                     json!({
                                         "trigger": &*trigger,
+                                        "source_ts_bucket": stage2a_context_ts_bucket,
+                                        "stage1_source_ts_bucket": bundle.raw.ts_bucket,
                                         "error": format!("{err:#}"),
                                     }),
                                 );
@@ -6035,10 +6082,12 @@ async fn invoke_workflow_bundle_models(
                         append_workflow_journal_event(
                             "workflow_stage2a_response_stale",
                             &symbol,
-                            bundle.raw.ts_bucket,
+                            stage2a_context_ts_bucket,
                             json!({
                                 "trigger": &*trigger,
                                 "model_name": selected_stage2a_model_name.clone(),
+                                "source_ts_bucket": stage2a_context_ts_bucket,
+                                "stage1_source_ts_bucket": bundle.raw.ts_bucket,
                                 "expected_path_id": stage2a_snapshot_path_id.clone(),
                                 "expected_stage1_completed_at": stage2a_snapshot_completed_at,
                                 "latest_path_id": stale.latest_path_id.clone(),
@@ -6069,9 +6118,11 @@ async fn invoke_workflow_bundle_models(
                                 append_workflow_journal_event(
                                     "workflow_stage1_reevaluation_requested",
                                     &symbol,
-                                    bundle.raw.ts_bucket,
+                                    stage2a_context_ts_bucket,
                                     json!({
                                         "trigger": &*trigger,
+                                        "source_ts_bucket": stage2a_context_ts_bucket,
+                                        "stage1_source_ts_bucket": bundle.raw.ts_bucket,
                                         "reevaluation_reason": parsed_stage2a.reevaluation_reason,
                                         "path_id": stage1_output.current_path.as_ref().map(|path| path.id.clone()),
                                     }),
@@ -6087,11 +6138,12 @@ async fn invoke_workflow_bundle_models(
                                 append_workflow_journal_event(
                                     "workflow_stage2a_wait",
                                     &symbol,
-                                    bundle.raw.ts_bucket,
+                                    stage2a_context_ts_bucket,
                                     json!({
                                         "trigger": &*trigger,
                                         "model_name": selected_stage2a_model_name.clone(),
-                                        "source_ts_bucket": bundle.raw.ts_bucket,
+                                        "source_ts_bucket": stage2a_context_ts_bucket,
+                                        "stage1_source_ts_bucket": bundle.raw.ts_bucket,
                                         "path_id": stage1_output.current_path.as_ref().map(|path| path.id.clone()),
                                         "wait_reason": parsed_stage2a.wait_reason,
                                     }),
@@ -6099,7 +6151,8 @@ async fn invoke_workflow_bundle_models(
                                 info!(
                                     symbol = %symbol,
                                     trigger = &*trigger,
-                                    source_ts_bucket = %bundle.raw.ts_bucket,
+                                    source_ts_bucket = %stage2a_context_ts_bucket,
+                                    stage1_source_ts_bucket = %bundle.raw.ts_bucket,
                                     path_id = ?stage1_output.current_path.as_ref().map(|path| path.id.clone()),
                                     wait_reason = ?parsed_stage2a.wait_reason,
                                     "workflow stage2a path confirmed but waiting for better execution"
@@ -6112,7 +6165,7 @@ async fn invoke_workflow_bundle_models(
                                     set_approved_tactical_plan(
                                         &mut workflow_state,
                                         tactical_plan,
-                                        bundle.raw.ts_bucket,
+                                        stage2a_context_ts_bucket,
                                         true,
                                     );
                                 } else {
@@ -6126,11 +6179,12 @@ async fn invoke_workflow_bundle_models(
                                 append_workflow_journal_event(
                                     "workflow_tactical_plan_approved",
                                     &symbol,
-                                    bundle.raw.ts_bucket,
+                                    stage2a_context_ts_bucket,
                                     json!({
                                         "trigger": &*trigger,
                                         "model_name": selected_stage2a_model_name.clone(),
-                                        "source_ts_bucket": bundle.raw.ts_bucket,
+                                        "source_ts_bucket": stage2a_context_ts_bucket,
+                                        "stage1_source_ts_bucket": bundle.raw.ts_bucket,
                                         "tactical_entry_plan": parsed_stage2a.tactical_entry_plan.clone(),
                                     }),
                                 );
@@ -6140,7 +6194,8 @@ async fn invoke_workflow_bundle_models(
                                     info!(
                                         symbol = %symbol,
                                         trigger = &*trigger,
-                                        source_ts_bucket = %bundle.raw.ts_bucket,
+                                        source_ts_bucket = %stage2a_context_ts_bucket,
+                                        stage1_source_ts_bucket = %bundle.raw.ts_bucket,
                                         path_id = %tactical_plan.path_id,
                                         side = %tactical_plan.entry_plan.side,
                                         entry_profile = %tactical_plan.entry_plan.entry_profile,
@@ -8475,6 +8530,48 @@ mod tests {
             false,
         )
         .is_none());
+    }
+
+    #[test]
+    fn select_stage2a_context_bundle_prefers_newer_persisted_bundle() {
+        let current_ts = parse_rfc3339_utc("2026-03-30T03:45:00Z").expect("parse current ts");
+        let newer_ts = parse_rfc3339_utc("2026-03-30T03:46:00Z").expect("parse newer ts");
+        let current_bundle = LatestBundle {
+            raw: MinuteBundleEnvelope {
+                msg_type: "bundle".to_string(),
+                routing_key: "test.route".to_string(),
+                symbol: "ETHUSDT".to_string(),
+                ts_bucket: current_ts,
+                window_code: "1m".to_string(),
+                indicator_count: 0,
+                published_at: None,
+                indicators: json!({}),
+            },
+            indicators: json!({}),
+            missing_indicator_codes: vec![],
+            received_at: current_ts,
+        };
+        let newer_bundle = LatestBundle {
+            raw: MinuteBundleEnvelope {
+                msg_type: "bundle".to_string(),
+                routing_key: "test.route".to_string(),
+                symbol: "ETHUSDT".to_string(),
+                ts_bucket: newer_ts,
+                window_code: "1m".to_string(),
+                indicator_count: 0,
+                published_at: None,
+                indicators: json!({}),
+            },
+            indicators: json!({}),
+            missing_indicator_codes: vec![],
+            received_at: newer_ts,
+        };
+
+        let selected = select_stage2a_context_bundle(&current_bundle, Some(newer_bundle.clone()));
+        assert_eq!(selected.raw.ts_bucket, newer_ts);
+
+        let fallback = select_stage2a_context_bundle(&current_bundle, None);
+        assert_eq!(fallback.raw.ts_bucket, current_ts);
     }
 
     #[test]
