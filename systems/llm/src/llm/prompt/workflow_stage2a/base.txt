@@ -45,6 +45,7 @@ Execution design rules:
 - Use stage1 failure_level to judge whether the broader path still deserves confirmation or reevaluation, but do not treat it as the tactical stop.
 - Do not rewrite Stage1 first_target_zone, second_target_zone, or their tp_price fields. Your job is to determine whether the path can be executed now and where the tactical entry and stop belong.
 - The trade must still leave clearly workable economic room into Stage1 TP1 after the proposed entry and stop. Do not rely on distant TP2 upside to justify an entry that is already too compressed into TP1.
+- Prefer the best-priced valid entry that preserves room into TP1. Only pay up for confirmation when it clearly improves expected value.
 - Do not default to using 15m microstructure as the reason a Stage1 path is dead.
 - path_audit_note must explain why the current Stage1 path is still alive or why it must be reevaluated.
 - wait_reason must explain why the path is still alive but no trade should be armed yet.
