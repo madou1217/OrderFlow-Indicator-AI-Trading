@@ -204,38 +204,45 @@ fn build_selected_avwap_anchors(
     };
     let avwap = context_child(&summary.position_layer, "avwap");
     let current_price = latest_15m_close(summary).unwrap_or_default();
-    let anchor_roles = [
+    let anchor_roles = vec![
         (
             "strategic_activation_level",
             path.activation_anchor_id.as_deref(),
-            &path.strategic_activation_level,
+            serde_json::to_value(&path.strategic_activation_level).unwrap_or(Value::Null),
+            path.strategic_activation_level.timeframe.clone(),
+            path.strategic_activation_level.midpoint(),
         ),
         (
             "first_target_zone",
             path.first_path_target_anchor_id.as_deref(),
-            &path.first_path_target,
+            serde_json::to_value(&path.first_path_target).unwrap_or(Value::Null),
+            path.first_path_target.timeframe.clone(),
+            (path.first_path_target.low + path.first_path_target.high) / 2.0,
         ),
         (
             "second_target_zone",
             path.next_path_target_anchor_id.as_deref(),
-            &path.next_path_target,
+            serde_json::to_value(&path.next_path_target).unwrap_or(Value::Null),
+            path.next_path_target.timeframe.clone(),
+            (path.next_path_target.low + path.next_path_target.high) / 2.0,
         ),
         (
             "failure_level",
             path.failure_anchor_id.as_deref(),
-            &path.failure_level,
+            serde_json::to_value(&path.failure_level).unwrap_or(Value::Null),
+            path.failure_level.timeframe.clone(),
+            path.failure_level.midpoint(),
         ),
     ];
 
-    let anchors = anchor_roles
-        .into_iter()
-        .map(|(anchor_role, anchor_id, zone)| {
+    let anchors = anchor_roles.into_iter().map(
+        |(anchor_role, anchor_id, zone, zone_timeframe, zone_midpoint)| {
             let tracked_zone = tracked_zone_for_anchor(stage1_output, anchor_id);
             let zone_state =
                 zone_state_for_zone_id(summary, tracked_zone.map(|item| item.zone_id.as_str()));
             let timeframe_hint = tracked_zone
                 .map(|item| item.timeframe.clone())
-                .or_else(|| zone.timeframe.clone())
+                .or(zone_timeframe)
                 .unwrap_or_else(|| "4h".to_string());
             let reference_windows = reference_windows_for_timeframe_hint(&timeframe_hint);
             let mapped_reference_window = primary_avwap_reference_window(&timeframe_hint, avwap);
@@ -257,15 +264,16 @@ fn build_selected_avwap_anchors(
                 "tracked_zone": tracked_zone,
                 "zone_state": zone_state,
                 "current_price": current_price,
-                "distance_to_zone_midpoint": current_price - zone.midpoint(),
+                "distance_to_zone_midpoint": current_price - zone_midpoint,
                 "mapped_reference_window": mapped_reference_window,
                 "mapped_avwap_reference": avwap_reference_for_window(avwap, mapped_reference_window),
                 "strategic_reference_30d": avwap_reference_for_window(avwap, "30d_lookback"),
                 "strategic_reference_7d": avwap_reference_for_window(avwap, "7d_lookback"),
                 "avwap_references": avwap_references,
             })
-        })
-        .collect::<Vec<_>>();
+        },
+    )
+    .collect::<Vec<_>>();
     Value::Array(anchors)
 }
 
@@ -924,18 +932,15 @@ fn build_strategic_context_frozen(
             .unwrap_or(Value::Null),
         "avwap_reference_30d": avwap_reference_for_window(avwap, "30d_lookback"),
         "avwap_reference_7d": avwap_reference_for_window(avwap, "7d_lookback"),
-        "realization_plan_reference": stage1_output
+        "target_price_reference": stage1_output
             .current_path
             .as_ref()
             .map(|path| {
                 json!({
-                    "tp1_price": path.realization_plan.tp1_price,
-                    "tp1_close_ratio": path.realization_plan.tp1_close_ratio,
-                    "tp2_price": path.realization_plan.tp2_price,
-                    "primary_execution_target_price": path.realization_plan.tp1_price,
-                    "runner_target_price": path.realization_plan.tp2_price,
-                    "after_tp1_stop_policy": path.realization_plan.after_tp1_stop_policy,
-                    "near_tp1_failure_policy": path.realization_plan.near_tp1_failure_policy,
+                    "tp1_price": path.first_path_target.tp_price,
+                    "tp2_price": path.next_path_target.tp_price,
+                    "primary_execution_target_price": path.first_path_target.tp_price,
+                    "runner_target_price": path.next_path_target.tp_price,
                 })
             })
             .unwrap_or(Value::Null),
@@ -965,13 +970,12 @@ fn build_stage1_target_distance_context(
 
     json!({
         "current_price": current_price,
-        "tp1_price": path.realization_plan.tp1_price,
-        "tp2_price": path.realization_plan.tp2_price,
-        "tp1_close_ratio": path.realization_plan.tp1_close_ratio,
-        "directional_distance_to_tp1": directional_distance(path.realization_plan.tp1_price),
-        "directional_distance_to_tp2": directional_distance(path.realization_plan.tp2_price),
-        "tp1_already_reached": target_reached(path.realization_plan.tp1_price),
-        "tp2_already_reached": target_reached(path.realization_plan.tp2_price),
+        "tp1_price": path.first_path_target.tp_price,
+        "tp2_price": path.next_path_target.tp_price,
+        "directional_distance_to_tp1": directional_distance(path.first_path_target.tp_price),
+        "directional_distance_to_tp2": directional_distance(path.next_path_target.tp_price),
+        "tp1_already_reached": target_reached(path.first_path_target.tp_price),
+        "tp2_already_reached": target_reached(path.next_path_target.tp_price),
     })
 }
 
@@ -1492,23 +1496,13 @@ mod tests {
     use crate::llm::input::ModelInvocationInput;
     use crate::workflow::code_layer::build_indicator_summary;
     use crate::workflow::schema::{
-        CurrentPath, EntrySnapshot, MapSummary, OpportunityAssessment, PriceZone, RealizationPlan,
-        ReevaluationTrigger, Stage1Meta, Stage1Output, TrackedZone, WorkflowPendingOrder,
-        WorkflowPosition,
+        CurrentPath, EntrySnapshot, MapSummary, OpportunityAssessment, PriceZone,
+        ReevaluationTrigger, Stage1Meta, Stage1Output, TargetZone, TrackedZone,
+        WorkflowPendingOrder, WorkflowPosition,
     };
     use chrono::{DateTime, Utc};
     use serde_json::json;
     use std::collections::HashMap;
-
-    fn sample_realization_plan(tp1_price: f64, tp2_price: f64) -> RealizationPlan {
-        RealizationPlan {
-            tp1_price,
-            tp1_close_ratio: 1.0,
-            tp2_price,
-            after_tp1_stop_policy: "breakeven".to_string(),
-            near_tp1_failure_policy: "tighten_stop".to_string(),
-        }
-    }
 
     #[test]
     fn aggregate_kline_history_5m_builds_complete_bars_from_1m() {
@@ -1594,20 +1588,22 @@ mod tests {
                     reason: None,
                 },
                 first_path_target_anchor_id: Some("zone_target_1".to_string()),
-                first_path_target: PriceZone {
+                first_path_target: TargetZone {
                     low: 104.0,
                     high: 106.0,
                     timeframe: Some("1d".to_string()),
                     label: None,
                     reason: None,
+                    tp_price: 106.0,
                 },
                 next_path_target_anchor_id: Some("zone_target_2".to_string()),
-                next_path_target: PriceZone {
+                next_path_target: TargetZone {
                     low: 108.0,
                     high: 110.0,
                     timeframe: Some("3d".to_string()),
                     label: None,
                     reason: None,
+                    tp_price: 109.0,
                 },
                 failure_anchor_id: Some("zone_failure".to_string()),
                 failure_level: PriceZone {
@@ -1617,7 +1613,7 @@ mod tests {
                     label: None,
                     reason: None,
                 },
-                realization_plan: sample_realization_plan(106.0, 109.0),
+                realization_plan: None,
                 failure_switch: None,
                 setup_type: "pullback".to_string(),
                 reevaluation_trigger: ReevaluationTrigger::default(),
@@ -2626,13 +2622,12 @@ mod tests {
             json!(99.0)
         );
         assert_eq!(
-            encoded["strategic_context_frozen"]["realization_plan_reference"]
+            encoded["strategic_context_frozen"]["target_price_reference"]
                 ["primary_execution_target_price"],
             json!(106.0)
         );
         assert_eq!(
-            encoded["strategic_context_frozen"]["realization_plan_reference"]
-                ["runner_target_price"],
+            encoded["strategic_context_frozen"]["target_price_reference"]["runner_target_price"],
             json!(109.0)
         );
         for removed_key in [

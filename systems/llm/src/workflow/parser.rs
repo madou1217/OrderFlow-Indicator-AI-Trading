@@ -1,7 +1,7 @@
 use crate::workflow::schema::{
     CurrentPath, EntryPlan, PendingOrderManagementAction, PendingOrderManagementPlan,
     PositionManagementAction, PositionManagementPlan, PriceTriggerCondition, PriceZone,
-    Stage1Output, Stage2AOutput, Stage2BOutput, Stage2COutput,
+    Stage1Output, Stage2AOutput, Stage2BOutput, Stage2COutput, TargetZone,
 };
 use anyhow::{anyhow, Result};
 use serde_json::Value;
@@ -41,8 +41,6 @@ const ALLOWED_DRIVER_SIGNALS: &[&str] = &[
     "fake_order_risk_rising",
     "driver_flip_confirmed",
 ];
-const ALLOWED_AFTER_TP1_STOP_POLICIES: &[&str] = &["breakeven", "lock_profit"];
-const ALLOWED_NEAR_TP1_FAILURE_POLICIES: &[&str] = &["reduce", "tighten_stop", "exit_full"];
 const ALLOWED_PATH_LIVE_ASSESSMENTS: &[&str] = &["live", "degraded", "invalidated"];
 const ALLOWED_PENDING_ORDER_EXPOSURE_STATES: &[&str] = &[
     "flat_with_live_entry_orders",
@@ -305,82 +303,50 @@ fn validate_driver_reevaluation_trigger(
     Ok(())
 }
 
-fn hydrate_legacy_realization_plan(path: &mut CurrentPath) {
-    if !path.realization_plan.tp1_price.is_finite()
-        || path.realization_plan.tp1_price.abs() <= f64::EPSILON
+fn hydrate_legacy_target_prices(path: &mut CurrentPath) {
+    let legacy_plan = path.realization_plan.as_ref();
+    if !path.first_path_target.tp_price.is_finite()
+        || path.first_path_target.tp_price.abs() <= f64::EPSILON
     {
-        path.realization_plan.tp1_price = path.first_path_target.directional_target(&path.side);
+        if let Some(plan) = legacy_plan {
+            path.first_path_target.tp_price = plan.tp1_price;
+        }
     }
-    if !path.realization_plan.tp2_price.is_finite()
-        || path.realization_plan.tp2_price.abs() <= f64::EPSILON
+    if !path.next_path_target.tp_price.is_finite()
+        || path.next_path_target.tp_price.abs() <= f64::EPSILON
     {
-        path.realization_plan.tp2_price = path.next_path_target.directional_target(&path.side);
+        if let Some(plan) = legacy_plan {
+            path.next_path_target.tp_price = plan.tp2_price;
+        }
     }
-    if !path.realization_plan.tp1_close_ratio.is_finite()
-        || !(0.0 < path.realization_plan.tp1_close_ratio
-            && path.realization_plan.tp1_close_ratio <= 1.0)
-    {
-        path.realization_plan.tp1_close_ratio = crate::workflow::schema::default_tp1_close_ratio();
-    }
-    if path
-        .realization_plan
-        .after_tp1_stop_policy
-        .trim()
-        .is_empty()
-    {
-        path.realization_plan.after_tp1_stop_policy =
-            crate::workflow::schema::default_after_tp1_stop_policy();
-    }
-    if path
-        .realization_plan
-        .near_tp1_failure_policy
-        .trim()
-        .is_empty()
-    {
-        path.realization_plan.near_tp1_failure_policy =
-            crate::workflow::schema::default_near_tp1_failure_policy();
-    }
+    path.realization_plan = None;
 }
 
-fn validate_realization_plan(path: &CurrentPath) -> Result<()> {
-    let plan = &path.realization_plan;
-    if !plan.tp1_price.is_finite() {
-        return Err(anyhow!(
-            "current_path.realization_plan.tp1_price must be finite"
-        ));
+fn validate_target_zone(field: &str, zone: &TargetZone) -> Result<()> {
+    if !zone.tp_price.is_finite() {
+        return Err(anyhow!("{field}.tp_price must be finite"));
     }
-    if !plan.tp2_price.is_finite() {
-        return Err(anyhow!(
-            "current_path.realization_plan.tp2_price must be finite"
-        ));
+    if zone.tp_price + f64::EPSILON < zone.low || zone.tp_price - f64::EPSILON > zone.high {
+        return Err(anyhow!("{field}.tp_price must sit inside the target zone"));
     }
-    if !(0.0 < plan.tp1_close_ratio && plan.tp1_close_ratio <= 1.0) {
-        return Err(anyhow!(
-            "current_path.realization_plan.tp1_close_ratio must be between 0 and 1"
-        ));
-    }
-    if !ALLOWED_AFTER_TP1_STOP_POLICIES.contains(&plan.after_tp1_stop_policy.as_str()) {
-        return Err(anyhow!(
-            "current_path.realization_plan.after_tp1_stop_policy must be one of [breakeven, lock_profit]"
-        ));
-    }
-    if !ALLOWED_NEAR_TP1_FAILURE_POLICIES.contains(&plan.near_tp1_failure_policy.as_str()) {
-        return Err(anyhow!(
-            "current_path.realization_plan.near_tp1_failure_policy must be one of [reduce, tighten_stop, exit_full]"
-        ));
-    }
+    Ok(())
+}
+
+fn validate_target_prices(path: &CurrentPath) -> Result<()> {
+    validate_target_zone("current_path.first_target_zone", &path.first_path_target)?;
+    validate_target_zone("current_path.second_target_zone", &path.next_path_target)?;
     match path.side.as_str() {
         "LONG" => {
-            if plan.tp2_price + f64::EPSILON < plan.tp1_price {
+            if path.next_path_target.tp_price + f64::EPSILON < path.first_path_target.tp_price {
                 return Err(anyhow!(
-                    "current_path.realization_plan.tp2_price must be >= tp1_price for LONG"
+                    "current_path.second_target_zone.tp_price must be >= current_path.first_target_zone.tp_price for LONG"
                 ));
             }
         }
         "SHORT" => {
-            if plan.tp2_price - f64::EPSILON > plan.tp1_price {
+            if path.next_path_target.tp_price - f64::EPSILON > path.first_path_target.tp_price {
                 return Err(anyhow!(
-                    "current_path.realization_plan.tp2_price must be <= tp1_price for SHORT"
+                    "current_path.second_target_zone.tp_price must be <= current_path.first_target_zone.tp_price for SHORT"
                 ));
             }
         }
@@ -434,7 +400,7 @@ pub fn parse_stage1_output(value: Value) -> Result<Stage1Output> {
             if !matches!(path.side.as_str(), "LONG" | "SHORT") {
                 return Err(anyhow!("current_path.side must be LONG or SHORT"));
             }
-            hydrate_legacy_realization_plan(path);
+            hydrate_legacy_target_prices(path);
             if !ALLOWED_RISK_GRADES.contains(&path.risk_grade.as_str()) {
                 return Err(anyhow!(
                     "risk_grade must be one of [aligned_trend, countertrend_repair, high_conflict_repair]"
@@ -451,6 +417,8 @@ pub fn parse_stage1_output(value: Value) -> Result<Stage1Output> {
                 }
             }
 
+            let first_target_zone = path.first_path_target.as_price_zone();
+            let second_target_zone = path.next_path_target.as_price_zone();
             validate_zone_timeframe(
                 "current_path.strategic_activation_level",
                 &path.strategic_activation_level,
@@ -459,13 +427,13 @@ pub fn parse_stage1_output(value: Value) -> Result<Stage1Output> {
             )?;
             validate_zone_timeframe(
                 "current_path.first_target_zone",
-                &path.first_path_target,
+                &first_target_zone,
                 ALLOWED_STRATEGIC_TIMEFRAMES,
                 true,
             )?;
             validate_zone_timeframe(
                 "current_path.second_target_zone",
-                &path.next_path_target,
+                &second_target_zone,
                 ALLOWED_STRATEGIC_TIMEFRAMES,
                 true,
             )?;
@@ -475,16 +443,16 @@ pub fn parse_stage1_output(value: Value) -> Result<Stage1Output> {
                 ALLOWED_STRATEGIC_TIMEFRAMES,
                 true,
             )?;
-            validate_realization_plan(path)?;
+            validate_target_prices(path)?;
 
             if path.activation_anchor_id.is_none() {
                 path.activation_anchor_id = infer_anchor_id(path, &path.strategic_activation_level);
             }
             if path.first_path_target_anchor_id.is_none() {
-                path.first_path_target_anchor_id = infer_anchor_id(path, &path.first_path_target);
+                path.first_path_target_anchor_id = infer_anchor_id(path, &first_target_zone);
             }
             if path.next_path_target_anchor_id.is_none() {
-                path.next_path_target_anchor_id = infer_anchor_id(path, &path.next_path_target);
+                path.next_path_target_anchor_id = infer_anchor_id(path, &second_target_zone);
             }
             if path.failure_anchor_id.is_none() {
                 path.failure_anchor_id = infer_anchor_id(path, &path.failure_level);
@@ -498,13 +466,13 @@ pub fn parse_stage1_output(value: Value) -> Result<Stage1Output> {
             validate_anchor_id(
                 path,
                 &path.first_path_target_anchor_id,
-                &path.first_path_target,
+                &first_target_zone,
                 "current_path.first_path_target_anchor_id",
             )?;
             validate_anchor_id(
                 path,
                 &path.next_path_target_anchor_id,
-                &path.next_path_target,
+                &second_target_zone,
                 "current_path.next_path_target_anchor_id",
             )?;
             validate_anchor_id(
@@ -1309,7 +1277,7 @@ mod tests {
     };
     use crate::workflow::schema::{
         CurrentPath, DriverAttribution, MapSummary, OpportunityAssessment, PriceZone,
-        RealizationPlan, ReevaluationTrigger, Stage1Meta, Stage1Output,
+        ReevaluationTrigger, Stage1Meta, Stage1Output, TargetZone,
     };
     use chrono::Utc;
     use serde_json::json;
@@ -1353,20 +1321,22 @@ mod tests {
                     reason: None,
                 },
                 first_path_target_anchor_id: None,
-                first_path_target: PriceZone {
+                first_path_target: TargetZone {
                     low: 2020.0,
                     high: 2025.0,
                     timeframe: Some("4h".to_string()),
                     label: Some("tp1".to_string()),
                     reason: None,
+                    tp_price: 2022.0,
                 },
                 next_path_target_anchor_id: None,
-                next_path_target: PriceZone {
+                next_path_target: TargetZone {
                     low: 2030.0,
                     high: 2035.0,
                     timeframe: Some("4h".to_string()),
                     label: Some("tp2".to_string()),
                     reason: None,
+                    tp_price: 2032.0,
                 },
                 failure_anchor_id: None,
                 failure_level: PriceZone {
@@ -1376,13 +1346,7 @@ mod tests {
                     label: Some("failure".to_string()),
                     reason: None,
                 },
-                realization_plan: RealizationPlan {
-                    tp1_price: 2022.0,
-                    tp1_close_ratio: 1.0,
-                    tp2_price: 2032.0,
-                    after_tp1_stop_policy: "breakeven".to_string(),
-                    near_tp1_failure_policy: "tighten_stop".to_string(),
-                },
+                realization_plan: None,
                 failure_switch: Some("continuation".to_string()),
                 setup_type: "B_reversal".to_string(),
                 reevaluation_trigger: ReevaluationTrigger::default(),

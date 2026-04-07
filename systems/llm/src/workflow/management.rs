@@ -55,20 +55,9 @@ pub fn snapshot_from_execution_intent(
 mod tests {
     use super::snapshot_from_execution_intent;
     use crate::workflow::schema::{
-        CurrentPath, EntrySnapshotRef, ExecutionIntent, PriceZone, RealizationPlan,
-        ReevaluationTrigger,
+        CurrentPath, EntrySnapshotRef, ExecutionIntent, PriceZone, ReevaluationTrigger, TargetZone,
     };
     use chrono::Utc;
-
-    fn sample_realization_plan(tp1_price: f64, tp2_price: f64) -> RealizationPlan {
-        RealizationPlan {
-            tp1_price,
-            tp1_close_ratio: 1.0,
-            tp2_price,
-            after_tp1_stop_policy: "breakeven".to_string(),
-            near_tp1_failure_policy: "tighten_stop".to_string(),
-        }
-    }
 
     #[test]
     fn snapshot_captures_allowed_management_levels_from_path_contract() {
@@ -129,20 +118,22 @@ mod tests {
                 reason: None,
             },
             first_path_target_anchor_id: None,
-            first_path_target: PriceZone {
+            first_path_target: TargetZone {
                 low: 103.0,
                 high: 103.0,
                 timeframe: None,
                 label: None,
                 reason: None,
+                tp_price: 103.0,
             },
             next_path_target_anchor_id: None,
-            next_path_target: PriceZone {
+            next_path_target: TargetZone {
                 low: 105.0,
                 high: 105.0,
                 timeframe: None,
                 label: None,
                 reason: None,
+                tp_price: 105.0,
             },
             failure_anchor_id: None,
             failure_level: PriceZone {
@@ -152,7 +143,7 @@ mod tests {
                 label: None,
                 reason: None,
             },
-            realization_plan: sample_realization_plan(103.0, 105.0),
+            realization_plan: None,
             failure_switch: Some("alt".to_string()),
             setup_type: "A_continuation".to_string(),
             reevaluation_trigger: ReevaluationTrigger::default(),
@@ -211,20 +202,22 @@ mod tests {
                 reason: None,
             },
             first_path_target_anchor_id: None,
-            first_path_target: PriceZone {
+            first_path_target: TargetZone {
                 low: 97.0,
                 high: 98.0,
                 timeframe: None,
                 label: None,
                 reason: None,
+                tp_price: 97.0,
             },
             next_path_target_anchor_id: None,
-            next_path_target: PriceZone {
+            next_path_target: TargetZone {
                 low: 94.0,
                 high: 95.0,
                 timeframe: None,
                 label: None,
                 reason: None,
+                tp_price: 94.0,
             },
             failure_anchor_id: None,
             failure_level: PriceZone {
@@ -234,7 +227,7 @@ mod tests {
                 label: None,
                 reason: None,
             },
-            realization_plan: sample_realization_plan(97.0, 94.0),
+            realization_plan: None,
             failure_switch: Some("alt".to_string()),
             setup_type: "A_continuation".to_string(),
             reevaluation_trigger: ReevaluationTrigger::default(),

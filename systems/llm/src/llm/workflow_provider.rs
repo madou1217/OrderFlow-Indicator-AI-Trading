@@ -292,29 +292,23 @@ fn driver_attribution_schema() -> Value {
     })
 }
 
-fn realization_plan_schema() -> Value {
+fn target_zone_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
         "required": [
-            "tp1_price",
-            "tp1_close_ratio",
-            "tp2_price",
-            "after_tp1_stop_policy",
-            "near_tp1_failure_policy"
+            "low",
+            "high",
+            "timeframe",
+            "tp_price"
         ],
         "properties": {
-            "tp1_price": {"type": "number"},
-            "tp1_close_ratio": {"type": "number", "exclusiveMinimum": 0.0, "maximum": 1.0},
-            "tp2_price": {"type": "number"},
-            "after_tp1_stop_policy": {
-                "type": "string",
-                "enum": ["breakeven", "lock_profit"]
-            },
-            "near_tp1_failure_policy": {
-                "type": "string",
-                "enum": ["reduce", "tighten_stop", "exit_full"]
-            }
+            "low": {"type": "number"},
+            "high": {"type": "number"},
+            "timeframe": {"type": "string", "enum": ["4h", "1d", "4h-1d"]},
+            "label": {"type": ["string", "null"]},
+            "reason": {"type": ["string", "null"]},
+            "tp_price": {"type": "number"},
         }
     })
 }
@@ -331,19 +325,17 @@ fn current_path_schema() -> Value {
             "first_target_zone",
             "second_target_zone",
             "failure_level",
-            "tracked_zones",
-            "realization_plan"
+            "tracked_zones"
         ],
         "properties": {
             "id": {"type": "string"},
             "side": {"type": "string", "enum": ["LONG", "SHORT"]},
             "thesis": {"type": "string"},
             "strategic_activation_level": price_zone_schema(&["4h", "1d", "4h-1d"]),
-            "first_target_zone": price_zone_schema(&["4h", "1d", "4h-1d"]),
-            "second_target_zone": price_zone_schema(&["4h", "1d", "4h-1d"]),
+            "first_target_zone": target_zone_schema(),
+            "second_target_zone": target_zone_schema(),
             "failure_level": price_zone_schema(&["4h", "1d", "4h-1d"]),
             "tracked_zones": {"type": "array", "items": tracked_zone_schema()},
-            "realization_plan": realization_plan_schema()
         }
     })
 }
@@ -1221,6 +1213,33 @@ mod tests {
     #[test]
     fn stage2b_schema_closes_all_object_nodes() {
         assert_closed_object_schemas(&workflow_stage2b_schema());
+    }
+
+    #[test]
+    fn stage1_schema_requires_tp_price_inside_both_target_zones() {
+        let schema = workflow_stage1_schema();
+        let first_target_required = schema["properties"]["current_path"]["anyOf"][0]["properties"]
+            ["first_target_zone"]["required"]
+            .as_array()
+            .expect("first_target_zone required array")
+            .iter()
+            .filter_map(|value| value.as_str())
+            .collect::<Vec<_>>();
+        let second_target_required = schema["properties"]["current_path"]["anyOf"][0]["properties"]
+            ["second_target_zone"]["required"]
+            .as_array()
+            .expect("second_target_zone required array")
+            .iter()
+            .filter_map(|value| value.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(first_target_required.contains(&"tp_price"));
+        assert!(second_target_required.contains(&"tp_price"));
+        assert!(
+            schema["properties"]["current_path"]["anyOf"][0]["properties"]
+                .get("realization_plan")
+                .is_none()
+        );
     }
 
     #[test]

@@ -19,15 +19,15 @@ Your job:
 - Do not anchor to prior management wording or assume older watcher actions should persist unless you would return them again from the current data.
 
 Management rules:
-- Stage1.current_path.realization_plan is the source of truth for TP1, TP2, TP1 size realization, and the intended handoff from TP1 into runner management.
-- first_target_zone and second_target_zone are strategic structure. They are not a substitute for executable TP1 and TP2.
+- Stage1.current_path.first_target_zone.tp_price and Stage1.current_path.second_target_zone.tp_price are the strategic TP1 and TP2 references for this path.
+- first_target_zone and second_target_zone remain structural context. Use their tp_price fields for executable target reference.
 - Adds are allowed only when they improve expectancy and remain consistent with the live strategic path.
 - Adds must remain management-layer adds: reuse the currently active entry template rather than redesigning a fresh tactical entry.
 - Reductions, stop moves, and profit-taking updates are valid whenever they improve expectancy.
-- When entry_snapshot.tp1_realized=false and Stage1 realization_plan.tp1_close_ratio < 1.0, the management queue should normally operationalize TP1 as a watcher-managed reduce at realization_plan.tp1_price for the planned reduce_ratio.
-- After TP1 is realized, use realization_plan.after_tp1_stop_policy to decide whether the stop should move to breakeven or lock profit.
-- If the remaining runner is still valid after TP1, keep or update the live take-profit toward realization_plan.tp2_price.
-- Use realization_plan.near_tp1_failure_policy when price gets close to TP1 but shows rejection, decay, or loss of continuation before TP1 is fully realized.
+- When entry_snapshot.tp1_realized=false, decide from the live context whether TP1 should be handled as a partial reduce, a full take-profit, or a bracket update.
+- After TP1 is realized, decide from the live context whether the stop should move to breakeven, lock profit, or stay unchanged.
+- If the remaining runner is still valid after TP1, keep or update the live take-profit toward second_target_zone.tp_price.
+- If price gets close to first_target_zone.tp_price but shows rejection, decay, or loss of continuation before TP1 is fully realized, you may reduce, tighten stop, or exit.
 - Do not invent a new TP1 or TP2 unless the live path quality has changed enough that a bracket patch genuinely improves expectancy.
 - move_stop and update_take_profit must remain patch-style bracket updates: reuse the current bracket template and only specify the fields that change.
 - Every returned action must carry trigger_condition with a concrete trigger_price.

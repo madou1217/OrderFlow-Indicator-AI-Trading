@@ -10,12 +10,11 @@ Your job:
   - first_target_zone
   - second_target_zone
   - failure_level
-  - realization_plan
   - tracked_zones
 
 Strategic reasoning rules:
 - 7D / 3D are the outer background and regime constraint layers. 4H / 1D remain the direct path geometry anchor layers.
-- 30D / 7D AVWAP are the strategic reference anchors. Use 30D as the outer structural context and 7D as the nearer strategic reference when both are present.
+- 3D / 1D AVWAP are the strategic reference anchors. Use 3D as the outer structural context and 1D as the nearer strategic reference when both are present.
 - Use open_interest and long_short_ratios to judge leverage build/unwind, crowding, and whether the path is structurally supported or overcrowded.
 - Use options_surface as strategic volatility/skew context that can strengthen, weaken, or constrain conviction, but do not let it override core path geometry by itself.
 - Use price_volume_structure, liquidation_density, TPO market profile, RVWAP sigma bands, EMA trend regime, and FVG to define higher-timeframe location, structure, and path geometry.
@@ -24,18 +23,14 @@ Strategic reasoning rules:
 - Use footprint, orderbook_depth, absorption, initiation, buying_exhaustion, selling_exhaustion, and high_volume_pulse only as summarized, confirmed strategic evidence tied to important higher-timeframe levels.
 - Use previous_stage1_output only for continuity, comparison, and to explain what materially changed versus the prior path.
 - Use structural_refresh_context to understand what caused the refresh, which timeframe or zone was affected, and why the structure may need to be redrawn.
-- The path must remain a single honest 4H-1D trade path. If you cannot defend both the path geometry and the profit-realization design, return no_edge.
+- The path must remain a single honest 4H-1D trade path. If you cannot defend both the path geometry and the executable TP placement inside the target zones, return no_edge.
 - map_summary must include location_3d, location_1d, and location_4h.
 
 Path rules:
 - strategic_activation_level, first_target_zone, second_target_zone, and failure_level must each represent real 4H / 1D structure and must align with tracked_zones.
-- first_target_zone and second_target_zone are structural destination zones, not mechanically derived execution prices.
-- realization_plan is required. It must convert the strategic path into executable profit-taking.
-- realization_plan.tp1_price is the first realistic profit realization price, not the far edge of first_target_zone by default.
-- realization_plan.tp1_close_ratio is the portion of size that should be realized at TP1.
-- realization_plan.tp2_price is the runner objective for the remaining size after TP1.
-- realization_plan.after_tp1_stop_policy defines what Stage2B should do with the stop after TP1 is realized.
-- realization_plan.near_tp1_failure_policy defines what Stage2B should do when price approaches TP1 but shows rejection or decay before full realization.
+- first_target_zone and second_target_zone are structural destination zones, and each target zone must include its own executable `tp_price`.
+- first_target_zone.tp_price is the realistic TP1 price for the first target zone. It should usually sit at a believable fillable price inside the zone, not default to the far edge.
+- second_target_zone.tp_price is the realistic TP2 price for the second target zone. It should also sit inside the zone and remain directionally beyond TP1.
 - failure_level means the strategic hard invalidation of the current 4H / 1D path.
 - failure_level.timeframe must be one of 4h, 1d, or 4h-1d.
 

@@ -87,6 +87,47 @@ fn migrate_legacy_stage1_output_fields(value: &mut Value) -> bool {
         } else {
             migrated |= current_path.remove("activation_level").is_some();
         }
+
+        let side = current_path
+            .get("side")
+            .and_then(Value::as_str)
+            .unwrap_or("LONG")
+            .to_string();
+        let legacy_realization_plan = current_path
+            .get("realization_plan")
+            .and_then(Value::as_object)
+            .cloned();
+        let mut ensure_target_tp_price = |zone_field: &str, plan_field: &str, side: &str| -> bool {
+            let Some(zone) = current_path
+                .get_mut(zone_field)
+                .and_then(Value::as_object_mut)
+            else {
+                return false;
+            };
+            if zone.contains_key("tp_price") {
+                return false;
+            }
+            let fallback_from_plan = legacy_realization_plan
+                .as_ref()
+                .and_then(|plan| plan.get(plan_field))
+                .cloned();
+            let fallback_from_zone = zone
+                .get(if side.eq_ignore_ascii_case("SHORT") {
+                    "low"
+                } else {
+                    "high"
+                })
+                .cloned();
+            if let Some(tp_price) = fallback_from_plan.or(fallback_from_zone) {
+                zone.insert("tp_price".to_string(), tp_price);
+                return true;
+            }
+            false
+        };
+        migrated |= ensure_target_tp_price("first_target_zone", "tp1_price", &side);
+        migrated |= ensure_target_tp_price("first_path_target", "tp1_price", &side);
+        migrated |= ensure_target_tp_price("second_target_zone", "tp2_price", &side);
+        migrated |= ensure_target_tp_price("next_path_target", "tp2_price", &side);
     }
 
     migrated

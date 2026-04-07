@@ -17,8 +17,8 @@ pub fn failure_level_breached(stage1_output: &Stage1Output, latest_price: f64) -
 mod tests {
     use super::failure_level_breached;
     use crate::workflow::schema::{
-        CurrentPath, MapSummary, OpportunityAssessment, PriceZone, RealizationPlan,
-        ReevaluationTrigger, Stage1Meta, Stage1Output,
+        CurrentPath, MapSummary, OpportunityAssessment, PriceZone, ReevaluationTrigger, Stage1Meta,
+        Stage1Output, TargetZone,
     };
     use chrono::Utc;
     use serde_json::json;
@@ -55,20 +55,22 @@ mod tests {
                     reason: None,
                 },
                 first_path_target_anchor_id: None,
-                first_path_target: PriceZone {
+                first_path_target: TargetZone {
                     low: 105.0,
                     high: 106.0,
                     timeframe: Some("4h".to_string()),
                     label: None,
                     reason: None,
+                    tp_price: 105.0,
                 },
                 next_path_target_anchor_id: None,
-                next_path_target: PriceZone {
+                next_path_target: TargetZone {
                     low: 110.0,
                     high: 111.0,
                     timeframe: Some("4h".to_string()),
                     label: None,
                     reason: None,
+                    tp_price: 110.0,
                 },
                 failure_anchor_id: None,
                 failure_level: PriceZone {
@@ -78,13 +80,7 @@ mod tests {
                     label: None,
                     reason: None,
                 },
-                realization_plan: RealizationPlan {
-                    tp1_price: 105.0,
-                    tp1_close_ratio: 1.0,
-                    tp2_price: 110.0,
-                    after_tp1_stop_policy: "breakeven".to_string(),
-                    near_tp1_failure_policy: "tighten_stop".to_string(),
-                },
+                realization_plan: None,
                 failure_switch: None,
                 setup_type: "continuation".to_string(),
                 reevaluation_trigger: ReevaluationTrigger::default(),

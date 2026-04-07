@@ -76,6 +76,52 @@ impl PriceZone {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct TargetZone {
+    pub low: f64,
+    pub high: f64,
+    #[serde(default)]
+    pub timeframe: Option<String>,
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+    pub tp_price: f64,
+}
+
+impl TargetZone {
+    pub fn midpoint(&self) -> f64 {
+        (self.low + self.high) / 2.0
+    }
+
+    pub fn leading_edge(&self, side: &str) -> f64 {
+        if side.eq_ignore_ascii_case("SHORT") {
+            self.high
+        } else {
+            self.low
+        }
+    }
+
+    pub fn directional_target(&self, side: &str) -> f64 {
+        if side.eq_ignore_ascii_case("SHORT") {
+            self.low
+        } else {
+            self.high
+        }
+    }
+
+    pub fn as_price_zone(&self) -> PriceZone {
+        PriceZone {
+            low: self.low,
+            high: self.high,
+            timeframe: self.timeframe.clone(),
+            label: self.label.clone(),
+            reason: self.reason.clone(),
+        }
+    }
+}
+
 pub fn derive_max_drift_pct(
     side: &str,
     entry_invalidation_level: &PriceZone,
@@ -313,18 +359,18 @@ pub struct CurrentPath {
     #[serde(default)]
     pub first_path_target_anchor_id: Option<String>,
     #[serde(rename = "first_target_zone", alias = "first_path_target")]
-    pub first_path_target: PriceZone,
+    pub first_path_target: TargetZone,
     #[serde(default)]
     pub next_path_target_anchor_id: Option<String>,
     #[serde(rename = "second_target_zone", alias = "next_path_target")]
-    pub next_path_target: PriceZone,
+    pub next_path_target: TargetZone,
     #[serde(default)]
     pub failure_anchor_id: Option<String>,
     pub failure_level: PriceZone,
     #[serde(default)]
     pub tracked_zones: Vec<TrackedZone>,
-    #[serde(default)]
-    pub realization_plan: RealizationPlan,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub realization_plan: Option<RealizationPlan>,
     #[serde(default = "default_risk_grade")]
     pub risk_grade: String,
     #[serde(default)]

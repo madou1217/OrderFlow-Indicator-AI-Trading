@@ -3490,13 +3490,13 @@ fn execution_intent_from_entry_plan(
 ) -> crate::workflow::schema::ExecutionIntent {
     let take_profit_1 = bracket_override
         .map(|item| item.take_profit_1)
-        .unwrap_or(current_path.realization_plan.tp1_price);
+        .unwrap_or(current_path.first_path_target.tp_price);
     let take_profit_2 = bracket_override
         .map(|item| item.take_profit_2)
-        .unwrap_or(current_path.realization_plan.tp2_price);
+        .unwrap_or(current_path.next_path_target.tp_price);
     let tp1_close_ratio = bracket_override
         .map(|item| item.tp1_close_ratio)
-        .unwrap_or(current_path.realization_plan.tp1_close_ratio);
+        .unwrap_or(crate::workflow::schema::default_tp1_close_ratio());
     let stop_loss = bracket_override
         .map(|item| item.stop_loss)
         .unwrap_or(plan.stop_loss);
@@ -3512,11 +3512,8 @@ fn execution_intent_from_entry_plan(
         take_profit_1,
         take_profit_2,
         tp1_close_ratio,
-        after_tp1_stop_policy: current_path.realization_plan.after_tp1_stop_policy.clone(),
-        near_tp1_failure_policy: current_path
-            .realization_plan
-            .near_tp1_failure_policy
-            .clone(),
+        after_tp1_stop_policy: crate::workflow::schema::default_after_tp1_stop_policy(),
+        near_tp1_failure_policy: crate::workflow::schema::default_near_tp1_failure_policy(),
         ttl_minutes,
         leverage: plan.leverage,
         max_drift_pct: plan.max_drift_pct,
@@ -3554,7 +3551,7 @@ fn build_fallback_entry_snapshot(
         .or_else(|| fallback_plan.map(|plan| plan.stop_loss))?;
     let tp1_close_ratio = bracket_override
         .map(|item| item.tp1_close_ratio)
-        .unwrap_or(current_path.realization_plan.tp1_close_ratio);
+        .unwrap_or(crate::workflow::schema::default_tp1_close_ratio());
     Some(crate::workflow::schema::EntrySnapshot {
         symbol: symbol.to_ascii_uppercase(),
         context_key: context_key.to_string(),
@@ -3572,16 +3569,13 @@ fn build_fallback_entry_snapshot(
         stop_loss,
         take_profit_1: bracket_override
             .map(|item| item.take_profit_1)
-            .unwrap_or(current_path.realization_plan.tp1_price),
+            .unwrap_or(current_path.first_path_target.tp_price),
         take_profit_2: bracket_override
             .map(|item| item.take_profit_2)
-            .unwrap_or(current_path.realization_plan.tp2_price),
+            .unwrap_or(current_path.next_path_target.tp_price),
         tp1_close_ratio,
-        after_tp1_stop_policy: current_path.realization_plan.after_tp1_stop_policy.clone(),
-        near_tp1_failure_policy: current_path
-            .realization_plan
-            .near_tp1_failure_policy
-            .clone(),
+        after_tp1_stop_policy: crate::workflow::schema::default_after_tp1_stop_policy(),
+        near_tp1_failure_policy: crate::workflow::schema::default_near_tp1_failure_policy(),
         allowed_stop_loss_levels: vec![],
         allowed_take_profit_levels: vec![],
         tp1_realized: false,
@@ -4625,13 +4619,14 @@ impl Stage1PathBoundary {
         }
     }
 
-    fn zone<'a>(
-        self,
-        current_path: &'a crate::workflow::schema::CurrentPath,
-    ) -> &'a crate::workflow::schema::PriceZone {
+    fn zone(self, current_path: &crate::workflow::schema::CurrentPath) -> Value {
         match self {
-            Self::FailureLevel => &current_path.failure_level,
-            Self::FirstPathTarget => &current_path.first_path_target,
+            Self::FailureLevel => {
+                serde_json::to_value(&current_path.failure_level).unwrap_or(Value::Null)
+            }
+            Self::FirstPathTarget => {
+                serde_json::to_value(&current_path.first_path_target).unwrap_or(Value::Null)
+            }
         }
     }
 
@@ -7090,8 +7085,8 @@ mod tests {
     use crate::workflow::schema::{
         CurrentPath, EntryPlan, EntrySnapshot, PendingOrderManagementAction,
         PendingOrderManagementPlan, PositionManagementAction, PositionManagementPlan,
-        PriceTriggerCondition, PriceZone, RealizationPlan, ReevaluationTrigger, Stage1Meta,
-        Stage1Output, TacticalEntryPlan,
+        PriceTriggerCondition, PriceZone, ReevaluationTrigger, Stage1Meta, Stage1Output,
+        TacticalEntryPlan, TargetZone,
     };
     use crate::workflow::state::WorkflowState;
     use chrono::Duration as ChronoDuration;
@@ -7126,13 +7121,14 @@ mod tests {
         }
     }
 
-    fn sample_realization_plan(tp1_price: f64, tp2_price: f64) -> RealizationPlan {
-        RealizationPlan {
-            tp1_price,
-            tp1_close_ratio: 1.0,
-            tp2_price,
-            after_tp1_stop_policy: "breakeven".to_string(),
-            near_tp1_failure_policy: "tighten_stop".to_string(),
+    fn sample_target_zone(low: f64, high: f64, timeframe: &str, tp_price: f64) -> TargetZone {
+        TargetZone {
+            low,
+            high,
+            timeframe: Some(timeframe.to_string()),
+            label: None,
+            reason: None,
+            tp_price,
         }
     }
 
@@ -7218,12 +7214,12 @@ mod tests {
                 activation_anchor_id: None,
                 strategic_activation_level: sample_price_zone(100.0, 101.0, "4h"),
                 first_path_target_anchor_id: None,
-                first_path_target: sample_price_zone(104.0, 104.0, "4h"),
+                first_path_target: sample_target_zone(104.0, 104.0, "4h", 104.0),
                 next_path_target_anchor_id: None,
-                next_path_target: sample_price_zone(107.0, 107.0, "1d"),
+                next_path_target: sample_target_zone(107.0, 107.0, "1d", 107.0),
                 failure_anchor_id: None,
                 failure_level: sample_price_zone(98.0, 98.0, "4h"),
-                realization_plan: sample_realization_plan(104.0, 107.0),
+                realization_plan: None,
                 failure_switch: Some("value_return".to_string()),
                 setup_type: "A_continuation".to_string(),
                 reevaluation_trigger: ReevaluationTrigger::default(),
@@ -7610,7 +7606,7 @@ mod tests {
     }
 
     #[test]
-    fn execution_intent_from_entry_plan_uses_stage1_realization_plan_levels() {
+    fn execution_intent_from_entry_plan_uses_stage1_target_zone_tp_prices() {
         let long_path = CurrentPath {
             id: "path_a".to_string(),
             side: "LONG".to_string(),
@@ -7619,12 +7615,12 @@ mod tests {
             activation_anchor_id: None,
             strategic_activation_level: sample_price_zone(100.0, 101.0, "4h"),
             first_path_target_anchor_id: None,
-            first_path_target: sample_price_zone(104.0, 106.0, "4h"),
+            first_path_target: sample_target_zone(104.0, 106.0, "4h", 105.0),
             next_path_target_anchor_id: None,
-            next_path_target: sample_price_zone(109.0, 112.0, "1d"),
+            next_path_target: sample_target_zone(109.0, 112.0, "1d", 110.5),
             failure_anchor_id: None,
             failure_level: sample_price_zone(98.0, 99.0, "4h"),
-            realization_plan: sample_realization_plan(105.0, 110.5),
+            realization_plan: None,
             failure_switch: Some("alt".to_string()),
             setup_type: "A_continuation".to_string(),
             reevaluation_trigger: ReevaluationTrigger::default(),
@@ -7632,7 +7628,8 @@ mod tests {
         };
         let short_path = CurrentPath {
             side: "SHORT".to_string(),
-            realization_plan: sample_realization_plan(97.0, 94.0),
+            first_path_target: sample_target_zone(96.0, 97.0, "4h", 97.0),
+            next_path_target: sample_target_zone(93.0, 95.0, "1d", 94.0),
             ..long_path.clone()
         };
         let long_plan = crate::workflow::schema::EntryPlan {
@@ -8151,10 +8148,10 @@ mod tests {
 
         let mut short_path = long_path.clone();
         short_path.side = "SHORT".to_string();
-        short_path.first_path_target = sample_price_zone(96.0, 97.0, "4h");
+        short_path.first_path_target = sample_target_zone(96.0, 97.0, "4h", 96.2);
 
-        assert!(!first_path_target_hit(&short_path, 96.1));
-        assert!(first_path_target_hit(&short_path, 96.0));
+        assert!(!first_path_target_hit(&short_path, 97.1));
+        assert!(first_path_target_hit(&short_path, 97.0));
     }
 
     #[test]
@@ -9396,20 +9393,22 @@ mod tests {
                     reason: None,
                 },
                 first_path_target_anchor_id: None,
-                first_path_target: crate::workflow::schema::PriceZone {
+                first_path_target: crate::workflow::schema::TargetZone {
                     low: 103.0,
                     high: 104.0,
                     timeframe: None,
                     label: None,
                     reason: None,
+                    tp_price: 103.5,
                 },
                 next_path_target_anchor_id: None,
-                next_path_target: crate::workflow::schema::PriceZone {
+                next_path_target: crate::workflow::schema::TargetZone {
                     low: 105.0,
                     high: 106.0,
                     timeframe: None,
                     label: None,
                     reason: None,
+                    tp_price: 105.0,
                 },
                 failure_anchor_id: None,
                 failure_level: crate::workflow::schema::PriceZone {
@@ -9419,7 +9418,7 @@ mod tests {
                     label: None,
                     reason: None,
                 },
-                realization_plan: sample_realization_plan(103.0, 105.0),
+                realization_plan: None,
                 failure_switch: Some("reevaluate_short".to_string()),
                 setup_type: "continuation".to_string(),
                 reevaluation_trigger: crate::workflow::schema::ReevaluationTrigger::default(),
