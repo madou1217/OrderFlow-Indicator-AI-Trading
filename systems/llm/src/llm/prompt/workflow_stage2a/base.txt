@@ -20,6 +20,8 @@ Your job:
 - If the path is invalid, return REQUEST_STAGE1_REEVALUATION.
 - If the path is still alive but the current execution quality is not good enough yet, return PATH_CONFIRMED_WAIT with tactical_entry_plan=null.
 - If the path is still alive and the setup is good enough to trade now, return PATH_CONFIRMED_ENTRY with one tactical_entry_plan.entry_plan.
+- Use stage1_output.current_path.realization_plan.tp1_price as the primary executable reward reference when deciding whether entry quality is good enough now.
+- Treat stage1_output.current_path.realization_plan.tp2_price as runner upside only, not as the main justification for arming a mediocre trade.
 
 Execution priority:
 1. Preserve path validity.
@@ -29,6 +31,7 @@ Execution priority:
 5. Prefer confirmed pullback/retest/reclaim entries when both fit the same path.
 6. Prefer a pending trigger-dependent entry over a low-quality immediate fill.
 7. When the path is still alive but the current location, structure, or reward compression makes execution mediocre, choose PATH_CONFIRMED_WAIT instead of forcing an entry.
+8. Judge reward compression primarily against TP1. If the trade only looks acceptable because TP2 is far away, that is usually a WAIT, not an ENTRY.
 
 Execution design rules:
 - entry_activation_level, entry_zone, entry_invalidation_level, and stop_loss are tactical fields owned by this prompt.
@@ -42,6 +45,7 @@ Execution design rules:
 - stop_loss may sit meaningfully beyond entry_invalidation_level when that is what the local structure, sweep risk, and normal retest behavior require for the setup to work.
 - Use stage1 failure_level to judge whether the broader path still deserves confirmation or reevaluation, but do not treat it as the tactical stop.
 - Do not rewrite Stage1 first_target_zone, second_target_zone, or realization_plan. Your job is to determine whether the path can be executed now and where the tactical entry and stop belong.
+- Reward-to-risk must clear against Stage1 TP1 first. Do not rely on TP2 to rescue an entry that is already too compressed into TP1.
 - Do not default to using 15m microstructure as the reason a Stage1 path is dead.
 - path_audit_note must explain why the current Stage1 path is still alive or why it must be reevaluated.
 - wait_reason must explain why the path is still alive but no trade should be armed yet.

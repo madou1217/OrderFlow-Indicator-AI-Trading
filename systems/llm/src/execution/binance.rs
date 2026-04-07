@@ -1313,8 +1313,8 @@ pub async fn execute_workflow_execution_intent(
     let position_side = resolve_position_side(exec_config, decision);
     let entry_plan = workflow_entry_plan_from_intent(intent)?;
     let entry_price = entry_plan.requested_entry_price;
-    // When Stage1 plans a partial TP1, Stage2B owns the watcher-managed TP1 reduce.
-    // In that case the exchange-side fallback take-profit sits at TP2 for the runner.
+    // Initial staged exits should always anchor to TP1.
+    // Stage2B can later decide whether the trade deserves extension toward TP2.
     let take_profit = exchange_take_profit_from_intent(intent);
     let stop_loss = intent.stop_loss;
     let book_ticker = fetch_book_ticker(http_client, api_config, symbol).await?;
@@ -2468,11 +2468,7 @@ fn build_trade_blocked_by_current_price_beyond_stop_loss(
 }
 
 fn exchange_take_profit_from_intent(intent: &AdaptedExecutionIntent) -> f64 {
-    if intent.tp1_close_ratio + f64::EPSILON < 1.0 {
-        intent.take_profit_2
-    } else {
-        intent.take_profit_1
-    }
+    intent.take_profit_1
 }
 
 fn compute_execution_rr(
@@ -4319,6 +4315,13 @@ mod tests {
     #[test]
     fn exchange_take_profit_from_intent_starts_at_tp1() {
         let intent = sample_workflow_execution_intent("LONG", "pullback", Some(101.5));
+        assert_eq!(exchange_take_profit_from_intent(&intent), 106.0);
+    }
+
+    #[test]
+    fn exchange_take_profit_from_intent_keeps_tp1_when_tp1_is_partial() {
+        let mut intent = sample_workflow_execution_intent("LONG", "pullback", Some(101.5));
+        intent.tp1_close_ratio = 0.5;
         assert_eq!(exchange_take_profit_from_intent(&intent), 106.0);
     }
 

@@ -559,7 +559,7 @@ fn post_fill_bracket_template_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["take_profit_1", "take_profit_2", "stop_loss"],
+        "required": ["take_profit_1", "take_profit_2", "tp1_close_ratio", "stop_loss"],
         "properties": {
             "take_profit_1": {"type": "number"},
             "take_profit_2": {"type": "number"},
@@ -1256,6 +1256,15 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(variants.contains(&"flat_with_live_entry_orders"));
         assert!(variants.contains(&"in_position_with_live_entry_orders"));
+        let bracket_template_required = schema["properties"]["pending_order_management_plan"]
+            ["properties"]["actions"]["items"]["properties"]["post_fill_bracket_template"]["anyOf"]
+            [0]["required"]
+            .as_array()
+            .expect("post_fill_bracket_template required array")
+            .iter()
+            .filter_map(|value| value.as_str())
+            .collect::<Vec<_>>();
+        assert!(bracket_template_required.contains(&"tp1_close_ratio"));
     }
 
     #[test]

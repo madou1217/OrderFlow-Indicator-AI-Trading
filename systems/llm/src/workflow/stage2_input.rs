@@ -924,6 +924,54 @@ fn build_strategic_context_frozen(
             .unwrap_or(Value::Null),
         "avwap_reference_30d": avwap_reference_for_window(avwap, "30d_lookback"),
         "avwap_reference_7d": avwap_reference_for_window(avwap, "7d_lookback"),
+        "realization_plan_reference": stage1_output
+            .current_path
+            .as_ref()
+            .map(|path| {
+                json!({
+                    "tp1_price": path.realization_plan.tp1_price,
+                    "tp1_close_ratio": path.realization_plan.tp1_close_ratio,
+                    "tp2_price": path.realization_plan.tp2_price,
+                    "primary_execution_target_price": path.realization_plan.tp1_price,
+                    "runner_target_price": path.realization_plan.tp2_price,
+                    "after_tp1_stop_policy": path.realization_plan.after_tp1_stop_policy,
+                    "near_tp1_failure_policy": path.realization_plan.near_tp1_failure_policy,
+                })
+            })
+            .unwrap_or(Value::Null),
+    })
+}
+
+fn build_stage1_target_distance_context(
+    input: &ModelInvocationInput,
+    summary: &StrategicIndicatorSummary,
+    stage1_output: &Stage1Output,
+) -> Value {
+    let Some(path) = stage1_output.current_path.as_ref() else {
+        return Value::Null;
+    };
+
+    let current_price = current_reference_price(input, summary);
+    let directional_distance = |target: f64| match path.side.as_str() {
+        "LONG" => target - current_price,
+        "SHORT" => current_price - target,
+        _ => 0.0,
+    };
+    let target_reached = |target: f64| match path.side.as_str() {
+        "LONG" => current_price >= target,
+        "SHORT" => current_price <= target,
+        _ => false,
+    };
+
+    json!({
+        "current_price": current_price,
+        "tp1_price": path.realization_plan.tp1_price,
+        "tp2_price": path.realization_plan.tp2_price,
+        "tp1_close_ratio": path.realization_plan.tp1_close_ratio,
+        "directional_distance_to_tp1": directional_distance(path.realization_plan.tp1_price),
+        "directional_distance_to_tp2": directional_distance(path.realization_plan.tp2_price),
+        "tp1_already_reached": target_reached(path.realization_plan.tp1_price),
+        "tp2_already_reached": target_reached(path.realization_plan.tp2_price),
     })
 }
 
@@ -950,6 +998,11 @@ fn build_entry_location_context_15m(
         "local_price_location_summary": local_price_location_summary,
         "local_flow_summary": local_flow_summary,
         "chasing_risk_flags": chasing_risk_flags,
+        "stage1_target_distance_context": build_stage1_target_distance_context(
+            input,
+            summary,
+            stage1_output
+        ),
     })
 }
 
@@ -2536,7 +2589,7 @@ mod tests {
             .expect("selected anchors");
         let next_target_anchor = selected_anchors
             .iter()
-            .find(|item| item["anchor_role"] == "next_path_target")
+            .find(|item| item["anchor_role"] == "second_target_zone")
             .expect("next path target anchor");
         assert_eq!(next_target_anchor["mapped_reference_window"], json!("3d"));
         assert_eq!(
@@ -2572,6 +2625,16 @@ mod tests {
             encoded["strategic_context_frozen"]["price_volume_structure_4h"]["1d"]["poc_price"],
             json!(99.0)
         );
+        assert_eq!(
+            encoded["strategic_context_frozen"]["realization_plan_reference"]
+                ["primary_execution_target_price"],
+            json!(106.0)
+        );
+        assert_eq!(
+            encoded["strategic_context_frozen"]["realization_plan_reference"]
+                ["runner_target_price"],
+            json!(109.0)
+        );
         for removed_key in [
             "funding_4h_1d",
             "vpin_4h_1d",
@@ -2598,6 +2661,34 @@ mod tests {
         assert_eq!(
             encoded["entry_location_context_15m"]["local_flow_summary"]["delta_spot_15m"],
             json!(18.0)
+        );
+        assert_eq!(
+            encoded["entry_location_context_15m"]["stage1_target_distance_context"]["tp1_price"],
+            json!(106.0)
+        );
+        assert_eq!(
+            encoded["entry_location_context_15m"]["stage1_target_distance_context"]["tp2_price"],
+            json!(109.0)
+        );
+        let directional_distance_to_tp1 = encoded["entry_location_context_15m"]
+            ["stage1_target_distance_context"]["directional_distance_to_tp1"]
+            .as_f64()
+            .expect("tp1 distance");
+        assert!((directional_distance_to_tp1 + 3.2).abs() < 1e-9);
+        let directional_distance_to_tp2 = encoded["entry_location_context_15m"]
+            ["stage1_target_distance_context"]["directional_distance_to_tp2"]
+            .as_f64()
+            .expect("tp2 distance");
+        assert!((directional_distance_to_tp2 + 0.2).abs() < 1e-9);
+        assert_eq!(
+            encoded["entry_location_context_15m"]["stage1_target_distance_context"]
+                ["tp1_already_reached"],
+            json!(true)
+        );
+        assert_eq!(
+            encoded["entry_location_context_15m"]["stage1_target_distance_context"]
+                ["tp2_already_reached"],
+            json!(true)
         );
         assert_eq!(
             selected_anchors[0]["zone_state"]["acceptance_state"],

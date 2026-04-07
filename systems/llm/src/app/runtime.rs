@@ -6424,17 +6424,16 @@ fn build_execution_trade_signal(
         .map(|report| report.maker_entry_price)
         .or(intent.trigger_price)
         .or(Some(intent.entry_zone.midpoint()));
-    let take_profit_1 = execution_report
-        .map(|report| report.actual_take_profit)
-        .or(Some(intent.take_profit_1));
+    // Trade notifications should reflect the full Stage1/intent TP ladder,
+    // not the exchange-side fallback exit that may be staged underneath it.
+    let take_profit_1 = Some(intent.take_profit_1);
     let take_profit_2 = Some(intent.take_profit_2);
     let stop_loss = execution_report
         .map(|report| report.actual_stop_loss)
         .or(Some(intent.stop_loss));
     let leverage = execution_report.map(|report| report.leverage as f64);
-    let risk_reward_ratio = execution_report
-        .map(|report| report.actual_risk_reward_ratio)
-        .or_else(|| compute_signal_rr(entry_price, stop_loss, take_profit_1));
+    let risk_reward_ratio = compute_signal_rr(entry_price, stop_loss, take_profit_1)
+        .or_else(|| execution_report.map(|report| report.actual_risk_reward_ratio));
 
     TradeSignalNotification {
         ts_bucket,
@@ -9908,7 +9907,7 @@ mod tests {
     }
 
     #[test]
-    fn build_execution_trade_signal_keeps_tp1_tp2_gradient_from_execution_and_intent() {
+    fn build_execution_trade_signal_keeps_full_tp_ladder_from_intent() {
         let ts_bucket = DateTime::parse_from_rfc3339("2026-03-28T05:15:00Z")
             .expect("ts")
             .with_timezone(&Utc);
@@ -9958,9 +9957,9 @@ mod tests {
             position_side: "LONG",
             dry_run: false,
             maker_entry_price: 2131.73,
-            actual_take_profit: 2140.08,
+            actual_take_profit: 2157.99,
             actual_stop_loss: 2128.78,
-            actual_risk_reward_ratio: 2.84,
+            actual_risk_reward_ratio: 8.89,
         };
         let trading_state = sample_flat_trading_state();
 
@@ -9977,7 +9976,8 @@ mod tests {
 
         assert_eq!(signal.take_profit_1, Some(2140.08));
         assert_eq!(signal.take_profit_2, Some(2157.99));
-        assert_eq!(signal.risk_reward_ratio, Some(2.84));
+        let rr = signal.risk_reward_ratio.expect("rr");
+        assert!((rr - 2.830508474576271).abs() < 1e-9);
     }
 
     #[test]
