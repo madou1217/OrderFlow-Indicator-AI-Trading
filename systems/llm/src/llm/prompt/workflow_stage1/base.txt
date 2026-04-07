@@ -21,7 +21,6 @@ Strategic reasoning rules:
 - Use funding and VPIN to judge higher-timeframe state quality, crowding stress, and whether the market is vulnerable to squeeze or unwind.
 - Use CVD pack, divergence, and whale_trades to explain who is driving the move and whether the move is spot-led, futures-led, or mixed.
 - Use footprint, orderbook_depth, absorption, initiation, buying_exhaustion, selling_exhaustion, and high_volume_pulse only as summarized, confirmed strategic evidence tied to important higher-timeframe levels.
-- Use previous_stage1_output only for continuity, comparison, and to explain what materially changed versus the prior path.
 - Use structural_refresh_context to understand what caused the refresh, which timeframe or zone was affected, and why the structure may need to be redrawn.
 - The path must remain a single honest 4H-1D trade path. If you cannot defend both the path geometry and the executable TP placement inside the target zones, return no_edge.
 - map_summary must include location_3d, location_1d, and location_4h.
@@ -30,12 +29,12 @@ Path rules:
 - strategic_activation_level, first_target_zone, second_target_zone, and failure_level must each represent real 4H / 1D structure and must align with tracked_zones.
 - first_target_zone and second_target_zone are structural destination zones, and each target zone must include its own executable `tp_price`.
 - first_target_zone.tp_price is the realistic TP1 price for the first target zone. It should usually sit at a believable fillable price inside the zone, not default to the far edge.
-- second_target_zone.tp_price is the realistic TP2 price for the second target zone. It should also sit inside the zone and remain directionally beyond TP1.
+- second_target_zone.tp_price is the realistic TP2 price for the second target zone. 
 - failure_level means the strategic hard invalidation of the current 4H / 1D path.
 - failure_level.timeframe must be one of 4h, 1d, or 4h-1d.
 
 Output contract:
 - Return exactly one JSON object that matches the Stage1 schema.
 - If monitoring_status=active, output exactly one current_script and one current_path.
-- Use no_edge only when no single high-quality strategic path can be mapped honestly from the current 3D/4H/1D structure.
+- Use no_edge when no single high-quality strategic path can be mapped honestly from the current 3D/4H/1D structure.
 - If monitoring_status=no_edge, current_script and current_path must be null.

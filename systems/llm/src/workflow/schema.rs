@@ -521,8 +521,6 @@ pub struct EntrySnapshot {
 pub struct Stage1PromptInput {
     pub task: String,
     pub strategic_indicator_summary: StrategicIndicatorSummary,
-    #[serde(default)]
-    pub previous_stage1_output: Option<Stage1Output>,
     pub refresh_reason: String,
 }
 

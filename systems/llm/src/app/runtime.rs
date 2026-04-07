@@ -333,6 +333,30 @@ pub async fn run(ctx: AppContext) -> Result<()> {
             "llm startup orphan-exit cleanup failed"
         ),
     }
+    match cleanup_stale_position_management_state_on_startup(
+        &ctx.http_client,
+        &ctx.config.api.binance,
+        &ctx.config.llm.execution,
+        &ctx.config.llm.symbol,
+        &ctx.config.llm.workflow.state_dir,
+    )
+    .await
+    {
+        Ok(result) if !result.removed_context_keys.is_empty() => info!(
+            symbol = %ctx.config.llm.symbol,
+            removed_context_keys = ?result.removed_context_keys,
+            deleted_entry_snapshot_count = result.deleted_entry_snapshot_count,
+            refreshed_active_position_count = result.refreshed_active_position_count,
+            refreshed_open_order_count = result.refreshed_open_order_count,
+            "llm startup stale stage2b management state cleanup completed"
+        ),
+        Ok(_) => {}
+        Err(err) => warn!(
+            symbol = %ctx.config.llm.symbol,
+            error = %err,
+            "llm startup stale stage2b management state cleanup failed"
+        ),
+    }
 
     if ctx.config.llm.purge_queue_on_start {
         let purged = ctx
@@ -2504,6 +2528,44 @@ async fn process_fast_position_management_actions(
             }
             continue;
         };
+        if !has_active_position_for_side(trading_state, &snapshot.side) {
+            append_workflow_journal_event(
+                "workflow_stage2b_management_skipped",
+                symbol,
+                event.event_ts,
+                json!({
+                    "trigger": "watcher_fast_consumer",
+                    "context_key": &action.context_key,
+                    "path_id": &action.path_id,
+                    "action": &action,
+                    "trigger_price": watch_facts.current_price,
+                    "price_source": event.source.as_str(),
+                    "routing_key": &event.routing_key,
+                    "reason": "fast_state_no_live_position_for_snapshot_side",
+                    "side": &snapshot.side,
+                    "active_position_count": trading_state.active_positions.len(),
+                    "open_order_count": trading_state.open_orders.len(),
+                }),
+            );
+            if reconcile_flat_position_management_context(
+                &ctx.http_client,
+                &ctx.config.api.binance,
+                &ctx.config.llm.execution,
+                symbol,
+                state_dir,
+                workflow_state,
+                entry_snapshots,
+                &action.context_key,
+                &action.path_id,
+                "watcher_fast_consumer",
+                event.event_ts,
+            )
+            .await?
+            {
+                state_dirty = true;
+            }
+            continue;
+        }
         info!(
             symbol = %symbol,
             trigger = "watcher_fast_consumer",
@@ -3947,6 +4009,35 @@ async fn reconcile_missing_position_management_snapshot(
     trigger: &str,
     ts_bucket: DateTime<Utc>,
 ) -> Result<bool> {
+    reconcile_flat_position_management_context(
+        http_client,
+        api_config,
+        exec_config,
+        symbol,
+        state_dir,
+        workflow_state,
+        entry_snapshots,
+        context_key,
+        path_id,
+        trigger,
+        ts_bucket,
+    )
+    .await
+}
+
+async fn reconcile_flat_position_management_context(
+    http_client: &Client,
+    api_config: &crate::app::config::BinanceApiConfig,
+    exec_config: &crate::app::config::LlmExecutionConfig,
+    symbol: &str,
+    state_dir: &str,
+    workflow_state: &mut crate::workflow::state::WorkflowState,
+    entry_snapshots: &mut HashMap<String, crate::workflow::schema::EntrySnapshot>,
+    context_key: &str,
+    path_id: &str,
+    trigger: &str,
+    ts_bucket: DateTime<Utc>,
+) -> Result<bool> {
     let Some(side) = workflow_side_from_context_key(context_key) else {
         append_workflow_journal_event(
             "workflow_stage2b_management_skipped",
@@ -3991,7 +4082,7 @@ async fn reconcile_missing_position_management_snapshot(
                 "trigger": trigger,
                 "context_key": context_key,
                 "path_id": path_id,
-                "reason": "snapshot_missing_refresh_still_live",
+                "reason": "position_management_refresh_still_live",
                 "side": side,
                 "refreshed_active_position_count": refreshed_state.active_positions.len(),
                 "refreshed_open_order_count": refreshed_state.open_orders.len(),
@@ -4026,13 +4117,87 @@ async fn reconcile_missing_position_management_snapshot(
             "trigger": trigger,
             "context_key": context_key,
             "path_id": path_id,
-            "reason": "snapshot_missing_refresh_confirmed_flat",
+            "reason": "position_management_refresh_confirmed_flat",
             "side": side,
             "refreshed_active_position_count": refreshed_state.active_positions.len(),
             "refreshed_open_order_count": refreshed_state.open_orders.len(),
         }),
     );
     Ok(true)
+}
+
+#[derive(Debug, Default)]
+struct StartupPositionManagementCleanupResult {
+    removed_context_keys: Vec<String>,
+    deleted_entry_snapshot_count: usize,
+    refreshed_active_position_count: usize,
+    refreshed_open_order_count: usize,
+}
+
+fn stale_position_management_context_keys(
+    workflow_state: &crate::workflow::state::WorkflowState,
+    trading_state: &TradingStateSnapshot,
+) -> Vec<String> {
+    workflow_state
+        .approved_position_management_plans
+        .keys()
+        .filter_map(|context_key| {
+            let side = workflow_side_from_context_key(context_key)?;
+            if has_active_position_for_side(trading_state, side) {
+                None
+            } else {
+                Some(context_key.clone())
+            }
+        })
+        .collect()
+}
+
+async fn cleanup_stale_position_management_state_on_startup(
+    http_client: &Client,
+    api_config: &crate::app::config::BinanceApiConfig,
+    exec_config: &crate::app::config::LlmExecutionConfig,
+    symbol: &str,
+    state_dir: &str,
+) -> Result<StartupPositionManagementCleanupResult> {
+    let mut workflow_state = crate::workflow::persistence::load_workflow_state(state_dir, symbol)?
+        .unwrap_or_else(|| default_workflow_state(symbol));
+    workflow_state.symbol = symbol.to_ascii_uppercase();
+    if workflow_state.approved_position_management_plans.is_empty() {
+        return Ok(StartupPositionManagementCleanupResult::default());
+    }
+
+    let mut entry_snapshots =
+        crate::workflow::persistence::load_entry_snapshots_for_symbol(state_dir, symbol)?
+            .into_iter()
+            .map(|snapshot| (snapshot.context_key.clone(), snapshot))
+            .collect::<HashMap<_, _>>();
+    let trading_state =
+        fetch_symbol_trading_state(http_client, api_config, exec_config, symbol).await?;
+    let stale_context_keys =
+        stale_position_management_context_keys(&workflow_state, &trading_state);
+    let mut result = StartupPositionManagementCleanupResult {
+        refreshed_active_position_count: trading_state.active_positions.len(),
+        refreshed_open_order_count: trading_state.open_orders.len(),
+        ..StartupPositionManagementCleanupResult::default()
+    };
+    if stale_context_keys.is_empty() {
+        return Ok(result);
+    }
+
+    for context_key in stale_context_keys {
+        remove_position_management_plan(&mut workflow_state, &context_key);
+        if entry_snapshots.remove(&context_key).is_some() {
+            crate::workflow::persistence::delete_entry_snapshot(state_dir, symbol, &context_key)?;
+            result.deleted_entry_snapshot_count += 1;
+        }
+        if workflow_state.last_filled_context_key.as_deref() == Some(context_key.as_str()) {
+            workflow_state.last_filled_context_key = None;
+        }
+        result.removed_context_keys.push(context_key);
+    }
+
+    crate::workflow::persistence::save_workflow_state(state_dir, &workflow_state)?;
+    Ok(result)
 }
 
 fn upsert_position_management_plan(
@@ -5253,7 +5418,6 @@ async fn maybe_refresh_stage1(
         crate::workflow::code_layer::build_indicator_summary(input, tracked_zones)?;
     let prompt_input = crate::workflow::stage1::build_stage1_prompt_input(
         indicator_summary,
-        stage1_output.clone(),
         refresh_reason.clone(),
     );
     let prompt_input_value =
