@@ -1566,19 +1566,10 @@ fn stage1_no_edge_retry_due(
     if !retry_minutes.contains(&current_minute) {
         return false;
     }
-    if workflow_state.last_stage1_refresh_reason.as_deref() != Some("scheduled_2h") {
-        return false;
-    }
     let Some(last_source_ts_bucket) = workflow_state.last_stage1_source_ts_bucket else {
         return false;
     };
     if last_source_ts_bucket >= current_ts_bucket {
-        return false;
-    }
-    if last_source_ts_bucket.date_naive() != current_ts_bucket.date_naive()
-        || last_source_ts_bucket.hour() != current_ts_bucket.hour()
-        || last_source_ts_bucket.minute() != 0
-    {
         return false;
     }
     true
@@ -9453,7 +9444,7 @@ mod tests {
     }
 
     #[test]
-    fn workflow_stage1_refresh_reason_does_not_retry_no_edge_after_non_scheduled_refresh() {
+    fn workflow_stage1_refresh_reason_retries_no_edge_after_non_scheduled_refresh() {
         let config = workflow_test_config();
         let symbol = "ETHUSDT_NO_EDGE_NO_RETRY";
         reset_startup_stage1_refresh_for_symbol(symbol);
@@ -9490,9 +9481,10 @@ mod tests {
         stage1_output.current_script = None;
         stage1_output.current_path = None;
 
-        assert!(
+        assert_eq!(
             workflow_stage1_refresh_reason(&config, &bundle, &state, Some(&stage1_output))
-                .is_none()
+                .as_deref(),
+            Some("scheduled_no_edge_retry")
         );
     }
 
