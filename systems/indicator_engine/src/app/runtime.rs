@@ -1023,7 +1023,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                         if confirmed_repair_controller.mark_pending(repair_from_ts) {
                             warn!(
                                 repair_start_ts = %repair_from_ts,
-                                "confirmed late canonical correction queued for rewind + replay repair"
+                                "confirmed late canonical correction queued for state-only rebuild repair"
                             );
                         }
                     }
@@ -1118,7 +1118,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                         warn!(
                             repair_start_ts = %repair_from_ts,
                             latest_confirmed_closed = %latest_confirmed_closed,
-                            "confirmed late canonical correction queued for rewind + replay repair"
+                            "confirmed late canonical correction queued for state-only rebuild repair"
                         );
                     }
                 }
@@ -1158,7 +1158,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                                                 repair_start_ts = %repair_from_ts,
                                                 latest_confirmed_closed = %latest_confirmed_closed,
                                                 reason = "live_gap_repair",
-                                                "confirmed late canonical correction queued for rewind + replay repair"
+                                                "confirmed late canonical correction queued for state-only rebuild repair"
                                             );
                                         }
                                     }
@@ -1273,7 +1273,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                                                 repair_start_ts = %repair_from_ts,
                                                 latest_confirmed_closed = %latest_confirmed_closed,
                                                 reason = "live_tail_reconcile",
-                                                "confirmed late canonical correction queued for rewind + replay repair"
+                                                "confirmed late canonical correction queued for state-only rebuild repair"
                                             );
                                         }
                                     }
@@ -1314,6 +1314,12 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                 }
 
                 if confirmed_repair_controller.pending_from_ts().is_some() {
+                    abort_oi_ratio_patch_task_shared(
+                        &mut oi_ratio_patch_task,
+                        &state_store,
+                        "confirmed_repair_pending",
+                    )
+                    .await;
                     let repaired = maybe_execute_confirmed_repair_replay(
                         &ctx,
                         metrics.clone(),
@@ -1321,6 +1327,8 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                         &state_store,
                         &mut scheduler,
                         &runtime_options,
+                        &snapshot_path,
+                        startup_checkpoint_path.as_deref(),
                         latest_confirmed_closed,
                         &live_prepare_minute_pending,
                         &live_ready_job_pending,
@@ -1527,6 +1535,8 @@ pub async fn run(ctx: AppContext) -> Result<()> {
             &mut state_store,
             &mut scheduler,
             &runtime_options,
+            &snapshot_path,
+            startup_checkpoint_path.as_deref(),
             &mut prepare_ingest_rx,
             &mut ingest_channel_closed,
             &trade_ingest_pending,
@@ -1839,6 +1849,8 @@ async fn shutdown_drain_and_persist(
     state_store: &mut StateStore,
     scheduler: &mut WindowScheduler,
     runtime_options: &IndicatorRuntimeOptions,
+    snapshot_path: &str,
+    startup_checkpoint_path: Option<&str>,
     ingest_rx: &mut mpsc::Receiver<QueuedIngestEvent>,
     ingest_channel_closed: &mut bool,
     trade_ingest_pending: &Arc<AtomicUsize>,
@@ -1899,6 +1911,8 @@ async fn shutdown_drain_and_persist(
                 state_store,
                 scheduler,
                 runtime_options,
+                snapshot_path,
+                startup_checkpoint_path,
                 repair_start_ts,
                 shutdown_closed_minute,
             )
@@ -3714,13 +3728,110 @@ async fn maybe_recover_from_leading_canonical_gap(
     })
 }
 
+async fn rebuild_repair_state_range(
+    ctx: &Arc<AppContext>,
+    state_store: &mut StateStore,
+    from_ts: DateTime<Utc>,
+    to_ts_inclusive: DateTime<Utc>,
+    reason: &'static str,
+) -> Result<usize> {
+    if from_ts > to_ts_inclusive {
+        return Ok(0);
+    }
+
+    let mut rebuilt_minutes = 0usize;
+    let mut rebuilt_since_yield = 0usize;
+    let mut minute = from_ts;
+    while minute <= to_ts_inclusive {
+        let batch_end_ts = replay_heatmap_hydration_batch_end(minute, to_ts_inclusive);
+        hydrate_futures_orderbook_heatmaps_for_range(
+            &ctx.db_pool,
+            &ctx.config.indicator.symbol,
+            state_store,
+            minute,
+            batch_end_ts + ChronoDuration::minutes(1),
+            reason,
+        )
+        .await?;
+
+        let rebuilt_batch = state_store.rebuild_finalized_state_range(minute, batch_end_ts);
+        rebuilt_minutes += rebuilt_batch;
+        rebuilt_since_yield += rebuilt_batch;
+        if rebuilt_since_yield >= STARTUP_BACKFILL_YIELD_EVERY_MINUTES {
+            tokio::task::yield_now().await;
+            rebuilt_since_yield = 0;
+        }
+
+        minute = batch_end_ts + ChronoDuration::minutes(1);
+    }
+
+    Ok(rebuilt_minutes)
+}
+
+async fn save_repair_completed_snapshot(
+    snap: &StateSnapshot,
+    snapshot_path: &str,
+    startup_checkpoint_path: Option<&str>,
+    repair_start_ts: DateTime<Utc>,
+    repair_ready_through_ts: DateTime<Utc>,
+    reason: &'static str,
+) -> Result<()> {
+    if snapshot_path.is_empty() {
+        warn!(
+            reason = reason,
+            repair_start_ts = %repair_start_ts,
+            repair_ready_through_ts = %repair_ready_through_ts,
+            "repair state rebuild completed without a configured runtime snapshot path; repaired state is only durable in memory"
+        );
+        return Ok(());
+    }
+
+    if !snapshot_is_reusable_recovery_seed(snap) {
+        warn!(
+            reason = reason,
+            repair_start_ts = %repair_start_ts,
+            repair_ready_through_ts = %repair_ready_through_ts,
+            last_finalized_ts = %snap.last_finalized_ts,
+            "repair state rebuild completed but snapshot is not yet reusable; skipping immediate save"
+        );
+        return Ok(());
+    }
+
+    save_state_snapshot_and_clear_startup_checkpoint_on_success(
+        snap,
+        snapshot_path,
+        startup_checkpoint_path,
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "save repair-completed runtime snapshot from_ts={repair_start_ts} to_ts={repair_ready_through_ts}"
+        )
+    })?;
+
+    info!(
+        reason = reason,
+        path = %snapshot_path,
+        repair_start_ts = %repair_start_ts,
+        repair_ready_through_ts = %repair_ready_through_ts,
+        last_finalized_ts = %snap.last_finalized_ts,
+        futures_bars = snap.history_futures.len(),
+        spot_bars = snap.history_spot.len(),
+        "repair state rebuild saved runtime snapshot"
+    );
+
+    Ok(())
+}
+
 async fn maybe_execute_confirmed_repair_replay(
     ctx: &Arc<AppContext>,
-    metrics: Arc<AppMetrics>,
+    _metrics: Arc<AppMetrics>,
     dispatcher: &Dispatcher,
     state_store: &Arc<Mutex<StateStore>>,
-    scheduler: &mut WindowScheduler,
-    runtime_options: &IndicatorRuntimeOptions,
+    _scheduler: &mut WindowScheduler,
+    _runtime_options: &IndicatorRuntimeOptions,
+    snapshot_path: &str,
+    startup_checkpoint_path: Option<&str>,
     latest_confirmed_closed: DateTime<Utc>,
     live_prepare_minute_pending: &Arc<AtomicUsize>,
     live_ready_job_pending: &Arc<AtomicUsize>,
@@ -3747,7 +3858,7 @@ async fn maybe_execute_confirmed_repair_replay(
                 live_prepare_pending,
                 live_ready_pending,
                 dirty_ready_pending,
-                "confirmed late canonical correction is waiting for the live pipeline to drain before rewind + replay"
+                "confirmed late canonical correction is waiting for the live pipeline to drain before state rebuild"
             );
         }
         return Ok(false);
@@ -3774,59 +3885,62 @@ async fn maybe_execute_confirmed_repair_replay(
     abort_oi_ratio_patch_task_shared(oi_ratio_patch_task, state_store, "confirmed_repair_replay")
         .await;
 
-    let rewind_target_ts = repair_start_ts - ChronoDuration::minutes(1);
     dispatcher
-        .rewind_persisted_tail(
+        .suppress_repair_bundle_publish_tail(
             &ctx.config.indicator.symbol,
             repair_start_ts,
             &ctx.config.mq.exchanges.ind.name,
         )
         .await?;
 
-    {
+    let (rebuilt_minutes, repair_snapshot) = {
         let mut state_store = state_store.lock().await;
         state_store.rewind_finalized_state_from(repair_start_ts);
         state_store.clear_dirty_recompute_state();
         state_store.clear_oi_ratio_patch_state();
-    }
-
-    scheduler.mark_emitted_through(rewind_target_ts);
-    metrics.set_last_persisted_ts(Some(rewind_target_ts.timestamp_millis()));
-
-    {
-        let mut state_store = state_store.lock().await;
-        process_ready_minutes(
+        let rebuilt_minutes = rebuild_repair_state_range(
             ctx,
-            metrics.clone(),
-            dispatcher,
             &mut state_store,
-            scheduler,
-            runtime_options,
+            repair_start_ts,
             repair_ready_through_ts,
-            DispatchMode::RepairReplay,
-            true,
+            "confirmed live repair state rebuild",
         )
         .await?;
-    }
+        state_store.clear_dirty_recompute_state();
+        state_store.clear_oi_ratio_patch_state();
+        (rebuilt_minutes, state_store.extract_snapshot())
+    };
+
+    save_repair_completed_snapshot(
+        &repair_snapshot,
+        snapshot_path,
+        startup_checkpoint_path,
+        repair_start_ts,
+        repair_ready_through_ts,
+        "confirmed_repair_rebuild",
+    )
+    .await?;
 
     repair_controller.clear();
     info!(
         repair_start_ts = %repair_start_ts,
-        rewind_target_ts = %rewind_target_ts,
         repair_ready_through_ts = %repair_ready_through_ts,
         latest_confirmed_closed = %latest_confirmed_closed,
-        "confirmed late canonical correction repaired via rewind + replay"
+        rebuilt_minutes = rebuilt_minutes,
+        "confirmed late canonical correction repaired via state-only rebuild"
     );
     Ok(true)
 }
 
 async fn maybe_execute_shutdown_confirmed_repair_replay(
     ctx: &Arc<AppContext>,
-    metrics: Arc<AppMetrics>,
+    _metrics: Arc<AppMetrics>,
     dispatcher: &Dispatcher,
     state_store: &mut StateStore,
-    scheduler: &mut WindowScheduler,
-    runtime_options: &IndicatorRuntimeOptions,
+    _scheduler: &mut WindowScheduler,
+    _runtime_options: &IndicatorRuntimeOptions,
+    snapshot_path: &str,
+    startup_checkpoint_path: Option<&str>,
     repair_start_ts: DateTime<Utc>,
     shutdown_closed_minute: DateTime<Utc>,
 ) -> Result<bool> {
@@ -3841,9 +3955,8 @@ async fn maybe_execute_shutdown_confirmed_repair_replay(
         return Ok(false);
     };
 
-    let rewind_target_ts = repair_start_ts - ChronoDuration::minutes(1);
     dispatcher
-        .rewind_persisted_tail(
+        .suppress_repair_bundle_publish_tail(
             &ctx.config.indicator.symbol,
             repair_start_ts,
             &ctx.config.mq.exchanges.ind.name,
@@ -3853,28 +3966,34 @@ async fn maybe_execute_shutdown_confirmed_repair_replay(
     state_store.rewind_finalized_state_from(repair_start_ts);
     state_store.clear_dirty_recompute_state();
     state_store.clear_oi_ratio_patch_state();
-    scheduler.mark_emitted_through(rewind_target_ts);
-    metrics.set_last_persisted_ts(Some(rewind_target_ts.timestamp_millis()));
-
-    process_ready_minutes(
+    let rebuilt_minutes = rebuild_repair_state_range(
         ctx,
-        metrics.clone(),
-        dispatcher,
         state_store,
-        scheduler,
-        runtime_options,
+        repair_start_ts,
         repair_ready_through_ts,
-        DispatchMode::RepairReplay,
-        true,
+        "shutdown confirmed repair state rebuild",
+    )
+    .await?;
+    state_store.clear_dirty_recompute_state();
+    state_store.clear_oi_ratio_patch_state();
+    let repair_snapshot = state_store.extract_snapshot();
+
+    save_repair_completed_snapshot(
+        &repair_snapshot,
+        snapshot_path,
+        startup_checkpoint_path,
+        repair_start_ts,
+        repair_ready_through_ts,
+        "shutdown_confirmed_repair_rebuild",
     )
     .await?;
 
     info!(
         repair_start_ts = %repair_start_ts,
-        rewind_target_ts = %rewind_target_ts,
         repair_ready_through_ts = %repair_ready_through_ts,
         shutdown_closed_minute = %shutdown_closed_minute,
-        "shutdown confirmed late canonical correction repaired via rewind + replay"
+        rebuilt_minutes = rebuilt_minutes,
+        "shutdown confirmed late canonical correction repaired via state-only rebuild"
     );
     Ok(true)
 }
@@ -3915,15 +4034,15 @@ async fn process_ready_minutes(
     // If we publish new live minutes while that suffix is only partially rebuilt, any
     // indicator that reads rolling minute history (for example orderbook_depth/liquidation
     // windows or recent_7d event coverage) can observe a temporary tail gap and emit
-    // false low-coverage snapshots. Drain dirty recompute to completion before releasing
-    // additional ready minutes.
-    let mut dirty_windows_processed = 0usize;
+    // false low-coverage snapshots. Drain dirty state rebuild to completion before
+    // releasing additional ready minutes, but do not rematerialize repaired history.
+    let mut dirty_windows_rebuilt = 0usize;
     loop {
-        if dirty_windows_processed >= DIRTY_RECOMPUTE_WINDOW_BUDGET_PER_TICK {
+        if dirty_windows_rebuilt >= DIRTY_RECOMPUTE_WINDOW_BUDGET_PER_TICK {
             break;
         }
         let remaining_budget =
-            DIRTY_RECOMPUTE_WINDOW_BUDGET_PER_TICK.saturating_sub(dirty_windows_processed);
+            DIRTY_RECOMPUTE_WINDOW_BUDGET_PER_TICK.saturating_sub(dirty_windows_rebuilt);
         if let Some((dirty_from, dirty_to)) = state_store
             .pending_dirty_recompute_batch_range(DIRTY_RECOMPUTE_BATCH_SIZE.min(remaining_budget))
         {
@@ -3937,55 +4056,25 @@ async fn process_ready_minutes(
             )
             .await?;
         }
-        let dirty_batch = state_store
-            .recompute_dirty_finalized_minutes(DIRTY_RECOMPUTE_BATCH_SIZE.min(remaining_budget));
-        if dirty_batch.is_empty() {
+        let rebuilt_batch = state_store
+            .rebuild_dirty_finalized_state(DIRTY_RECOMPUTE_BATCH_SIZE.min(remaining_budget));
+        if rebuilt_batch == 0 {
             break;
         }
-        dirty_windows_processed += dirty_batch.len();
-        for window in dirty_batch {
-            let minute = window.ts_bucket;
-            let snapshots =
-                process_window_bundle(ctx, dispatcher, runtime_options, window, dispatch_mode)
-                    .await?;
-            metrics.inc_exported_window();
-            metrics.set_last_persisted_ts(Some(minute.timestamp_millis()));
-            let (computed, missing) = indicator_coverage(&snapshots);
-            windows_processed += 1;
-            if first_bucket.is_none() {
-                first_bucket = Some(minute);
-            }
-            last_bucket = Some(minute);
-            last_computed = computed;
-            for item in missing {
-                missing_union.insert(item);
-            }
-            if ctx.config.indicator.enable_file_export {
-                if let Err(err) = export_snapshots(
-                    &ctx.config.indicator.export_dir,
-                    minute,
-                    &ctx.config.indicator.symbol,
-                    &snapshots,
-                )
-                .await
-                {
-                    warn!(error = %err, "export indicator snapshot file failed");
-                }
-            }
-        }
+        dirty_windows_rebuilt += rebuilt_batch;
     }
 
     if state_store.has_pending_dirty_recompute() {
         let elapsed_ms = batch_started_at.elapsed().as_millis();
-        if dirty_windows_processed > 0 || elapsed_ms >= PROCESS_READY_MINUTES_WARN_MS {
+        if dirty_windows_rebuilt > 0 || elapsed_ms >= PROCESS_READY_MINUTES_WARN_MS {
             warn!(
                 batch_start_minute = ?batch_start_minute,
                 ready_through_ts = %ready_through_ts,
-                dirty_windows_processed = dirty_windows_processed,
+                dirty_windows_rebuilt = dirty_windows_rebuilt,
                 dirty_budget_per_tick = DIRTY_RECOMPUTE_WINDOW_BUDGET_PER_TICK,
                 planned_ready_minutes = planned_ready_minutes,
                 elapsed_ms = elapsed_ms,
-                "process_ready_minutes yielded early with dirty recompute still pending"
+                "process_ready_minutes yielded early with dirty state rebuild still pending"
             );
         }
         return Ok(());
@@ -4062,7 +4151,7 @@ async fn process_ready_minutes(
                 ts_bucket_to = %last_bucket,
                 processed_windows = windows_processed,
                 planned_ready_minutes = planned_ready_minutes,
-                dirty_windows_processed = dirty_windows_processed,
+                dirty_windows_rebuilt = dirty_windows_rebuilt,
                 oi_ratio_patch_windows_processed = oi_ratio_patch_windows_processed,
                 dirty_pending_at_start = had_dirty_pending_at_start,
                 ready_through_ts = %ready_through_ts,
@@ -4083,7 +4172,7 @@ async fn process_ready_minutes(
                 ts_bucket_to = %last_bucket,
                 processed_windows = windows_processed,
                 planned_ready_minutes = planned_ready_minutes,
-                dirty_windows_processed = dirty_windows_processed,
+                dirty_windows_rebuilt = dirty_windows_rebuilt,
                 oi_ratio_patch_windows_processed = oi_ratio_patch_windows_processed,
                 dirty_pending_at_start = had_dirty_pending_at_start,
                 ready_through_ts = %ready_through_ts,
@@ -4307,14 +4396,6 @@ async fn abort_oi_ratio_patch_task_shared(
         windows_requeued = task.minutes.len(),
         "aborted in-flight oi_ratio patch task and requeued batch"
     );
-}
-
-fn available_ready_job_slots(queue_capacity: usize, ready_job_pending: &Arc<AtomicUsize>) -> usize {
-    queue_capacity.saturating_sub(
-        ready_job_pending
-            .load(Ordering::Acquire)
-            .min(queue_capacity),
-    )
 }
 
 fn available_live_pipeline_slots(
@@ -4814,7 +4895,7 @@ async fn enqueue_live_ready_jobs(
     live_prepare_task_tx: &mpsc::Sender<PrepareMinuteTask>,
     live_prepare_minute_pending: &Arc<AtomicUsize>,
     live_ready_job_pending: &Arc<AtomicUsize>,
-    dirty_ready_job_tx: &mpsc::Sender<ReadyMinuteJob>,
+    _dirty_ready_job_tx: &mpsc::Sender<ReadyMinuteJob>,
     dirty_ready_job_pending: &Arc<AtomicUsize>,
     ready_through_ts: DateTime<Utc>,
     dispatch_mode: DispatchMode,
@@ -4825,7 +4906,7 @@ async fn enqueue_live_ready_jobs(
         .map(|start| (ready_through_ts - start).num_minutes().max(0) as usize + 1)
         .unwrap_or(0);
     let mut live_windows_enqueued = 0usize;
-    let mut dirty_windows_enqueued = 0usize;
+    let mut dirty_windows_rebuilt = 0usize;
     let mut first_bucket: Option<DateTime<Utc>> = None;
     let mut last_bucket: Option<DateTime<Utc>> = None;
 
@@ -4893,18 +4974,12 @@ async fn enqueue_live_ready_jobs(
 
     if allow_dirty_enqueue {
         loop {
-            let available_dirty_slots =
-                available_ready_job_slots(DIRTY_READY_JOB_QUEUE_CAPACITY, dirty_ready_job_pending);
-            if available_dirty_slots == 0
-                || dirty_windows_enqueued >= DIRTY_RECOMPUTE_WINDOW_BUDGET_PER_TICK
-            {
+            if dirty_windows_rebuilt >= DIRTY_RECOMPUTE_WINDOW_BUDGET_PER_TICK {
                 break;
             }
             let remaining_budget =
-                DIRTY_RECOMPUTE_WINDOW_BUDGET_PER_TICK.saturating_sub(dirty_windows_enqueued);
-            let batch_limit = DIRTY_RECOMPUTE_BATCH_SIZE
-                .min(remaining_budget)
-                .min(available_dirty_slots);
+                DIRTY_RECOMPUTE_WINDOW_BUDGET_PER_TICK.saturating_sub(dirty_windows_rebuilt);
+            let batch_limit = DIRTY_RECOMPUTE_BATCH_SIZE.min(remaining_budget);
             let dirty_batch_plan = {
                 let state_store = state_store.lock().await;
                 state_store
@@ -4934,7 +5009,7 @@ async fn enqueue_live_ready_jobs(
             } else {
                 Vec::new()
             };
-            let dirty_batch = {
+            let rebuilt_batch = {
                 let mut state_store = state_store.lock().await;
                 if needs_hydration
                     && state_store
@@ -4948,30 +5023,13 @@ async fn enqueue_live_ready_jobs(
                         "live dirty recompute",
                     )?;
                 }
-                state_store.recompute_dirty_finalized_minutes(batch_limit)
+                state_store.rebuild_dirty_finalized_state(batch_limit)
             };
-            if dirty_batch.is_empty() {
+            if rebuilt_batch == 0 {
                 break;
             }
-            for window in dirty_batch {
-                let minute = window.ts_bucket;
-                let enqueued = try_enqueue_ready_minute_job(
-                    dirty_ready_job_tx,
-                    dirty_ready_job_pending,
-                    ReadyMinuteJob {
-                        ts_bucket: minute,
-                        mode: dispatch_mode,
-                        source: ReadyJobSource::DirtyRecompute,
-                        enqueued_at: Instant::now(),
-                        bundle: window,
-                    },
-                )?;
-                if !enqueued {
-                    break;
-                }
-                dirty_windows_enqueued += 1;
-            }
-            if dirty_windows_enqueued >= DIRTY_RECOMPUTE_WINDOW_BUDGET_PER_TICK {
+            dirty_windows_rebuilt += rebuilt_batch;
+            if dirty_windows_rebuilt >= DIRTY_RECOMPUTE_WINDOW_BUDGET_PER_TICK {
                 break;
             }
         }
@@ -4991,9 +5049,10 @@ async fn enqueue_live_ready_jobs(
                 live_queue_pending = live_queue_pending,
                 live_minutes_still_ready = live_minutes_still_ready,
                 dirty_pending = true,
+                dirty_windows_rebuilt = dirty_windows_rebuilt,
                 dirty_queue_pending = dirty_ready_job_pending.load(Ordering::Acquire),
                 elapsed_ms = elapsed_ms,
-                "deferred dirty recompute enqueue to preserve live priority"
+                "deferred dirty state rebuild to preserve live priority"
             );
         }
     }
@@ -5006,7 +5065,7 @@ async fn enqueue_live_ready_jobs(
             ts_bucket_from = %first_bucket,
             ts_bucket_to = %last_bucket,
             live_windows_enqueued = live_windows_enqueued,
-            dirty_windows_enqueued = dirty_windows_enqueued,
+            dirty_windows_rebuilt = dirty_windows_rebuilt,
             planned_ready_minutes = planned_ready_minutes,
             ready_through_ts = %ready_through_ts,
             live_queue_pending = live_ready_job_pending.load(Ordering::Acquire),

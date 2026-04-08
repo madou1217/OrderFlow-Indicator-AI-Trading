@@ -1808,6 +1808,25 @@ impl StateStore {
         self.finish_finalize_minute_state(ts_bucket);
     }
 
+    pub fn rebuild_finalized_state_range(
+        &mut self,
+        from_ts: DateTime<Utc>,
+        to_ts_inclusive: DateTime<Utc>,
+    ) -> usize {
+        if from_ts > to_ts_inclusive {
+            return 0;
+        }
+
+        let mut rebuilt = 0usize;
+        let mut minute = from_ts;
+        while minute <= to_ts_inclusive {
+            self.advance_finalized_state(minute);
+            rebuilt += 1;
+            minute += Duration::minutes(1);
+        }
+        rebuilt
+    }
+
     fn finish_finalize_minute_state(&mut self, ts_bucket: DateTime<Utc>) {
         self.apply_canonical_funding_minute(ts_bucket);
         self.last_finalized_minute = Some(ts_bucket);
@@ -1817,16 +1836,12 @@ impl StateStore {
         self.refresh_incremental_indicator_outputs(ts_bucket);
     }
 
-    /// Process at most `max_batch` dirty-recompute windows per call, yielding
-    /// control back to the caller between batches.  Call repeatedly (on each
-    /// tick) until an empty Vec is returned, which signals completion.
-    ///
-    /// Splitting into batches lets the async select loop stay responsive to
-    /// SIGTERM / Ctrl-C and to new live events between batches, even when
-    /// hundreds of minutes need recomputing after a canonical-data correction.
-    pub fn recompute_dirty_finalized_minutes(&mut self, max_batch: usize) -> Vec<WindowBundle> {
+    fn take_dirty_recompute_batch_range(
+        &mut self,
+        max_batch: usize,
+    ) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
         let Some(start) = self.dirty_recompute_from else {
-            return Vec::new();
+            return None;
         };
 
         // Lazily capture the target end on the first batch of a new dirty series.
@@ -1835,7 +1850,7 @@ impl StateStore {
                 Some(lf) => self.dirty_recompute_end = Some(lf),
                 None => {
                     self.dirty_recompute_from = None;
-                    return Vec::new();
+                    return None;
                 }
             }
         }
@@ -1845,7 +1860,7 @@ impl StateStore {
             self.dirty_recompute_from = None;
             self.dirty_recompute_end = None;
             self.dirty_recompute_truncated = false;
-            return Vec::new();
+            return None;
         }
 
         // Truncate history suffix once per dirty series (or whenever dirty_from
@@ -1868,6 +1883,21 @@ impl StateStore {
             self.dirty_recompute_from = Some(batch_end + Duration::minutes(1));
         }
 
+        Some((start, batch_end))
+    }
+
+    /// Process at most `max_batch` dirty-recompute windows per call, yielding
+    /// control back to the caller between batches.  Call repeatedly (on each
+    /// tick) until an empty Vec is returned, which signals completion.
+    ///
+    /// Splitting into batches lets the async select loop stay responsive to
+    /// SIGTERM / Ctrl-C and to new live events between batches, even when
+    /// hundreds of minutes need recomputing after a canonical-data correction.
+    pub fn recompute_dirty_finalized_minutes(&mut self, max_batch: usize) -> Vec<WindowBundle> {
+        let Some((start, batch_end)) = self.take_dirty_recompute_batch_range(max_batch) else {
+            return Vec::new();
+        };
+
         let mut out = Vec::new();
         let mut minute = start;
         while minute <= batch_end {
@@ -1875,6 +1905,21 @@ impl StateStore {
             minute += Duration::minutes(1);
         }
         out
+    }
+
+    pub fn rebuild_dirty_finalized_state(&mut self, max_batch: usize) -> usize {
+        let Some((start, batch_end)) = self.take_dirty_recompute_batch_range(max_batch) else {
+            return 0;
+        };
+
+        let mut rebuilt = 0usize;
+        let mut minute = start;
+        while minute <= batch_end {
+            self.advance_finalized_state(minute);
+            rebuilt += 1;
+            minute += Duration::minutes(1);
+        }
+        rebuilt
     }
 
     pub fn has_pending_dirty_recompute(&self) -> bool {
@@ -5055,6 +5100,101 @@ mod tests {
     }
 
     #[test]
+    fn rebuild_finalized_state_range_matches_finalize_minute_side_effects() {
+        let ts_1 = Utc.with_ymd_and_hms(2026, 3, 6, 5, 0, 0).single().unwrap();
+        let ts_2 = ts_1 + ChronoDuration::minutes(1);
+        let mut full_store = StateStore::new("TESTUSDT".to_string(), 1_000.0);
+        let mut state_only_store = StateStore::new("TESTUSDT".to_string(), 1_000.0);
+
+        for store in [&mut full_store, &mut state_only_store] {
+            for ts in [ts_1, ts_2] {
+                store.ingest(agg_trade_event(ts, 1.0, 0.5, 0.2));
+                store.ingest(agg_trade_event_spot(ts, 1.0, 0.5, 0.2));
+                store.ingest(agg_orderbook_event(ts, 4, 4, 0.1));
+                store.ingest(agg_orderbook_event_spot(ts, 4, 4, 0.1));
+                store.ingest(agg_liq_event(ts, 10.0));
+                store.ingest(agg_funding_mark_event(ts, 45, 2000.0, 0.01));
+            }
+        }
+
+        let _ = full_store.finalize_minute(ts_1);
+        let _ = full_store.finalize_minute(ts_2);
+        let rebuilt = state_only_store.rebuild_finalized_state_range(ts_1, ts_2);
+
+        assert_eq!(rebuilt, 2);
+        assert_eq!(
+            state_only_store.last_finalized_minute,
+            full_store.last_finalized_minute
+        );
+        assert_eq!(state_only_store.cvd_futures, full_store.cvd_futures);
+        assert_eq!(state_only_store.cvd_spot, full_store.cvd_spot);
+        assert_eq!(
+            state_only_store.history_futures.len(),
+            full_store.history_futures.len()
+        );
+        assert_eq!(
+            state_only_store.history_spot.len(),
+            full_store.history_spot.len()
+        );
+        assert_eq!(
+            state_only_store.history_futures.back().map(|h| (
+                h.ts_bucket,
+                h.close_price,
+                h.cvd,
+                h.vpin
+            )),
+            full_store
+                .history_futures
+                .back()
+                .map(|h| (h.ts_bucket, h.close_price, h.cvd, h.vpin))
+        );
+        assert_eq!(
+            state_only_store.history_spot.back().map(|h| (
+                h.ts_bucket,
+                h.close_price,
+                h.cvd,
+                h.vpin
+            )),
+            full_store
+                .history_spot
+                .back()
+                .map(|h| (h.ts_bucket, h.close_price, h.cvd, h.vpin))
+        );
+        assert_eq!(
+            state_only_store.finalized_vpin_futures.len(),
+            full_store.finalized_vpin_futures.len()
+        );
+        assert_eq!(
+            state_only_store.finalized_vpin_futures.back().map(|s| (
+                s.ts_bucket,
+                s.snapshot.last_vpin,
+                s.snapshot.imbalances.len()
+            )),
+            full_store.finalized_vpin_futures.back().map(|s| (
+                s.ts_bucket,
+                s.snapshot.last_vpin,
+                s.snapshot.imbalances.len()
+            ))
+        );
+        assert_eq!(
+            state_only_store.finalized_vpin_spot.len(),
+            full_store.finalized_vpin_spot.len()
+        );
+        assert_eq!(
+            state_only_store.finalized_vpin_spot.back().map(|s| (
+                s.ts_bucket,
+                s.snapshot.last_vpin,
+                s.snapshot.imbalances.len()
+            )),
+            full_store.finalized_vpin_spot.back().map(|s| (
+                s.ts_bucket,
+                s.snapshot.last_vpin,
+                s.snapshot.imbalances.len()
+            ))
+        );
+    }
+
+    #[test]
     fn canonical_minute_presence_reports_missing_required_sources() {
         let mut store = StateStore::new("TESTUSDT".to_string(), 1_000.0);
         let ts = Utc.with_ymd_and_hms(2026, 3, 6, 5, 0, 0).single().unwrap();
@@ -5456,6 +5596,37 @@ mod tests {
         let second_batch = store.recompute_dirty_finalized_minutes(1);
         assert_eq!(second_batch.len(), 1);
         assert!(!store.has_pending_dirty_recompute());
+    }
+
+    #[test]
+    fn canonical_trade_correction_rebuilds_finalized_state_without_materializing_windows() {
+        let mut store = StateStore::new("TESTUSDT".to_string(), 1_000.0);
+        let ts_1 = Utc.with_ymd_and_hms(2026, 3, 6, 7, 0, 0).single().unwrap();
+        let ts_2 = ts_1 + ChronoDuration::minutes(1);
+
+        store.ingest(agg_trade_event(ts_1, 2.0, 1.0, 0.20));
+        store.finalize_minute(ts_1);
+        store.ingest(agg_trade_event(ts_2, 1.0, 0.0, 0.30));
+        store.finalize_minute(ts_2);
+
+        store.ingest(agg_trade_event(ts_1, 5.0, 1.0, 0.55));
+        let rebuilt = store.rebuild_dirty_finalized_state(10_000);
+
+        assert_eq!(rebuilt, 2);
+        assert!(!store.has_pending_dirty_recompute());
+        assert_eq!(store.last_finalized_minute(), Some(ts_2));
+        assert_eq!(
+            store.history_futures.back().map(|h| h.ts_bucket),
+            Some(ts_2)
+        );
+        assert_eq!(
+            store.history_futures.front().map(|h| h.total_qty),
+            Some(6.0)
+        );
+        assert_eq!(store.history_futures.front().map(|h| h.cvd), Some(4.0));
+        assert_eq!(store.history_futures.front().map(|h| h.vpin), Some(0.55));
+        assert_eq!(store.history_futures.back().map(|h| h.cvd), Some(5.0));
+        assert_eq!(store.history_futures.back().map(|h| h.vpin), Some(0.30));
     }
 
     #[test]

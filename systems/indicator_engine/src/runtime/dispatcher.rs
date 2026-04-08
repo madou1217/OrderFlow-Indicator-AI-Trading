@@ -459,6 +459,17 @@ impl Dispatcher {
             .await
     }
 
+    pub async fn suppress_repair_bundle_publish_tail(
+        &self,
+        symbol: &str,
+        repair_start_ts: chrono::DateTime<chrono::Utc>,
+        exchange_name: &str,
+    ) -> Result<()> {
+        self.snapshot_writer
+            .suppress_repair_bundle_publish_tail(symbol, repair_start_ts, exchange_name)
+            .await
+    }
+
     pub async fn process_oi_ratio_patch_window(
         &self,
         ctx: Arc<IndicatorContext>,

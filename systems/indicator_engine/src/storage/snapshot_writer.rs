@@ -428,6 +428,57 @@ impl SnapshotWriter {
         Ok(())
     }
 
+    pub async fn suppress_repair_bundle_publish_tail(
+        &self,
+        symbol: &str,
+        repair_start_ts: DateTime<Utc>,
+        exchange_name: &str,
+    ) -> Result<()> {
+        let symbol_upper = symbol.to_uppercase();
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("begin indicator repair publish suppression tx")?;
+
+        sqlx::query(
+            r#"
+            DELETE FROM ops.indicator_bundle_outbox
+            WHERE exchange_name = $1
+              AND COALESCE(NULLIF(upper(symbol), ''), upper(payload_json->>'symbol')) = $2
+              AND COALESCE(
+                    ts_bucket,
+                    NULLIF(payload_json->>'ts_bucket', '')::timestamptz,
+                    NULLIF(payload_json->>'event_ts', '')::timestamptz
+                  ) >= $3
+            "#,
+        )
+        .bind(exchange_name)
+        .bind(&symbol_upper)
+        .bind(repair_start_ts)
+        .execute(&mut *tx)
+        .await
+        .context("delete indicator bundle outbox tail for repair publish suppression")?;
+
+        sqlx::query(
+            r#"
+            DELETE FROM ops.indicator_bundle_payload_cache
+            WHERE symbol = $1
+              AND ts_bucket >= $2
+            "#,
+        )
+        .bind(&symbol_upper)
+        .bind(repair_start_ts)
+        .execute(&mut *tx)
+        .await
+        .context("delete indicator bundle payload cache tail for repair publish suppression")?;
+
+        tx.commit()
+            .await
+            .context("commit indicator repair publish suppression tx")?;
+        Ok(())
+    }
+
     pub async fn rewind_persisted_tail(
         &self,
         symbol: &str,
