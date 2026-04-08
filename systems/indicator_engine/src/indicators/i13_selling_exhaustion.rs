@@ -4,6 +4,7 @@ use crate::indicators::i12_buying_exhaustion::{
 };
 use crate::indicators::indicator_trait::Indicator;
 use crate::indicators::shared::event_views::{build_event_window_view, build_recent_7d_payload};
+use chrono::Duration;
 use serde_json::json;
 
 pub struct I13SellingExhaustion;
@@ -43,7 +44,13 @@ impl Indicator for I13SellingExhaustion {
             ..Default::default()
         };
 
-        append_exhaustion_rows(&mut out, &ctx.symbol, self.code(), &all_events);
+        let current_available_ts = ctx.ts_bucket + Duration::minutes(1);
+        let current_events = all_events
+            .iter()
+            .filter(|event| event.confirm_ts == current_available_ts)
+            .cloned()
+            .collect::<Vec<_>>();
+        append_exhaustion_rows(&mut out, &ctx.symbol, self.code(), &current_events);
 
         out
     }

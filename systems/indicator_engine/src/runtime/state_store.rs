@@ -3471,6 +3471,10 @@ impl StateStore {
     pub fn extract_snapshot(&self) -> StateSnapshot {
         let last_finalized_ts = self
             .last_finalized_minute
+            .or_else(|| {
+                self.latest_continuous_canonical_segment()
+                    .map(|(_, end)| end)
+            })
             .unwrap_or_else(|| Utc::now() - chrono::Duration::minutes(1));
         StateSnapshot {
             version: STATE_SNAPSHOT_VERSION,
@@ -3860,6 +3864,34 @@ fn classify_term_structure_state(front_iv: Option<f64>, second_iv: Option<f64>) 
 }
 
 pub const STATE_SNAPSHOT_VERSION: u32 = 5;
+
+pub fn snapshot_canonical_minutes_cover_range(
+    snap: &StateSnapshot,
+    from_ts: DateTime<Utc>,
+    to_ts: DateTime<Utc>,
+) -> bool {
+    if from_ts > to_ts {
+        return false;
+    }
+
+    let by_minute = snap
+        .canonical_minutes
+        .iter()
+        .map(|minute| (minute.ts_bucket.timestamp(), &minute.inputs))
+        .collect::<BTreeMap<_, _>>();
+    let mut minute = from_ts;
+    while minute <= to_ts {
+        let Some(inputs) = by_minute.get(&minute.timestamp()) else {
+            return false;
+        };
+        if !canonical_minute_is_complete(inputs) {
+            return false;
+        }
+        minute += Duration::minutes(1);
+    }
+
+    true
+}
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct OptionGreeksBucketSnapshot {
