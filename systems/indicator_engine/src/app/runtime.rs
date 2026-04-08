@@ -1891,6 +1891,23 @@ async fn shutdown_drain_and_persist(
         );
         total_drained += drain_result.drained_count;
 
+        if let Some(repair_start_ts) = drain_result.confirmed_repair_from_ts {
+            let repaired = maybe_execute_shutdown_confirmed_repair_replay(
+                ctx,
+                metrics.clone(),
+                dispatcher,
+                state_store,
+                scheduler,
+                runtime_options,
+                repair_start_ts,
+                shutdown_closed_minute,
+            )
+            .await?;
+            if repaired {
+                continue;
+            }
+        }
+
         let ready_through_ts = shutdown_ready_through_candidate(
             scheduler.next_minute_to_emit(),
             shutdown_closed_minute,
@@ -3799,6 +3816,65 @@ async fn maybe_execute_confirmed_repair_replay(
         repair_ready_through_ts = %repair_ready_through_ts,
         latest_confirmed_closed = %latest_confirmed_closed,
         "confirmed late canonical correction repaired via rewind + replay"
+    );
+    Ok(true)
+}
+
+async fn maybe_execute_shutdown_confirmed_repair_replay(
+    ctx: &Arc<AppContext>,
+    metrics: Arc<AppMetrics>,
+    dispatcher: &Dispatcher,
+    state_store: &mut StateStore,
+    scheduler: &mut WindowScheduler,
+    runtime_options: &IndicatorRuntimeOptions,
+    repair_start_ts: DateTime<Utc>,
+    shutdown_closed_minute: DateTime<Utc>,
+) -> Result<bool> {
+    let repair_ready_through_ts = state_store
+        .latest_contiguous_complete_canonical_minute_from(repair_start_ts, shutdown_closed_minute);
+    let Some(repair_ready_through_ts) = repair_ready_through_ts else {
+        info!(
+            repair_start_ts = %repair_start_ts,
+            shutdown_closed_minute = %shutdown_closed_minute,
+            "shutdown confirmed repair is waiting for a contiguous confirmed replay window"
+        );
+        return Ok(false);
+    };
+
+    let rewind_target_ts = repair_start_ts - ChronoDuration::minutes(1);
+    dispatcher
+        .rewind_persisted_tail(
+            &ctx.config.indicator.symbol,
+            repair_start_ts,
+            &ctx.config.mq.exchanges.ind.name,
+        )
+        .await?;
+
+    state_store.rewind_finalized_state_from(repair_start_ts);
+    state_store.clear_dirty_recompute_state();
+    state_store.clear_oi_ratio_patch_state();
+    scheduler.mark_emitted_through(rewind_target_ts);
+    metrics.set_last_persisted_ts(Some(rewind_target_ts.timestamp_millis()));
+
+    process_ready_minutes(
+        ctx,
+        metrics.clone(),
+        dispatcher,
+        state_store,
+        scheduler,
+        runtime_options,
+        repair_ready_through_ts,
+        DispatchMode::RepairReplay,
+        true,
+    )
+    .await?;
+
+    info!(
+        repair_start_ts = %repair_start_ts,
+        rewind_target_ts = %rewind_target_ts,
+        repair_ready_through_ts = %repair_ready_through_ts,
+        shutdown_closed_minute = %shutdown_closed_minute,
+        "shutdown confirmed late canonical correction repaired via rewind + replay"
     );
     Ok(true)
 }
