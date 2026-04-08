@@ -325,7 +325,10 @@ impl SnapshotWriter {
             .context("begin indicator progress+outbox tx")?;
         let begin_ms = begin_started_at.elapsed().as_millis();
         let enqueue_started_at = Instant::now();
-        enqueue_outbox_batch_in_tx(&mut tx, messages).await?;
+        // Live minute bundles remain reconstructible from feat.indicator_snapshot,
+        // so we can skip the extra payload-cache blob write on the hot path and
+        // let the outbox dispatcher rebuild on cache miss.
+        enqueue_outbox_batch_in_tx(&mut tx, messages, false).await?;
         let enqueue_ms = enqueue_started_at.elapsed().as_millis();
         let progress_started_at = Instant::now();
         upsert_indicator_progress(&mut tx, symbol, ts_bucket).await?;
@@ -361,7 +364,7 @@ impl SnapshotWriter {
             .begin()
             .await
             .context("begin indicator repair outbox tx")?;
-        enqueue_outbox_batch_in_tx(&mut tx, messages).await?;
+        enqueue_outbox_batch_in_tx(&mut tx, messages, true).await?;
         tx.commit()
             .await
             .context("commit indicator repair outbox tx")?;
@@ -631,58 +634,61 @@ impl SnapshotWriter {
 async fn enqueue_outbox_batch_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     messages: &[BundleOutboxMessage],
+    write_payload_cache: bool,
 ) -> Result<()> {
     if messages.is_empty() {
         return Ok(());
     }
 
-    let published_at = Utc::now();
-    let payload_bytes = messages
-        .iter()
-        .map(|message| message.payload_bytes_with_published_at(published_at))
-        .collect::<Result<Vec<_>>>()?;
+    if write_payload_cache {
+        let published_at = Utc::now();
+        let payload_bytes = messages
+            .iter()
+            .map(|message| message.payload_bytes_with_published_at(published_at))
+            .collect::<Result<Vec<_>>>()?;
 
-    let mut payload_builder = QueryBuilder::<Postgres>::new(
-        r#"
-        INSERT INTO ops.indicator_bundle_payload_cache (
-            symbol, ts_bucket, schema_version, indicator_count, payload_encoding, payload_bytes
-        )
-        "#,
-    );
-
-    payload_builder.push_values(
-        messages.iter().zip(payload_bytes.iter()),
-        |mut b, (message, payload_bytes)| {
-            b.push_bind(&message.symbol)
-                .push_bind(message.ts_bucket)
-                .push_bind(message.schema_version)
-                .push_bind(message.indicator_count)
-                .push_bind(&message.payload_encoding)
-                .push_bind(payload_bytes);
-        },
-    );
-
-    payload_builder.push(
-        r#"
-        ON CONFLICT (symbol, ts_bucket)
-        DO UPDATE SET
-            schema_version = EXCLUDED.schema_version,
-            indicator_count = EXCLUDED.indicator_count,
-            payload_encoding = EXCLUDED.payload_encoding,
-            payload_bytes = EXCLUDED.payload_bytes,
-            created_at = now()
-        "#,
-    );
-    payload_builder
-        .build()
-        .execute(tx.as_mut())
-        .await
-        .with_context(|| {
-            format!(
-                "upsert indicator bundle payload cache count={}",
-                messages.len()
+        let mut payload_builder = QueryBuilder::<Postgres>::new(
+            r#"
+            INSERT INTO ops.indicator_bundle_payload_cache (
+                symbol, ts_bucket, schema_version, indicator_count, payload_encoding, payload_bytes
             )
-        })?;
+            "#,
+        );
+
+        payload_builder.push_values(
+            messages.iter().zip(payload_bytes.iter()),
+            |mut b, (message, payload_bytes)| {
+                b.push_bind(&message.symbol)
+                    .push_bind(message.ts_bucket)
+                    .push_bind(message.schema_version)
+                    .push_bind(message.indicator_count)
+                    .push_bind(&message.payload_encoding)
+                    .push_bind(payload_bytes);
+            },
+        );
+
+        payload_builder.push(
+            r#"
+            ON CONFLICT (symbol, ts_bucket)
+            DO UPDATE SET
+                schema_version = EXCLUDED.schema_version,
+                indicator_count = EXCLUDED.indicator_count,
+                payload_encoding = EXCLUDED.payload_encoding,
+                payload_bytes = EXCLUDED.payload_bytes,
+                created_at = now()
+            "#,
+        );
+        payload_builder
+            .build()
+            .execute(tx.as_mut())
+            .await
+            .with_context(|| {
+                format!(
+                    "upsert indicator bundle payload cache count={}",
+                    messages.len()
+                )
+            })?;
+    }
 
     let mut builder = QueryBuilder::<Postgres>::new(
         r#"
