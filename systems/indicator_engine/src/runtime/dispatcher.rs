@@ -25,6 +25,7 @@ pub enum DispatchMode {
     WarmStateOnly,
     ReplayMaterialize,
     Live,
+    RepairReplay,
     ShutdownFlush,
 }
 
@@ -34,11 +35,11 @@ impl DispatchMode {
     }
 
     fn persist_snapshots(self) -> bool {
-        matches!(self, Self::Live | Self::ShutdownFlush)
+        matches!(self, Self::Live | Self::RepairReplay | Self::ShutdownFlush)
     }
 
     fn publish_outputs(self) -> bool {
-        matches!(self, Self::Live | Self::ShutdownFlush)
+        matches!(self, Self::Live | Self::RepairReplay | Self::ShutdownFlush)
     }
 }
 
@@ -324,49 +325,68 @@ impl Dispatcher {
                 .write_liquidation_levels(ctx.ts_bucket, &ctx.symbol, &liq_rows)
                 .await?;
             let level_write_ms = level_started_at.elapsed().as_millis();
-            let event_history_start_ts = event_history_start_ts(&ctx);
             let event_history_end_ts = ctx.ts_bucket + chrono::Duration::minutes(1);
             let event_started_at = Instant::now();
-            self.event_writer
-                .write_indicator_events(
-                    &ctx.symbol,
-                    event_history_start_ts,
-                    event_history_end_ts,
-                    &events,
-                )
-                .await?;
-            self.event_writer
-                .write_divergence_events(
-                    &ctx.symbol,
-                    event_history_start_ts,
-                    event_history_end_ts,
-                    &divergence_rows,
-                )
-                .await?;
-            self.event_writer
-                .write_absorption_events(
-                    &ctx.symbol,
-                    event_history_start_ts,
-                    event_history_end_ts,
-                    &absorption_rows,
-                )
-                .await?;
-            self.event_writer
-                .write_initiation_events(
-                    &ctx.symbol,
-                    event_history_start_ts,
-                    event_history_end_ts,
-                    &initiation_rows,
-                )
-                .await?;
-            self.event_writer
-                .write_exhaustion_events(
-                    &ctx.symbol,
-                    event_history_start_ts,
-                    event_history_end_ts,
-                    &exhaustion_rows,
-                )
-                .await?;
+            if let Err(err) = self
+                .event_writer
+                .write_indicator_events(&ctx.symbol, event_history_end_ts, &events)
+                .await
+            {
+                warn!(
+                    error = %err,
+                    ts_bucket = %ctx.ts_bucket,
+                    symbol = %ctx.symbol,
+                    "indicator event projection failed; continuing without blocking persisted frontier"
+                );
+            }
+            if let Err(err) = self
+                .event_writer
+                .write_divergence_events(&ctx.symbol, event_history_end_ts, &divergence_rows)
+                .await
+            {
+                warn!(
+                    error = %err,
+                    ts_bucket = %ctx.ts_bucket,
+                    symbol = %ctx.symbol,
+                    "divergence event projection failed; continuing without blocking persisted frontier"
+                );
+            }
+            if let Err(err) = self
+                .event_writer
+                .write_absorption_events(&ctx.symbol, event_history_end_ts, &absorption_rows)
+                .await
+            {
+                warn!(
+                    error = %err,
+                    ts_bucket = %ctx.ts_bucket,
+                    symbol = %ctx.symbol,
+                    "absorption event projection failed; continuing without blocking persisted frontier"
+                );
+            }
+            if let Err(err) = self
+                .event_writer
+                .write_initiation_events(&ctx.symbol, event_history_end_ts, &initiation_rows)
+                .await
+            {
+                warn!(
+                    error = %err,
+                    ts_bucket = %ctx.ts_bucket,
+                    symbol = %ctx.symbol,
+                    "initiation event projection failed; continuing without blocking persisted frontier"
+                );
+            }
+            if let Err(err) = self
+                .event_writer
+                .write_exhaustion_events(&ctx.symbol, event_history_end_ts, &exhaustion_rows)
+                .await
+            {
+                warn!(
+                    error = %err,
+                    ts_bucket = %ctx.ts_bucket,
+                    symbol = %ctx.symbol,
+                    "exhaustion event projection failed; continuing without blocking persisted frontier"
+                );
+            }
             let event_write_ms = event_started_at.elapsed().as_millis();
             let feature_started_at = Instant::now();
             self.feature_writer.write_all(&ctx).await?;
@@ -515,15 +535,6 @@ fn spawn_group_worker(
     tokio::task::spawn_blocking(move || evaluate_indicator_group(indicators, ctx.as_ref()))
 }
 
-fn event_history_start_ts(ctx: &IndicatorContext) -> chrono::DateTime<chrono::Utc> {
-    match (ctx.history_futures.first(), ctx.history_spot.first()) {
-        (Some(fut), Some(spot)) => fut.ts_bucket.max(spot.ts_bucket),
-        (Some(fut), None) => fut.ts_bucket,
-        (None, Some(spot)) => spot.ts_bucket,
-        (None, None) => ctx.ts_bucket,
-    }
-}
-
 async fn join_group(group_name: &str, handle: JoinHandle<GroupOutput>) -> Result<GroupOutput> {
     handle
         .await
@@ -629,6 +640,13 @@ mod tests {
         assert!(DispatchMode::ShutdownFlush.persist_outputs());
         assert!(DispatchMode::ShutdownFlush.persist_snapshots());
         assert!(DispatchMode::ShutdownFlush.publish_outputs());
+    }
+
+    #[test]
+    fn repair_replay_still_persists_and_publishes_outputs() {
+        assert!(DispatchMode::RepairReplay.persist_outputs());
+        assert!(DispatchMode::RepairReplay.persist_snapshots());
+        assert!(DispatchMode::RepairReplay.publish_outputs());
     }
 
     #[test]

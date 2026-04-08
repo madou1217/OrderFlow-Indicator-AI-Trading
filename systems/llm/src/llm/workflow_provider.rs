@@ -293,6 +293,12 @@ fn driver_attribution_schema() -> Value {
 }
 
 fn target_zone_schema() -> Value {
+    let timeframes = vec![
+        Value::String("4h".to_string()),
+        Value::String("1d".to_string()),
+        Value::String("4h-1d".to_string()),
+        Value::Null,
+    ];
     json!({
         "type": "object",
         "additionalProperties": false,
@@ -300,12 +306,14 @@ fn target_zone_schema() -> Value {
             "low",
             "high",
             "timeframe",
+            "label",
+            "reason",
             "tp_price"
         ],
         "properties": {
             "low": {"type": "number"},
             "high": {"type": "number"},
-            "timeframe": {"type": "string", "enum": ["4h", "1d", "4h-1d"]},
+            "timeframe": {"type": ["string", "null"], "enum": timeframes},
             "label": {"type": ["string", "null"]},
             "reason": {"type": ["string", "null"]},
             "tp_price": {"type": "number"},

@@ -457,7 +457,13 @@ impl Indicator for I06Absorption {
             ..Default::default()
         };
 
-        append_absorption_rows(&mut out, &ctx.symbol, self.code(), all_events.as_slice());
+        let current_events = detect_absorption_events(ctx);
+        append_absorption_rows(
+            &mut out,
+            &ctx.symbol,
+            self.code(),
+            current_events.as_slice(),
+        );
 
         out
     }

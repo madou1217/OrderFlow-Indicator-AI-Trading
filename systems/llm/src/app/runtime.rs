@@ -227,6 +227,8 @@ struct FastWatcherPlanState {
     last_event_ts: Option<DateTime<Utc>>,
     activation_seen_at: Option<DateTime<Utc>>,
     advanced_beyond_entry_after_activation: bool,
+    pullback_touch_seen_at: Option<DateTime<Utc>>,
+    pullback_reclaim_started_at: Option<DateTime<Utc>>,
     breakout_started_at: Option<DateTime<Utc>>,
     breakout_extreme_price: Option<f64>,
     invalidation_probe_seen_at: Option<DateTime<Utc>>,
@@ -331,6 +333,30 @@ pub async fn run(ctx: AppContext) -> Result<()> {
             symbol = %ctx.config.llm.symbol,
             error = %err,
             "llm startup orphan-exit cleanup failed"
+        ),
+    }
+    match cleanup_stale_position_management_state_on_startup(
+        &ctx.http_client,
+        &ctx.config.api.binance,
+        &ctx.config.llm.execution,
+        &ctx.config.llm.symbol,
+        &ctx.config.llm.workflow.state_dir,
+    )
+    .await
+    {
+        Ok(result) if !result.removed_context_keys.is_empty() => info!(
+            symbol = %ctx.config.llm.symbol,
+            removed_context_keys = ?result.removed_context_keys,
+            deleted_entry_snapshot_count = result.deleted_entry_snapshot_count,
+            refreshed_active_position_count = result.refreshed_active_position_count,
+            refreshed_open_order_count = result.refreshed_open_order_count,
+            "llm startup stale stage2b management state cleanup completed"
+        ),
+        Ok(_) => {}
+        Err(err) => warn!(
+            symbol = %ctx.config.llm.symbol,
+            error = %err,
+            "llm startup stale stage2b management state cleanup failed"
         ),
     }
 
@@ -1403,6 +1429,34 @@ fn build_persist_only_input(bundle: &LatestBundle) -> ModelInvocationInput {
     }
 }
 
+fn select_stage2a_context_bundle(
+    current_bundle: &LatestBundle,
+    latest_persisted_bundle: Option<LatestBundle>,
+) -> LatestBundle {
+    match latest_persisted_bundle {
+        Some(latest) if latest.raw.ts_bucket > current_bundle.raw.ts_bucket => latest,
+        _ => current_bundle.clone(),
+    }
+}
+
+async fn build_latest_stage2a_model_input(
+    pool: &PgPool,
+    symbol: &str,
+    current_bundle: &LatestBundle,
+    trading_state: &TradingStateSnapshot,
+    entry_snapshots: &HashMap<String, crate::workflow::schema::EntrySnapshot>,
+) -> Result<(LatestBundle, ModelInvocationInput)> {
+    let latest_persisted_bundle = load_persisted_latest_bundle_for_symbol(symbol)?;
+    let stage2a_context_bundle =
+        select_stage2a_context_bundle(current_bundle, latest_persisted_bundle);
+    let mut stage2a_input = build_persist_only_input(&stage2a_context_bundle);
+    patch_input_kline_history_from_db(pool, &mut stage2a_input, "stage2a:latest_context").await?;
+    stage2a_input.trading_state = Some(trading_state.clone());
+    stage2a_input.management_snapshot =
+        build_workflow_management_snapshot(trading_state, symbol, entry_snapshots);
+    Ok((stage2a_context_bundle, stage2a_input))
+}
+
 fn queue_latest_bundle_invoke(
     ctx: &AppContext,
     latest_bundle: &Option<LatestBundle>,
@@ -1514,19 +1568,10 @@ fn stage1_no_edge_retry_due(
     if !retry_minutes.contains(&current_minute) {
         return false;
     }
-    if workflow_state.last_stage1_refresh_reason.as_deref() != Some("scheduled_2h") {
-        return false;
-    }
     let Some(last_source_ts_bucket) = workflow_state.last_stage1_source_ts_bucket else {
         return false;
     };
     if last_source_ts_bucket >= current_ts_bucket {
-        return false;
-    }
-    if last_source_ts_bucket.date_naive() != current_ts_bucket.date_naive()
-        || last_source_ts_bucket.hour() != current_ts_bucket.hour()
-        || last_source_ts_bucket.minute() != 0
-    {
         return false;
     }
     true
@@ -1939,6 +1984,54 @@ fn pullback_dispatch_price_ok(plan: &crate::workflow::schema::EntryPlan, price: 
     }
 }
 
+fn pullback_overshoot_exceeded(
+    plan: &crate::workflow::schema::EntryPlan,
+    price: f64,
+    watcher_cfg: &crate::app::config::WorkflowWatcherConfig,
+) -> bool {
+    let max_overshoot_ratio = watcher_cfg
+        .price_predicates
+        .pullback_acceptance_confirmed
+        .max_overshoot_bps
+        / 10_000.0;
+    match plan.side.as_str() {
+        "LONG" => price < plan.entry_zone.low * (1.0 - max_overshoot_ratio),
+        "SHORT" => price > plan.entry_zone.high * (1.0 + max_overshoot_ratio),
+        _ => false,
+    }
+}
+
+fn pullback_touch_detected(
+    plan: &crate::workflow::schema::EntryPlan,
+    price: f64,
+    watcher_cfg: &crate::app::config::WorkflowWatcherConfig,
+) -> bool {
+    let pullback_cfg = &watcher_cfg.price_predicates.pullback_acceptance_confirmed;
+    let activation_zone = activation_or_entry_zone(plan);
+    let max_overshoot_ratio = pullback_cfg.max_overshoot_bps / 10_000.0;
+    match plan.side.as_str() {
+        "LONG" => {
+            let touch_floor = plan.entry_zone.low * (1.0 - max_overshoot_ratio);
+            let touch_ceiling = if pullback_cfg.require_touch_entry_zone {
+                plan.entry_zone.high
+            } else {
+                activation_zone.high.max(plan.entry_zone.high)
+            };
+            price >= touch_floor && price <= touch_ceiling
+        }
+        "SHORT" => {
+            let touch_ceiling = plan.entry_zone.high * (1.0 + max_overshoot_ratio);
+            let touch_floor = if pullback_cfg.require_touch_entry_zone {
+                plan.entry_zone.low
+            } else {
+                activation_zone.low.min(plan.entry_zone.low)
+            };
+            price >= touch_floor && price <= touch_ceiling
+        }
+        _ => false,
+    }
+}
+
 fn inside_or_beyond_activation(plan: &crate::workflow::schema::EntryPlan, price: f64) -> bool {
     let activation_zone = activation_or_entry_zone(plan);
     activation_zone.contains(price) || favorable_beyond_zone(&plan.side, price, activation_zone)
@@ -2030,7 +2123,47 @@ fn fast_watcher_entry_ready(
             if state.activation_seen_at.is_some() && breakout_crossed(plan, event.price) {
                 state.advanced_beyond_entry_after_activation = true;
             }
-            state.activation_seen_at.is_some() && pullback_dispatch_price_ok(plan, event.price)
+            if pullback_overshoot_exceeded(plan, event.price, watcher_cfg) {
+                state.advanced_beyond_entry_after_activation = false;
+                state.pullback_touch_seen_at = None;
+                state.pullback_reclaim_started_at = None;
+                return false;
+            }
+            if !state.advanced_beyond_entry_after_activation {
+                return false;
+            }
+            if pullback_touch_detected(plan, event.price, watcher_cfg) {
+                if state.pullback_touch_seen_at.is_none() {
+                    state.pullback_touch_seen_at = Some(event.event_ts);
+                    state.pullback_reclaim_started_at = None;
+                    return false;
+                }
+            }
+            let Some(touch_seen_at) = state.pullback_touch_seen_at else {
+                return false;
+            };
+            if event.event_ts <= touch_seen_at {
+                return false;
+            }
+            if !inside_or_beyond_activation(plan, event.price) {
+                state.pullback_reclaim_started_at = None;
+                return false;
+            }
+            let reclaim_started_at = *state
+                .pullback_reclaim_started_at
+                .get_or_insert(event.event_ts);
+            let reclaim_ms = fast_confirm_duration_ms(
+                watcher_cfg
+                    .price_predicates
+                    .pullback_acceptance_confirmed
+                    .confirm_bars,
+            );
+            event
+                .event_ts
+                .signed_duration_since(reclaim_started_at)
+                .num_milliseconds()
+                >= reclaim_ms
+                && pullback_dispatch_price_ok(plan, event.price)
         }
         "breakout" => {
             if !breakout_crossed(plan, event.price) {
@@ -2504,6 +2637,44 @@ async fn process_fast_position_management_actions(
             }
             continue;
         };
+        if !has_active_position_for_side(trading_state, &snapshot.side) {
+            append_workflow_journal_event(
+                "workflow_stage2b_management_skipped",
+                symbol,
+                event.event_ts,
+                json!({
+                    "trigger": "watcher_fast_consumer",
+                    "context_key": &action.context_key,
+                    "path_id": &action.path_id,
+                    "action": &action,
+                    "trigger_price": watch_facts.current_price,
+                    "price_source": event.source.as_str(),
+                    "routing_key": &event.routing_key,
+                    "reason": "fast_state_no_live_position_for_snapshot_side",
+                    "side": &snapshot.side,
+                    "active_position_count": trading_state.active_positions.len(),
+                    "open_order_count": trading_state.open_orders.len(),
+                }),
+            );
+            if reconcile_flat_position_management_context(
+                &ctx.http_client,
+                &ctx.config.api.binance,
+                &ctx.config.llm.execution,
+                symbol,
+                state_dir,
+                workflow_state,
+                entry_snapshots,
+                &action.context_key,
+                &action.path_id,
+                "watcher_fast_consumer",
+                event.event_ts,
+            )
+            .await?
+            {
+                state_dirty = true;
+            }
+            continue;
+        }
         info!(
             symbol = %symbol,
             trigger = "watcher_fast_consumer",
@@ -3947,6 +4118,35 @@ async fn reconcile_missing_position_management_snapshot(
     trigger: &str,
     ts_bucket: DateTime<Utc>,
 ) -> Result<bool> {
+    reconcile_flat_position_management_context(
+        http_client,
+        api_config,
+        exec_config,
+        symbol,
+        state_dir,
+        workflow_state,
+        entry_snapshots,
+        context_key,
+        path_id,
+        trigger,
+        ts_bucket,
+    )
+    .await
+}
+
+async fn reconcile_flat_position_management_context(
+    http_client: &Client,
+    api_config: &crate::app::config::BinanceApiConfig,
+    exec_config: &crate::app::config::LlmExecutionConfig,
+    symbol: &str,
+    state_dir: &str,
+    workflow_state: &mut crate::workflow::state::WorkflowState,
+    entry_snapshots: &mut HashMap<String, crate::workflow::schema::EntrySnapshot>,
+    context_key: &str,
+    path_id: &str,
+    trigger: &str,
+    ts_bucket: DateTime<Utc>,
+) -> Result<bool> {
     let Some(side) = workflow_side_from_context_key(context_key) else {
         append_workflow_journal_event(
             "workflow_stage2b_management_skipped",
@@ -3991,7 +4191,7 @@ async fn reconcile_missing_position_management_snapshot(
                 "trigger": trigger,
                 "context_key": context_key,
                 "path_id": path_id,
-                "reason": "snapshot_missing_refresh_still_live",
+                "reason": "position_management_refresh_still_live",
                 "side": side,
                 "refreshed_active_position_count": refreshed_state.active_positions.len(),
                 "refreshed_open_order_count": refreshed_state.open_orders.len(),
@@ -4026,13 +4226,87 @@ async fn reconcile_missing_position_management_snapshot(
             "trigger": trigger,
             "context_key": context_key,
             "path_id": path_id,
-            "reason": "snapshot_missing_refresh_confirmed_flat",
+            "reason": "position_management_refresh_confirmed_flat",
             "side": side,
             "refreshed_active_position_count": refreshed_state.active_positions.len(),
             "refreshed_open_order_count": refreshed_state.open_orders.len(),
         }),
     );
     Ok(true)
+}
+
+#[derive(Debug, Default)]
+struct StartupPositionManagementCleanupResult {
+    removed_context_keys: Vec<String>,
+    deleted_entry_snapshot_count: usize,
+    refreshed_active_position_count: usize,
+    refreshed_open_order_count: usize,
+}
+
+fn stale_position_management_context_keys(
+    workflow_state: &crate::workflow::state::WorkflowState,
+    trading_state: &TradingStateSnapshot,
+) -> Vec<String> {
+    workflow_state
+        .approved_position_management_plans
+        .keys()
+        .filter_map(|context_key| {
+            let side = workflow_side_from_context_key(context_key)?;
+            if has_active_position_for_side(trading_state, side) {
+                None
+            } else {
+                Some(context_key.clone())
+            }
+        })
+        .collect()
+}
+
+async fn cleanup_stale_position_management_state_on_startup(
+    http_client: &Client,
+    api_config: &crate::app::config::BinanceApiConfig,
+    exec_config: &crate::app::config::LlmExecutionConfig,
+    symbol: &str,
+    state_dir: &str,
+) -> Result<StartupPositionManagementCleanupResult> {
+    let mut workflow_state = crate::workflow::persistence::load_workflow_state(state_dir, symbol)?
+        .unwrap_or_else(|| default_workflow_state(symbol));
+    workflow_state.symbol = symbol.to_ascii_uppercase();
+    if workflow_state.approved_position_management_plans.is_empty() {
+        return Ok(StartupPositionManagementCleanupResult::default());
+    }
+
+    let mut entry_snapshots =
+        crate::workflow::persistence::load_entry_snapshots_for_symbol(state_dir, symbol)?
+            .into_iter()
+            .map(|snapshot| (snapshot.context_key.clone(), snapshot))
+            .collect::<HashMap<_, _>>();
+    let trading_state =
+        fetch_symbol_trading_state(http_client, api_config, exec_config, symbol).await?;
+    let stale_context_keys =
+        stale_position_management_context_keys(&workflow_state, &trading_state);
+    let mut result = StartupPositionManagementCleanupResult {
+        refreshed_active_position_count: trading_state.active_positions.len(),
+        refreshed_open_order_count: trading_state.open_orders.len(),
+        ..StartupPositionManagementCleanupResult::default()
+    };
+    if stale_context_keys.is_empty() {
+        return Ok(result);
+    }
+
+    for context_key in stale_context_keys {
+        remove_position_management_plan(&mut workflow_state, &context_key);
+        if entry_snapshots.remove(&context_key).is_some() {
+            crate::workflow::persistence::delete_entry_snapshot(state_dir, symbol, &context_key)?;
+            result.deleted_entry_snapshot_count += 1;
+        }
+        if workflow_state.last_filled_context_key.as_deref() == Some(context_key.as_str()) {
+            workflow_state.last_filled_context_key = None;
+        }
+        result.removed_context_keys.push(context_key);
+    }
+
+    crate::workflow::persistence::save_workflow_state(state_dir, &workflow_state)?;
+    Ok(result)
 }
 
 fn upsert_position_management_plan(
@@ -5253,7 +5527,6 @@ async fn maybe_refresh_stage1(
         crate::workflow::code_layer::build_indicator_summary(input, tracked_zones)?;
     let prompt_input = crate::workflow::stage1::build_stage1_prompt_input(
         indicator_summary,
-        stage1_output.clone(),
         refresh_reason.clone(),
     );
     let prompt_input_value =
@@ -5765,16 +6038,30 @@ async fn invoke_workflow_bundle_models(
                 }
 
                 if should_run_stage2a {
+                    let (stage2a_context_bundle, stage2a_input) = build_latest_stage2a_model_input(
+                        &db_pool,
+                        &symbol,
+                        &bundle,
+                        &trading_state,
+                        &entry_snapshots,
+                    )
+                    .await?;
+                    let stage2a_context_ts_bucket = stage2a_context_bundle.raw.ts_bucket;
+                    let stage2a_indicator_summary =
+                        crate::workflow::code_layer::build_indicator_summary(
+                            &stage2a_input,
+                            &tracked_zones,
+                        )?;
                     let prompt_input = crate::workflow::stage2_input::build_stage2a_prompt_input(
-                        &input,
-                        &indicator_summary,
+                        &stage2a_input,
+                        &stage2a_indicator_summary,
                         &stage1_output,
                     );
                     let prompt_value = serde_json::to_value(&prompt_input)
                         .context("serialize workflow stage2a prompt input")?;
                     if config.llm.workflow.persist_prompt_inputs {
                         let _ = persist_workflow_prompt_input_to_disk(
-                            &bundle.raw,
+                            &stage2a_context_bundle.raw,
                             "workflow_stage2a",
                             &prompt_value,
                             retention_minutes,
@@ -5783,9 +6070,10 @@ async fn invoke_workflow_bundle_models(
                     }
                     info!(
                         symbol = %symbol,
-                        ts_bucket = %bundle.raw.ts_bucket,
+                        ts_bucket = %stage2a_context_ts_bucket,
                         trigger = &*trigger,
                         path_id = %current_path_id,
+                        stage1_source_ts_bucket = %bundle.raw.ts_bucket,
                         "invoking workflow stage2a models"
                     );
                     for out in crate::llm::workflow_provider::invoke_stage2a_models(
@@ -5800,6 +6088,8 @@ async fn invoke_workflow_bundle_models(
                         let payload = json!({
                             "trigger": &*trigger,
                             "stage": "stage2a",
+                            "source_ts_bucket": stage2a_context_ts_bucket,
+                            "stage1_source_ts_bucket": bundle.raw.ts_bucket,
                             "model_name": out.model_name,
                             "provider": out.provider,
                             "model_id": out.model,
@@ -5811,13 +6101,13 @@ async fn invoke_workflow_bundle_models(
                         append_workflow_journal_event(
                             "workflow_stage2a_response",
                             &symbol,
-                            bundle.raw.ts_bucket,
+                            stage2a_context_ts_bucket,
                             payload.clone(),
                         );
                         if print_response {
                             println!(
                                 "WORKFLOW_STAGE2A_RESPONSE ts_bucket={} trigger={} symbol={} payload={}",
-                                bundle.raw.ts_bucket,
+                                stage2a_context_ts_bucket,
                                 &*trigger,
                                 symbol,
                                 render_pretty_json_value(&payload)
@@ -5838,9 +6128,11 @@ async fn invoke_workflow_bundle_models(
                                 append_workflow_journal_event(
                                     "workflow_stage2a_parse_error",
                                     &symbol,
-                                    bundle.raw.ts_bucket,
+                                    stage2a_context_ts_bucket,
                                     json!({
                                         "trigger": &*trigger,
+                                        "source_ts_bucket": stage2a_context_ts_bucket,
+                                        "stage1_source_ts_bucket": bundle.raw.ts_bucket,
                                         "error": format!("{err:#}"),
                                     }),
                                 );
@@ -5871,10 +6163,12 @@ async fn invoke_workflow_bundle_models(
                         append_workflow_journal_event(
                             "workflow_stage2a_response_stale",
                             &symbol,
-                            bundle.raw.ts_bucket,
+                            stage2a_context_ts_bucket,
                             json!({
                                 "trigger": &*trigger,
                                 "model_name": selected_stage2a_model_name.clone(),
+                                "source_ts_bucket": stage2a_context_ts_bucket,
+                                "stage1_source_ts_bucket": bundle.raw.ts_bucket,
                                 "expected_path_id": stage2a_snapshot_path_id.clone(),
                                 "expected_stage1_completed_at": stage2a_snapshot_completed_at,
                                 "latest_path_id": stale.latest_path_id.clone(),
@@ -5905,9 +6199,11 @@ async fn invoke_workflow_bundle_models(
                                 append_workflow_journal_event(
                                     "workflow_stage1_reevaluation_requested",
                                     &symbol,
-                                    bundle.raw.ts_bucket,
+                                    stage2a_context_ts_bucket,
                                     json!({
                                         "trigger": &*trigger,
+                                        "source_ts_bucket": stage2a_context_ts_bucket,
+                                        "stage1_source_ts_bucket": bundle.raw.ts_bucket,
                                         "reevaluation_reason": parsed_stage2a.reevaluation_reason,
                                         "path_id": stage1_output.current_path.as_ref().map(|path| path.id.clone()),
                                     }),
@@ -5923,11 +6219,12 @@ async fn invoke_workflow_bundle_models(
                                 append_workflow_journal_event(
                                     "workflow_stage2a_wait",
                                     &symbol,
-                                    bundle.raw.ts_bucket,
+                                    stage2a_context_ts_bucket,
                                     json!({
                                         "trigger": &*trigger,
                                         "model_name": selected_stage2a_model_name.clone(),
-                                        "source_ts_bucket": bundle.raw.ts_bucket,
+                                        "source_ts_bucket": stage2a_context_ts_bucket,
+                                        "stage1_source_ts_bucket": bundle.raw.ts_bucket,
                                         "path_id": stage1_output.current_path.as_ref().map(|path| path.id.clone()),
                                         "wait_reason": parsed_stage2a.wait_reason,
                                     }),
@@ -5935,7 +6232,8 @@ async fn invoke_workflow_bundle_models(
                                 info!(
                                     symbol = %symbol,
                                     trigger = &*trigger,
-                                    source_ts_bucket = %bundle.raw.ts_bucket,
+                                    source_ts_bucket = %stage2a_context_ts_bucket,
+                                    stage1_source_ts_bucket = %bundle.raw.ts_bucket,
                                     path_id = ?stage1_output.current_path.as_ref().map(|path| path.id.clone()),
                                     wait_reason = ?parsed_stage2a.wait_reason,
                                     "workflow stage2a path confirmed but waiting for better execution"
@@ -5948,7 +6246,7 @@ async fn invoke_workflow_bundle_models(
                                     set_approved_tactical_plan(
                                         &mut workflow_state,
                                         tactical_plan,
-                                        bundle.raw.ts_bucket,
+                                        stage2a_context_ts_bucket,
                                         true,
                                     );
                                 } else {
@@ -5962,11 +6260,12 @@ async fn invoke_workflow_bundle_models(
                                 append_workflow_journal_event(
                                     "workflow_tactical_plan_approved",
                                     &symbol,
-                                    bundle.raw.ts_bucket,
+                                    stage2a_context_ts_bucket,
                                     json!({
                                         "trigger": &*trigger,
                                         "model_name": selected_stage2a_model_name.clone(),
-                                        "source_ts_bucket": bundle.raw.ts_bucket,
+                                        "source_ts_bucket": stage2a_context_ts_bucket,
+                                        "stage1_source_ts_bucket": bundle.raw.ts_bucket,
                                         "tactical_entry_plan": parsed_stage2a.tactical_entry_plan.clone(),
                                     }),
                                 );
@@ -5976,7 +6275,8 @@ async fn invoke_workflow_bundle_models(
                                     info!(
                                         symbol = %symbol,
                                         trigger = &*trigger,
-                                        source_ts_bucket = %bundle.raw.ts_bucket,
+                                        source_ts_bucket = %stage2a_context_ts_bucket,
+                                        stage1_source_ts_bucket = %bundle.raw.ts_bucket,
                                         path_id = %tactical_plan.path_id,
                                         side = %tactical_plan.entry_plan.side,
                                         entry_profile = %tactical_plan.entry_plan.entry_profile,
@@ -8061,7 +8361,7 @@ mod tests {
     }
 
     #[test]
-    fn fast_watcher_pullback_arms_after_activation() {
+    fn fast_watcher_pullback_requires_retest_then_reclaim() {
         let watcher_cfg = sample_fast_watcher_config();
         let plan = sample_fast_entry_plan("pullback", "pullback_acceptance");
         let mut state = FastWatcherPlanState::default();
@@ -8072,10 +8372,78 @@ mod tests {
             &sample_fast_price_event("2026-03-30T09:35:00Z", 99.8),
             &watcher_cfg,
         ));
-        assert!(fast_watcher_entry_ready(
+        assert!(!fast_watcher_entry_ready(
             &mut state,
             &plan,
             &sample_fast_price_event("2026-03-30T09:35:01Z", 101.1),
+            &watcher_cfg,
+        ));
+        assert!(!fast_watcher_entry_ready(
+            &mut state,
+            &plan,
+            &sample_fast_price_event("2026-03-30T09:35:02Z", 100.6),
+            &watcher_cfg,
+        ));
+        assert!(!fast_watcher_entry_ready(
+            &mut state,
+            &plan,
+            &sample_fast_price_event("2026-03-30T09:35:03Z", 100.8),
+            &watcher_cfg,
+        ));
+        assert!(fast_watcher_entry_ready(
+            &mut state,
+            &plan,
+            &sample_fast_price_event("2026-03-30T09:35:04Z", 101.1),
+            &watcher_cfg,
+        ));
+    }
+
+    #[test]
+    fn fast_watcher_pullback_requires_fresh_breakout_after_deep_overshoot() {
+        let watcher_cfg = sample_fast_watcher_config();
+        let plan = sample_fast_entry_plan("pullback", "pullback_acceptance");
+        let mut state = FastWatcherPlanState::default();
+
+        assert!(!fast_watcher_entry_ready(
+            &mut state,
+            &plan,
+            &sample_fast_price_event("2026-03-30T09:35:00Z", 101.3),
+            &watcher_cfg,
+        ));
+        assert!(!fast_watcher_entry_ready(
+            &mut state,
+            &plan,
+            &sample_fast_price_event("2026-03-30T09:35:01Z", 99.8),
+            &watcher_cfg,
+        ));
+        assert!(!fast_watcher_entry_ready(
+            &mut state,
+            &plan,
+            &sample_fast_price_event("2026-03-30T09:35:02Z", 100.6),
+            &watcher_cfg,
+        ));
+        assert!(!fast_watcher_entry_ready(
+            &mut state,
+            &plan,
+            &sample_fast_price_event("2026-03-30T09:35:03Z", 101.3),
+            &watcher_cfg,
+        ));
+        assert!(!fast_watcher_entry_ready(
+            &mut state,
+            &plan,
+            &sample_fast_price_event("2026-03-30T09:35:04Z", 100.6),
+            &watcher_cfg,
+        ));
+        assert!(!fast_watcher_entry_ready(
+            &mut state,
+            &plan,
+            &sample_fast_price_event("2026-03-30T09:35:05Z", 100.8),
+            &watcher_cfg,
+        ));
+        assert!(fast_watcher_entry_ready(
+            &mut state,
+            &plan,
+            &sample_fast_price_event("2026-03-30T09:35:06Z", 101.0),
             &watcher_cfg,
         ));
     }
@@ -8311,6 +8679,48 @@ mod tests {
             false,
         )
         .is_none());
+    }
+
+    #[test]
+    fn select_stage2a_context_bundle_prefers_newer_persisted_bundle() {
+        let current_ts = parse_rfc3339_utc("2026-03-30T03:45:00Z").expect("parse current ts");
+        let newer_ts = parse_rfc3339_utc("2026-03-30T03:46:00Z").expect("parse newer ts");
+        let current_bundle = LatestBundle {
+            raw: MinuteBundleEnvelope {
+                msg_type: "bundle".to_string(),
+                routing_key: "test.route".to_string(),
+                symbol: "ETHUSDT".to_string(),
+                ts_bucket: current_ts,
+                window_code: "1m".to_string(),
+                indicator_count: 0,
+                published_at: None,
+                indicators: json!({}),
+            },
+            indicators: json!({}),
+            missing_indicator_codes: vec![],
+            received_at: current_ts,
+        };
+        let newer_bundle = LatestBundle {
+            raw: MinuteBundleEnvelope {
+                msg_type: "bundle".to_string(),
+                routing_key: "test.route".to_string(),
+                symbol: "ETHUSDT".to_string(),
+                ts_bucket: newer_ts,
+                window_code: "1m".to_string(),
+                indicator_count: 0,
+                published_at: None,
+                indicators: json!({}),
+            },
+            indicators: json!({}),
+            missing_indicator_codes: vec![],
+            received_at: newer_ts,
+        };
+
+        let selected = select_stage2a_context_bundle(&current_bundle, Some(newer_bundle.clone()));
+        assert_eq!(selected.raw.ts_bucket, newer_ts);
+
+        let fallback = select_stage2a_context_bundle(&current_bundle, None);
+        assert_eq!(fallback.raw.ts_bucket, current_ts);
     }
 
     #[test]
@@ -9192,7 +9602,7 @@ mod tests {
     }
 
     #[test]
-    fn workflow_stage1_refresh_reason_does_not_retry_no_edge_after_non_scheduled_refresh() {
+    fn workflow_stage1_refresh_reason_retries_no_edge_after_non_scheduled_refresh() {
         let config = workflow_test_config();
         let symbol = "ETHUSDT_NO_EDGE_NO_RETRY";
         reset_startup_stage1_refresh_for_symbol(symbol);
@@ -9229,9 +9639,10 @@ mod tests {
         stage1_output.current_script = None;
         stage1_output.current_path = None;
 
-        assert!(
+        assert_eq!(
             workflow_stage1_refresh_reason(&config, &bundle, &state, Some(&stage1_output))
-                .is_none()
+                .as_deref(),
+            Some("scheduled_no_edge_retry")
         );
     }
 

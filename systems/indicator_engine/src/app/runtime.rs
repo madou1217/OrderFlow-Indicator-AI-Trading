@@ -17,8 +17,9 @@ use crate::publish::outbox_dispatcher::OutboxDispatcher;
 use crate::publish::snapshot_fanout_projector::SnapshotFanoutProjector;
 use crate::runtime::dispatcher::{DispatchMode, Dispatcher, ProcessedWindowArtifacts};
 use crate::runtime::state_store::{
-    CanonicalFrontierSnapshot, CanonicalMinutePresence, IngestOutcome, MinuteHistory,
-    StateSnapshot, StateStore, HISTORY_LIMIT_MINUTES, STATE_SNAPSHOT_VERSION,
+    snapshot_canonical_minutes_cover_range, CanonicalFrontierSnapshot, CanonicalMinutePresence,
+    IngestOutcome, MinuteHistory, StateSnapshot, StateStore, HISTORY_LIMIT_MINUTES,
+    STATE_SNAPSHOT_VERSION,
 };
 use crate::runtime::window_scheduler::WindowScheduler;
 use crate::storage::event_writer::EventWriter;
@@ -68,6 +69,8 @@ const STUCK_WARN_INTERVAL_SECS: u64 = 60;
 const LIVE_CANONICAL_GAP_REPAIR_RETRY_SECS: u64 = 15;
 const LIVE_CANONICAL_TAIL_RECONCILE_INTERVAL_SECS: u64 = 24 * 60;
 const LIVE_CANONICAL_TAIL_RECONCILE_LOOKBACK_MINUTES: i64 = 31;
+const CONFIRMED_REPAIR_DEFER_LOG_INTERVAL_SECS: u64 = 30;
+const SNAPSHOT_FANOUT_START_MAX_PERSIST_LAG_MINUTES: i64 = 5;
 const CANONICAL_REPLAY_FETCH_WINDOW_MINUTES: i64 = 360;
 const STARTUP_BACKFILL_YIELD_EVERY_MINUTES: usize = 64;
 const STARTUP_BACKFILL_PROGRESS_LOG_INTERVAL_SECS: u64 = 15;
@@ -84,6 +87,12 @@ enum SnapshotLoadOutcome {
     Fresh(StateSnapshot),
     StaleRecoverySeed { snap: StateSnapshot, age_hours: i64 },
     Rejected,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnapshotRecoverySeedKind {
+    FinalizedHistory,
+    CanonicalReplay,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -129,6 +138,9 @@ impl StartupBackfillProgress {
         symbol: &str,
         snapshot: StateSnapshot,
     ) -> Option<StartupBackfillCheckpoint> {
+        if !snapshot_has_any_restart_recovery_state(&snapshot) {
+            return None;
+        }
         Some(StartupBackfillCheckpoint {
             version: STARTUP_BACKFILL_CHECKPOINT_VERSION,
             symbol: symbol.to_string(),
@@ -204,6 +216,12 @@ struct LiveCanonicalRepairController {
     last_gap_repair_attempt_at: Option<Instant>,
     last_gap_repair_minute: Option<DateTime<Utc>>,
     last_tail_reconcile_at: Option<Instant>,
+}
+
+#[derive(Debug, Default)]
+struct ConfirmedLateRepairController {
+    pending_from_ts: Option<DateTime<Utc>>,
+    last_deferred_log_at: Option<Instant>,
 }
 
 struct OiRatioPatchTask {
@@ -297,6 +315,42 @@ impl LiveCanonicalRepairController {
     }
 }
 
+impl ConfirmedLateRepairController {
+    fn mark_pending(&mut self, ts: DateTime<Utc>) -> bool {
+        let previous = self.pending_from_ts;
+        self.pending_from_ts = Some(previous.map(|prev| prev.min(ts)).unwrap_or(ts));
+        let changed = self.pending_from_ts != previous;
+        if changed {
+            self.last_deferred_log_at = None;
+        }
+        changed
+    }
+
+    fn pending_from_ts(&self) -> Option<DateTime<Utc>> {
+        self.pending_from_ts
+    }
+
+    fn clear(&mut self) {
+        self.pending_from_ts = None;
+        self.last_deferred_log_at = None;
+    }
+
+    fn should_log_deferred(&mut self) -> bool {
+        let now = Instant::now();
+        let allow = self
+            .last_deferred_log_at
+            .map(|last| {
+                now.duration_since(last)
+                    >= Duration::from_secs(CONFIRMED_REPAIR_DEFER_LOG_INTERVAL_SECS)
+            })
+            .unwrap_or(true);
+        if allow {
+            self.last_deferred_log_at = Some(now);
+        }
+        allow
+    }
+}
+
 #[derive(Debug, Default)]
 struct CanonicalRepairStats {
     fetched_rows: usize,
@@ -305,6 +359,7 @@ struct CanonicalRepairStats {
     changed_rows: usize,
     dirty_recompute_marked_rows: usize,
     oi_ratio_patch_marked_rows: usize,
+    confirmed_repair_from_ts: Option<DateTime<Utc>>,
     changed_minutes: HashSet<i64>,
     first_bucket: Option<DateTime<Utc>>,
     last_bucket: Option<DateTime<Utc>>,
@@ -337,6 +392,11 @@ impl CanonicalRepairStats {
         self.changed_rows += 1;
         if outcome.dirty_recompute_marked {
             self.dirty_recompute_marked_rows += 1;
+            self.confirmed_repair_from_ts = Some(
+                self.confirmed_repair_from_ts
+                    .map(|prev| prev.min(bucket))
+                    .unwrap_or(bucket),
+            );
         }
         if outcome.oi_ratio_patch_marked {
             self.oi_ratio_patch_marked_rows += 1;
@@ -388,6 +448,13 @@ fn live_backlog_minutes(next_minute: Option<DateTime<Utc>>, latest_closed: DateT
         .unwrap_or(0)
 }
 
+fn confirmed_closed_minute(
+    latest_closed: DateTime<Utc>,
+    confirm_lag_minutes: i64,
+) -> DateTime<Utc> {
+    latest_closed - ChronoDuration::minutes(confirm_lag_minutes.max(0))
+}
+
 fn allow_live_tail_reconcile(
     state_store: &StateStore,
     next_minute: Option<DateTime<Utc>>,
@@ -404,6 +471,16 @@ fn allow_oi_ratio_patch_processing(
     latest_closed: DateTime<Utc>,
 ) -> bool {
     live_backlog_minutes(next_minute, latest_closed) <= OI_RATIO_PATCH_MAX_BACKLOG_MINUTES
+}
+
+fn confirmed_repair_pipeline_idle(
+    live_prepare_minute_pending: &Arc<AtomicUsize>,
+    live_ready_job_pending: &Arc<AtomicUsize>,
+    dirty_ready_job_pending: &Arc<AtomicUsize>,
+) -> bool {
+    live_prepare_minute_pending.load(Ordering::Acquire) == 0
+        && live_ready_job_pending.load(Ordering::Acquire) == 0
+        && dirty_ready_job_pending.load(Ordering::Acquire) == 0
 }
 
 pub fn build_indicator_runtime_options(
@@ -658,6 +735,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
         startup_max_catchup_minutes = ctx.config.indicator.startup_max_catchup_minutes,
         stale_limit_secs = stale_limit_secs,
         watermark_lateness_secs = ctx.config.indicator.watermark_lateness_secs,
+        confirm_lag_minutes = ctx.config.indicator.confirm_lag_minutes,
         "indicator_engine started; press Ctrl+C to stop"
     );
 
@@ -701,22 +779,29 @@ pub async fn run(ctx: AppContext) -> Result<()> {
     if got_signal_before_live {
         let snap = state_store.extract_snapshot();
         let history_len = snap.history_futures.len();
+        let canonical_minutes = snap.canonical_minutes.len();
         let checkpoint_progress = startup_backfill_progress.lock().await.clone();
-        if let (Some(path), Some(checkpoint)) = (
-            startup_checkpoint_path.as_deref(),
-            checkpoint_progress.to_checkpoint(&ctx.config.indicator.symbol, snap.clone()),
-        ) {
-            match save_startup_backfill_checkpoint(&checkpoint, path).await {
-                Ok(()) => info!(
+        if let Some(path) = startup_checkpoint_path.as_deref() {
+            match checkpoint_progress.to_checkpoint(&ctx.config.indicator.symbol, snap.clone()) {
+                Some(checkpoint) => match save_startup_backfill_checkpoint(&checkpoint, path).await
+                {
+                    Ok(()) => info!(
+                        path = %path,
+                        from_ts = %checkpoint.from_ts,
+                        to_ts_exclusive = %checkpoint.to_ts_exclusive,
+                        next_canonical_window_from_ts = ?checkpoint.next_canonical_window_from_ts,
+                        "startup backfill checkpoint saved"
+                    ),
+                    Err(err) => {
+                        warn!(error = %err, path = %path, "failed to save startup backfill checkpoint")
+                    }
+                },
+                None => info!(
                     path = %path,
-                    from_ts = %checkpoint.from_ts,
-                    to_ts_exclusive = %checkpoint.to_ts_exclusive,
-                    next_canonical_window_from_ts = ?checkpoint.next_canonical_window_from_ts,
-                    "startup backfill checkpoint saved"
+                    history_bars = history_len,
+                    canonical_minutes,
+                    "skipping startup backfill checkpoint save because no replay state has been materialized yet"
                 ),
-                Err(err) => {
-                    warn!(error = %err, path = %path, "failed to save startup backfill checkpoint")
-                }
             }
         }
         if !snapshot_path.is_empty() && snapshot_is_reusable_recovery_seed(&snap) {
@@ -724,9 +809,14 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                 history_bars = history_len,
                 "Saving state snapshot before exit (mid-backfill)..."
             );
-            match save_state_snapshot(&snap, &snapshot_path).await {
+            match save_state_snapshot_and_clear_startup_checkpoint_on_success(
+                &snap,
+                &snapshot_path,
+                startup_checkpoint_path.as_deref(),
+            )
+            .await
+            {
                 Ok(()) => {
-                    remove_startup_backfill_checkpoint(startup_checkpoint_path.as_deref());
                     info!(path = %snapshot_path, history_bars = history_len, "State snapshot saved (mid-backfill)")
                 }
                 Err(e) => warn!(error = %e, "Failed to save state snapshot"),
@@ -744,7 +834,41 @@ pub async fn run(ctx: AppContext) -> Result<()> {
         }
         return Ok(());
     }
-    remove_startup_backfill_checkpoint(startup_checkpoint_path.as_deref());
+    if !snapshot_path.is_empty() {
+        let snap = state_store.extract_snapshot();
+        if snapshot_is_reusable_recovery_seed(&snap) {
+            match save_state_snapshot_and_clear_startup_checkpoint_on_success(
+                &snap,
+                &snapshot_path,
+                startup_checkpoint_path.as_deref(),
+            )
+            .await
+            {
+                Ok(()) => info!(
+                    path = %snapshot_path,
+                    futures_bars = snap.history_futures.len(),
+                    spot_bars = snap.history_spot.len(),
+                    canonical_minutes = snap.canonical_minutes.len(),
+                    last_ts = %snap.last_finalized_ts,
+                    "startup backfill completed; reusable state snapshot saved"
+                ),
+                Err(err) => warn!(
+                    error = %err,
+                    path = %snapshot_path,
+                    "startup backfill completed but failed to save reusable state snapshot; keeping startup checkpoint"
+                ),
+            }
+        } else if startup_checkpoint_path.is_some() {
+            info!(
+                futures_bars = snap.history_futures.len(),
+                spot_bars = snap.history_spot.len(),
+                canonical_minutes = snap.canonical_minutes.len(),
+                last_ts = %snap.last_finalized_ts,
+                effective_history_floor_ts = ?snap.effective_history_floor_ts,
+                "startup backfill completed without a reusable main snapshot; preserving startup checkpoint"
+            );
+        }
+    }
     metrics.set_backfill_mode(false);
 
     let state_store = Arc::new(Mutex::new(state_store));
@@ -754,6 +878,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
         Some(tokio::spawn(run_periodic_runtime_snapshot_loop(
             state_store.clone(),
             snapshot_path.clone(),
+            startup_checkpoint_path.clone(),
         )))
     };
     let (live_ready_job_tx_raw, live_ready_job_rx_raw) =
@@ -814,12 +939,12 @@ pub async fn run(ctx: AppContext) -> Result<()> {
 
     let mut startup_cutover_completed = startup_replay_cutoff_bucket.is_none();
     let outbox_handle = tokio::spawn(async move { outbox_dispatcher.run_loop().await });
-    snapshot_fanout_projector
-        .initialize_progress_if_absent()
-        .await
-        .context("initialize indicator snapshot fanout progress")?;
-    let snapshot_fanout_handle =
-        tokio::spawn(async move { snapshot_fanout_projector.run_loop().await });
+    let mut snapshot_fanout_handle: Option<JoinHandle<Result<()>>> = None;
+    let mut snapshot_fanout_started = false;
+    info!(
+        max_persist_lag_minutes = SNAPSHOT_FANOUT_START_MAX_PERSIST_LAG_MINUTES,
+        "indicator snapshot fanout projector will start after the persisted frontier is near live"
+    );
 
     let (prepare_ingest_tx, mut prepare_ingest_rx) = mpsc::channel(PREPARE_INGEST_QUEUE_CAPACITY);
     let trade_ingest_pending = Arc::new(AtomicUsize::new(0));
@@ -844,19 +969,26 @@ pub async fn run(ctx: AppContext) -> Result<()> {
     let mut stall_detector =
         RuntimeStallDetector::new(ts_from_millis(metrics.snapshot().last_persisted_ts_ms));
     let mut live_repair_controller = LiveCanonicalRepairController::default();
+    let mut confirmed_repair_controller = ConfirmedLateRepairController::default();
     let mut oi_ratio_patch_task: Option<OiRatioPatchTask> = None;
 
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
-                let cutoff = scheduler.closed_minute(Utc::now());
+                let cutoff = confirmed_closed_minute(
+                    scheduler.closed_minute(Utc::now()),
+                    ctx.config.indicator.confirm_lag_minutes,
+                );
                 info!(shutdown_closed_minute = %cutoff, "Ctrl+C received, shutting down");
                 shutdown_requested = true;
                 shutdown_closed_minute = Some(cutoff);
                 break;
             }
             _ = sigterm.recv() => {
-                let cutoff = scheduler.closed_minute(Utc::now());
+                let cutoff = confirmed_closed_minute(
+                    scheduler.closed_minute(Utc::now()),
+                    ctx.config.indicator.confirm_lag_minutes,
+                );
                 info!(shutdown_closed_minute = %cutoff, "SIGTERM received, shutting down");
                 shutdown_requested = true;
                 shutdown_closed_minute = Some(cutoff);
@@ -870,7 +1002,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                         &non_trade_ingest_pending,
                     );
                     let mut state_store = state_store.lock().await;
-                    handle_ingest_event(
+                    if let Some(repair_from_ts) = handle_ingest_event(
                         queued.event,
                         startup_replay_cutoff_bucket,
                         &mut startup_cutover_completed,
@@ -887,7 +1019,14 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                         &metrics,
                         &mut state_store,
                         &mut scheduler,
-                    );
+                    ) {
+                        if confirmed_repair_controller.mark_pending(repair_from_ts) {
+                            warn!(
+                                repair_start_ts = %repair_from_ts,
+                                "confirmed late canonical correction queued for rewind + replay repair"
+                            );
+                        }
+                    }
                 } else {
                     ingest_channel_closed = true;
                     warn!("all mq consumers ended, stopping indicator engine");
@@ -970,19 +1109,33 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                 }
 
                 let latest_closed = scheduler.closed_minute(Utc::now());
+                let latest_confirmed_closed = confirmed_closed_minute(
+                    latest_closed,
+                    ctx.config.indicator.confirm_lag_minutes,
+                );
+                if let Some(repair_from_ts) = drain_result.confirmed_repair_from_ts {
+                    if confirmed_repair_controller.mark_pending(repair_from_ts) {
+                        warn!(
+                            repair_start_ts = %repair_from_ts,
+                            latest_confirmed_closed = %latest_confirmed_closed,
+                            "confirmed late canonical correction queued for rewind + replay repair"
+                        );
+                    }
+                }
                 let next_minute_before_repairs = scheduler.next_minute_to_emit();
-                if startup_cutover_completed {
+                if startup_cutover_completed && confirmed_repair_controller.pending_from_ts().is_none() {
                     if let Some(next_minute) = next_minute_before_repairs {
                         let next_minute_presence = {
                             let state_store = state_store.lock().await;
                             state_store.canonical_minute_presence(next_minute)
                         };
-                        if next_minute <= latest_closed
+                        if next_minute <= latest_confirmed_closed
                             && !next_minute_presence.complete_under_current_policy()
                             && live_repair_controller.gap_repair_due(next_minute)
                         {
                             live_repair_controller.mark_gap_repair_attempt(next_minute);
-                            let repair_to_ts = latest_closed + ChronoDuration::minutes(1);
+                            let repair_to_ts =
+                                latest_confirmed_closed + ChronoDuration::minutes(1);
                             let mut state_store = state_store.lock().await;
                             match ingest_canonical_range_from_db(
                                 &ctx.db_pool,
@@ -998,6 +1151,17 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                             .await
                             {
                                 Ok(stats) => {
+                                    if let Some(repair_from_ts) = stats.confirmed_repair_from_ts {
+                                        if confirmed_repair_controller.mark_pending(repair_from_ts)
+                                        {
+                                            warn!(
+                                                repair_start_ts = %repair_from_ts,
+                                                latest_confirmed_closed = %latest_confirmed_closed,
+                                                reason = "live_gap_repair",
+                                                "confirmed late canonical correction queued for rewind + replay repair"
+                                            );
+                                        }
+                                    }
                                     let next_minute_presence_after =
                                         state_store.canonical_minute_presence(next_minute);
                                     let healed = next_minute_presence_after
@@ -1005,7 +1169,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                                     let healed_ready_through = if healed {
                                         state_store.latest_contiguous_complete_canonical_minute_from(
                                             next_minute,
-                                            latest_closed,
+                                            latest_confirmed_closed,
                                         )
                                     } else {
                                         None
@@ -1016,6 +1180,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                                             from_ts = %next_minute,
                                             to_ts_exclusive = %repair_to_ts,
                                             latest_closed = %latest_closed,
+                                            latest_confirmed_closed = %latest_confirmed_closed,
                                             fetched_rows = stats.fetched_rows,
                                             ingested_rows = stats.ingested_rows,
                                             touched_minutes = stats.touched_minute_count(),
@@ -1034,6 +1199,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                                             from_ts = %next_minute,
                                             to_ts_exclusive = %repair_to_ts,
                                             latest_closed = %latest_closed,
+                                            latest_confirmed_closed = %latest_confirmed_closed,
                                             fetched_rows = stats.fetched_rows,
                                             ingested_rows = stats.ingested_rows,
                                             next_minute_complete_after = next_minute_presence_after.complete_under_current_policy(),
@@ -1049,6 +1215,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                                         from_ts = %next_minute,
                                         to_ts_exclusive = %repair_to_ts,
                                         latest_closed = %latest_closed,
+                                        latest_confirmed_closed = %latest_confirmed_closed,
                                         "live canonical gap repair failed"
                                     );
                                 }
@@ -1067,7 +1234,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                                 && allow_live_tail_reconcile(
                                     &state_store,
                                     next_minute_before_repairs,
-                                    latest_closed,
+                                    latest_confirmed_closed,
                                 )
                         };
                         if allow_tail_reconcile {
@@ -1099,6 +1266,17 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                             .await
                             {
                                 Ok(stats) => {
+                                    if let Some(repair_from_ts) = stats.confirmed_repair_from_ts {
+                                        if confirmed_repair_controller.mark_pending(repair_from_ts)
+                                        {
+                                            warn!(
+                                                repair_start_ts = %repair_from_ts,
+                                                latest_confirmed_closed = %latest_confirmed_closed,
+                                                reason = "live_tail_reconcile",
+                                                "confirmed late canonical correction queued for rewind + replay repair"
+                                            );
+                                        }
+                                    }
                                     if stats.changed_rows > 0 {
                                         info!(
                                             reason = "live_tail_reconcile",
@@ -1135,6 +1313,27 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                     }
                 }
 
+                if confirmed_repair_controller.pending_from_ts().is_some() {
+                    let repaired = maybe_execute_confirmed_repair_replay(
+                        &ctx,
+                        metrics.clone(),
+                        dispatcher.as_ref(),
+                        &state_store,
+                        &mut scheduler,
+                        &runtime_options,
+                        latest_confirmed_closed,
+                        &live_prepare_minute_pending,
+                        &live_ready_job_pending,
+                        &dirty_ready_job_pending,
+                        &mut confirmed_repair_controller,
+                        &mut oi_ratio_patch_task,
+                    )
+                    .await?;
+                    if repaired || confirmed_repair_controller.pending_from_ts().is_some() {
+                        continue;
+                    }
+                }
+
                 let next_minute_before_ready = scheduler.next_minute_to_emit();
                 let leading_gap_recovery = {
                     let mut state_store = state_store.lock().await;
@@ -1165,7 +1364,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                         let ready_through_ts = next_minute.and_then(|minute| {
                             state_store.latest_contiguous_complete_canonical_minute_from(
                                 minute,
-                                latest_closed,
+                                latest_confirmed_closed,
                             )
                         });
                         let frontier_snapshot = refresh_runtime_observability_metrics(
@@ -1187,7 +1386,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                         )
                     };
                 let allow_oi_ratio_patches =
-                    allow_oi_ratio_patch_processing(next_minute, latest_closed);
+                    allow_oi_ratio_patch_processing(next_minute, latest_confirmed_closed);
                 maybe_warn_runtime_stall(
                     &mut stall_detector,
                     &metrics,
@@ -1198,6 +1397,26 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                     trade_channel_len,
                     non_trade_channel_len,
                 );
+                if !snapshot_fanout_started {
+                    let persisted_ts = ts_from_millis(metrics.snapshot().last_persisted_ts_ms);
+                    let fanout_reference_ts = ready_through_ts.or(Some(latest_confirmed_closed));
+                    if snapshot_fanout_start_ready(persisted_ts, fanout_reference_ts) {
+                        snapshot_fanout_projector
+                            .initialize_progress_if_absent()
+                            .await
+                            .context("initialize indicator snapshot fanout progress")?;
+                        let projector = snapshot_fanout_projector.clone();
+                        snapshot_fanout_handle =
+                            Some(tokio::spawn(async move { projector.run_loop().await }));
+                        snapshot_fanout_started = true;
+                        info!(
+                            persisted_ts = ?persisted_ts,
+                            fanout_reference_ts = ?fanout_reference_ts,
+                            max_persist_lag_minutes = SNAPSHOT_FANOUT_START_MAX_PERSIST_LAG_MINUTES,
+                            "starting indicator snapshot fanout projector after persisted frontier catch-up"
+                        );
+                    }
+                }
 
                 let Some(_next_minute) = next_minute else {
                     if has_pending_oi_ratio_patch && allow_oi_ratio_patches && oi_ratio_patch_task.is_none() {
@@ -1266,8 +1485,12 @@ pub async fn run(ctx: AppContext) -> Result<()> {
     }
 
     if shutdown_requested {
-        let shutdown_closed_minute =
-            shutdown_closed_minute.unwrap_or_else(|| scheduler.closed_minute(Utc::now()));
+        let shutdown_closed_minute = shutdown_closed_minute.unwrap_or_else(|| {
+            confirmed_closed_minute(
+                scheduler.closed_minute(Utc::now()),
+                ctx.config.indicator.confirm_lag_minutes,
+            )
+        });
         info!(
             shutdown_closed_minute = %shutdown_closed_minute,
             "stopping ingress and flushing ready indicator minutes before snapshot save"
@@ -1287,7 +1510,10 @@ pub async fn run(ctx: AppContext) -> Result<()> {
         )
         .await;
         outbox_handle.abort();
-        snapshot_fanout_handle.abort();
+        if let Some(handle) = snapshot_fanout_handle.take() {
+            handle.abort();
+            let _ = handle.await;
+        }
         abort_periodic_runtime_snapshot_handle(&mut periodic_snapshot_handle).await;
 
         let mut state_store = Arc::try_unwrap(state_store)
@@ -1328,7 +1554,13 @@ pub async fn run(ctx: AppContext) -> Result<()> {
             info!("Saving state snapshot before exit...");
             let snap = state_store.extract_snapshot();
             if snapshot_is_reusable_recovery_seed(&snap) {
-                match save_state_snapshot(&snap, &snapshot_path).await {
+                match save_state_snapshot_and_clear_startup_checkpoint_on_success(
+                    &snap,
+                    &snapshot_path,
+                    startup_checkpoint_path.as_deref(),
+                )
+                .await
+                {
                     Ok(()) => info!(
                         path = %snapshot_path,
                         futures_bars = snap.history_futures.len(),
@@ -1359,7 +1591,10 @@ pub async fn run(ctx: AppContext) -> Result<()> {
             let _ = handle.await;
         }
         outbox_handle.abort();
-        snapshot_fanout_handle.abort();
+        if let Some(handle) = snapshot_fanout_handle.take() {
+            handle.abort();
+            let _ = handle.await;
+        }
         for h in consumer_handles {
             h.abort();
         }
@@ -1390,7 +1625,10 @@ pub async fn run(ctx: AppContext) -> Result<()> {
         let _ = handle.await;
     }
     outbox_handle.abort();
-    snapshot_fanout_handle.abort();
+    if let Some(handle) = snapshot_fanout_handle.take() {
+        handle.abort();
+        let _ = handle.await;
+    }
     abort_periodic_runtime_snapshot_handle(&mut periodic_snapshot_handle).await;
     for h in consumer_handles {
         h.abort();
@@ -1404,7 +1642,13 @@ pub async fn run(ctx: AppContext) -> Result<()> {
         info!("Saving state snapshot before exit...");
         let snap = state_store.extract_snapshot();
         if snapshot_is_reusable_recovery_seed(&snap) {
-            match save_state_snapshot(&snap, &snapshot_path).await {
+            match save_state_snapshot_and_clear_startup_checkpoint_on_success(
+                &snap,
+                &snapshot_path,
+                startup_checkpoint_path.as_deref(),
+            )
+            .await
+            {
                 Ok(()) => info!(
                     path = %snapshot_path,
                     futures_bars = snap.history_futures.len(),
@@ -1431,6 +1675,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
 struct DrainPendingIngestResult {
     all_channels_closed: bool,
     drained_count: usize,
+    confirmed_repair_from_ts: Option<DateTime<Utc>>,
 }
 
 async fn drain_pending_ingest_events_shared(
@@ -1456,6 +1701,7 @@ async fn drain_pending_ingest_events_shared(
 ) -> DrainPendingIngestResult {
     let mut drained = 0usize;
     let mut drained_events = Vec::new();
+    let mut confirmed_repair_from_ts: Option<DateTime<Utc>> = None;
 
     while drained < INGEST_DRAIN_PER_TICK_LIMIT {
         match ingest_rx.try_recv() {
@@ -1479,7 +1725,7 @@ async fn drain_pending_ingest_events_shared(
     if !drained_events.is_empty() {
         let mut state_store = state_store.lock().await;
         for event in drained_events {
-            handle_ingest_event(
+            if let Some(repair_from_ts) = handle_ingest_event(
                 event,
                 startup_replay_cutoff_bucket,
                 startup_cutover_completed,
@@ -1496,13 +1742,20 @@ async fn drain_pending_ingest_events_shared(
                 metrics,
                 &mut state_store,
                 scheduler,
-            );
+            ) {
+                confirmed_repair_from_ts = Some(
+                    confirmed_repair_from_ts
+                        .map(|prev| prev.min(repair_from_ts))
+                        .unwrap_or(repair_from_ts),
+                );
+            }
         }
     }
 
     DrainPendingIngestResult {
         all_channels_closed: *ingest_channel_closed,
         drained_count: drained,
+        confirmed_repair_from_ts,
     }
 }
 
@@ -1528,6 +1781,7 @@ fn drain_pending_ingest_events_owned(
     scheduler: &mut WindowScheduler,
 ) -> DrainPendingIngestResult {
     let mut drained = 0usize;
+    let mut confirmed_repair_from_ts: Option<DateTime<Utc>> = None;
 
     while drained < INGEST_DRAIN_PER_TICK_LIMIT {
         match ingest_rx.try_recv() {
@@ -1537,7 +1791,7 @@ fn drain_pending_ingest_events_owned(
                     trade_ingest_pending,
                     non_trade_ingest_pending,
                 );
-                handle_ingest_event(
+                if let Some(repair_from_ts) = handle_ingest_event(
                     queued.event,
                     startup_replay_cutoff_bucket,
                     startup_cutover_completed,
@@ -1554,7 +1808,13 @@ fn drain_pending_ingest_events_owned(
                     metrics,
                     state_store,
                     scheduler,
-                );
+                ) {
+                    confirmed_repair_from_ts = Some(
+                        confirmed_repair_from_ts
+                            .map(|prev| prev.min(repair_from_ts))
+                            .unwrap_or(repair_from_ts),
+                    );
+                }
                 drained += 1;
             }
             Err(mpsc::error::TryRecvError::Empty) => break,
@@ -1568,6 +1828,7 @@ fn drain_pending_ingest_events_owned(
     DrainPendingIngestResult {
         all_channels_closed: *ingest_channel_closed,
         drained_count: drained,
+        confirmed_repair_from_ts,
     }
 }
 
@@ -1629,6 +1890,23 @@ async fn shutdown_drain_and_persist(
             scheduler,
         );
         total_drained += drain_result.drained_count;
+
+        if let Some(repair_start_ts) = drain_result.confirmed_repair_from_ts {
+            let repaired = maybe_execute_shutdown_confirmed_repair_replay(
+                ctx,
+                metrics.clone(),
+                dispatcher,
+                state_store,
+                scheduler,
+                runtime_options,
+                repair_start_ts,
+                shutdown_closed_minute,
+            )
+            .await?;
+            if repaired {
+                continue;
+            }
+        }
 
         let ready_through_ts = shutdown_ready_through_candidate(
             scheduler.next_minute_to_emit(),
@@ -1801,71 +2079,20 @@ fn try_load_state_snapshot(path: &str, symbol: &str, max_age_hours: u64) -> Snap
         warn!(snap_symbol = %snap.symbol, "State snapshot symbol mismatch, ignoring");
         return SnapshotLoadOutcome::Rejected;
     }
-    if !snapshot_has_required_history(&snap) {
+    let recovery_seed_kind = snapshot_recovery_seed_kind(&snap);
+    if recovery_seed_kind.is_none() {
+        let _ = snapshot_has_reusable_finalized_history_seed(&snap);
+        let _ = snapshot_has_required_canonical_recovery_seed(&snap);
         return SnapshotLoadOutcome::Rejected;
     }
-    if !minute_history_is_strictly_contiguous(&snap.history_futures, snap.last_finalized_ts) {
-        warn!("State snapshot futures history is not a strict contiguous minute series, ignoring");
-        return SnapshotLoadOutcome::Rejected;
-    }
-    if let Some((start, end, len)) = find_long_null_price_run(
-        &snap.history_futures,
-        MAX_CONSECUTIVE_NULL_PRICE_MINUTES_IN_SNAPSHOT,
-    ) {
-        if snapshot_null_price_run_reaches_recent_tail(
-            snap.last_finalized_ts,
-            end,
-            MIN_RECENT_BARS_AFTER_NULL_RUN_IN_SNAPSHOT,
-        ) {
-            warn!(
-                run_start = %start,
-                run_end = %end,
-                run_len = len,
-                max_allowed = MAX_CONSECUTIVE_NULL_PRICE_MINUTES_IN_SNAPSHOT,
-                min_recent_bars_after_run = MIN_RECENT_BARS_AFTER_NULL_RUN_IN_SNAPSHOT,
-                "State snapshot futures history contains recent long null-price run, ignoring"
-            );
-            return SnapshotLoadOutcome::Rejected;
-        }
+    if recovery_seed_kind == Some(SnapshotRecoverySeedKind::CanonicalReplay) {
         info!(
-            run_start = %start,
-            run_end = %end,
-            run_len = len,
-            min_recent_bars_after_run = MIN_RECENT_BARS_AFTER_NULL_RUN_IN_SNAPSHOT,
-            "State snapshot futures history contains only historical long null-price run, accepting snapshot"
-        );
-    }
-    if !snap.history_spot.is_empty()
-        && !minute_history_is_strictly_contiguous(&snap.history_spot, snap.last_finalized_ts)
-    {
-        warn!("State snapshot spot history is not a strict contiguous minute series, ignoring");
-        return SnapshotLoadOutcome::Rejected;
-    }
-    if let Some((start, end, len)) = find_long_null_price_run(
-        &snap.history_spot,
-        MAX_CONSECUTIVE_NULL_PRICE_MINUTES_IN_SNAPSHOT,
-    ) {
-        if snapshot_null_price_run_reaches_recent_tail(
-            snap.last_finalized_ts,
-            end,
-            MIN_RECENT_BARS_AFTER_NULL_RUN_IN_SNAPSHOT,
-        ) {
-            warn!(
-                run_start = %start,
-                run_end = %end,
-                run_len = len,
-                max_allowed = MAX_CONSECUTIVE_NULL_PRICE_MINUTES_IN_SNAPSHOT,
-                min_recent_bars_after_run = MIN_RECENT_BARS_AFTER_NULL_RUN_IN_SNAPSHOT,
-                "State snapshot spot history contains recent long null-price run, ignoring"
-            );
-            return SnapshotLoadOutcome::Rejected;
-        }
-        info!(
-            run_start = %start,
-            run_end = %end,
-            run_len = len,
-            min_recent_bars_after_run = MIN_RECENT_BARS_AFTER_NULL_RUN_IN_SNAPSHOT,
-            "State snapshot spot history contains only historical long null-price run, accepting snapshot"
+            last_finalized_ts = %snap.last_finalized_ts,
+            required_start_ts = %required_snapshot_history_start_ts(&snap),
+            canonical_start_ts = ?snap.canonical_minutes.first().map(|minute| minute.ts_bucket),
+            canonical_end_ts = ?snap.canonical_minutes.last().map(|minute| minute.ts_bucket),
+            canonical_minutes = snap.canonical_minutes.len(),
+            "State snapshot lacks reusable finalized history but canonical replay state covers the required restart window; accepting it as a recovery seed"
         );
     }
     let age = Utc::now().signed_duration_since(snap.saved_at);
@@ -1908,12 +2135,13 @@ fn try_load_startup_backfill_checkpoint(
         );
         return None;
     }
-    if checkpoint.next_canonical_window_from_ts.is_some()
-        && checkpoint.snapshot.canonical_minutes.is_empty()
-    {
+    if !snapshot_has_any_restart_recovery_state(&checkpoint.snapshot) {
         warn!(
             path = %path,
-            "startup backfill checkpoint has no canonical replay state, ignoring"
+            canonical_minutes = checkpoint.snapshot.canonical_minutes.len(),
+            history_futures = checkpoint.snapshot.history_futures.len(),
+            history_spot = checkpoint.snapshot.history_spot.len(),
+            "startup backfill checkpoint has no restart recovery state, ignoring"
         );
         return None;
     }
@@ -1995,6 +2223,26 @@ fn minute_history_has_any_price(row: &MinuteHistory) -> bool {
         || row.low_price.is_some()
         || row.close_price.is_some()
         || row.last_price.is_some()
+}
+
+fn snapshot_has_any_restart_recovery_state(snap: &StateSnapshot) -> bool {
+    !snap.canonical_minutes.is_empty()
+        || !snap.history_futures.is_empty()
+        || !snap.history_spot.is_empty()
+}
+
+fn snapshot_has_required_history_quiet(snap: &StateSnapshot) -> bool {
+    let required_start_ts = required_snapshot_history_start_ts(snap);
+    snapshot_history_covers_required_window(
+        &snap.history_futures,
+        required_start_ts,
+        snap.last_finalized_ts,
+    ) && (snap.history_spot.is_empty()
+        || snapshot_history_covers_required_window(
+            &snap.history_spot,
+            required_start_ts,
+            snap.last_finalized_ts,
+        ))
 }
 
 fn snapshot_has_required_history(snap: &StateSnapshot) -> bool {
@@ -2079,11 +2327,8 @@ fn expand_startup_backfill_to_minimum_recovery_window(
     }
 }
 
-fn snapshot_is_reusable_recovery_seed(snap: &StateSnapshot) -> bool {
-    if !snapshot_has_required_history(snap) {
-        return false;
-    }
-    if !minute_history_is_strictly_contiguous(&snap.history_futures, snap.last_finalized_ts) {
+fn snapshot_has_reusable_finalized_history_seed_quiet(snap: &StateSnapshot) -> bool {
+    if !snapshot_has_required_history_quiet(snap) {
         return false;
     }
     if let Some((_, end, _)) = find_long_null_price_run(
@@ -2098,11 +2343,6 @@ fn snapshot_is_reusable_recovery_seed(snap: &StateSnapshot) -> bool {
             return false;
         }
     }
-    if !snap.history_spot.is_empty()
-        && !minute_history_is_strictly_contiguous(&snap.history_spot, snap.last_finalized_ts)
-    {
-        return false;
-    }
     if let Some((_, end, _)) = find_long_null_price_run(
         &snap.history_spot,
         MAX_CONSECUTIVE_NULL_PRICE_MINUTES_IN_SNAPSHOT,
@@ -2116,6 +2356,104 @@ fn snapshot_is_reusable_recovery_seed(snap: &StateSnapshot) -> bool {
         }
     }
     true
+}
+
+fn snapshot_has_reusable_finalized_history_seed(snap: &StateSnapshot) -> bool {
+    if !snapshot_has_required_history(snap) {
+        return false;
+    }
+    if let Some((start, end, len)) = find_long_null_price_run(
+        &snap.history_futures,
+        MAX_CONSECUTIVE_NULL_PRICE_MINUTES_IN_SNAPSHOT,
+    ) {
+        if snapshot_null_price_run_reaches_recent_tail(
+            snap.last_finalized_ts,
+            end,
+            MIN_RECENT_BARS_AFTER_NULL_RUN_IN_SNAPSHOT,
+        ) {
+            warn!(
+                run_start = %start,
+                run_end = %end,
+                run_len = len,
+                max_allowed = MAX_CONSECUTIVE_NULL_PRICE_MINUTES_IN_SNAPSHOT,
+                min_recent_bars_after_run = MIN_RECENT_BARS_AFTER_NULL_RUN_IN_SNAPSHOT,
+                "State snapshot futures history contains recent long null-price run, ignoring"
+            );
+            return false;
+        }
+        info!(
+            run_start = %start,
+            run_end = %end,
+            run_len = len,
+            min_recent_bars_after_run = MIN_RECENT_BARS_AFTER_NULL_RUN_IN_SNAPSHOT,
+            "State snapshot futures history contains only historical long null-price run, accepting snapshot"
+        );
+    }
+    if let Some((start, end, len)) = find_long_null_price_run(
+        &snap.history_spot,
+        MAX_CONSECUTIVE_NULL_PRICE_MINUTES_IN_SNAPSHOT,
+    ) {
+        if snapshot_null_price_run_reaches_recent_tail(
+            snap.last_finalized_ts,
+            end,
+            MIN_RECENT_BARS_AFTER_NULL_RUN_IN_SNAPSHOT,
+        ) {
+            warn!(
+                run_start = %start,
+                run_end = %end,
+                run_len = len,
+                max_allowed = MAX_CONSECUTIVE_NULL_PRICE_MINUTES_IN_SNAPSHOT,
+                min_recent_bars_after_run = MIN_RECENT_BARS_AFTER_NULL_RUN_IN_SNAPSHOT,
+                "State snapshot spot history contains recent long null-price run, ignoring"
+            );
+            return false;
+        }
+        info!(
+            run_start = %start,
+            run_end = %end,
+            run_len = len,
+            min_recent_bars_after_run = MIN_RECENT_BARS_AFTER_NULL_RUN_IN_SNAPSHOT,
+            "State snapshot spot history contains only historical long null-price run, accepting snapshot"
+        );
+    }
+    true
+}
+
+fn snapshot_has_required_canonical_recovery_seed_quiet(snap: &StateSnapshot) -> bool {
+    if snap.canonical_minutes.is_empty() {
+        return false;
+    }
+    let required_start_ts = required_snapshot_history_start_ts(snap);
+    snapshot_canonical_minutes_cover_range(snap, required_start_ts, snap.last_finalized_ts)
+}
+
+fn snapshot_has_required_canonical_recovery_seed(snap: &StateSnapshot) -> bool {
+    if snapshot_has_required_canonical_recovery_seed_quiet(snap) {
+        return true;
+    }
+    warn!(
+        required_start_ts = %required_snapshot_history_start_ts(snap),
+        canonical_start_ts = ?snap.canonical_minutes.first().map(|minute| minute.ts_bucket),
+        canonical_end_ts = ?snap.canonical_minutes.last().map(|minute| minute.ts_bucket),
+        canonical_minutes = snap.canonical_minutes.len(),
+        last_finalized_ts = %snap.last_finalized_ts,
+        "State snapshot canonical replay state does not provide contiguous required restart coverage, ignoring"
+    );
+    false
+}
+
+fn snapshot_recovery_seed_kind(snap: &StateSnapshot) -> Option<SnapshotRecoverySeedKind> {
+    if snapshot_has_reusable_finalized_history_seed_quiet(snap) {
+        Some(SnapshotRecoverySeedKind::FinalizedHistory)
+    } else if snapshot_has_required_canonical_recovery_seed_quiet(snap) {
+        Some(SnapshotRecoverySeedKind::CanonicalReplay)
+    } else {
+        None
+    }
+}
+
+fn snapshot_is_reusable_recovery_seed(snap: &StateSnapshot) -> bool {
+    snapshot_recovery_seed_kind(snap).is_some()
 }
 
 async fn save_gzip_json_atomic<T: serde::Serialize>(value: &T, path: &str) -> anyhow::Result<()> {
@@ -2144,6 +2482,16 @@ async fn save_state_snapshot(snap: &StateSnapshot, path: &str) -> anyhow::Result
     save_gzip_json_atomic(snap, path).await
 }
 
+async fn save_state_snapshot_and_clear_startup_checkpoint_on_success(
+    snap: &StateSnapshot,
+    snapshot_path: &str,
+    startup_checkpoint_path: Option<&str>,
+) -> anyhow::Result<()> {
+    save_state_snapshot(snap, snapshot_path).await?;
+    remove_startup_backfill_checkpoint(startup_checkpoint_path);
+    Ok(())
+}
+
 async fn save_startup_backfill_checkpoint(
     checkpoint: &StartupBackfillCheckpoint,
     path: &str,
@@ -2167,6 +2515,7 @@ fn remove_startup_backfill_checkpoint(path: Option<&str>) {
 async fn run_periodic_runtime_snapshot_loop(
     state_store: Arc<Mutex<StateStore>>,
     snapshot_path: String,
+    startup_checkpoint_path: Option<String>,
 ) {
     let mut tick = interval(Duration::from_secs(PERIODIC_RUNTIME_SNAPSHOT_POLL_SECS));
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -2221,7 +2570,13 @@ async fn run_periodic_runtime_snapshot_loop(
             continue;
         }
 
-        match save_state_snapshot(&snap, &snapshot_path).await {
+        match save_state_snapshot_and_clear_startup_checkpoint_on_success(
+            &snap,
+            &snapshot_path,
+            startup_checkpoint_path.as_deref(),
+        )
+        .await
+        {
             Ok(()) => {
                 last_saved_finalized_ts = Some(snap.last_finalized_ts);
                 info!(
@@ -2946,6 +3301,20 @@ fn ts_from_millis(ts_ms: i64) -> Option<DateTime<Utc>> {
     }
 }
 
+fn snapshot_fanout_start_ready(
+    persisted_ts: Option<DateTime<Utc>>,
+    reference_ts: Option<DateTime<Utc>>,
+) -> bool {
+    match (persisted_ts, reference_ts) {
+        (Some(persisted_ts), Some(reference_ts)) => {
+            persisted_ts
+                >= reference_ts
+                    - ChronoDuration::minutes(SNAPSHOT_FANOUT_START_MAX_PERSIST_LAG_MINUTES)
+        }
+        _ => false,
+    }
+}
+
 fn refresh_runtime_observability_metrics(
     metrics: &Arc<AppMetrics>,
     state_store: &StateStore,
@@ -3090,11 +3459,11 @@ fn handle_ingest_event(
     metrics: &Arc<AppMetrics>,
     state_store: &mut StateStore,
     scheduler: &mut WindowScheduler,
-) {
+) -> Option<DateTime<Utc>> {
     let event_bucket_ts = logical_event_bucket_ts(&event);
     if let Some(cutoff_bucket_ts) = startup_replay_cutoff_bucket {
         if event_bucket_ts < cutoff_bucket_ts {
-            return;
+            return None;
         }
         if !*startup_cutover_completed {
             if event_bucket_ts > cutoff_bucket_ts {
@@ -3140,7 +3509,7 @@ fn handle_ingest_event(
                 .map_or(event.event_ts, |ts| ts.max(event.event_ts));
             *stale_drop_oldest_ts = Some(next_oldest);
             *stale_drop_newest_ts = Some(next_newest);
-            return;
+            return None;
         }
     }
 
@@ -3156,7 +3525,8 @@ fn handle_ingest_event(
     }
     // EventBuffer was a no-op wrapper (push immediately followed by pop with no watermark
     // gating). Ingest directly to avoid the unnecessary allocation round-trip.
-    state_store.ingest(event);
+    let outcome = state_store.ingest(event);
+    outcome.dirty_recompute_marked.then_some(event_bucket_ts)
 }
 
 async fn ingest_canonical_range_from_db(
@@ -3342,6 +3712,171 @@ async fn maybe_recover_from_leading_canonical_gap(
         continuity_end_ts,
         warmed_minutes,
     })
+}
+
+async fn maybe_execute_confirmed_repair_replay(
+    ctx: &Arc<AppContext>,
+    metrics: Arc<AppMetrics>,
+    dispatcher: &Dispatcher,
+    state_store: &Arc<Mutex<StateStore>>,
+    scheduler: &mut WindowScheduler,
+    runtime_options: &IndicatorRuntimeOptions,
+    latest_confirmed_closed: DateTime<Utc>,
+    live_prepare_minute_pending: &Arc<AtomicUsize>,
+    live_ready_job_pending: &Arc<AtomicUsize>,
+    dirty_ready_job_pending: &Arc<AtomicUsize>,
+    repair_controller: &mut ConfirmedLateRepairController,
+    oi_ratio_patch_task: &mut Option<OiRatioPatchTask>,
+) -> Result<bool> {
+    let Some(repair_start_ts) = repair_controller.pending_from_ts() else {
+        return Ok(false);
+    };
+
+    let live_prepare_pending = live_prepare_minute_pending.load(Ordering::Acquire);
+    let live_ready_pending = live_ready_job_pending.load(Ordering::Acquire);
+    let dirty_ready_pending = dirty_ready_job_pending.load(Ordering::Acquire);
+    if !confirmed_repair_pipeline_idle(
+        live_prepare_minute_pending,
+        live_ready_job_pending,
+        dirty_ready_job_pending,
+    ) {
+        if repair_controller.should_log_deferred() {
+            info!(
+                repair_start_ts = %repair_start_ts,
+                latest_confirmed_closed = %latest_confirmed_closed,
+                live_prepare_pending,
+                live_ready_pending,
+                dirty_ready_pending,
+                "confirmed late canonical correction is waiting for the live pipeline to drain before rewind + replay"
+            );
+        }
+        return Ok(false);
+    }
+
+    let repair_ready_through_ts = {
+        let state_store = state_store.lock().await;
+        state_store.latest_contiguous_complete_canonical_minute_from(
+            repair_start_ts,
+            latest_confirmed_closed,
+        )
+    };
+    let Some(repair_ready_through_ts) = repair_ready_through_ts else {
+        if repair_controller.should_log_deferred() {
+            info!(
+                repair_start_ts = %repair_start_ts,
+                latest_confirmed_closed = %latest_confirmed_closed,
+                "confirmed late canonical correction is waiting for a contiguous confirmed replay window"
+            );
+        }
+        return Ok(false);
+    };
+
+    abort_oi_ratio_patch_task_shared(oi_ratio_patch_task, state_store, "confirmed_repair_replay")
+        .await;
+
+    let rewind_target_ts = repair_start_ts - ChronoDuration::minutes(1);
+    dispatcher
+        .rewind_persisted_tail(
+            &ctx.config.indicator.symbol,
+            repair_start_ts,
+            &ctx.config.mq.exchanges.ind.name,
+        )
+        .await?;
+
+    {
+        let mut state_store = state_store.lock().await;
+        state_store.rewind_finalized_state_from(repair_start_ts);
+        state_store.clear_dirty_recompute_state();
+        state_store.clear_oi_ratio_patch_state();
+    }
+
+    scheduler.mark_emitted_through(rewind_target_ts);
+    metrics.set_last_persisted_ts(Some(rewind_target_ts.timestamp_millis()));
+
+    {
+        let mut state_store = state_store.lock().await;
+        process_ready_minutes(
+            ctx,
+            metrics.clone(),
+            dispatcher,
+            &mut state_store,
+            scheduler,
+            runtime_options,
+            repair_ready_through_ts,
+            DispatchMode::RepairReplay,
+            true,
+        )
+        .await?;
+    }
+
+    repair_controller.clear();
+    info!(
+        repair_start_ts = %repair_start_ts,
+        rewind_target_ts = %rewind_target_ts,
+        repair_ready_through_ts = %repair_ready_through_ts,
+        latest_confirmed_closed = %latest_confirmed_closed,
+        "confirmed late canonical correction repaired via rewind + replay"
+    );
+    Ok(true)
+}
+
+async fn maybe_execute_shutdown_confirmed_repair_replay(
+    ctx: &Arc<AppContext>,
+    metrics: Arc<AppMetrics>,
+    dispatcher: &Dispatcher,
+    state_store: &mut StateStore,
+    scheduler: &mut WindowScheduler,
+    runtime_options: &IndicatorRuntimeOptions,
+    repair_start_ts: DateTime<Utc>,
+    shutdown_closed_minute: DateTime<Utc>,
+) -> Result<bool> {
+    let repair_ready_through_ts = state_store
+        .latest_contiguous_complete_canonical_minute_from(repair_start_ts, shutdown_closed_minute);
+    let Some(repair_ready_through_ts) = repair_ready_through_ts else {
+        info!(
+            repair_start_ts = %repair_start_ts,
+            shutdown_closed_minute = %shutdown_closed_minute,
+            "shutdown confirmed repair is waiting for a contiguous confirmed replay window"
+        );
+        return Ok(false);
+    };
+
+    let rewind_target_ts = repair_start_ts - ChronoDuration::minutes(1);
+    dispatcher
+        .rewind_persisted_tail(
+            &ctx.config.indicator.symbol,
+            repair_start_ts,
+            &ctx.config.mq.exchanges.ind.name,
+        )
+        .await?;
+
+    state_store.rewind_finalized_state_from(repair_start_ts);
+    state_store.clear_dirty_recompute_state();
+    state_store.clear_oi_ratio_patch_state();
+    scheduler.mark_emitted_through(rewind_target_ts);
+    metrics.set_last_persisted_ts(Some(rewind_target_ts.timestamp_millis()));
+
+    process_ready_minutes(
+        ctx,
+        metrics.clone(),
+        dispatcher,
+        state_store,
+        scheduler,
+        runtime_options,
+        repair_ready_through_ts,
+        DispatchMode::RepairReplay,
+        true,
+    )
+    .await?;
+
+    info!(
+        repair_start_ts = %repair_start_ts,
+        rewind_target_ts = %rewind_target_ts,
+        repair_ready_through_ts = %repair_ready_through_ts,
+        shutdown_closed_minute = %shutdown_closed_minute,
+        "shutdown confirmed late canonical correction repaired via rewind + replay"
+    );
+    Ok(true)
 }
 
 fn shutdown_ready_through_candidate(
@@ -3746,6 +4281,31 @@ async fn abort_oi_ratio_patch_task(
         to_ts = ?patch_to,
         windows_requeued = task.minutes.len(),
         "aborted in-flight oi_ratio patch task during shutdown and requeued batch"
+    );
+}
+
+async fn abort_oi_ratio_patch_task_shared(
+    task_slot: &mut Option<OiRatioPatchTask>,
+    state_store: &Arc<Mutex<StateStore>>,
+    reason: &'static str,
+) {
+    let Some(task) = task_slot.take() else {
+        return;
+    };
+    let patch_from = task.minutes.first().copied();
+    let patch_to = task.minutes.last().copied();
+    task.handle.abort();
+    let _ = task.handle.await;
+    {
+        let mut state_store = state_store.lock().await;
+        state_store.requeue_oi_ratio_patch_batch(&task.minutes);
+    }
+    info!(
+        reason = reason,
+        from_ts = ?patch_from,
+        to_ts = ?patch_to,
+        windows_requeued = task.minutes.len(),
+        "aborted in-flight oi_ratio patch task and requeued batch"
     );
 }
 
@@ -4622,10 +5182,14 @@ async fn run_startup_backfill(
     };
     let raw_to_ts = now - ChronoDuration::seconds(STARTUP_BACKFILL_SAFETY_LAG_SECS);
     // Backfill must stop at a full-minute boundary so we never ingest a partial
-    // minute from replay and then mix it with live stream data.
-    // `fetch_backfill_batch` uses `ts_bucket < to_ts_exclusive`, so partial minutes
-    // must round up to include the last fully closed bucket before `raw_to_ts`.
-    let to_ts = minute_exclusive_upper_bound(raw_to_ts);
+    // minute from replay and then mix it with live stream data.  `fetch_backfill_batch`
+    // uses `ts_bucket < to_ts_exclusive`, so partial minutes must round up to include
+    // the last fully closed bucket before `raw_to_ts`, then shift back by the
+    // configured confirm lag so startup only materializes already-confirmed minutes.
+    let latest_safe_closed = minute_exclusive_upper_bound(raw_to_ts) - ChronoDuration::minutes(1);
+    let latest_confirmed_closed =
+        confirmed_closed_minute(latest_safe_closed, ctx.config.indicator.confirm_lag_minutes);
+    let to_ts = latest_confirmed_closed + ChronoDuration::minutes(1);
     let mut startup_max_catchup_minutes = ctx.config.indicator.startup_max_catchup_minutes;
     if startup_max_catchup_minutes > 0
         && startup_max_catchup_minutes < MIN_REUSABLE_SNAPSHOT_HISTORY_MINUTES
@@ -4681,35 +5245,74 @@ async fn run_startup_backfill(
             ctx.config.indicator.snapshot_max_age_hours,
         ) {
             SnapshotLoadOutcome::Fresh(snap) => {
+                let recovery_seed_kind = snapshot_recovery_seed_kind(&snap)
+                    .unwrap_or(SnapshotRecoverySeedKind::CanonicalReplay);
                 let snap_ts = snap.last_finalized_ts;
+                let canonical_recovery_start_ts = required_snapshot_history_start_ts(&snap);
                 state_store.restore_from_snapshot(snap);
                 snapshot_was_loaded = true;
-                let snap_overlap_from_ts = floor_minute(
-                    snap_ts - ChronoDuration::minutes(STARTUP_BACKFILL_OVERLAP_MINUTES),
-                );
-                from_ts = from_ts.min(snap_overlap_from_ts);
-                info!(
-                    snap_ts = %snap_ts,
-                    overlap_from_ts = %snap_overlap_from_ts,
-                    effective_from_ts = %from_ts,
-                    "State snapshot loaded successfully, running overlap repair backfill"
-                );
+                match recovery_seed_kind {
+                    SnapshotRecoverySeedKind::FinalizedHistory => {
+                        let snap_overlap_from_ts = floor_minute(
+                            snap_ts - ChronoDuration::minutes(STARTUP_BACKFILL_OVERLAP_MINUTES),
+                        );
+                        from_ts = from_ts.min(snap_overlap_from_ts);
+                        info!(
+                            snap_ts = %snap_ts,
+                            overlap_from_ts = %snap_overlap_from_ts,
+                            effective_from_ts = %from_ts,
+                            "State snapshot loaded successfully, running overlap repair backfill"
+                        );
+                    }
+                    SnapshotRecoverySeedKind::CanonicalReplay => {
+                        let resume_from_ts = snap_ts + ChronoDuration::minutes(1);
+                        checkpoint_resume_from_ts = Some(resume_from_ts);
+                        from_ts = from_ts.min(canonical_recovery_start_ts);
+                        info!(
+                            snap_ts = %snap_ts,
+                            canonical_recovery_start_ts = %canonical_recovery_start_ts,
+                            resume_from_ts = %resume_from_ts,
+                            effective_from_ts = %from_ts,
+                            "State snapshot loaded successfully via canonical replay seed; resuming canonical ingest after snapshot tail"
+                        );
+                    }
+                }
             }
             SnapshotLoadOutcome::StaleRecoverySeed { snap, age_hours } => {
+                let recovery_seed_kind = snapshot_recovery_seed_kind(&snap)
+                    .unwrap_or(SnapshotRecoverySeedKind::CanonicalReplay);
                 let snap_ts = snap.last_finalized_ts;
+                let canonical_recovery_start_ts = required_snapshot_history_start_ts(&snap);
                 state_store.restore_from_snapshot(snap);
                 snapshot_was_loaded = true;
-                let snap_overlap_from_ts = floor_minute(
-                    snap_ts - ChronoDuration::minutes(STARTUP_BACKFILL_OVERLAP_MINUTES),
-                );
-                from_ts = from_ts.min(snap_overlap_from_ts);
-                info!(
-                    snap_ts = %snap_ts,
-                    age_hours,
-                    overlap_from_ts = %snap_overlap_from_ts,
-                    effective_from_ts = %from_ts,
-                    "State snapshot exceeded age limit but passed structural checks; using it as a recovery seed"
-                );
+                match recovery_seed_kind {
+                    SnapshotRecoverySeedKind::FinalizedHistory => {
+                        let snap_overlap_from_ts = floor_minute(
+                            snap_ts - ChronoDuration::minutes(STARTUP_BACKFILL_OVERLAP_MINUTES),
+                        );
+                        from_ts = from_ts.min(snap_overlap_from_ts);
+                        info!(
+                            snap_ts = %snap_ts,
+                            age_hours,
+                            overlap_from_ts = %snap_overlap_from_ts,
+                            effective_from_ts = %from_ts,
+                            "State snapshot exceeded age limit but passed structural checks; using it as a recovery seed"
+                        );
+                    }
+                    SnapshotRecoverySeedKind::CanonicalReplay => {
+                        let resume_from_ts = snap_ts + ChronoDuration::minutes(1);
+                        checkpoint_resume_from_ts = Some(resume_from_ts);
+                        from_ts = from_ts.min(canonical_recovery_start_ts);
+                        info!(
+                            snap_ts = %snap_ts,
+                            age_hours,
+                            canonical_recovery_start_ts = %canonical_recovery_start_ts,
+                            resume_from_ts = %resume_from_ts,
+                            effective_from_ts = %from_ts,
+                            "State snapshot exceeded age limit but canonical replay state remains reusable; resuming canonical ingest after snapshot tail"
+                        );
+                    }
+                }
             }
             SnapshotLoadOutcome::Rejected => {
                 info!("No reusable state snapshot found, rebuilding only the minimum reusable warm-history window");
@@ -4739,6 +5342,45 @@ async fn run_startup_backfill(
             from_ts = minimum_recovery_floor;
         }
     }
+
+    let unconfirmed_tail_start_ts = latest_confirmed_closed + ChronoDuration::minutes(1);
+    if persisted_frontier_ts
+        .map(|frontier| frontier > latest_confirmed_closed)
+        .unwrap_or(false)
+    {
+        dispatcher
+            .rewind_persisted_tail(
+                &ctx.config.indicator.symbol,
+                unconfirmed_tail_start_ts,
+                &ctx.config.mq.exchanges.ind.name,
+            )
+            .await?;
+        persisted_frontier_ts = Some(latest_confirmed_closed);
+        info!(
+            latest_confirmed_closed = %latest_confirmed_closed,
+            unconfirmed_tail_start_ts = %unconfirmed_tail_start_ts,
+            confirm_lag_minutes = ctx.config.indicator.confirm_lag_minutes,
+            exchange_name = %ctx.config.mq.exchanges.ind.name,
+            "rewound persisted indicator tail beyond confirmed frontier during startup"
+        );
+    }
+    if state_store
+        .last_finalized_minute()
+        .map(|last| last > latest_confirmed_closed)
+        .unwrap_or(false)
+    {
+        state_store.rewind_finalized_state_from(unconfirmed_tail_start_ts);
+        state_store.clear_dirty_recompute_state();
+        state_store.clear_oi_ratio_patch_state();
+        info!(
+            latest_confirmed_closed = %latest_confirmed_closed,
+            unconfirmed_tail_start_ts = %unconfirmed_tail_start_ts,
+            confirm_lag_minutes = ctx.config.indicator.confirm_lag_minutes,
+            "rewound in-memory finalized state beyond confirmed frontier during startup"
+        );
+    }
+    checkpoint_resume_from_ts = checkpoint_resume_from_ts.map(|ts| ts.min(to_ts));
+
     metrics.set_last_persisted_ts(persisted_frontier_ts.map(|ts| ts.timestamp_millis()));
     // Startup replay is bucket-based for canonical 1m rows. Floor the lower bound so
     // we never drop a completed ts_bucket just because the resume timestamp carried
@@ -4779,6 +5421,9 @@ async fn run_startup_backfill(
         from_ts = %from_ts,
         to_ts = %to_ts,
         raw_to_ts = %raw_to_ts,
+        latest_safe_closed = %latest_safe_closed,
+        latest_confirmed_closed = %latest_confirmed_closed,
+        confirm_lag_minutes = ctx.config.indicator.confirm_lag_minutes,
         persisted_frontier_ts = ?persisted_frontier_ts,
         symbol = %ctx.config.indicator.symbol,
         fallback_lookback_minutes = STARTUP_BACKFILL_FALLBACK_LOOKBACK_MINUTES,
@@ -7080,20 +7725,21 @@ mod tests {
     use super::{
         allow_live_tail_reconcile, allow_oi_ratio_patch_processing, build_backfill_sql,
         build_paged_backfill_sql, build_paged_backfill_sql_internal,
-        expand_startup_backfill_to_minimum_recovery_window, find_long_null_price_run,
-        handle_ingest_event, hydrate_futures_orderbook_heatmaps_for_range_with_fetch,
-        live_tail_reconcile_start_ts, minimum_startup_recovery_history_floor,
-        minute_exclusive_upper_bound, minute_history_is_strictly_contiguous,
-        replay_heatmap_hydration_batch_end, replay_row_after_cursor,
-        save_startup_backfill_checkpoint, save_state_snapshot, shutdown_ready_through_candidate,
-        snapshot_has_required_history, snapshot_null_price_run_reaches_recent_tail,
+        confirmed_repair_pipeline_idle, expand_startup_backfill_to_minimum_recovery_window,
+        find_long_null_price_run, handle_ingest_event,
+        hydrate_futures_orderbook_heatmaps_for_range_with_fetch, live_tail_reconcile_start_ts,
+        minimum_startup_recovery_history_floor, minute_exclusive_upper_bound,
+        minute_history_is_strictly_contiguous, replay_heatmap_hydration_batch_end,
+        replay_row_after_cursor, save_startup_backfill_checkpoint, save_state_snapshot,
+        shutdown_ready_through_candidate, snapshot_has_required_history,
+        snapshot_is_reusable_recovery_seed, snapshot_null_price_run_reaches_recent_tail,
         startup_backfill_checkpoint_path, try_load_startup_backfill_checkpoint,
-        try_load_state_snapshot, BackfillCursor, LiveCanonicalRepairController, ReplayRow,
-        SnapshotLoadOutcome, StartupBackfillCheckpoint, FUNDING_BACKFILL_WINDOW_SQL,
-        LIQ_BACKFILL_WINDOW_SQL, LIVE_CANONICAL_TAIL_RECONCILE_LOOKBACK_MINUTES,
-        MIN_REUSABLE_SNAPSHOT_HISTORY_MINUTES, ORDERBOOK_BACKFILL_WINDOW_SQL_SCALAR,
-        ORDERBOOK_BACKFILL_WINDOW_SQL_WITH_HEATMAP, STARTUP_BACKFILL_CHECKPOINT_VERSION,
-        TRADE_BACKFILL_WINDOW_SQL,
+        try_load_state_snapshot, BackfillCursor, ConfirmedLateRepairController,
+        LiveCanonicalRepairController, ReplayRow, SnapshotLoadOutcome, StartupBackfillCheckpoint,
+        StartupBackfillProgress, FUNDING_BACKFILL_WINDOW_SQL, LIQ_BACKFILL_WINDOW_SQL,
+        LIVE_CANONICAL_TAIL_RECONCILE_LOOKBACK_MINUTES, MIN_REUSABLE_SNAPSHOT_HISTORY_MINUTES,
+        ORDERBOOK_BACKFILL_WINDOW_SQL_SCALAR, ORDERBOOK_BACKFILL_WINDOW_SQL_WITH_HEATMAP,
+        STARTUP_BACKFILL_CHECKPOINT_VERSION, TRADE_BACKFILL_WINDOW_SQL,
     };
     use crate::ingest::decoder::{
         AggFundingMark1mEvent, AggFundingPoint, AggHeatmapLevel, AggLiq1mEvent, AggLiqLevel,
@@ -7102,13 +7748,15 @@ mod tests {
     };
     use crate::observability::metrics::AppMetrics;
     use crate::runtime::state_store::{
-        FinalizedVpinState, FundingChange, LatestFundingState, LatestMarkState, MinuteHistory,
-        StateSnapshot, StateStore, VpinState, HISTORY_LIMIT_MINUTES, STATE_SNAPSHOT_VERSION,
+        CanonicalMinuteSnapshot, FinalizedVpinState, FundingChange, LatestFundingState,
+        LatestMarkState, MinuteHistory, StateSnapshot, StateStore, VpinState,
+        HISTORY_LIMIT_MINUTES, STATE_SNAPSHOT_VERSION,
     };
     use crate::runtime::window_scheduler::WindowScheduler;
     use chrono::{Duration as ChronoDuration, TimeZone, Utc};
     use serde_json::json;
     use std::collections::{BTreeMap, HashMap};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use uuid::Uuid;
 
@@ -7421,6 +8069,40 @@ mod tests {
         }
     }
 
+    fn canonical_only_snapshot_fixture(last_finalized_ts: chrono::DateTime<Utc>) -> StateSnapshot {
+        let required_minutes = MIN_REUSABLE_SNAPSHOT_HISTORY_MINUTES - 1;
+        let history_start_ts = last_finalized_ts - ChronoDuration::minutes(required_minutes);
+        let prototype_ts = Utc.with_ymd_and_hms(2026, 3, 29, 3, 0, 0).single().unwrap();
+        let mut store = StateStore::new("TESTUSDT".to_string(), 1_000.0);
+        store.ingest(agg_trade_event(prototype_ts, 2.0, 1.0, 0.15));
+        store.ingest(agg_trade_event_spot(prototype_ts, 1.5, 0.5, 0.10));
+        store.ingest(agg_orderbook_event(prototype_ts, true, 4.0));
+        store.ingest(agg_orderbook_event_spot(prototype_ts, true, 4.0));
+        store.ingest(agg_liq_event(prototype_ts, 10.0));
+        store.ingest(agg_funding_mark_event(prototype_ts, 30, 2000.0, -0.0010));
+        let prototype = store
+            .extract_snapshot()
+            .canonical_minutes
+            .into_iter()
+            .next()
+            .expect("canonical minute prototype");
+
+        let mut snap = snapshot_fixture(
+            last_finalized_ts,
+            Vec::new(),
+            Vec::new(),
+            Some(history_start_ts),
+        );
+        snap.saved_at = Utc::now();
+        snap.canonical_minutes = (0..=required_minutes)
+            .map(|offset| CanonicalMinuteSnapshot {
+                ts_bucket: history_start_ts + ChronoDuration::minutes(offset),
+                inputs: prototype.inputs.clone(),
+            })
+            .collect();
+        snap
+    }
+
     #[test]
     fn startup_backfill_sql_filters_canonical_rows_by_ts_bucket() {
         let sql = build_backfill_sql(false, false);
@@ -7589,6 +8271,72 @@ mod tests {
             .unwrap();
         let to_ts_exclusive = minute_exclusive_upper_bound(raw_to_ts);
         assert_eq!(to_ts_exclusive, raw_to_ts);
+    }
+
+    #[test]
+    fn confirmed_closed_minute_applies_confirm_lag() {
+        let latest_closed = Utc
+            .with_ymd_and_hms(2026, 3, 21, 8, 24, 0)
+            .single()
+            .unwrap();
+        assert_eq!(
+            super::confirmed_closed_minute(latest_closed, 15),
+            Utc.with_ymd_and_hms(2026, 3, 21, 8, 9, 0).single().unwrap()
+        );
+        assert_eq!(
+            super::confirmed_closed_minute(latest_closed, -5),
+            latest_closed
+        );
+    }
+
+    #[test]
+    fn confirmed_repair_controller_tracks_earliest_pending_minute() {
+        let later = Utc
+            .with_ymd_and_hms(2026, 3, 28, 3, 10, 0)
+            .single()
+            .unwrap();
+        let earlier = later - ChronoDuration::minutes(7);
+        let mut controller = ConfirmedLateRepairController::default();
+
+        assert!(controller.mark_pending(later));
+        assert_eq!(controller.pending_from_ts(), Some(later));
+        assert!(!controller.mark_pending(later));
+        assert!(controller.mark_pending(earlier));
+        assert_eq!(controller.pending_from_ts(), Some(earlier));
+    }
+
+    #[test]
+    fn confirmed_repair_pipeline_idle_requires_all_queues_empty() {
+        let live_prepare = Arc::new(AtomicUsize::new(0));
+        let live_ready = Arc::new(AtomicUsize::new(0));
+        let dirty_ready = Arc::new(AtomicUsize::new(0));
+
+        assert!(confirmed_repair_pipeline_idle(
+            &live_prepare,
+            &live_ready,
+            &dirty_ready
+        ));
+
+        live_prepare.store(1, Ordering::Release);
+        assert!(!confirmed_repair_pipeline_idle(
+            &live_prepare,
+            &live_ready,
+            &dirty_ready
+        ));
+        live_prepare.store(0, Ordering::Release);
+        live_ready.store(1, Ordering::Release);
+        assert!(!confirmed_repair_pipeline_idle(
+            &live_prepare,
+            &live_ready,
+            &dirty_ready
+        ));
+        live_ready.store(0, Ordering::Release);
+        dirty_ready.store(1, Ordering::Release);
+        assert!(!confirmed_repair_pipeline_idle(
+            &live_prepare,
+            &live_ready,
+            &dirty_ready
+        ));
     }
 
     #[test]
@@ -7877,6 +8625,46 @@ mod tests {
         }
     }
 
+    #[test]
+    fn canonical_only_snapshot_is_reusable_recovery_seed() {
+        let last_finalized_ts = Utc::now() - ChronoDuration::minutes(5);
+        let snap = canonical_only_snapshot_fixture(last_finalized_ts);
+
+        assert!(snap.history_futures.is_empty());
+        assert!(snap.history_spot.is_empty());
+        assert!(snapshot_is_reusable_recovery_seed(&snap));
+    }
+
+    #[tokio::test]
+    async fn canonical_only_snapshot_is_accepted_as_recovery_seed() {
+        let last_finalized_ts = Utc::now() - ChronoDuration::minutes(5);
+        let snap = canonical_only_snapshot_fixture(last_finalized_ts);
+        let temp_path = std::env::temp_dir().join(format!(
+            "indicator_engine_canonical_seed_snapshot_{}.json.gz",
+            Uuid::new_v4()
+        ));
+        save_state_snapshot(&snap, temp_path.to_str().unwrap())
+            .await
+            .expect("save canonical-only snapshot");
+
+        let outcome = try_load_state_snapshot(temp_path.to_str().unwrap(), "TESTUSDT", 24);
+        let _ = std::fs::remove_file(&temp_path);
+
+        match outcome {
+            SnapshotLoadOutcome::Fresh(loaded) => {
+                assert_eq!(loaded.last_finalized_ts, snap.last_finalized_ts);
+                assert_eq!(loaded.canonical_minutes.len(), snap.canonical_minutes.len());
+                assert!(loaded.history_futures.is_empty());
+            }
+            SnapshotLoadOutcome::StaleRecoverySeed { .. } => {
+                panic!("expected fresh canonical recovery seed, got stale")
+            }
+            SnapshotLoadOutcome::Rejected => {
+                panic!("expected canonical recovery seed snapshot to load")
+            }
+        }
+    }
+
     #[tokio::test]
     async fn startup_backfill_checkpoint_round_trips() {
         let last_finalized_ts = Utc::now() - ChronoDuration::minutes(10);
@@ -7929,6 +8717,61 @@ mod tests {
     }
 
     #[test]
+    fn startup_backfill_progress_skips_checkpoint_without_replay_state() {
+        let from_ts = Utc::now() - ChronoDuration::hours(2);
+        let to_ts = from_ts + ChronoDuration::hours(1);
+        let mut progress = StartupBackfillProgress::default();
+        progress.record(from_ts, to_ts, Some(from_ts), false, None);
+
+        let empty_snapshot = snapshot_fixture(
+            to_ts - ChronoDuration::minutes(1),
+            Vec::new(),
+            Vec::new(),
+            None,
+        );
+        assert!(progress.to_checkpoint("TESTUSDT", empty_snapshot).is_none());
+    }
+
+    #[tokio::test]
+    async fn startup_backfill_checkpoint_accepts_canonical_replay_state() {
+        let last_finalized_ts = Utc::now() - ChronoDuration::minutes(5);
+        let snap = canonical_only_snapshot_fixture(last_finalized_ts);
+        let checkpoint = StartupBackfillCheckpoint {
+            version: STARTUP_BACKFILL_CHECKPOINT_VERSION,
+            symbol: "TESTUSDT".to_string(),
+            saved_at: last_finalized_ts,
+            from_ts: last_finalized_ts
+                - ChronoDuration::minutes(MIN_REUSABLE_SNAPSHOT_HISTORY_MINUTES - 1),
+            to_ts_exclusive: last_finalized_ts + ChronoDuration::minutes(1),
+            next_canonical_window_from_ts: Some(last_finalized_ts + ChronoDuration::minutes(1)),
+            snapshot_was_loaded: false,
+            persisted_frontier_ts: Some(last_finalized_ts),
+            snapshot: snap,
+        };
+        let temp_path = std::env::temp_dir().join(format!(
+            "indicator_engine_startup_checkpoint_canonical_seed_{}.json.gz",
+            Uuid::new_v4()
+        ));
+
+        save_startup_backfill_checkpoint(&checkpoint, temp_path.to_str().unwrap())
+            .await
+            .expect("save startup checkpoint");
+        let loaded = try_load_startup_backfill_checkpoint(temp_path.to_str(), "TESTUSDT")
+            .expect("load startup checkpoint");
+        let _ = std::fs::remove_file(&temp_path);
+
+        assert_eq!(
+            loaded.next_canonical_window_from_ts,
+            checkpoint.next_canonical_window_from_ts
+        );
+        assert_eq!(
+            loaded.snapshot.canonical_minutes.len(),
+            checkpoint.snapshot.canonical_minutes.len()
+        );
+        assert!(loaded.snapshot.history_futures.is_empty());
+    }
+
+    #[test]
     fn cutover_gap_preserves_warm_state_and_waits_for_gap_repair() {
         let cutoff_bucket_ts = Utc.with_ymd_and_hms(2026, 3, 21, 3, 0, 0).single().unwrap();
         let prior_bucket_ts = cutoff_bucket_ts - ChronoDuration::minutes(1);
@@ -7958,7 +8801,7 @@ mod tests {
         let mut scheduler = WindowScheduler::new(0);
         scheduler.mark_emitted_through(prior_bucket_ts);
 
-        handle_ingest_event(
+        let _ = handle_ingest_event(
             frontier_event(
                 first_live_bucket_ts + ChronoDuration::seconds(5),
                 MdData::Trade(TradeEvent {
@@ -8220,6 +9063,34 @@ mod tests {
             next_live_minute,
             ready_through_ts,
             false
+        ));
+    }
+
+    #[test]
+    fn snapshot_fanout_start_ready_requires_recent_persisted_frontier() {
+        let reference_ts = Utc
+            .with_ymd_and_hms(2026, 3, 24, 7, 10, 0)
+            .single()
+            .unwrap();
+        let ready_persisted_ts = reference_ts
+            - ChronoDuration::minutes(super::SNAPSHOT_FANOUT_START_MAX_PERSIST_LAG_MINUTES);
+        let stale_persisted_ts = ready_persisted_ts - ChronoDuration::minutes(1);
+
+        assert!(super::snapshot_fanout_start_ready(
+            Some(ready_persisted_ts),
+            Some(reference_ts)
+        ));
+        assert!(!super::snapshot_fanout_start_ready(
+            Some(stale_persisted_ts),
+            Some(reference_ts)
+        ));
+        assert!(!super::snapshot_fanout_start_ready(
+            None,
+            Some(reference_ts)
+        ));
+        assert!(!super::snapshot_fanout_start_ready(
+            Some(ready_persisted_ts),
+            None
         ));
     }
 }

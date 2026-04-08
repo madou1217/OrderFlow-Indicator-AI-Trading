@@ -536,7 +536,13 @@ impl Indicator for I12BuyingExhaustion {
             ..Default::default()
         };
 
-        append_exhaustion_rows(&mut out, &ctx.symbol, self.code(), &all_events);
+        let current_available_ts = ctx.ts_bucket + Duration::minutes(1);
+        let current_events = all_events
+            .iter()
+            .filter(|event| event.confirm_ts == current_available_ts)
+            .cloned()
+            .collect::<Vec<_>>();
+        append_exhaustion_rows(&mut out, &ctx.symbol, self.code(), &current_events);
 
         out
     }

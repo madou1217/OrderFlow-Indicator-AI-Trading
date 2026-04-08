@@ -19,10 +19,10 @@ const EVENT_WRITE_TIMEOUT: Duration = Duration::from_secs(3);
 const EVENT_WRITE_WARN_INTERVAL_MS: i64 = 30_000;
 const GENERIC_RECONCILE_INDICATOR_CODES: [&str; 5] = [
     "divergence",
-    "absorption",
-    "initiation",
-    "buying_exhaustion",
-    "selling_exhaustion",
+    "bullish_absorption",
+    "bearish_absorption",
+    "bullish_initiation",
+    "bearish_initiation",
 ];
 const TYPED_EVENT_SCOPE_TS_EXPR: &str =
     "COALESCE(event_available_ts, ts_event_end, ts_event_start)";
@@ -40,7 +40,10 @@ fn should_write_generic_indicator_event(indicator_code: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{should_write_generic_indicator_event, TYPED_EVENT_SCOPE_TS_EXPR};
+    use super::{
+        should_write_generic_indicator_event, GENERIC_RECONCILE_INDICATOR_CODES,
+        TYPED_EVENT_SCOPE_TS_EXPR,
+    };
 
     #[test]
     fn typed_history_indicators_do_not_write_generic_rows() {
@@ -60,6 +63,20 @@ mod tests {
             "COALESCE(event_available_ts, ts_event_end, ts_event_start)"
         );
         assert!(!TYPED_EVENT_SCOPE_TS_EXPR.contains("confirm_ts"));
+    }
+
+    #[test]
+    fn generic_reconcile_scope_matches_written_indicator_codes() {
+        assert_eq!(
+            GENERIC_RECONCILE_INDICATOR_CODES,
+            [
+                "divergence",
+                "bullish_absorption",
+                "bearish_absorption",
+                "bullish_initiation",
+                "bearish_initiation",
+            ]
+        );
     }
 }
 
@@ -84,22 +101,18 @@ impl EventWriter {
     pub async fn write_indicator_events(
         &self,
         symbol: &str,
-        history_start_ts: DateTime<Utc>,
         history_end_ts: DateTime<Utc>,
         rows: &[IndicatorEventRow],
     ) -> Result<()> {
         let mut all_ok = true;
+        let scope_ts = history_end_ts;
         let generic_rows = rows
             .iter()
             .filter(|row| should_write_generic_indicator_event(row.indicator_code))
+            .filter(|row| generic_event_scope_ts(row) == scope_ts)
             .collect::<Vec<_>>();
         let expected_event_ids = generic_rows
             .iter()
-            .filter(|row| {
-                GENERIC_RECONCILE_INDICATOR_CODES
-                    .iter()
-                    .any(|code| *code == row.indicator_code)
-            })
             .map(|row| self.resolve_indicator_event_id(symbol, row))
             .collect::<BTreeSet<_>>()
             .into_iter()
@@ -111,8 +124,7 @@ impl EventWriter {
         all_ok &= self
             .reconcile_indicator_event_scope(
                 symbol,
-                history_start_ts,
-                history_end_ts,
+                scope_ts,
                 &scoped_indicator_codes,
                 &expected_event_ids,
             )
@@ -202,10 +214,9 @@ impl EventWriter {
             Ok(())
         } else {
             Err(anyhow!(
-                "write_indicator_events failed symbol={} scope={}..{}",
+                "write_indicator_events failed symbol={} scope_ts={}",
                 symbol,
-                history_start_ts,
-                history_end_ts
+                scope_ts
             ))
         }
     }
@@ -213,11 +224,15 @@ impl EventWriter {
     pub async fn write_divergence_events(
         &self,
         symbol: &str,
-        history_start_ts: DateTime<Utc>,
         history_end_ts: DateTime<Utc>,
         rows: &[DivergenceEventRow],
     ) -> Result<()> {
         let mut all_ok = true;
+        let scope_ts = history_end_ts;
+        let rows = rows
+            .iter()
+            .filter(|row| divergence_event_scope_ts(row) == scope_ts)
+            .collect::<Vec<_>>();
         let expected_event_ids = rows
             .iter()
             .map(|row| row.event_id.clone())
@@ -228,8 +243,7 @@ impl EventWriter {
             .reconcile_event_scope(
                 "evt.divergence_event",
                 symbol,
-                history_start_ts,
-                history_end_ts,
+                scope_ts,
                 &expected_event_ids,
             )
             .await;
@@ -393,10 +407,9 @@ impl EventWriter {
             Ok(())
         } else {
             Err(anyhow!(
-                "write_divergence_events failed symbol={} scope={}..{}",
+                "write_divergence_events failed symbol={} scope_ts={}",
                 symbol,
-                history_start_ts,
-                history_end_ts
+                scope_ts
             ))
         }
     }
@@ -404,11 +417,15 @@ impl EventWriter {
     pub async fn write_absorption_events(
         &self,
         symbol: &str,
-        history_start_ts: DateTime<Utc>,
         history_end_ts: DateTime<Utc>,
         rows: &[AbsorptionEventRow],
     ) -> Result<()> {
         let mut all_ok = true;
+        let scope_ts = history_end_ts;
+        let rows = rows
+            .iter()
+            .filter(|row| row.event_available_ts == scope_ts)
+            .collect::<Vec<_>>();
         let expected_event_ids = rows
             .iter()
             .map(|row| row.event_id.clone())
@@ -419,8 +436,7 @@ impl EventWriter {
             .reconcile_event_scope(
                 "evt.absorption_event",
                 symbol,
-                history_start_ts,
-                history_end_ts,
+                scope_ts,
                 &expected_event_ids,
             )
             .await;
@@ -528,10 +544,9 @@ impl EventWriter {
             Ok(())
         } else {
             Err(anyhow!(
-                "write_absorption_events failed symbol={} scope={}..{}",
+                "write_absorption_events failed symbol={} scope_ts={}",
                 symbol,
-                history_start_ts,
-                history_end_ts
+                scope_ts
             ))
         }
     }
@@ -539,11 +554,15 @@ impl EventWriter {
     pub async fn write_initiation_events(
         &self,
         symbol: &str,
-        history_start_ts: DateTime<Utc>,
         history_end_ts: DateTime<Utc>,
         rows: &[InitiationEventRow],
     ) -> Result<()> {
         let mut all_ok = true;
+        let scope_ts = history_end_ts;
+        let rows = rows
+            .iter()
+            .filter(|row| row.event_available_ts == scope_ts)
+            .collect::<Vec<_>>();
         let expected_event_ids = rows
             .iter()
             .map(|row| row.event_id.clone())
@@ -554,8 +573,7 @@ impl EventWriter {
             .reconcile_event_scope(
                 "evt.initiation_event",
                 symbol,
-                history_start_ts,
-                history_end_ts,
+                scope_ts,
                 &expected_event_ids,
             )
             .await;
@@ -656,10 +674,9 @@ impl EventWriter {
             Ok(())
         } else {
             Err(anyhow!(
-                "write_initiation_events failed symbol={} scope={}..{}",
+                "write_initiation_events failed symbol={} scope_ts={}",
                 symbol,
-                history_start_ts,
-                history_end_ts
+                scope_ts
             ))
         }
     }
@@ -667,11 +684,15 @@ impl EventWriter {
     pub async fn write_exhaustion_events(
         &self,
         symbol: &str,
-        history_start_ts: DateTime<Utc>,
         history_end_ts: DateTime<Utc>,
         rows: &[ExhaustionEventRow],
     ) -> Result<()> {
         let mut all_ok = true;
+        let scope_ts = history_end_ts;
+        let rows = rows
+            .iter()
+            .filter(|row| row.event_available_ts == scope_ts)
+            .collect::<Vec<_>>();
         let expected_event_ids = rows
             .iter()
             .map(|row| row.event_id.clone())
@@ -682,8 +703,7 @@ impl EventWriter {
             .reconcile_event_scope(
                 "evt.exhaustion_event",
                 symbol,
-                history_start_ts,
-                history_end_ts,
+                scope_ts,
                 &expected_event_ids,
             )
             .await;
@@ -778,10 +798,9 @@ impl EventWriter {
             Ok(())
         } else {
             Err(anyhow!(
-                "write_exhaustion_events failed symbol={} scope={}..{}",
+                "write_exhaustion_events failed symbol={} scope_ts={}",
                 symbol,
-                history_start_ts,
-                history_end_ts
+                scope_ts
             ))
         }
     }
@@ -790,18 +809,12 @@ impl EventWriter {
         &self,
         table: &str,
         symbol: &str,
-        history_start_ts: DateTime<Utc>,
-        history_end_ts: DateTime<Utc>,
+        scope_ts: DateTime<Utc>,
         expected_event_ids: &[String],
     ) -> bool {
-        if history_start_ts > history_end_ts {
-            return true;
-        }
-
         let op = format!(
-            "reconcile {table} scope={}..{} ids={}",
-            history_start_ts.to_rfc3339(),
-            history_end_ts.to_rfc3339(),
+            "reconcile {table} scope_ts={} ids={}",
+            scope_ts.to_rfc3339(),
             expected_event_ids.len()
         );
 
@@ -810,8 +823,7 @@ impl EventWriter {
                 r#"
                 DELETE FROM {table}
                 WHERE symbol = $1
-                  AND {TYPED_EVENT_SCOPE_TS_EXPR} >= $2
-                  AND {TYPED_EVENT_SCOPE_TS_EXPR} <= $3
+                  AND {TYPED_EVENT_SCOPE_TS_EXPR} = $2
                 "#
             );
             return self
@@ -819,8 +831,7 @@ impl EventWriter {
                     op,
                     sqlx::query(&delete_sql)
                         .bind(symbol)
-                        .bind(history_start_ts)
-                        .bind(history_end_ts)
+                        .bind(scope_ts)
                         .execute(&self.pool),
                 )
                 .await;
@@ -828,19 +839,17 @@ impl EventWriter {
 
         let delete_sql = format!(
             r#"
-            DELETE FROM {table}
-            WHERE symbol = $1
-              AND {TYPED_EVENT_SCOPE_TS_EXPR} >= $2
-              AND {TYPED_EVENT_SCOPE_TS_EXPR} <= $3
-              AND NOT (event_id = ANY($4))
-            "#
+                DELETE FROM {table}
+                WHERE symbol = $1
+                  AND {TYPED_EVENT_SCOPE_TS_EXPR} = $2
+                  AND NOT (event_id = ANY($3))
+                "#
         );
         self.execute_with_timeout(
             op,
             sqlx::query(&delete_sql)
                 .bind(symbol)
-                .bind(history_start_ts)
-                .bind(history_end_ts)
+                .bind(scope_ts)
                 .bind(expected_event_ids)
                 .execute(&self.pool),
         )
@@ -850,19 +859,17 @@ impl EventWriter {
     async fn reconcile_indicator_event_scope(
         &self,
         symbol: &str,
-        history_start_ts: DateTime<Utc>,
-        history_end_ts: DateTime<Utc>,
+        scope_ts: DateTime<Utc>,
         indicator_codes: &[String],
         expected_event_ids: &[String],
     ) -> bool {
-        if history_start_ts > history_end_ts || indicator_codes.is_empty() {
+        if indicator_codes.is_empty() {
             return true;
         }
 
         let op = format!(
-            "reconcile evt.indicator_event scope={}..{} codes={} ids={}",
-            history_start_ts.to_rfc3339(),
-            history_end_ts.to_rfc3339(),
+            "reconcile evt.indicator_event scope_ts={} codes={} ids={}",
+            scope_ts.to_rfc3339(),
             indicator_codes.len(),
             expected_event_ids.len()
         );
@@ -876,14 +883,12 @@ impl EventWriter {
                         DELETE FROM evt.indicator_event
                         WHERE symbol = $1
                           AND indicator_code = ANY($2)
-                          AND COALESCE(event_available_ts, ts_event_end, ts_event_start) >= $3
-                          AND COALESCE(event_available_ts, ts_event_end, ts_event_start) <= $4
+                          AND COALESCE(event_available_ts, ts_event_end, ts_event_start) = $3
                         "#,
                     )
                     .bind(symbol)
                     .bind(indicator_codes)
-                    .bind(history_start_ts)
-                    .bind(history_end_ts)
+                    .bind(scope_ts)
                     .execute(&self.pool),
                 )
                 .await;
@@ -896,15 +901,13 @@ impl EventWriter {
                 DELETE FROM evt.indicator_event
                 WHERE symbol = $1
                   AND indicator_code = ANY($2)
-                  AND COALESCE(event_available_ts, ts_event_end, ts_event_start) >= $3
-                  AND COALESCE(event_available_ts, ts_event_end, ts_event_start) <= $4
-                  AND NOT (event_id = ANY($5))
+                  AND COALESCE(event_available_ts, ts_event_end, ts_event_start) = $3
+                  AND NOT (event_id = ANY($4))
                 "#,
             )
             .bind(symbol)
             .bind(indicator_codes)
-            .bind(history_start_ts)
-            .bind(history_end_ts)
+            .bind(scope_ts)
             .bind(expected_event_ids)
             .execute(&self.pool),
         )
@@ -979,4 +982,12 @@ impl EventWriter {
             self.suppressed_warns.fetch_add(1, Ordering::Relaxed);
         }
     }
+}
+
+fn generic_event_scope_ts(row: &IndicatorEventRow) -> DateTime<Utc> {
+    row.event_available_ts
+}
+
+fn divergence_event_scope_ts(row: &DivergenceEventRow) -> DateTime<Utc> {
+    row.event_available_ts.unwrap_or(row.ts_event_end)
 }

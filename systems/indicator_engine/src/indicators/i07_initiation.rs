@@ -436,7 +436,13 @@ impl Indicator for I07Initiation {
             ..Default::default()
         };
 
-        append_initiation_rows(&mut out, &ctx.symbol, self.code(), all_events.as_slice());
+        let current_events = detect_initiation_events(ctx);
+        append_initiation_rows(
+            &mut out,
+            &ctx.symbol,
+            self.code(),
+            current_events.as_slice(),
+        );
         out
     }
 }
