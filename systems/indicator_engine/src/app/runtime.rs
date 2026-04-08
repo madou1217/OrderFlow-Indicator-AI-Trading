@@ -69,6 +69,7 @@ const STUCK_WARN_INTERVAL_SECS: u64 = 60;
 const LIVE_CANONICAL_GAP_REPAIR_RETRY_SECS: u64 = 15;
 const LIVE_CANONICAL_TAIL_RECONCILE_INTERVAL_SECS: u64 = 24 * 60;
 const LIVE_CANONICAL_TAIL_RECONCILE_LOOKBACK_MINUTES: i64 = 31;
+const CONFIRMED_REPAIR_DEFER_LOG_INTERVAL_SECS: u64 = 30;
 const SNAPSHOT_FANOUT_START_MAX_PERSIST_LAG_MINUTES: i64 = 5;
 const CANONICAL_REPLAY_FETCH_WINDOW_MINUTES: i64 = 360;
 const STARTUP_BACKFILL_YIELD_EVERY_MINUTES: usize = 64;
@@ -217,6 +218,12 @@ struct LiveCanonicalRepairController {
     last_tail_reconcile_at: Option<Instant>,
 }
 
+#[derive(Debug, Default)]
+struct ConfirmedLateRepairController {
+    pending_from_ts: Option<DateTime<Utc>>,
+    last_deferred_log_at: Option<Instant>,
+}
+
 struct OiRatioPatchTask {
     minutes: Vec<DateTime<Utc>>,
     started_at: Instant,
@@ -308,6 +315,42 @@ impl LiveCanonicalRepairController {
     }
 }
 
+impl ConfirmedLateRepairController {
+    fn mark_pending(&mut self, ts: DateTime<Utc>) -> bool {
+        let previous = self.pending_from_ts;
+        self.pending_from_ts = Some(previous.map(|prev| prev.min(ts)).unwrap_or(ts));
+        let changed = self.pending_from_ts != previous;
+        if changed {
+            self.last_deferred_log_at = None;
+        }
+        changed
+    }
+
+    fn pending_from_ts(&self) -> Option<DateTime<Utc>> {
+        self.pending_from_ts
+    }
+
+    fn clear(&mut self) {
+        self.pending_from_ts = None;
+        self.last_deferred_log_at = None;
+    }
+
+    fn should_log_deferred(&mut self) -> bool {
+        let now = Instant::now();
+        let allow = self
+            .last_deferred_log_at
+            .map(|last| {
+                now.duration_since(last)
+                    >= Duration::from_secs(CONFIRMED_REPAIR_DEFER_LOG_INTERVAL_SECS)
+            })
+            .unwrap_or(true);
+        if allow {
+            self.last_deferred_log_at = Some(now);
+        }
+        allow
+    }
+}
+
 #[derive(Debug, Default)]
 struct CanonicalRepairStats {
     fetched_rows: usize,
@@ -316,6 +359,7 @@ struct CanonicalRepairStats {
     changed_rows: usize,
     dirty_recompute_marked_rows: usize,
     oi_ratio_patch_marked_rows: usize,
+    confirmed_repair_from_ts: Option<DateTime<Utc>>,
     changed_minutes: HashSet<i64>,
     first_bucket: Option<DateTime<Utc>>,
     last_bucket: Option<DateTime<Utc>>,
@@ -348,6 +392,11 @@ impl CanonicalRepairStats {
         self.changed_rows += 1;
         if outcome.dirty_recompute_marked {
             self.dirty_recompute_marked_rows += 1;
+            self.confirmed_repair_from_ts = Some(
+                self.confirmed_repair_from_ts
+                    .map(|prev| prev.min(bucket))
+                    .unwrap_or(bucket),
+            );
         }
         if outcome.oi_ratio_patch_marked {
             self.oi_ratio_patch_marked_rows += 1;
@@ -399,6 +448,13 @@ fn live_backlog_minutes(next_minute: Option<DateTime<Utc>>, latest_closed: DateT
         .unwrap_or(0)
 }
 
+fn confirmed_closed_minute(
+    latest_closed: DateTime<Utc>,
+    confirm_lag_minutes: i64,
+) -> DateTime<Utc> {
+    latest_closed - ChronoDuration::minutes(confirm_lag_minutes.max(0))
+}
+
 fn allow_live_tail_reconcile(
     state_store: &StateStore,
     next_minute: Option<DateTime<Utc>>,
@@ -415,6 +471,16 @@ fn allow_oi_ratio_patch_processing(
     latest_closed: DateTime<Utc>,
 ) -> bool {
     live_backlog_minutes(next_minute, latest_closed) <= OI_RATIO_PATCH_MAX_BACKLOG_MINUTES
+}
+
+fn confirmed_repair_pipeline_idle(
+    live_prepare_minute_pending: &Arc<AtomicUsize>,
+    live_ready_job_pending: &Arc<AtomicUsize>,
+    dirty_ready_job_pending: &Arc<AtomicUsize>,
+) -> bool {
+    live_prepare_minute_pending.load(Ordering::Acquire) == 0
+        && live_ready_job_pending.load(Ordering::Acquire) == 0
+        && dirty_ready_job_pending.load(Ordering::Acquire) == 0
 }
 
 pub fn build_indicator_runtime_options(
@@ -669,6 +735,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
         startup_max_catchup_minutes = ctx.config.indicator.startup_max_catchup_minutes,
         stale_limit_secs = stale_limit_secs,
         watermark_lateness_secs = ctx.config.indicator.watermark_lateness_secs,
+        confirm_lag_minutes = ctx.config.indicator.confirm_lag_minutes,
         "indicator_engine started; press Ctrl+C to stop"
     );
 
@@ -902,19 +969,26 @@ pub async fn run(ctx: AppContext) -> Result<()> {
     let mut stall_detector =
         RuntimeStallDetector::new(ts_from_millis(metrics.snapshot().last_persisted_ts_ms));
     let mut live_repair_controller = LiveCanonicalRepairController::default();
+    let mut confirmed_repair_controller = ConfirmedLateRepairController::default();
     let mut oi_ratio_patch_task: Option<OiRatioPatchTask> = None;
 
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
-                let cutoff = scheduler.closed_minute(Utc::now());
+                let cutoff = confirmed_closed_minute(
+                    scheduler.closed_minute(Utc::now()),
+                    ctx.config.indicator.confirm_lag_minutes,
+                );
                 info!(shutdown_closed_minute = %cutoff, "Ctrl+C received, shutting down");
                 shutdown_requested = true;
                 shutdown_closed_minute = Some(cutoff);
                 break;
             }
             _ = sigterm.recv() => {
-                let cutoff = scheduler.closed_minute(Utc::now());
+                let cutoff = confirmed_closed_minute(
+                    scheduler.closed_minute(Utc::now()),
+                    ctx.config.indicator.confirm_lag_minutes,
+                );
                 info!(shutdown_closed_minute = %cutoff, "SIGTERM received, shutting down");
                 shutdown_requested = true;
                 shutdown_closed_minute = Some(cutoff);
@@ -928,7 +1002,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                         &non_trade_ingest_pending,
                     );
                     let mut state_store = state_store.lock().await;
-                    handle_ingest_event(
+                    if let Some(repair_from_ts) = handle_ingest_event(
                         queued.event,
                         startup_replay_cutoff_bucket,
                         &mut startup_cutover_completed,
@@ -945,7 +1019,14 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                         &metrics,
                         &mut state_store,
                         &mut scheduler,
-                    );
+                    ) {
+                        if confirmed_repair_controller.mark_pending(repair_from_ts) {
+                            warn!(
+                                repair_start_ts = %repair_from_ts,
+                                "confirmed late canonical correction queued for rewind + replay repair"
+                            );
+                        }
+                    }
                 } else {
                     ingest_channel_closed = true;
                     warn!("all mq consumers ended, stopping indicator engine");
@@ -1028,19 +1109,33 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                 }
 
                 let latest_closed = scheduler.closed_minute(Utc::now());
+                let latest_confirmed_closed = confirmed_closed_minute(
+                    latest_closed,
+                    ctx.config.indicator.confirm_lag_minutes,
+                );
+                if let Some(repair_from_ts) = drain_result.confirmed_repair_from_ts {
+                    if confirmed_repair_controller.mark_pending(repair_from_ts) {
+                        warn!(
+                            repair_start_ts = %repair_from_ts,
+                            latest_confirmed_closed = %latest_confirmed_closed,
+                            "confirmed late canonical correction queued for rewind + replay repair"
+                        );
+                    }
+                }
                 let next_minute_before_repairs = scheduler.next_minute_to_emit();
-                if startup_cutover_completed {
+                if startup_cutover_completed && confirmed_repair_controller.pending_from_ts().is_none() {
                     if let Some(next_minute) = next_minute_before_repairs {
                         let next_minute_presence = {
                             let state_store = state_store.lock().await;
                             state_store.canonical_minute_presence(next_minute)
                         };
-                        if next_minute <= latest_closed
+                        if next_minute <= latest_confirmed_closed
                             && !next_minute_presence.complete_under_current_policy()
                             && live_repair_controller.gap_repair_due(next_minute)
                         {
                             live_repair_controller.mark_gap_repair_attempt(next_minute);
-                            let repair_to_ts = latest_closed + ChronoDuration::minutes(1);
+                            let repair_to_ts =
+                                latest_confirmed_closed + ChronoDuration::minutes(1);
                             let mut state_store = state_store.lock().await;
                             match ingest_canonical_range_from_db(
                                 &ctx.db_pool,
@@ -1056,6 +1151,17 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                             .await
                             {
                                 Ok(stats) => {
+                                    if let Some(repair_from_ts) = stats.confirmed_repair_from_ts {
+                                        if confirmed_repair_controller.mark_pending(repair_from_ts)
+                                        {
+                                            warn!(
+                                                repair_start_ts = %repair_from_ts,
+                                                latest_confirmed_closed = %latest_confirmed_closed,
+                                                reason = "live_gap_repair",
+                                                "confirmed late canonical correction queued for rewind + replay repair"
+                                            );
+                                        }
+                                    }
                                     let next_minute_presence_after =
                                         state_store.canonical_minute_presence(next_minute);
                                     let healed = next_minute_presence_after
@@ -1063,7 +1169,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                                     let healed_ready_through = if healed {
                                         state_store.latest_contiguous_complete_canonical_minute_from(
                                             next_minute,
-                                            latest_closed,
+                                            latest_confirmed_closed,
                                         )
                                     } else {
                                         None
@@ -1074,6 +1180,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                                             from_ts = %next_minute,
                                             to_ts_exclusive = %repair_to_ts,
                                             latest_closed = %latest_closed,
+                                            latest_confirmed_closed = %latest_confirmed_closed,
                                             fetched_rows = stats.fetched_rows,
                                             ingested_rows = stats.ingested_rows,
                                             touched_minutes = stats.touched_minute_count(),
@@ -1092,6 +1199,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                                             from_ts = %next_minute,
                                             to_ts_exclusive = %repair_to_ts,
                                             latest_closed = %latest_closed,
+                                            latest_confirmed_closed = %latest_confirmed_closed,
                                             fetched_rows = stats.fetched_rows,
                                             ingested_rows = stats.ingested_rows,
                                             next_minute_complete_after = next_minute_presence_after.complete_under_current_policy(),
@@ -1107,6 +1215,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                                         from_ts = %next_minute,
                                         to_ts_exclusive = %repair_to_ts,
                                         latest_closed = %latest_closed,
+                                        latest_confirmed_closed = %latest_confirmed_closed,
                                         "live canonical gap repair failed"
                                     );
                                 }
@@ -1125,7 +1234,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                                 && allow_live_tail_reconcile(
                                     &state_store,
                                     next_minute_before_repairs,
-                                    latest_closed,
+                                    latest_confirmed_closed,
                                 )
                         };
                         if allow_tail_reconcile {
@@ -1157,6 +1266,17 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                             .await
                             {
                                 Ok(stats) => {
+                                    if let Some(repair_from_ts) = stats.confirmed_repair_from_ts {
+                                        if confirmed_repair_controller.mark_pending(repair_from_ts)
+                                        {
+                                            warn!(
+                                                repair_start_ts = %repair_from_ts,
+                                                latest_confirmed_closed = %latest_confirmed_closed,
+                                                reason = "live_tail_reconcile",
+                                                "confirmed late canonical correction queued for rewind + replay repair"
+                                            );
+                                        }
+                                    }
                                     if stats.changed_rows > 0 {
                                         info!(
                                             reason = "live_tail_reconcile",
@@ -1193,6 +1313,27 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                     }
                 }
 
+                if confirmed_repair_controller.pending_from_ts().is_some() {
+                    let repaired = maybe_execute_confirmed_repair_replay(
+                        &ctx,
+                        metrics.clone(),
+                        dispatcher.as_ref(),
+                        &state_store,
+                        &mut scheduler,
+                        &runtime_options,
+                        latest_confirmed_closed,
+                        &live_prepare_minute_pending,
+                        &live_ready_job_pending,
+                        &dirty_ready_job_pending,
+                        &mut confirmed_repair_controller,
+                        &mut oi_ratio_patch_task,
+                    )
+                    .await?;
+                    if repaired || confirmed_repair_controller.pending_from_ts().is_some() {
+                        continue;
+                    }
+                }
+
                 let next_minute_before_ready = scheduler.next_minute_to_emit();
                 let leading_gap_recovery = {
                     let mut state_store = state_store.lock().await;
@@ -1223,7 +1364,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                         let ready_through_ts = next_minute.and_then(|minute| {
                             state_store.latest_contiguous_complete_canonical_minute_from(
                                 minute,
-                                latest_closed,
+                                latest_confirmed_closed,
                             )
                         });
                         let frontier_snapshot = refresh_runtime_observability_metrics(
@@ -1245,7 +1386,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                         )
                     };
                 let allow_oi_ratio_patches =
-                    allow_oi_ratio_patch_processing(next_minute, latest_closed);
+                    allow_oi_ratio_patch_processing(next_minute, latest_confirmed_closed);
                 maybe_warn_runtime_stall(
                     &mut stall_detector,
                     &metrics,
@@ -1258,7 +1399,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                 );
                 if !snapshot_fanout_started {
                     let persisted_ts = ts_from_millis(metrics.snapshot().last_persisted_ts_ms);
-                    let fanout_reference_ts = ready_through_ts.or(Some(latest_closed));
+                    let fanout_reference_ts = ready_through_ts.or(Some(latest_confirmed_closed));
                     if snapshot_fanout_start_ready(persisted_ts, fanout_reference_ts) {
                         snapshot_fanout_projector
                             .initialize_progress_if_absent()
@@ -1344,8 +1485,12 @@ pub async fn run(ctx: AppContext) -> Result<()> {
     }
 
     if shutdown_requested {
-        let shutdown_closed_minute =
-            shutdown_closed_minute.unwrap_or_else(|| scheduler.closed_minute(Utc::now()));
+        let shutdown_closed_minute = shutdown_closed_minute.unwrap_or_else(|| {
+            confirmed_closed_minute(
+                scheduler.closed_minute(Utc::now()),
+                ctx.config.indicator.confirm_lag_minutes,
+            )
+        });
         info!(
             shutdown_closed_minute = %shutdown_closed_minute,
             "stopping ingress and flushing ready indicator minutes before snapshot save"
@@ -1530,6 +1675,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
 struct DrainPendingIngestResult {
     all_channels_closed: bool,
     drained_count: usize,
+    confirmed_repair_from_ts: Option<DateTime<Utc>>,
 }
 
 async fn drain_pending_ingest_events_shared(
@@ -1555,6 +1701,7 @@ async fn drain_pending_ingest_events_shared(
 ) -> DrainPendingIngestResult {
     let mut drained = 0usize;
     let mut drained_events = Vec::new();
+    let mut confirmed_repair_from_ts: Option<DateTime<Utc>> = None;
 
     while drained < INGEST_DRAIN_PER_TICK_LIMIT {
         match ingest_rx.try_recv() {
@@ -1578,7 +1725,7 @@ async fn drain_pending_ingest_events_shared(
     if !drained_events.is_empty() {
         let mut state_store = state_store.lock().await;
         for event in drained_events {
-            handle_ingest_event(
+            if let Some(repair_from_ts) = handle_ingest_event(
                 event,
                 startup_replay_cutoff_bucket,
                 startup_cutover_completed,
@@ -1595,13 +1742,20 @@ async fn drain_pending_ingest_events_shared(
                 metrics,
                 &mut state_store,
                 scheduler,
-            );
+            ) {
+                confirmed_repair_from_ts = Some(
+                    confirmed_repair_from_ts
+                        .map(|prev| prev.min(repair_from_ts))
+                        .unwrap_or(repair_from_ts),
+                );
+            }
         }
     }
 
     DrainPendingIngestResult {
         all_channels_closed: *ingest_channel_closed,
         drained_count: drained,
+        confirmed_repair_from_ts,
     }
 }
 
@@ -1627,6 +1781,7 @@ fn drain_pending_ingest_events_owned(
     scheduler: &mut WindowScheduler,
 ) -> DrainPendingIngestResult {
     let mut drained = 0usize;
+    let mut confirmed_repair_from_ts: Option<DateTime<Utc>> = None;
 
     while drained < INGEST_DRAIN_PER_TICK_LIMIT {
         match ingest_rx.try_recv() {
@@ -1636,7 +1791,7 @@ fn drain_pending_ingest_events_owned(
                     trade_ingest_pending,
                     non_trade_ingest_pending,
                 );
-                handle_ingest_event(
+                if let Some(repair_from_ts) = handle_ingest_event(
                     queued.event,
                     startup_replay_cutoff_bucket,
                     startup_cutover_completed,
@@ -1653,7 +1808,13 @@ fn drain_pending_ingest_events_owned(
                     metrics,
                     state_store,
                     scheduler,
-                );
+                ) {
+                    confirmed_repair_from_ts = Some(
+                        confirmed_repair_from_ts
+                            .map(|prev| prev.min(repair_from_ts))
+                            .unwrap_or(repair_from_ts),
+                    );
+                }
                 drained += 1;
             }
             Err(mpsc::error::TryRecvError::Empty) => break,
@@ -1667,6 +1828,7 @@ fn drain_pending_ingest_events_owned(
     DrainPendingIngestResult {
         all_channels_closed: *ingest_channel_closed,
         drained_count: drained,
+        confirmed_repair_from_ts,
     }
 }
 
@@ -3280,11 +3442,11 @@ fn handle_ingest_event(
     metrics: &Arc<AppMetrics>,
     state_store: &mut StateStore,
     scheduler: &mut WindowScheduler,
-) {
+) -> Option<DateTime<Utc>> {
     let event_bucket_ts = logical_event_bucket_ts(&event);
     if let Some(cutoff_bucket_ts) = startup_replay_cutoff_bucket {
         if event_bucket_ts < cutoff_bucket_ts {
-            return;
+            return None;
         }
         if !*startup_cutover_completed {
             if event_bucket_ts > cutoff_bucket_ts {
@@ -3330,7 +3492,7 @@ fn handle_ingest_event(
                 .map_or(event.event_ts, |ts| ts.max(event.event_ts));
             *stale_drop_oldest_ts = Some(next_oldest);
             *stale_drop_newest_ts = Some(next_newest);
-            return;
+            return None;
         }
     }
 
@@ -3346,7 +3508,8 @@ fn handle_ingest_event(
     }
     // EventBuffer was a no-op wrapper (push immediately followed by pop with no watermark
     // gating). Ingest directly to avoid the unnecessary allocation round-trip.
-    state_store.ingest(event);
+    let outcome = state_store.ingest(event);
+    outcome.dirty_recompute_marked.then_some(event_bucket_ts)
 }
 
 async fn ingest_canonical_range_from_db(
@@ -3532,6 +3695,112 @@ async fn maybe_recover_from_leading_canonical_gap(
         continuity_end_ts,
         warmed_minutes,
     })
+}
+
+async fn maybe_execute_confirmed_repair_replay(
+    ctx: &Arc<AppContext>,
+    metrics: Arc<AppMetrics>,
+    dispatcher: &Dispatcher,
+    state_store: &Arc<Mutex<StateStore>>,
+    scheduler: &mut WindowScheduler,
+    runtime_options: &IndicatorRuntimeOptions,
+    latest_confirmed_closed: DateTime<Utc>,
+    live_prepare_minute_pending: &Arc<AtomicUsize>,
+    live_ready_job_pending: &Arc<AtomicUsize>,
+    dirty_ready_job_pending: &Arc<AtomicUsize>,
+    repair_controller: &mut ConfirmedLateRepairController,
+    oi_ratio_patch_task: &mut Option<OiRatioPatchTask>,
+) -> Result<bool> {
+    let Some(repair_start_ts) = repair_controller.pending_from_ts() else {
+        return Ok(false);
+    };
+
+    let live_prepare_pending = live_prepare_minute_pending.load(Ordering::Acquire);
+    let live_ready_pending = live_ready_job_pending.load(Ordering::Acquire);
+    let dirty_ready_pending = dirty_ready_job_pending.load(Ordering::Acquire);
+    if !confirmed_repair_pipeline_idle(
+        live_prepare_minute_pending,
+        live_ready_job_pending,
+        dirty_ready_job_pending,
+    ) {
+        if repair_controller.should_log_deferred() {
+            info!(
+                repair_start_ts = %repair_start_ts,
+                latest_confirmed_closed = %latest_confirmed_closed,
+                live_prepare_pending,
+                live_ready_pending,
+                dirty_ready_pending,
+                "confirmed late canonical correction is waiting for the live pipeline to drain before rewind + replay"
+            );
+        }
+        return Ok(false);
+    }
+
+    let repair_ready_through_ts = {
+        let state_store = state_store.lock().await;
+        state_store.latest_contiguous_complete_canonical_minute_from(
+            repair_start_ts,
+            latest_confirmed_closed,
+        )
+    };
+    let Some(repair_ready_through_ts) = repair_ready_through_ts else {
+        if repair_controller.should_log_deferred() {
+            info!(
+                repair_start_ts = %repair_start_ts,
+                latest_confirmed_closed = %latest_confirmed_closed,
+                "confirmed late canonical correction is waiting for a contiguous confirmed replay window"
+            );
+        }
+        return Ok(false);
+    };
+
+    abort_oi_ratio_patch_task_shared(oi_ratio_patch_task, state_store, "confirmed_repair_replay")
+        .await;
+
+    let rewind_target_ts = repair_start_ts - ChronoDuration::minutes(1);
+    dispatcher
+        .rewind_persisted_tail(
+            &ctx.config.indicator.symbol,
+            repair_start_ts,
+            &ctx.config.mq.exchanges.ind.name,
+        )
+        .await?;
+
+    {
+        let mut state_store = state_store.lock().await;
+        state_store.rewind_finalized_state_from(repair_start_ts);
+        state_store.clear_dirty_recompute_state();
+        state_store.clear_oi_ratio_patch_state();
+    }
+
+    scheduler.mark_emitted_through(rewind_target_ts);
+    metrics.set_last_persisted_ts(Some(rewind_target_ts.timestamp_millis()));
+
+    {
+        let mut state_store = state_store.lock().await;
+        process_ready_minutes(
+            ctx,
+            metrics.clone(),
+            dispatcher,
+            &mut state_store,
+            scheduler,
+            runtime_options,
+            repair_ready_through_ts,
+            DispatchMode::RepairReplay,
+            true,
+        )
+        .await?;
+    }
+
+    repair_controller.clear();
+    info!(
+        repair_start_ts = %repair_start_ts,
+        rewind_target_ts = %rewind_target_ts,
+        repair_ready_through_ts = %repair_ready_through_ts,
+        latest_confirmed_closed = %latest_confirmed_closed,
+        "confirmed late canonical correction repaired via rewind + replay"
+    );
+    Ok(true)
 }
 
 fn shutdown_ready_through_candidate(
@@ -3936,6 +4205,31 @@ async fn abort_oi_ratio_patch_task(
         to_ts = ?patch_to,
         windows_requeued = task.minutes.len(),
         "aborted in-flight oi_ratio patch task during shutdown and requeued batch"
+    );
+}
+
+async fn abort_oi_ratio_patch_task_shared(
+    task_slot: &mut Option<OiRatioPatchTask>,
+    state_store: &Arc<Mutex<StateStore>>,
+    reason: &'static str,
+) {
+    let Some(task) = task_slot.take() else {
+        return;
+    };
+    let patch_from = task.minutes.first().copied();
+    let patch_to = task.minutes.last().copied();
+    task.handle.abort();
+    let _ = task.handle.await;
+    {
+        let mut state_store = state_store.lock().await;
+        state_store.requeue_oi_ratio_patch_batch(&task.minutes);
+    }
+    info!(
+        reason = reason,
+        from_ts = ?patch_from,
+        to_ts = ?patch_to,
+        windows_requeued = task.minutes.len(),
+        "aborted in-flight oi_ratio patch task and requeued batch"
     );
 }
 
@@ -4812,10 +5106,14 @@ async fn run_startup_backfill(
     };
     let raw_to_ts = now - ChronoDuration::seconds(STARTUP_BACKFILL_SAFETY_LAG_SECS);
     // Backfill must stop at a full-minute boundary so we never ingest a partial
-    // minute from replay and then mix it with live stream data.
-    // `fetch_backfill_batch` uses `ts_bucket < to_ts_exclusive`, so partial minutes
-    // must round up to include the last fully closed bucket before `raw_to_ts`.
-    let to_ts = minute_exclusive_upper_bound(raw_to_ts);
+    // minute from replay and then mix it with live stream data.  `fetch_backfill_batch`
+    // uses `ts_bucket < to_ts_exclusive`, so partial minutes must round up to include
+    // the last fully closed bucket before `raw_to_ts`, then shift back by the
+    // configured confirm lag so startup only materializes already-confirmed minutes.
+    let latest_safe_closed = minute_exclusive_upper_bound(raw_to_ts) - ChronoDuration::minutes(1);
+    let latest_confirmed_closed =
+        confirmed_closed_minute(latest_safe_closed, ctx.config.indicator.confirm_lag_minutes);
+    let to_ts = latest_confirmed_closed + ChronoDuration::minutes(1);
     let mut startup_max_catchup_minutes = ctx.config.indicator.startup_max_catchup_minutes;
     if startup_max_catchup_minutes > 0
         && startup_max_catchup_minutes < MIN_REUSABLE_SNAPSHOT_HISTORY_MINUTES
@@ -4968,6 +5266,45 @@ async fn run_startup_backfill(
             from_ts = minimum_recovery_floor;
         }
     }
+
+    let unconfirmed_tail_start_ts = latest_confirmed_closed + ChronoDuration::minutes(1);
+    if persisted_frontier_ts
+        .map(|frontier| frontier > latest_confirmed_closed)
+        .unwrap_or(false)
+    {
+        dispatcher
+            .rewind_persisted_tail(
+                &ctx.config.indicator.symbol,
+                unconfirmed_tail_start_ts,
+                &ctx.config.mq.exchanges.ind.name,
+            )
+            .await?;
+        persisted_frontier_ts = Some(latest_confirmed_closed);
+        info!(
+            latest_confirmed_closed = %latest_confirmed_closed,
+            unconfirmed_tail_start_ts = %unconfirmed_tail_start_ts,
+            confirm_lag_minutes = ctx.config.indicator.confirm_lag_minutes,
+            exchange_name = %ctx.config.mq.exchanges.ind.name,
+            "rewound persisted indicator tail beyond confirmed frontier during startup"
+        );
+    }
+    if state_store
+        .last_finalized_minute()
+        .map(|last| last > latest_confirmed_closed)
+        .unwrap_or(false)
+    {
+        state_store.rewind_finalized_state_from(unconfirmed_tail_start_ts);
+        state_store.clear_dirty_recompute_state();
+        state_store.clear_oi_ratio_patch_state();
+        info!(
+            latest_confirmed_closed = %latest_confirmed_closed,
+            unconfirmed_tail_start_ts = %unconfirmed_tail_start_ts,
+            confirm_lag_minutes = ctx.config.indicator.confirm_lag_minutes,
+            "rewound in-memory finalized state beyond confirmed frontier during startup"
+        );
+    }
+    checkpoint_resume_from_ts = checkpoint_resume_from_ts.map(|ts| ts.min(to_ts));
+
     metrics.set_last_persisted_ts(persisted_frontier_ts.map(|ts| ts.timestamp_millis()));
     // Startup replay is bucket-based for canonical 1m rows. Floor the lower bound so
     // we never drop a completed ts_bucket just because the resume timestamp carried
@@ -5008,6 +5345,9 @@ async fn run_startup_backfill(
         from_ts = %from_ts,
         to_ts = %to_ts,
         raw_to_ts = %raw_to_ts,
+        latest_safe_closed = %latest_safe_closed,
+        latest_confirmed_closed = %latest_confirmed_closed,
+        confirm_lag_minutes = ctx.config.indicator.confirm_lag_minutes,
         persisted_frontier_ts = ?persisted_frontier_ts,
         symbol = %ctx.config.indicator.symbol,
         fallback_lookback_minutes = STARTUP_BACKFILL_FALLBACK_LOOKBACK_MINUTES,
@@ -7309,15 +7649,16 @@ mod tests {
     use super::{
         allow_live_tail_reconcile, allow_oi_ratio_patch_processing, build_backfill_sql,
         build_paged_backfill_sql, build_paged_backfill_sql_internal,
-        expand_startup_backfill_to_minimum_recovery_window, find_long_null_price_run,
-        handle_ingest_event, hydrate_futures_orderbook_heatmaps_for_range_with_fetch,
-        live_tail_reconcile_start_ts, minimum_startup_recovery_history_floor,
-        minute_exclusive_upper_bound, minute_history_is_strictly_contiguous,
-        replay_heatmap_hydration_batch_end, replay_row_after_cursor,
-        save_startup_backfill_checkpoint, save_state_snapshot, shutdown_ready_through_candidate,
-        snapshot_has_required_history, snapshot_is_reusable_recovery_seed,
-        snapshot_null_price_run_reaches_recent_tail, startup_backfill_checkpoint_path,
-        try_load_startup_backfill_checkpoint, try_load_state_snapshot, BackfillCursor,
+        confirmed_repair_pipeline_idle, expand_startup_backfill_to_minimum_recovery_window,
+        find_long_null_price_run, handle_ingest_event,
+        hydrate_futures_orderbook_heatmaps_for_range_with_fetch, live_tail_reconcile_start_ts,
+        minimum_startup_recovery_history_floor, minute_exclusive_upper_bound,
+        minute_history_is_strictly_contiguous, replay_heatmap_hydration_batch_end,
+        replay_row_after_cursor, save_startup_backfill_checkpoint, save_state_snapshot,
+        shutdown_ready_through_candidate, snapshot_has_required_history,
+        snapshot_is_reusable_recovery_seed, snapshot_null_price_run_reaches_recent_tail,
+        startup_backfill_checkpoint_path, try_load_startup_backfill_checkpoint,
+        try_load_state_snapshot, BackfillCursor, ConfirmedLateRepairController,
         LiveCanonicalRepairController, ReplayRow, SnapshotLoadOutcome, StartupBackfillCheckpoint,
         StartupBackfillProgress, FUNDING_BACKFILL_WINDOW_SQL, LIQ_BACKFILL_WINDOW_SQL,
         LIVE_CANONICAL_TAIL_RECONCILE_LOOKBACK_MINUTES, MIN_REUSABLE_SNAPSHOT_HISTORY_MINUTES,
@@ -7339,6 +7680,7 @@ mod tests {
     use chrono::{Duration as ChronoDuration, TimeZone, Utc};
     use serde_json::json;
     use std::collections::{BTreeMap, HashMap};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use uuid::Uuid;
 
@@ -7856,6 +8198,72 @@ mod tests {
     }
 
     #[test]
+    fn confirmed_closed_minute_applies_confirm_lag() {
+        let latest_closed = Utc
+            .with_ymd_and_hms(2026, 3, 21, 8, 24, 0)
+            .single()
+            .unwrap();
+        assert_eq!(
+            super::confirmed_closed_minute(latest_closed, 15),
+            Utc.with_ymd_and_hms(2026, 3, 21, 8, 9, 0).single().unwrap()
+        );
+        assert_eq!(
+            super::confirmed_closed_minute(latest_closed, -5),
+            latest_closed
+        );
+    }
+
+    #[test]
+    fn confirmed_repair_controller_tracks_earliest_pending_minute() {
+        let later = Utc
+            .with_ymd_and_hms(2026, 3, 28, 3, 10, 0)
+            .single()
+            .unwrap();
+        let earlier = later - ChronoDuration::minutes(7);
+        let mut controller = ConfirmedLateRepairController::default();
+
+        assert!(controller.mark_pending(later));
+        assert_eq!(controller.pending_from_ts(), Some(later));
+        assert!(!controller.mark_pending(later));
+        assert!(controller.mark_pending(earlier));
+        assert_eq!(controller.pending_from_ts(), Some(earlier));
+    }
+
+    #[test]
+    fn confirmed_repair_pipeline_idle_requires_all_queues_empty() {
+        let live_prepare = Arc::new(AtomicUsize::new(0));
+        let live_ready = Arc::new(AtomicUsize::new(0));
+        let dirty_ready = Arc::new(AtomicUsize::new(0));
+
+        assert!(confirmed_repair_pipeline_idle(
+            &live_prepare,
+            &live_ready,
+            &dirty_ready
+        ));
+
+        live_prepare.store(1, Ordering::Release);
+        assert!(!confirmed_repair_pipeline_idle(
+            &live_prepare,
+            &live_ready,
+            &dirty_ready
+        ));
+        live_prepare.store(0, Ordering::Release);
+        live_ready.store(1, Ordering::Release);
+        assert!(!confirmed_repair_pipeline_idle(
+            &live_prepare,
+            &live_ready,
+            &dirty_ready
+        ));
+        live_ready.store(0, Ordering::Release);
+        dirty_ready.store(1, Ordering::Release);
+        assert!(!confirmed_repair_pipeline_idle(
+            &live_prepare,
+            &live_ready,
+            &dirty_ready
+        ));
+    }
+
+    #[test]
     fn tail_reconcile_yields_to_live_backlog_and_patch_backlog() {
         let latest_closed = Utc.with_ymd_and_hms(2026, 3, 28, 3, 0, 0).single().unwrap();
         let near_live = latest_closed - ChronoDuration::minutes(3);
@@ -8317,7 +8725,7 @@ mod tests {
         let mut scheduler = WindowScheduler::new(0);
         scheduler.mark_emitted_through(prior_bucket_ts);
 
-        handle_ingest_event(
+        let _ = handle_ingest_event(
             frontier_event(
                 first_live_bucket_ts + ChronoDuration::seconds(5),
                 MdData::Trade(TradeEvent {

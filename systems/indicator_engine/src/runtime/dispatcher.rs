@@ -25,6 +25,7 @@ pub enum DispatchMode {
     WarmStateOnly,
     ReplayMaterialize,
     Live,
+    RepairReplay,
     ShutdownFlush,
 }
 
@@ -34,11 +35,11 @@ impl DispatchMode {
     }
 
     fn persist_snapshots(self) -> bool {
-        matches!(self, Self::Live | Self::ShutdownFlush)
+        matches!(self, Self::Live | Self::RepairReplay | Self::ShutdownFlush)
     }
 
     fn publish_outputs(self) -> bool {
-        matches!(self, Self::Live | Self::ShutdownFlush)
+        matches!(self, Self::Live | Self::RepairReplay | Self::ShutdownFlush)
     }
 }
 
@@ -639,6 +640,13 @@ mod tests {
         assert!(DispatchMode::ShutdownFlush.persist_outputs());
         assert!(DispatchMode::ShutdownFlush.persist_snapshots());
         assert!(DispatchMode::ShutdownFlush.publish_outputs());
+    }
+
+    #[test]
+    fn repair_replay_still_persists_and_publishes_outputs() {
+        assert!(DispatchMode::RepairReplay.persist_outputs());
+        assert!(DispatchMode::RepairReplay.persist_snapshots());
+        assert!(DispatchMode::RepairReplay.publish_outputs());
     }
 
     #[test]

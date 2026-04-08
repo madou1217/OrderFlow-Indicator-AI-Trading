@@ -245,6 +245,8 @@ pub struct IndicatorConfig {
     pub live_drop_stale_enabled: bool,
     #[serde(default = "default_watermark_lateness_secs")]
     pub watermark_lateness_secs: i64,
+    #[serde(default = "default_confirm_lag_minutes")]
+    pub confirm_lag_minutes: i64,
     #[serde(default = "default_live_purge_on_start")]
     pub live_purge_on_start: bool,
     /// Cap startup historical catch-up window in minutes.
@@ -286,6 +288,7 @@ impl Default for IndicatorConfig {
             live_drop_stale_event_secs: default_live_drop_stale_event_secs(),
             live_drop_stale_enabled: default_live_drop_stale_enabled(),
             watermark_lateness_secs: default_watermark_lateness_secs(),
+            confirm_lag_minutes: default_confirm_lag_minutes(),
             live_purge_on_start: default_live_purge_on_start(),
             startup_max_catchup_minutes: default_startup_max_catchup_minutes(),
             startup_backfill_batch_size: default_startup_backfill_batch_size(),
@@ -762,6 +765,10 @@ fn default_live_drop_stale_enabled() -> bool {
 
 fn default_watermark_lateness_secs() -> i64 {
     5
+}
+
+fn default_confirm_lag_minutes() -> i64 {
+    0
 }
 
 fn default_live_purge_on_start() -> bool {
