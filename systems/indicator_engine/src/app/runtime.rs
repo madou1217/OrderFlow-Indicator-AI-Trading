@@ -234,6 +234,47 @@ impl LivePublishState {
 }
 
 #[derive(Debug, Default)]
+struct LiveCatchupCutoverStabilityTracker {
+    consecutive_stable_minutes: u64,
+    last_stable_confirmed_minute: Option<DateTime<Utc>>,
+}
+
+impl LiveCatchupCutoverStabilityTracker {
+    fn reset(&mut self) {
+        self.consecutive_stable_minutes = 0;
+        self.last_stable_confirmed_minute = None;
+    }
+
+    fn observe_confirmed_minute(&mut self, latest_confirmed_closed: DateTime<Utc>) {
+        match self.last_stable_confirmed_minute {
+            Some(last_seen) if latest_confirmed_closed <= last_seen => {}
+            Some(last_seen)
+                if latest_confirmed_closed - last_seen == ChronoDuration::minutes(1) =>
+            {
+                self.consecutive_stable_minutes = self.consecutive_stable_minutes.saturating_add(1);
+                self.last_stable_confirmed_minute = Some(latest_confirmed_closed);
+            }
+            Some(_) => {
+                self.consecutive_stable_minutes = 1;
+                self.last_stable_confirmed_minute = Some(latest_confirmed_closed);
+            }
+            None => {
+                self.consecutive_stable_minutes = 1;
+                self.last_stable_confirmed_minute = Some(latest_confirmed_closed);
+            }
+        }
+    }
+
+    fn stable_enough(&self, required_minutes: u64) -> bool {
+        self.consecutive_stable_minutes >= required_minutes.max(1)
+    }
+
+    fn observed_minutes(&self) -> u64 {
+        self.consecutive_stable_minutes
+    }
+}
+
+#[derive(Debug, Default)]
 struct LiveCanonicalRepairController {
     last_gap_repair_attempt_at: Option<Instant>,
     last_gap_repair_minute: Option<DateTime<Utc>>,
@@ -512,6 +553,10 @@ fn configured_live_catchup_resume_lag_minutes(config: &RootConfig) -> i64 {
         .min(enter_lag_minutes.saturating_sub(1))
 }
 
+fn configured_live_catchup_resume_stable_minutes(config: &RootConfig) -> u64 {
+    config.indicator.live_catchup_resume_stable_minutes.max(1)
+}
+
 fn live_catchup_requested(
     config: &RootConfig,
     next_minute: Option<DateTime<Utc>>,
@@ -531,7 +576,6 @@ fn live_catchup_cutover_ready(
     latest_confirmed_closed: DateTime<Utc>,
     dirty_recompute_from_ts: Option<DateTime<Utc>>,
     has_pending_oi_ratio_patch: bool,
-    pipeline_idle: bool,
     oi_ratio_patch_task_running: bool,
 ) -> bool {
     if !config.indicator.live_catchup_progress_only_enabled {
@@ -542,7 +586,6 @@ fn live_catchup_cutover_ready(
         <= configured_live_catchup_resume_lag_minutes(config)
         && dirty_recompute_from_ts.is_none()
         && !has_pending_oi_ratio_patch
-        && pipeline_idle
         && !oi_ratio_patch_task_running
 }
 
@@ -1125,7 +1168,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
     } else {
         LivePublishState::Publishing
     };
-    let mut live_catchup_cutover_stable_since: Option<Instant> = None;
+    let mut live_catchup_cutover_stability = LiveCatchupCutoverStabilityTracker::default();
     let mut last_logged_live_publish_state: Option<LivePublishState> = None;
 
     loop {
@@ -1565,7 +1608,6 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                     latest_confirmed_closed,
                     frontier_snapshot.dirty_recompute_from_ts,
                     has_pending_oi_ratio_patch,
-                    repair_pipeline_idle,
                     oi_ratio_patch_task.is_some(),
                 );
 
@@ -1584,28 +1626,23 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                     }
                     snapshot_fanout_started = false;
                     live_publish_state = LivePublishState::MutedCatchup;
-                    live_catchup_cutover_stable_since = None;
+                    live_catchup_cutover_stability.reset();
                 }
 
                 if matches!(live_publish_state, LivePublishState::MutedCatchup) && cutover_ready {
-                    if live_catchup_cutover_stable_since.is_none() {
-                        live_catchup_cutover_stable_since = Some(Instant::now());
-                    }
+                    live_catchup_cutover_stability
+                        .observe_confirmed_minute(latest_confirmed_closed);
                 } else {
-                    live_catchup_cutover_stable_since = None;
+                    live_catchup_cutover_stability.reset();
                 }
 
-                let cutover_stable_enough = live_catchup_cutover_stable_since
-                    .map(|stable_since| {
-                        stable_since.elapsed()
-                            >= Duration::from_secs(
-                                ctx.config.indicator.live_catchup_resume_stable_secs.max(1),
-                            )
-                    })
-                    .unwrap_or(false);
+                let cutover_stable_enough = live_catchup_cutover_stability.stable_enough(
+                    configured_live_catchup_resume_stable_minutes(ctx.config.as_ref()),
+                );
 
                 if matches!(live_publish_state, LivePublishState::MutedCatchup)
                     && cutover_stable_enough
+                    && repair_pipeline_idle
                 {
                     if maybe_execute_live_catchup_cutover(
                         &ctx,
@@ -1629,7 +1666,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                     .is_some()
                     {
                         live_publish_state = LivePublishState::Publishing;
-                        live_catchup_cutover_stable_since = None;
+                        live_catchup_cutover_stability.reset();
                     }
                 }
 
@@ -1640,7 +1677,8 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                         backlog_minutes = live_backlog_minutes(next_minute, latest_confirmed_closed),
                         enter_lag_threshold_minutes = configured_live_catchup_enter_lag_minutes(ctx.config.as_ref()),
                         resume_lag_threshold_minutes = configured_live_catchup_resume_lag_minutes(ctx.config.as_ref()),
-                        resume_stable_secs = ctx.config.indicator.live_catchup_resume_stable_secs.max(1),
+                        resume_stable_minutes = configured_live_catchup_resume_stable_minutes(ctx.config.as_ref()),
+                        observed_stable_minutes = live_catchup_cutover_stability.observed_minutes(),
                         cutover_tail_minutes = configured_live_catchup_cutover_tail_minutes(ctx.config.as_ref()),
                         next_minute = ?next_minute,
                         latest_confirmed_closed = %latest_confirmed_closed,
@@ -8891,10 +8929,11 @@ mod tests {
         allow_live_tail_reconcile, allow_oi_ratio_patch_processing, build_backfill_sql,
         build_paged_backfill_sql, build_paged_backfill_sql_internal,
         configured_live_catchup_enter_lag_minutes, configured_live_catchup_resume_lag_minutes,
-        confirmed_repair_pipeline_idle, effective_live_commit_frontier_ts,
-        expand_startup_backfill_to_minimum_recovery_window, find_long_null_price_run,
-        handle_ingest_event, hydrate_futures_orderbook_heatmaps_for_range_with_fetch,
-        live_catchup_cutover_ready, live_catchup_requested, live_tail_reconcile_start_ts,
+        configured_live_catchup_resume_stable_minutes, confirmed_repair_pipeline_idle,
+        effective_live_commit_frontier_ts, expand_startup_backfill_to_minimum_recovery_window,
+        find_long_null_price_run, handle_ingest_event,
+        hydrate_futures_orderbook_heatmaps_for_range_with_fetch, live_catchup_cutover_ready,
+        live_catchup_requested, live_tail_reconcile_start_ts,
         minimum_live_catchup_cutover_tail_minutes, minimum_startup_recovery_history_floor,
         minute_exclusive_upper_bound, minute_history_is_strictly_contiguous,
         replay_heatmap_hydration_batch_end, replay_row_after_cursor,
@@ -8903,8 +8942,9 @@ mod tests {
         snapshot_is_reusable_recovery_seed, snapshot_null_price_run_reaches_recent_tail,
         startup_backfill_checkpoint_path, try_load_startup_backfill_checkpoint,
         try_load_state_snapshot, BackfillCursor, ConfirmedLateRepairController,
-        LiveCanonicalRepairController, ReplayRow, SnapshotLoadOutcome, StartupBackfillCheckpoint,
-        StartupBackfillProgress, FUNDING_BACKFILL_WINDOW_SQL, LIQ_BACKFILL_WINDOW_SQL,
+        LiveCanonicalRepairController, LiveCatchupCutoverStabilityTracker, ReplayRow,
+        SnapshotLoadOutcome, StartupBackfillCheckpoint, StartupBackfillProgress,
+        FUNDING_BACKFILL_WINDOW_SQL, LIQ_BACKFILL_WINDOW_SQL,
         LIVE_CANONICAL_TAIL_RECONCILE_LOOKBACK_MINUTES, MIN_RESTART_RECOVERY_HISTORY_MINUTES,
         MIN_REUSABLE_FINALIZED_HISTORY_MINUTES, ORDERBOOK_BACKFILL_WINDOW_SQL_SCALAR,
         ORDERBOOK_BACKFILL_WINDOW_SQL_WITH_HEATMAP, STARTUP_BACKFILL_CHECKPOINT_VERSION,
@@ -9523,6 +9563,16 @@ mod tests {
     }
 
     #[test]
+    fn live_catchup_resume_stable_minutes_has_minimum_of_one() {
+        let mut config = test_root_config();
+        config.indicator.live_catchup_resume_stable_minutes = 0;
+        assert_eq!(configured_live_catchup_resume_stable_minutes(&config), 1);
+
+        config.indicator.live_catchup_resume_stable_minutes = 5;
+        assert_eq!(configured_live_catchup_resume_stable_minutes(&config), 5);
+    }
+
+    #[test]
     fn live_catchup_requested_uses_high_watermark_threshold() {
         let mut config = test_root_config();
         config.indicator.live_catchup_progress_only_enabled = true;
@@ -9542,7 +9592,7 @@ mod tests {
     }
 
     #[test]
-    fn live_catchup_cutover_ready_requires_low_watermark_and_idle_pipeline() {
+    fn live_catchup_cutover_ready_requires_low_watermark_and_clean_repair_state() {
         let mut config = test_root_config();
         config.indicator.live_catchup_progress_only_enabled = true;
         config.indicator.live_catchup_progress_only_lag_minutes = 10;
@@ -9555,7 +9605,6 @@ mod tests {
             latest_confirmed_closed,
             None,
             false,
-            true,
             false,
         ));
         assert!(!live_catchup_cutover_ready(
@@ -9564,7 +9613,6 @@ mod tests {
             latest_confirmed_closed,
             None,
             false,
-            true,
             false,
         ));
         assert!(!live_catchup_cutover_ready(
@@ -9573,7 +9621,6 @@ mod tests {
             latest_confirmed_closed,
             Some(Utc.with_ymd_and_hms(2026, 4, 9, 8, 18, 0).single().unwrap()),
             false,
-            true,
             false,
         ));
         assert!(!live_catchup_cutover_ready(
@@ -9582,9 +9629,36 @@ mod tests {
             latest_confirmed_closed,
             None,
             false,
-            false,
+            true,
+        ));
+        assert!(!live_catchup_cutover_ready(
+            &config,
+            Some(Utc.with_ymd_and_hms(2026, 4, 9, 8, 19, 0).single().unwrap()),
+            latest_confirmed_closed,
+            None,
+            true,
             false,
         ));
+    }
+
+    #[test]
+    fn live_catchup_cutover_stability_tracks_consecutive_confirmed_minutes() {
+        let mut tracker = LiveCatchupCutoverStabilityTracker::default();
+        let m1 = Utc.with_ymd_and_hms(2026, 4, 9, 8, 20, 0).single().unwrap();
+        let m2 = Utc.with_ymd_and_hms(2026, 4, 9, 8, 21, 0).single().unwrap();
+        let m4 = Utc.with_ymd_and_hms(2026, 4, 9, 8, 23, 0).single().unwrap();
+
+        tracker.observe_confirmed_minute(m1);
+        tracker.observe_confirmed_minute(m1);
+        assert_eq!(tracker.observed_minutes(), 1);
+
+        tracker.observe_confirmed_minute(m2);
+        assert_eq!(tracker.observed_minutes(), 2);
+
+        tracker.observe_confirmed_minute(m4);
+        assert_eq!(tracker.observed_minutes(), 1);
+        assert!(tracker.stable_enough(1));
+        assert!(!tracker.stable_enough(2));
     }
 
     #[test]

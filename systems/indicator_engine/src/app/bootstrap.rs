@@ -260,10 +260,11 @@ pub struct IndicatorConfig {
     /// backlog shrinks to this lower-watermark lag.
     #[serde(default = "default_live_catchup_resume_lag_minutes")]
     pub live_catchup_resume_lag_minutes: i64,
-    /// Require the low-watermark catch-up conditions to remain stable for at
-    /// least this many seconds before triggering automatic cutover replay.
-    #[serde(default = "default_live_catchup_resume_stable_secs")]
-    pub live_catchup_resume_stable_secs: u64,
+    /// Require the low-watermark catch-up conditions to remain stable for this
+    /// many consecutive confirmed minutes before triggering automatic cutover
+    /// replay.
+    #[serde(default = "default_live_catchup_resume_stable_minutes")]
+    pub live_catchup_resume_stable_minutes: u64,
     /// Canonical tail window to durable-rebuild during automatic live cutover.
     /// 0 means derive the minimum safe window from current repair/lookback rules.
     #[serde(default)]
@@ -312,7 +313,7 @@ impl Default for IndicatorConfig {
             live_catchup_progress_only_lag_minutes: default_live_catchup_progress_only_lag_minutes(
             ),
             live_catchup_resume_lag_minutes: default_live_catchup_resume_lag_minutes(),
-            live_catchup_resume_stable_secs: default_live_catchup_resume_stable_secs(),
+            live_catchup_resume_stable_minutes: default_live_catchup_resume_stable_minutes(),
             live_catchup_cutover_tail_minutes: 0,
             startup_max_catchup_minutes: default_startup_max_catchup_minutes(),
             startup_backfill_batch_size: default_startup_backfill_batch_size(),
@@ -803,8 +804,8 @@ fn default_live_catchup_resume_lag_minutes() -> i64 {
     1
 }
 
-fn default_live_catchup_resume_stable_secs() -> u64 {
-    60
+fn default_live_catchup_resume_stable_minutes() -> u64 {
+    5
 }
 
 fn default_startup_max_catchup_minutes() -> i64 {
