@@ -45,6 +45,7 @@ use uuid::Uuid;
 const STARTUP_BACKFILL_FALLBACK_LOOKBACK_MINUTES: i64 = 30;
 const STARTUP_BACKFILL_OVERLAP_MINUTES: i64 = 30;
 const MIN_RESTART_RECOVERY_HISTORY_MINUTES: i64 = 24 * 60;
+const MIN_REUSABLE_FINALIZED_HISTORY_MINUTES: i64 = 7 * 24 * 60;
 const STARTUP_BACKFILL_SAFETY_LAG_SECS: i64 = 10;
 const STARTUP_BACKFILL_MARKET: &str = "all";
 const STALE_DROP_REPORT_INTERVAL_SECS: u64 = 10;
@@ -2554,12 +2555,12 @@ fn snapshot_has_required_history(snap: &StateSnapshot) -> bool {
 fn required_snapshot_history_start_ts(snap: &StateSnapshot) -> DateTime<Utc> {
     let retention_floor =
         snap.last_finalized_ts - ChronoDuration::minutes((HISTORY_LIMIT_MINUTES as i64) - 1);
-    let restart_floor =
-        snap.last_finalized_ts - ChronoDuration::minutes(MIN_RESTART_RECOVERY_HISTORY_MINUTES - 1);
+    let reusable_history_floor = snap.last_finalized_ts
+        - ChronoDuration::minutes(MIN_REUSABLE_FINALIZED_HISTORY_MINUTES - 1);
     let required_floor = snap
         .effective_history_floor_ts
-        .map(|effective_floor| effective_floor.min(restart_floor))
-        .unwrap_or(restart_floor);
+        .map(|effective_floor| effective_floor.min(reusable_history_floor))
+        .unwrap_or(reusable_history_floor);
     retention_floor.max(required_floor)
 }
 
@@ -2583,7 +2584,7 @@ fn snapshot_history_covers_required_window(
 }
 
 fn minimum_startup_recovery_history_floor(to_ts: DateTime<Utc>) -> DateTime<Utc> {
-    to_ts - ChronoDuration::minutes(MIN_RESTART_RECOVERY_HISTORY_MINUTES)
+    to_ts - ChronoDuration::minutes(MIN_REUSABLE_FINALIZED_HISTORY_MINUTES)
 }
 
 fn expand_startup_backfill_to_minimum_recovery_window(
@@ -6405,8 +6406,8 @@ async fn run_startup_backfill(
                     info!(
                         original_from_ts = %from_ts,
                         minimum_recovery_floor = %minimum_recovery_floor,
-                        minimum_recovery_history_minutes = MIN_RESTART_RECOVERY_HISTORY_MINUTES,
-                        "startup historical backfill expanded to rebuild minimum reusable restart history"
+                        minimum_recovery_history_minutes = MIN_REUSABLE_FINALIZED_HISTORY_MINUTES,
+                        "startup historical backfill expanded to rebuild minimum reusable finalized history"
                     );
                     from_ts = minimum_recovery_floor;
                 }
@@ -6419,8 +6420,8 @@ async fn run_startup_backfill(
             info!(
                 original_from_ts = %from_ts,
                 minimum_recovery_floor = %minimum_recovery_floor,
-                minimum_recovery_history_minutes = MIN_RESTART_RECOVERY_HISTORY_MINUTES,
-                "startup historical backfill expanded to rebuild minimum reusable restart history"
+                minimum_recovery_history_minutes = MIN_REUSABLE_FINALIZED_HISTORY_MINUTES,
+                "startup historical backfill expanded to rebuild minimum reusable finalized history"
             );
             from_ts = minimum_recovery_floor;
         }
@@ -8905,8 +8906,9 @@ mod tests {
         LiveCanonicalRepairController, ReplayRow, SnapshotLoadOutcome, StartupBackfillCheckpoint,
         StartupBackfillProgress, FUNDING_BACKFILL_WINDOW_SQL, LIQ_BACKFILL_WINDOW_SQL,
         LIVE_CANONICAL_TAIL_RECONCILE_LOOKBACK_MINUTES, MIN_RESTART_RECOVERY_HISTORY_MINUTES,
-        ORDERBOOK_BACKFILL_WINDOW_SQL_SCALAR, ORDERBOOK_BACKFILL_WINDOW_SQL_WITH_HEATMAP,
-        STARTUP_BACKFILL_CHECKPOINT_VERSION, TRADE_BACKFILL_WINDOW_SQL,
+        MIN_REUSABLE_FINALIZED_HISTORY_MINUTES, ORDERBOOK_BACKFILL_WINDOW_SQL_SCALAR,
+        ORDERBOOK_BACKFILL_WINDOW_SQL_WITH_HEATMAP, STARTUP_BACKFILL_CHECKPOINT_VERSION,
+        TRADE_BACKFILL_WINDOW_SQL,
     };
     use crate::app::bootstrap::{
         AppSection, DatabaseConfig, IndicatorConfig, MqConfig, MqExchangeConfig, MqExchanges,
@@ -9823,7 +9825,7 @@ mod tests {
     fn snapshot_required_history_accepts_reusable_rolling_7d_window() {
         let last_finalized_ts = Utc.with_ymd_and_hms(2026, 3, 21, 3, 0, 0).single().unwrap();
         let effective_floor_ts = last_finalized_ts - ChronoDuration::minutes(90);
-        let required_minutes = MIN_RESTART_RECOVERY_HISTORY_MINUTES - 1;
+        let required_minutes = MIN_REUSABLE_FINALIZED_HISTORY_MINUTES - 1;
         let history_start_ts = last_finalized_ts - ChronoDuration::minutes(required_minutes);
         let history = (0..=required_minutes)
             .map(|offset| {
@@ -9860,9 +9862,9 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_required_history_accepts_recent_recovery_floor_above_minimum() {
+    fn snapshot_required_history_accepts_effective_floor_older_than_reusable_minimum() {
         let last_finalized_ts = Utc.with_ymd_and_hms(2026, 3, 21, 3, 0, 0).single().unwrap();
-        let effective_floor_ts = last_finalized_ts - ChronoDuration::minutes(3 * 24 * 60);
+        let effective_floor_ts = last_finalized_ts - ChronoDuration::minutes(10 * 24 * 60);
         let required_minutes = (last_finalized_ts - effective_floor_ts).num_minutes();
         let history = (0..=required_minutes)
             .map(|offset| {
@@ -9910,7 +9912,7 @@ mod tests {
         assert_eq!(expanded, minimum_startup_recovery_history_floor(to_ts));
         assert_eq!(
             expanded,
-            to_ts - ChronoDuration::minutes(MIN_RESTART_RECOVERY_HISTORY_MINUTES)
+            to_ts - ChronoDuration::minutes(MIN_REUSABLE_FINALIZED_HISTORY_MINUTES)
         );
     }
 
@@ -9926,7 +9928,7 @@ mod tests {
     #[tokio::test]
     async fn stale_snapshot_is_accepted_as_recovery_seed() {
         let last_finalized_ts = Utc::now() - ChronoDuration::hours(30);
-        let required_minutes = MIN_RESTART_RECOVERY_HISTORY_MINUTES - 1;
+        let required_minutes = MIN_REUSABLE_FINALIZED_HISTORY_MINUTES - 1;
         let history_start_ts = last_finalized_ts - ChronoDuration::minutes(required_minutes);
         let history = (0..=required_minutes)
             .map(|offset| {
@@ -9965,17 +9967,17 @@ mod tests {
     }
 
     #[test]
-    fn canonical_only_snapshot_is_reusable_recovery_seed() {
+    fn canonical_only_snapshot_is_not_reusable_recovery_seed() {
         let last_finalized_ts = Utc::now() - ChronoDuration::minutes(5);
         let snap = canonical_only_snapshot_fixture(last_finalized_ts);
 
         assert!(snap.history_futures.is_empty());
         assert!(snap.history_spot.is_empty());
-        assert!(snapshot_is_reusable_recovery_seed(&snap));
+        assert!(!snapshot_is_reusable_recovery_seed(&snap));
     }
 
     #[tokio::test]
-    async fn canonical_only_snapshot_is_accepted_as_recovery_seed() {
+    async fn canonical_only_snapshot_is_rejected_as_recovery_seed() {
         let last_finalized_ts = Utc::now() - ChronoDuration::minutes(5);
         let snap = canonical_only_snapshot_fixture(last_finalized_ts);
         let temp_path = std::env::temp_dir().join(format!(
@@ -9989,19 +9991,7 @@ mod tests {
         let outcome = try_load_state_snapshot(temp_path.to_str().unwrap(), "TESTUSDT", 24);
         let _ = std::fs::remove_file(&temp_path);
 
-        match outcome {
-            SnapshotLoadOutcome::Fresh(loaded) => {
-                assert_eq!(loaded.last_finalized_ts, snap.last_finalized_ts);
-                assert_eq!(loaded.canonical_minutes.len(), snap.canonical_minutes.len());
-                assert!(loaded.history_futures.is_empty());
-            }
-            SnapshotLoadOutcome::StaleRecoverySeed { .. } => {
-                panic!("expected fresh canonical recovery seed, got stale")
-            }
-            SnapshotLoadOutcome::Rejected => {
-                panic!("expected canonical recovery seed snapshot to load")
-            }
-        }
+        assert!(matches!(outcome, SnapshotLoadOutcome::Rejected));
     }
 
     #[tokio::test]
