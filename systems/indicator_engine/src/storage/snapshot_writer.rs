@@ -1,7 +1,8 @@
 use crate::indicators::context::IndicatorSnapshotRow;
 use crate::publish::ind_publisher::BundleOutboxMessage;
+use crate::runtime::state_store::floor_minute;
 use anyhow::{Context, Result};
-use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Timelike, Utc};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres, QueryBuilder, Transaction};
@@ -14,6 +15,7 @@ const SNAPSHOT_BLOB_REF_KEY: &str = "__snapshot_blob_ref_v1";
 const SNAPSHOT_BLOB_CHUNKS_KEY: &str = "__snapshot_blob_chunks_v1";
 const SNAPSHOT_BLOB_MIN_BYTES: usize = 4 * 1024;
 const SNAPSHOT_BLOB_CHUNK_SIZE: usize = 256;
+const DERIV_FEATURE_BUCKET_MINUTES: i64 = 5;
 
 #[derive(Clone)]
 pub struct SnapshotWriter {
@@ -325,7 +327,10 @@ impl SnapshotWriter {
             .context("begin indicator progress+outbox tx")?;
         let begin_ms = begin_started_at.elapsed().as_millis();
         let enqueue_started_at = Instant::now();
-        enqueue_outbox_batch_in_tx(&mut tx, messages).await?;
+        // Live minute bundles remain reconstructible from feat.indicator_snapshot,
+        // so we can skip the extra payload-cache blob write on the hot path and
+        // let the outbox dispatcher rebuild on cache miss.
+        enqueue_outbox_batch_in_tx(&mut tx, messages, false).await?;
         let enqueue_ms = enqueue_started_at.elapsed().as_millis();
         let progress_started_at = Instant::now();
         upsert_indicator_progress(&mut tx, symbol, ts_bucket).await?;
@@ -361,7 +366,7 @@ impl SnapshotWriter {
             .begin()
             .await
             .context("begin indicator repair outbox tx")?;
-        enqueue_outbox_batch_in_tx(&mut tx, messages).await?;
+        enqueue_outbox_batch_in_tx(&mut tx, messages, true).await?;
         tx.commit()
             .await
             .context("commit indicator repair outbox tx")?;
@@ -428,6 +433,32 @@ impl SnapshotWriter {
         Ok(())
     }
 
+    pub async fn set_snapshot_fanout_progress(
+        &self,
+        symbol: &str,
+        ts_bucket: DateTime<Utc>,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO ops.indicator_snapshot_fanout_progress (
+                symbol,
+                last_published_snapshot_ts
+            )
+            VALUES ($1, $2)
+            ON CONFLICT (symbol)
+            DO UPDATE SET
+                last_published_snapshot_ts = EXCLUDED.last_published_snapshot_ts,
+                updated_at = now()
+            "#,
+        )
+        .bind(symbol.to_uppercase())
+        .bind(ts_bucket)
+        .execute(&self.pool)
+        .await
+        .context("set indicator snapshot fanout progress")?;
+        Ok(())
+    }
+
     pub async fn suppress_repair_bundle_publish_tail(
         &self,
         symbol: &str,
@@ -486,6 +517,8 @@ impl SnapshotWriter {
         exchange_name: &str,
     ) -> Result<()> {
         let rewind_target_ts = repair_start_ts - ChronoDuration::minutes(1);
+        let deriv_feature_repair_start_ts =
+            floor_timestamp_to_interval_minutes(repair_start_ts, DERIV_FEATURE_BUCKET_MINUTES);
         let symbol_upper = symbol.to_uppercase();
         let mut tx = self
             .pool
@@ -577,6 +610,20 @@ impl SnapshotWriter {
         }
 
         for table in [
+            "feat.open_interest_feature",
+            "feat.long_short_ratio_feature",
+            "feat.options_surface_feature",
+        ] {
+            let query = format!("DELETE FROM {table} WHERE symbol = $1 AND ts_bucket >= $2");
+            sqlx::query(&query)
+                .bind(&symbol_upper)
+                .bind(deriv_feature_repair_start_ts)
+                .execute(&mut *tx)
+                .await
+                .with_context(|| format!("delete {table} tail for overlap repair"))?;
+        }
+
+        for table in [
             "evt.indicator_event",
             "evt.divergence_event",
             "evt.absorption_event",
@@ -620,7 +667,7 @@ impl SnapshotWriter {
         .await
         .context("rewind indicator snapshot fanout progress")?;
 
-        set_indicator_progress_exact(&mut tx, &symbol_upper, rewind_target_ts).await?;
+        rewind_indicator_progress_at_most(&mut tx, &symbol_upper, rewind_target_ts).await?;
         tx.commit()
             .await
             .context("commit indicator persisted tail rewind tx")?;
@@ -631,58 +678,61 @@ impl SnapshotWriter {
 async fn enqueue_outbox_batch_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     messages: &[BundleOutboxMessage],
+    write_payload_cache: bool,
 ) -> Result<()> {
     if messages.is_empty() {
         return Ok(());
     }
 
-    let published_at = Utc::now();
-    let payload_bytes = messages
-        .iter()
-        .map(|message| message.payload_bytes_with_published_at(published_at))
-        .collect::<Result<Vec<_>>>()?;
+    if write_payload_cache {
+        let published_at = Utc::now();
+        let payload_bytes = messages
+            .iter()
+            .map(|message| message.payload_bytes_with_published_at(published_at))
+            .collect::<Result<Vec<_>>>()?;
 
-    let mut payload_builder = QueryBuilder::<Postgres>::new(
-        r#"
-        INSERT INTO ops.indicator_bundle_payload_cache (
-            symbol, ts_bucket, schema_version, indicator_count, payload_encoding, payload_bytes
-        )
-        "#,
-    );
-
-    payload_builder.push_values(
-        messages.iter().zip(payload_bytes.iter()),
-        |mut b, (message, payload_bytes)| {
-            b.push_bind(&message.symbol)
-                .push_bind(message.ts_bucket)
-                .push_bind(message.schema_version)
-                .push_bind(message.indicator_count)
-                .push_bind(&message.payload_encoding)
-                .push_bind(payload_bytes);
-        },
-    );
-
-    payload_builder.push(
-        r#"
-        ON CONFLICT (symbol, ts_bucket)
-        DO UPDATE SET
-            schema_version = EXCLUDED.schema_version,
-            indicator_count = EXCLUDED.indicator_count,
-            payload_encoding = EXCLUDED.payload_encoding,
-            payload_bytes = EXCLUDED.payload_bytes,
-            created_at = now()
-        "#,
-    );
-    payload_builder
-        .build()
-        .execute(tx.as_mut())
-        .await
-        .with_context(|| {
-            format!(
-                "upsert indicator bundle payload cache count={}",
-                messages.len()
+        let mut payload_builder = QueryBuilder::<Postgres>::new(
+            r#"
+            INSERT INTO ops.indicator_bundle_payload_cache (
+                symbol, ts_bucket, schema_version, indicator_count, payload_encoding, payload_bytes
             )
-        })?;
+            "#,
+        );
+
+        payload_builder.push_values(
+            messages.iter().zip(payload_bytes.iter()),
+            |mut b, (message, payload_bytes)| {
+                b.push_bind(&message.symbol)
+                    .push_bind(message.ts_bucket)
+                    .push_bind(message.schema_version)
+                    .push_bind(message.indicator_count)
+                    .push_bind(&message.payload_encoding)
+                    .push_bind(payload_bytes);
+            },
+        );
+
+        payload_builder.push(
+            r#"
+            ON CONFLICT (symbol, ts_bucket)
+            DO UPDATE SET
+                schema_version = EXCLUDED.schema_version,
+                indicator_count = EXCLUDED.indicator_count,
+                payload_encoding = EXCLUDED.payload_encoding,
+                payload_bytes = EXCLUDED.payload_bytes,
+                created_at = now()
+            "#,
+        );
+        payload_builder
+            .build()
+            .execute(tx.as_mut())
+            .await
+            .with_context(|| {
+                format!(
+                    "upsert indicator bundle payload cache count={}",
+                    messages.len()
+                )
+            })?;
+    }
 
     let mut builder = QueryBuilder::<Postgres>::new(
         r#"
@@ -1062,7 +1112,7 @@ async fn upsert_indicator_progress(
     Ok(())
 }
 
-async fn set_indicator_progress_exact(
+async fn rewind_indicator_progress_at_most(
     tx: &mut Transaction<'_, Postgres>,
     symbol: &str,
     ts_bucket: DateTime<Utc>,
@@ -1073,7 +1123,10 @@ async fn set_indicator_progress_exact(
         VALUES ($1, $2)
         ON CONFLICT (symbol)
         DO UPDATE SET
-            last_success_ts = EXCLUDED.last_success_ts,
+            last_success_ts = LEAST(
+                feat.indicator_progress.last_success_ts,
+                EXCLUDED.last_success_ts
+            ),
             updated_at = now()
         "#,
     )
@@ -1081,7 +1134,7 @@ async fn set_indicator_progress_exact(
     .bind(ts_bucket)
     .execute(&mut **tx)
     .await
-    .context("set feat.indicator_progress exact")?;
+    .context("rewind feat.indicator_progress at most")?;
     Ok(())
 }
 
@@ -1328,6 +1381,12 @@ fn assemble_bundle_indicators_json(mut rows: Vec<SnapshotBundleRow>) -> Value {
             });
     }
     Value::Object(indicators)
+}
+
+fn floor_timestamp_to_interval_minutes(ts: DateTime<Utc>, interval_minutes: i64) -> DateTime<Utc> {
+    let floored = floor_minute(ts);
+    let offset = (floored.minute() as i64).rem_euclid(interval_minutes.max(1));
+    floored - ChronoDuration::minutes(offset)
 }
 
 #[cfg(test)]

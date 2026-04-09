@@ -1,10 +1,11 @@
 use anyhow::{anyhow, bail, Context, Result};
-use chrono::{DateTime, NaiveDateTime, Timelike, Utc};
+use chrono::{DateTime, NaiveDateTime, TimeZone, Timelike, Utc};
 use indicator_engine::app::bootstrap::{build_db_pool, load_config};
 use indicator_engine::storage::snapshot_writer::SnapshotWriter;
 use sqlx::{PgPool, Row};
 
 const DEFAULT_CONFIG_PATH: &str = "config/config.yaml";
+const DERIV_FEATURE_BUCKET_MINUTES: i64 = 5;
 
 #[derive(Debug)]
 struct Args {
@@ -40,6 +41,9 @@ struct TargetPresence {
     trade_flow_spot_rows: i64,
     orderbook_rows: i64,
     funding_rows: i64,
+    oi_rows: i64,
+    ratio_rows: i64,
+    options_surface_rows: i64,
 }
 
 #[tokio::main]
@@ -77,14 +81,17 @@ async fn main() -> Result<()> {
         completeness.fund_fut
     );
     println!(
-        "target_rows snapshot={} level={} liq_level={} trade_flow_fut={} trade_flow_spot={} orderbook={} funding={}",
+        "target_rows snapshot={} level={} liq_level={} trade_flow_fut={} trade_flow_spot={} orderbook={} funding={} oi={} ratio={} options_surface={}",
         target_presence.snapshot_rows,
         target_presence.level_rows,
         target_presence.liq_level_rows,
         target_presence.trade_flow_fut_rows,
         target_presence.trade_flow_spot_rows,
         target_presence.orderbook_rows,
-        target_presence.funding_rows
+        target_presence.funding_rows,
+        target_presence.oi_rows,
+        target_presence.ratio_rows,
+        target_presence.options_surface_rows
     );
     println!(
         "indicator_progress_before={}",
@@ -121,14 +128,17 @@ async fn main() -> Result<()> {
             .unwrap_or_else(|| "NULL".to_string())
     );
     println!(
-        "target_rows_after snapshot={} level={} liq_level={} trade_flow_fut={} trade_flow_spot={} orderbook={} funding={}",
+        "target_rows_after snapshot={} level={} liq_level={} trade_flow_fut={} trade_flow_spot={} orderbook={} funding={} oi={} ratio={} options_surface={}",
         target_presence_after.snapshot_rows,
         target_presence_after.level_rows,
         target_presence_after.liq_level_rows,
         target_presence_after.trade_flow_fut_rows,
         target_presence_after.trade_flow_spot_rows,
         target_presence_after.orderbook_rows,
-        target_presence_after.funding_rows
+        target_presence_after.funding_rows,
+        target_presence_after.oi_rows,
+        target_presence_after.ratio_rows,
+        target_presence_after.options_surface_rows
     );
     println!(
         "next step: restart orderflow-indicator-engine so it replays from canonical md.* history"
@@ -275,6 +285,8 @@ async fn load_target_presence(
     symbol: &str,
     ts_bucket: DateTime<Utc>,
 ) -> Result<TargetPresence> {
+    let deriv_feature_ts_bucket =
+        floor_timestamp_to_interval_minutes(ts_bucket, DERIV_FEATURE_BUCKET_MINUTES);
     let row = sqlx::query(
         r#"
         SELECT
@@ -284,11 +296,15 @@ async fn load_target_presence(
             (SELECT count(*) FROM feat.trade_flow_feature WHERE symbol = $1 AND market = 'futures' AND ts_bucket = $2) AS trade_flow_fut_rows,
             (SELECT count(*) FROM feat.trade_flow_feature WHERE symbol = $1 AND market = 'spot' AND ts_bucket = $2) AS trade_flow_spot_rows,
             (SELECT count(*) FROM feat.orderbook_feature WHERE symbol = $1 AND ts_bucket = $2) AS orderbook_rows,
-            (SELECT count(*) FROM feat.funding_feature WHERE symbol = $1 AND ts_bucket = $2) AS funding_rows
+            (SELECT count(*) FROM feat.funding_feature WHERE symbol = $1 AND ts_bucket = $2) AS funding_rows,
+            (SELECT count(*) FROM feat.open_interest_feature WHERE symbol = $1 AND ts_bucket = $3) AS oi_rows,
+            (SELECT count(*) FROM feat.long_short_ratio_feature WHERE symbol = $1 AND ts_bucket = $3) AS ratio_rows,
+            (SELECT count(*) FROM feat.options_surface_feature WHERE symbol = $1 AND ts_bucket = $3) AS options_surface_rows
         "#,
     )
     .bind(symbol)
     .bind(ts_bucket)
+    .bind(deriv_feature_ts_bucket)
     .fetch_one(pool)
     .await
     .context("query indicator target presence")?;
@@ -301,5 +317,16 @@ async fn load_target_presence(
         trade_flow_spot_rows: row.get("trade_flow_spot_rows"),
         orderbook_rows: row.get("orderbook_rows"),
         funding_rows: row.get("funding_rows"),
+        oi_rows: row.get("oi_rows"),
+        ratio_rows: row.get("ratio_rows"),
+        options_surface_rows: row.get("options_surface_rows"),
     })
+}
+
+fn floor_timestamp_to_interval_minutes(ts: DateTime<Utc>, interval_minutes: i64) -> DateTime<Utc> {
+    let sec = ts.timestamp();
+    let floored = sec - sec.rem_euclid(60);
+    let minute_floor = Utc.timestamp_opt(floored, 0).single().unwrap_or(ts);
+    let offset = (minute_floor.minute() as i64).rem_euclid(interval_minutes.max(1));
+    minute_floor - chrono::Duration::minutes(offset)
 }
