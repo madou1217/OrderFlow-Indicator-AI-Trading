@@ -211,6 +211,25 @@ struct RuntimeStallDetector {
     last_warn_at: Option<Instant>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LivePublishState {
+    Publishing,
+    MutedCatchup,
+}
+
+impl LivePublishState {
+    fn dispatch_mode(self) -> DispatchMode {
+        match self {
+            Self::Publishing => DispatchMode::Live,
+            Self::MutedCatchup => DispatchMode::LiveCatchup,
+        }
+    }
+
+    fn publishing_enabled(self) -> bool {
+        matches!(self, Self::Publishing)
+    }
+}
+
 #[derive(Debug, Default)]
 struct LiveCanonicalRepairController {
     last_gap_repair_attempt_at: Option<Instant>,
@@ -446,6 +465,50 @@ fn live_backlog_minutes(next_minute: Option<DateTime<Utc>>, latest_closed: DateT
     next_minute
         .map(|minute| (latest_closed - minute).num_minutes().max(0))
         .unwrap_or(0)
+}
+
+fn live_catchup_requested(
+    config: &RootConfig,
+    next_minute: Option<DateTime<Utc>>,
+    latest_confirmed_closed: DateTime<Utc>,
+) -> bool {
+    if !config.indicator.live_catchup_progress_only_enabled {
+        return false;
+    }
+
+    let lag_threshold_minutes = config
+        .indicator
+        .live_catchup_progress_only_lag_minutes
+        .max(1);
+    live_backlog_minutes(next_minute, latest_confirmed_closed) >= lag_threshold_minutes
+}
+
+fn round_up_minutes(value: i64, step: i64) -> i64 {
+    if value <= 0 {
+        return 0;
+    }
+    if step <= 1 {
+        return value;
+    }
+    ((value + step - 1) / step) * step
+}
+
+fn minimum_live_catchup_cutover_tail_minutes(confirm_lag_minutes: i64) -> i64 {
+    let base = STARTUP_BACKFILL_OVERLAP_MINUTES
+        .max(LIVE_CANONICAL_TAIL_RECONCILE_LOOKBACK_MINUTES)
+        .max(confirm_lag_minutes.max(0))
+        .max(1);
+    round_up_minutes(base, OPTIONS_SURFACE_BUCKET_MINUTES)
+}
+
+fn configured_live_catchup_cutover_tail_minutes(config: &RootConfig) -> i64 {
+    let minimum = minimum_live_catchup_cutover_tail_minutes(config.indicator.confirm_lag_minutes);
+    let configured = config.indicator.live_catchup_cutover_tail_minutes;
+    if configured > 0 {
+        configured.max(minimum)
+    } else {
+        minimum
+    }
 }
 
 fn confirmed_closed_minute(
@@ -971,6 +1034,12 @@ pub async fn run(ctx: AppContext) -> Result<()> {
     let mut live_repair_controller = LiveCanonicalRepairController::default();
     let mut confirmed_repair_controller = ConfirmedLateRepairController::default();
     let mut oi_ratio_patch_task: Option<OiRatioPatchTask> = None;
+    let mut live_publish_state = if ctx.config.indicator.live_catchup_progress_only_enabled {
+        LivePublishState::MutedCatchup
+    } else {
+        LivePublishState::Publishing
+    };
+    let mut last_logged_live_publish_state: Option<LivePublishState> = None;
 
     loop {
         tokio::select! {
@@ -1404,8 +1473,72 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                     &next_minute_presence,
                     trade_channel_len,
                     non_trade_channel_len,
+                    matches!(live_publish_state, LivePublishState::MutedCatchup),
                 );
-                if !snapshot_fanout_started {
+
+                if live_publish_state.publishing_enabled()
+                    && live_catchup_requested(ctx.config.as_ref(), next_minute, latest_confirmed_closed)
+                {
+                    abort_oi_ratio_patch_task_shared(
+                        &mut oi_ratio_patch_task,
+                        &state_store,
+                        "live_catchup_enter",
+                    )
+                    .await;
+                    if let Some(handle) = snapshot_fanout_handle.take() {
+                        handle.abort();
+                        let _ = handle.await;
+                    }
+                    snapshot_fanout_started = false;
+                    live_publish_state = LivePublishState::MutedCatchup;
+                }
+
+                if matches!(live_publish_state, LivePublishState::MutedCatchup)
+                    && !live_catchup_requested(ctx.config.as_ref(), next_minute, latest_confirmed_closed)
+                {
+                    if maybe_execute_live_catchup_cutover(
+                        &ctx,
+                        metrics.clone(),
+                        dispatcher.as_ref(),
+                        &state_store,
+                        &mut scheduler,
+                        &runtime_options,
+                        &snapshot_path,
+                        startup_checkpoint_path.as_deref(),
+                        latest_confirmed_closed,
+                        next_minute,
+                        &frontier_snapshot,
+                        &live_prepare_minute_pending,
+                        &live_ready_job_pending,
+                        &dirty_ready_job_pending,
+                        &mut oi_ratio_patch_task,
+                    )
+                    .await?
+                    .is_some()
+                    {
+                        live_publish_state = LivePublishState::Publishing;
+                    }
+                }
+
+                if last_logged_live_publish_state != Some(live_publish_state) {
+                    info!(
+                        state = ?live_publish_state,
+                        dispatch_mode = ?live_publish_state.dispatch_mode(),
+                        backlog_minutes = live_backlog_minutes(next_minute, latest_confirmed_closed),
+                        lag_threshold_minutes = ctx
+                            .config
+                            .indicator
+                            .live_catchup_progress_only_lag_minutes
+                            .max(1),
+                        cutover_tail_minutes = configured_live_catchup_cutover_tail_minutes(ctx.config.as_ref()),
+                        next_minute = ?next_minute,
+                        latest_confirmed_closed = %latest_confirmed_closed,
+                        "indicator live output state changed"
+                    );
+                    last_logged_live_publish_state = Some(live_publish_state);
+                }
+
+                if live_publish_state.publishing_enabled() && !snapshot_fanout_started {
                     let persisted_ts = ts_from_millis(metrics.snapshot().last_persisted_ts_ms);
                     let fanout_reference_ts = ready_through_ts.or(Some(latest_confirmed_closed));
                     if snapshot_fanout_start_ready(persisted_ts, fanout_reference_ts) {
@@ -1427,7 +1560,11 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                 }
 
                 let Some(_next_minute) = next_minute else {
-                    if has_pending_oi_ratio_patch && allow_oi_ratio_patches && oi_ratio_patch_task.is_none() {
+                    if live_publish_state.publishing_enabled()
+                        && has_pending_oi_ratio_patch
+                        && allow_oi_ratio_patches
+                        && oi_ratio_patch_task.is_none()
+                    {
                         let mut state_store = state_store.lock().await;
                         oi_ratio_patch_task = spawn_oi_ratio_patch_task(
                             dispatcher.clone(),
@@ -1439,7 +1576,11 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                     continue;
                 };
                 let Some(ready_through_ts) = ready_through_ts else {
-                    if has_pending_oi_ratio_patch && allow_oi_ratio_patches && oi_ratio_patch_task.is_none() {
+                    if live_publish_state.publishing_enabled()
+                        && has_pending_oi_ratio_patch
+                        && allow_oi_ratio_patches
+                        && oi_ratio_patch_task.is_none()
+                    {
                         let mut state_store = state_store.lock().await;
                         oi_ratio_patch_task = spawn_oi_ratio_patch_task(
                             dispatcher.clone(),
@@ -1465,14 +1606,17 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                         .expect("dirty ready job sender must exist while runtime loop is active"),
                     &dirty_ready_job_pending,
                     ready_through_ts,
-                    DispatchMode::Live,
+                    live_publish_state.dispatch_mode(),
                 )
                 .await
                 {
                     error!(error = %err, "enqueue ready indicator minutes failed");
                     return Err(err).context("enqueue ready indicator minutes failed");
                 }
-                if allow_oi_ratio_patches && oi_ratio_patch_task.is_none() {
+                if live_publish_state.publishing_enabled()
+                    && allow_oi_ratio_patches
+                    && oi_ratio_patch_task.is_none()
+                {
                     let mut state_store = state_store.lock().await;
                     if state_store.has_pending_oi_ratio_patch() {
                         oi_ratio_patch_task = spawn_oi_ratio_patch_task(
@@ -3381,7 +3525,11 @@ fn maybe_warn_runtime_stall(
     next_minute_presence: &CanonicalMinutePresence,
     trade_channel_len: usize,
     non_trade_channel_len: usize,
+    suppress_idle_warn: bool,
 ) {
+    if suppress_idle_warn {
+        return;
+    }
     let metrics_snapshot = metrics.snapshot();
     let persisted_ts = ts_from_millis(metrics_snapshot.last_persisted_ts_ms);
     stall_detector.observe_persisted_ts(persisted_ts);
@@ -3821,6 +3969,281 @@ async fn save_repair_completed_snapshot(
     );
 
     Ok(())
+}
+
+async fn materialize_repair_range(
+    ctx: &Arc<AppContext>,
+    metrics: Arc<AppMetrics>,
+    dispatcher: &Dispatcher,
+    state_store: &mut StateStore,
+    runtime_options: &IndicatorRuntimeOptions,
+    from_ts: DateTime<Utc>,
+    to_ts_inclusive: DateTime<Utc>,
+    mode: DispatchMode,
+    reason: &'static str,
+) -> Result<usize> {
+    if from_ts > to_ts_inclusive {
+        return Ok(0);
+    }
+
+    let mut materialized_windows = 0usize;
+    let mut last_computed: Vec<String> = Vec::new();
+    let mut missing_union: BTreeSet<String> = BTreeSet::new();
+    let mut first_materialized_bucket: Option<DateTime<Utc>> = None;
+    let mut last_materialized_bucket: Option<DateTime<Utc>> = None;
+    let mut materialized_since_yield = 0usize;
+    let mut minute = from_ts;
+
+    while minute <= to_ts_inclusive {
+        let batch_end_ts = replay_heatmap_hydration_batch_end(minute, to_ts_inclusive);
+        hydrate_futures_orderbook_heatmaps_for_range(
+            &ctx.db_pool,
+            &ctx.config.indicator.symbol,
+            state_store,
+            minute,
+            batch_end_ts + ChronoDuration::minutes(1),
+            reason,
+        )
+        .await?;
+
+        refresh_runtime_observability_metrics(
+            &metrics,
+            state_store,
+            Some(minute),
+            Some(to_ts_inclusive),
+            0,
+            0,
+        );
+        while minute <= batch_end_ts {
+            let window = state_store.finalize_minute(minute);
+            let snapshots =
+                process_window_bundle(ctx, dispatcher, runtime_options, window, mode).await?;
+            metrics.inc_exported_window();
+            if mode.persist_outputs() {
+                metrics.set_last_persisted_ts(Some(minute.timestamp_millis()));
+            }
+            materialized_windows += 1;
+            first_materialized_bucket.get_or_insert(minute);
+            last_materialized_bucket = Some(minute);
+            let (computed, missing) = indicator_coverage(&snapshots);
+            last_computed = computed;
+            for item in missing {
+                missing_union.insert(item);
+            }
+            if ctx.config.indicator.enable_file_export {
+                if let Err(err) = export_snapshots(
+                    &ctx.config.indicator.export_dir,
+                    minute,
+                    &ctx.config.indicator.symbol,
+                    &snapshots,
+                )
+                .await
+                {
+                    warn!(error = %err, reason = reason, "export indicator snapshot file failed");
+                }
+            }
+            minute += ChronoDuration::minutes(1);
+            materialized_since_yield += 1;
+            if materialized_since_yield % STARTUP_BACKFILL_YIELD_EVERY_MINUTES == 0 {
+                tokio::task::yield_now().await;
+            }
+        }
+    }
+
+    if let Some(last_bucket) = last_materialized_bucket {
+        let first_bucket = first_materialized_bucket.unwrap_or(last_bucket);
+        if missing_union.is_empty() {
+            info!(
+                reason = reason,
+                mode = ?mode,
+                ts_bucket_from = %first_bucket,
+                ts_bucket_to = %last_bucket,
+                processed_windows = materialized_windows,
+                computed_count = last_computed.len(),
+                missing_count = 0,
+                computed_indicators = %last_computed.join(","),
+                missing_indicators = "none",
+                "indicator repair range materialized"
+            );
+        } else {
+            let missing_indicators = missing_union.iter().cloned().collect::<Vec<_>>().join(",");
+            warn!(
+                reason = reason,
+                mode = ?mode,
+                ts_bucket_from = %first_bucket,
+                ts_bucket_to = %last_bucket,
+                processed_windows = materialized_windows,
+                computed_count = last_computed.len(),
+                missing_count = missing_union.len(),
+                computed_indicators = %last_computed.join(","),
+                missing_indicators = %missing_indicators,
+                "indicator repair range materialized with missing indicators (warmup or data gap)"
+            );
+        }
+    }
+
+    Ok(materialized_windows)
+}
+
+async fn maybe_execute_live_catchup_cutover(
+    ctx: &Arc<AppContext>,
+    metrics: Arc<AppMetrics>,
+    dispatcher: &Dispatcher,
+    state_store: &Arc<Mutex<StateStore>>,
+    scheduler: &mut WindowScheduler,
+    runtime_options: &IndicatorRuntimeOptions,
+    snapshot_path: &str,
+    startup_checkpoint_path: Option<&str>,
+    latest_confirmed_closed: DateTime<Utc>,
+    next_minute: Option<DateTime<Utc>>,
+    frontier_snapshot: &CanonicalFrontierSnapshot,
+    live_prepare_minute_pending: &Arc<AtomicUsize>,
+    live_ready_job_pending: &Arc<AtomicUsize>,
+    dirty_ready_job_pending: &Arc<AtomicUsize>,
+    oi_ratio_patch_task: &mut Option<OiRatioPatchTask>,
+) -> Result<Option<DateTime<Utc>>> {
+    if !ctx.config.indicator.live_catchup_progress_only_enabled {
+        return Ok(None);
+    }
+    if snapshot_path.is_empty() {
+        warn!(
+            latest_confirmed_closed = %latest_confirmed_closed,
+            "live catch-up cutover requires indicator.snapshot_file_path so dropped historical persistence can still recover safely after restart"
+        );
+        return Ok(None);
+    }
+    if !next_minute
+        .map(|minute| minute > latest_confirmed_closed)
+        .unwrap_or(true)
+    {
+        return Ok(None);
+    }
+    if !confirmed_repair_pipeline_idle(
+        live_prepare_minute_pending,
+        live_ready_job_pending,
+        dirty_ready_job_pending,
+    ) {
+        return Ok(None);
+    }
+
+    abort_oi_ratio_patch_task_shared(oi_ratio_patch_task, state_store, "live_catchup_cutover")
+        .await;
+
+    let tail_minutes = configured_live_catchup_cutover_tail_minutes(ctx.config.as_ref());
+    let mut repair_start_ts =
+        latest_confirmed_closed - ChronoDuration::minutes(tail_minutes.saturating_sub(1));
+    if let Some(dirty_from_ts) = frontier_snapshot.dirty_recompute_from_ts {
+        repair_start_ts = repair_start_ts.min(dirty_from_ts);
+    }
+    if let Some(oi_patch_from_ts) = frontier_snapshot.oi_ratio_patch_from_ts {
+        repair_start_ts = repair_start_ts.min(oi_patch_from_ts);
+    }
+    if let Some(history_floor_ts) = frontier_snapshot.effective_history_floor_ts {
+        repair_start_ts = repair_start_ts.max(history_floor_ts);
+    }
+    repair_start_ts = repair_start_ts.min(latest_confirmed_closed);
+    let repair_to_ts_exclusive = latest_confirmed_closed + ChronoDuration::minutes(1);
+
+    let (canonical_stats, repair_start_ts, repair_ready_through_ts) = {
+        let mut state_store = state_store.lock().await;
+        let canonical_stats = ingest_canonical_range_from_db(
+            &ctx.db_pool,
+            &ctx.config.indicator.symbol,
+            &metrics,
+            &mut state_store,
+            scheduler,
+            repair_start_ts,
+            repair_to_ts_exclusive,
+            ctx.config.indicator.startup_backfill_batch_size,
+            "live_catchup_cutover",
+        )
+        .await?;
+        let mut adjusted_repair_start_ts = canonical_stats
+            .confirmed_repair_from_ts
+            .map(|ts| ts.min(repair_start_ts))
+            .unwrap_or(repair_start_ts);
+        if let Some(history_floor_ts) = frontier_snapshot.effective_history_floor_ts {
+            adjusted_repair_start_ts = adjusted_repair_start_ts.max(history_floor_ts);
+        }
+        let repair_ready_through_ts = state_store.latest_contiguous_complete_canonical_minute_from(
+            adjusted_repair_start_ts,
+            latest_confirmed_closed,
+        );
+        (
+            canonical_stats,
+            adjusted_repair_start_ts,
+            repair_ready_through_ts,
+        )
+    };
+    let Some(repair_ready_through_ts) = repair_ready_through_ts else {
+        warn!(
+            repair_start_ts = %repair_start_ts,
+            latest_confirmed_closed = %latest_confirmed_closed,
+            tail_minutes = tail_minutes,
+            "live catch-up cutover is waiting for a contiguous confirmed tail window"
+        );
+        return Ok(None);
+    };
+
+    dispatcher
+        .rewind_persisted_tail(
+            &ctx.config.indicator.symbol,
+            repair_start_ts,
+            &ctx.config.mq.exchanges.ind.name,
+        )
+        .await?;
+    let rewind_target_ts = repair_start_ts - ChronoDuration::minutes(1);
+    metrics.set_last_persisted_ts(Some(rewind_target_ts.timestamp_millis()));
+
+    let (materialized_windows, repair_snapshot) = {
+        let mut state_store = state_store.lock().await;
+        state_store.rewind_finalized_state_from(repair_start_ts);
+        state_store.clear_dirty_recompute_state();
+        state_store.clear_oi_ratio_patch_state();
+        let materialized_windows = materialize_repair_range(
+            ctx,
+            metrics.clone(),
+            dispatcher,
+            &mut state_store,
+            runtime_options,
+            repair_start_ts,
+            repair_ready_through_ts,
+            DispatchMode::CutoverReplay,
+            "live catchup cutover materialization",
+        )
+        .await?;
+        state_store.clear_dirty_recompute_state();
+        state_store.clear_oi_ratio_patch_state();
+        (materialized_windows, state_store.extract_snapshot())
+    };
+
+    save_repair_completed_snapshot(
+        &repair_snapshot,
+        snapshot_path,
+        startup_checkpoint_path,
+        repair_start_ts,
+        repair_ready_through_ts,
+        "live_catchup_cutover",
+    )
+    .await?;
+    dispatcher
+        .set_snapshot_fanout_progress(&ctx.config.indicator.symbol, repair_ready_through_ts)
+        .await?;
+    metrics.set_last_persisted_ts(Some(repair_ready_through_ts.timestamp_millis()));
+
+    info!(
+        repair_start_ts = %repair_start_ts,
+        repair_ready_through_ts = %repair_ready_through_ts,
+        latest_confirmed_closed = %latest_confirmed_closed,
+        tail_minutes = tail_minutes,
+        canonical_fetched_rows = canonical_stats.fetched_rows,
+        canonical_ingested_rows = canonical_stats.ingested_rows,
+        canonical_changed_rows = canonical_stats.changed_rows,
+        canonical_changed_minutes = canonical_stats.changed_minute_count(),
+        materialized_windows = materialized_windows,
+        "live catch-up cutover completed; live publish can resume from canonicalized tail"
+    );
+    Ok(Some(repair_ready_through_ts))
 }
 
 async fn maybe_execute_confirmed_repair_replay(
@@ -4528,7 +4951,8 @@ async fn run_live_materialize_loop(
         match result {
             Ok(snapshots) => {
                 metrics.inc_exported_window();
-                if matches!(worker_kind, MaterializeWorkerKind::Live) {
+                if matches!(worker_kind, MaterializeWorkerKind::Live) && job.mode.persist_outputs()
+                {
                     metrics.set_last_persisted_ts(Some(ts_bucket.timestamp_millis()));
                     metrics.set_live_ready_to_bundle_ms(enqueued_at.elapsed().as_millis());
                 }
@@ -4645,11 +5069,14 @@ async fn commit_live_jobs_in_order(
         let Some(job) = pending.remove(&expected_ts) else {
             break;
         };
+        let mode = job.artifacts.mode;
         let snapshots = dispatcher.persist_window_artifacts(job.artifacts).await?;
         live_ready_job_pending.fetch_sub(1, Ordering::AcqRel);
         metrics.inc_exported_window();
-        metrics.set_last_persisted_ts(Some(expected_ts.timestamp_millis()));
-        metrics.set_live_ready_to_bundle_ms(job.enqueued_at.elapsed().as_millis());
+        if mode.persist_outputs() {
+            metrics.set_last_persisted_ts(Some(expected_ts.timestamp_millis()));
+            metrics.set_live_ready_to_bundle_ms(job.enqueued_at.elapsed().as_millis());
+        }
         log_materialized_coverage(job.source, expected_ts, &snapshots, job.enqueued_at);
         *next_commit_ts = Some(expected_ts + ChronoDuration::minutes(1));
     }
@@ -7787,15 +8214,16 @@ mod tests {
         confirmed_repair_pipeline_idle, expand_startup_backfill_to_minimum_recovery_window,
         find_long_null_price_run, handle_ingest_event,
         hydrate_futures_orderbook_heatmaps_for_range_with_fetch, live_tail_reconcile_start_ts,
-        minimum_startup_recovery_history_floor, minute_exclusive_upper_bound,
-        minute_history_is_strictly_contiguous, replay_heatmap_hydration_batch_end,
-        replay_row_after_cursor, save_startup_backfill_checkpoint, save_state_snapshot,
-        shutdown_ready_through_candidate, snapshot_has_required_history,
-        snapshot_is_reusable_recovery_seed, snapshot_null_price_run_reaches_recent_tail,
-        startup_backfill_checkpoint_path, try_load_startup_backfill_checkpoint,
-        try_load_state_snapshot, BackfillCursor, ConfirmedLateRepairController,
-        LiveCanonicalRepairController, ReplayRow, SnapshotLoadOutcome, StartupBackfillCheckpoint,
-        StartupBackfillProgress, FUNDING_BACKFILL_WINDOW_SQL, LIQ_BACKFILL_WINDOW_SQL,
+        minimum_live_catchup_cutover_tail_minutes, minimum_startup_recovery_history_floor,
+        minute_exclusive_upper_bound, minute_history_is_strictly_contiguous,
+        replay_heatmap_hydration_batch_end, replay_row_after_cursor,
+        save_startup_backfill_checkpoint, save_state_snapshot, shutdown_ready_through_candidate,
+        snapshot_has_required_history, snapshot_is_reusable_recovery_seed,
+        snapshot_null_price_run_reaches_recent_tail, startup_backfill_checkpoint_path,
+        try_load_startup_backfill_checkpoint, try_load_state_snapshot, BackfillCursor,
+        ConfirmedLateRepairController, LiveCanonicalRepairController, ReplayRow,
+        SnapshotLoadOutcome, StartupBackfillCheckpoint, StartupBackfillProgress,
+        FUNDING_BACKFILL_WINDOW_SQL, LIQ_BACKFILL_WINDOW_SQL,
         LIVE_CANONICAL_TAIL_RECONCILE_LOOKBACK_MINUTES, MIN_REUSABLE_SNAPSHOT_HISTORY_MINUTES,
         ORDERBOOK_BACKFILL_WINDOW_SQL_SCALAR, ORDERBOOK_BACKFILL_WINDOW_SQL_WITH_HEATMAP,
         STARTUP_BACKFILL_CHECKPOINT_VERSION, TRADE_BACKFILL_WINDOW_SQL,
@@ -8346,6 +8774,13 @@ mod tests {
             super::confirmed_closed_minute(latest_closed, -5),
             latest_closed
         );
+    }
+
+    #[test]
+    fn live_catchup_cutover_tail_respects_existing_overlap_and_5m_alignment() {
+        assert_eq!(minimum_live_catchup_cutover_tail_minutes(15), 35);
+        assert_eq!(minimum_live_catchup_cutover_tail_minutes(31), 35);
+        assert_eq!(minimum_live_catchup_cutover_tail_minutes(62), 65);
     }
 
     #[test]

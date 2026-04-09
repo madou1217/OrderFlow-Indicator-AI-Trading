@@ -25,20 +25,25 @@ pub enum DispatchMode {
     WarmStateOnly,
     ReplayMaterialize,
     Live,
+    LiveCatchup,
+    CutoverReplay,
     RepairReplay,
     ShutdownFlush,
 }
 
 impl DispatchMode {
-    fn persist_outputs(self) -> bool {
-        !matches!(self, Self::WarmStateOnly)
+    pub(crate) fn persist_outputs(self) -> bool {
+        !matches!(self, Self::WarmStateOnly | Self::LiveCatchup)
     }
 
-    fn persist_snapshots(self) -> bool {
-        matches!(self, Self::Live | Self::RepairReplay | Self::ShutdownFlush)
+    pub(crate) fn persist_snapshots(self) -> bool {
+        matches!(
+            self,
+            Self::Live | Self::CutoverReplay | Self::RepairReplay | Self::ShutdownFlush
+        )
     }
 
-    fn publish_outputs(self) -> bool {
+    pub(crate) fn publish_outputs(self) -> bool {
         matches!(self, Self::Live | Self::RepairReplay | Self::ShutdownFlush)
     }
 }
@@ -470,6 +475,16 @@ impl Dispatcher {
             .await
     }
 
+    pub async fn set_snapshot_fanout_progress(
+        &self,
+        symbol: &str,
+        ts_bucket: chrono::DateTime<chrono::Utc>,
+    ) -> Result<()> {
+        self.snapshot_writer
+            .set_snapshot_fanout_progress(symbol, ts_bucket)
+            .await
+    }
+
     pub async fn process_oi_ratio_patch_window(
         &self,
         ctx: Arc<IndicatorContext>,
@@ -665,6 +680,20 @@ mod tests {
         assert!(DispatchMode::ReplayMaterialize.persist_outputs());
         assert!(!DispatchMode::ReplayMaterialize.persist_snapshots());
         assert!(!DispatchMode::ReplayMaterialize.publish_outputs());
+    }
+
+    #[test]
+    fn live_catchup_stays_compute_only() {
+        assert!(!DispatchMode::LiveCatchup.persist_outputs());
+        assert!(!DispatchMode::LiveCatchup.persist_snapshots());
+        assert!(!DispatchMode::LiveCatchup.publish_outputs());
+    }
+
+    #[test]
+    fn cutover_replay_persists_without_publishing() {
+        assert!(DispatchMode::CutoverReplay.persist_outputs());
+        assert!(DispatchMode::CutoverReplay.persist_snapshots());
+        assert!(!DispatchMode::CutoverReplay.publish_outputs());
     }
 
     #[test]
