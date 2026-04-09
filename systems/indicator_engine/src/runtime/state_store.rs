@@ -1781,7 +1781,7 @@ impl StateStore {
                 outcome = self.store_long_short_ratio_5m(long_short_ratio);
             }
             MdData::OptionMarkGreeks5m(option_mark) => {
-                outcome = self.store_option_mark_greeks_5m(option_mark);
+                outcome = self.store_option_mark_greeks_5m(option_mark, bucket_ts);
             }
         }
 
@@ -2433,7 +2433,11 @@ impl StateStore {
         IngestOutcome::default()
     }
 
-    fn store_option_mark_greeks_5m(&mut self, event: OptionMarkGreeks5mEvent) -> IngestOutcome {
+    fn store_option_mark_greeks_5m(
+        &mut self,
+        event: OptionMarkGreeks5mEvent,
+        source_minute_ts: DateTime<Utc>,
+    ) -> IngestOutcome {
         let point = OptionMarkGreeksPoint {
             ts_bucket: event.ts_bucket,
             option_symbol: event.option_symbol,
@@ -2474,6 +2478,7 @@ impl StateStore {
                 ts_bucket = %ts_bucket,
                 latest_options_surface_bucket = ?latest_surface_bucket,
                 previous_latest_options_surface_bucket = ?previous_latest_surface_bucket,
+                source_minute_ts = %source_minute_ts,
                 "options surface bucket advanced"
             );
         }
@@ -3023,6 +3028,11 @@ impl StateStore {
         ts_bucket: DateTime<Utc>,
     ) -> OptionsSurfaceWindowView {
         let as_of_ts = ts_bucket + Duration::minutes(1);
+        let latest_raw_bucket = self
+            .option_mark_greeks_by_bucket_5m
+            .range(..=as_of_ts)
+            .next_back()
+            .map(|(bucket, _)| *bucket);
         let points = self
             .options_surface_5m_history
             .iter()
@@ -3030,6 +3040,18 @@ impl StateStore {
             .cloned()
             .collect::<Vec<_>>();
         let latest_bucket = points.last().map(|point| point.ts_bucket);
+        if latest_raw_bucket != latest_bucket {
+            let lag_minutes = latest_raw_bucket
+                .zip(latest_bucket)
+                .map(|(raw, snapshot)| (raw - snapshot).num_minutes());
+            debug!(
+                source_minute_ts = %ts_bucket,
+                latest_raw_bucket = ?latest_raw_bucket,
+                latest_snapshot_bucket = ?latest_bucket,
+                lag_minutes = ?lag_minutes,
+                "options surface snapshot lag"
+            );
+        }
         OptionsSurfaceWindowView {
             latest_bucket,
             points,
@@ -5851,18 +5873,21 @@ mod tests {
         for offset in 0..=OPTIONS_SURFACE_HISTORY_KEEP_5M_BUCKETS {
             let bucket = start + ChronoDuration::minutes((offset as i64) * 5);
             for side in ["CALL", "PUT"] {
-                store.store_option_mark_greeks_5m(option_mark_event(
+                store.store_option_mark_greeks_5m(
+                    option_mark_event(
+                        bucket,
+                        &format!("TEST-{}-{}", offset, side),
+                        expiry,
+                        100.0,
+                        side,
+                        100.0,
+                        Some(0.50),
+                        None,
+                        None,
+                        Some(if side == "CALL" { 0.25 } else { -0.25 }),
+                    ),
                     bucket,
-                    &format!("TEST-{}-{}", offset, side),
-                    expiry,
-                    100.0,
-                    side,
-                    100.0,
-                    Some(0.50),
-                    None,
-                    None,
-                    Some(if side == "CALL" { 0.25 } else { -0.25 }),
-                ));
+                );
             }
         }
 
@@ -5991,33 +6016,39 @@ mod tests {
 
         store.last_finalized_minute = Some(finalized_minute);
 
-        let first = store.store_option_mark_greeks_5m(option_mark_event(
+        let first = store.store_option_mark_greeks_5m(
+            option_mark_event(
+                ts_bucket,
+                "LATE-CALL",
+                expiry,
+                100.0,
+                "CALL",
+                100.0,
+                Some(0.55),
+                None,
+                None,
+                Some(0.25),
+            ),
             ts_bucket,
-            "LATE-CALL",
-            expiry,
-            100.0,
-            "CALL",
-            100.0,
-            Some(0.55),
-            None,
-            None,
-            Some(0.25),
-        ));
+        );
         assert!(first.material_change);
         assert!(first.dirty_recompute_marked);
 
-        let second = store.store_option_mark_greeks_5m(option_mark_event(
+        let second = store.store_option_mark_greeks_5m(
+            option_mark_event(
+                ts_bucket,
+                "LATE-PUT",
+                expiry,
+                100.0,
+                "PUT",
+                100.0,
+                Some(0.60),
+                None,
+                None,
+                Some(-0.25),
+            ),
             ts_bucket,
-            "LATE-PUT",
-            expiry,
-            100.0,
-            "PUT",
-            100.0,
-            Some(0.60),
-            None,
-            None,
-            Some(-0.25),
-        ));
+        );
         assert!(second.material_change);
         assert!(second.dirty_recompute_marked);
         assert_eq!(store.dirty_recompute_from, Some(ts_bucket));
@@ -6049,30 +6080,36 @@ mod tests {
         let expiry = ts_0 + ChronoDuration::days(14);
 
         for (bucket, front_iv) in [(ts_0, 0.50), (ts_1, 0.55)] {
-            store.store_option_mark_greeks_5m(option_mark_event(
+            store.store_option_mark_greeks_5m(
+                option_mark_event(
+                    bucket,
+                    &format!("TEST-{}-CALL", bucket.timestamp()),
+                    expiry,
+                    100.0,
+                    "CALL",
+                    100.0,
+                    Some(front_iv),
+                    None,
+                    None,
+                    Some(0.25),
+                ),
                 bucket,
-                &format!("TEST-{}-CALL", bucket.timestamp()),
-                expiry,
-                100.0,
-                "CALL",
-                100.0,
-                Some(front_iv),
-                None,
-                None,
-                Some(0.25),
-            ));
-            store.store_option_mark_greeks_5m(option_mark_event(
+            );
+            store.store_option_mark_greeks_5m(
+                option_mark_event(
+                    bucket,
+                    &format!("TEST-{}-PUT", bucket.timestamp()),
+                    expiry,
+                    100.0,
+                    "PUT",
+                    100.0,
+                    Some(front_iv),
+                    None,
+                    None,
+                    Some(-0.25),
+                ),
                 bucket,
-                &format!("TEST-{}-PUT", bucket.timestamp()),
-                expiry,
-                100.0,
-                "PUT",
-                100.0,
-                Some(front_iv),
-                None,
-                None,
-                Some(-0.25),
-            ));
+            );
         }
 
         let expected_bundle = store.build_window_bundle(
@@ -6111,30 +6148,36 @@ mod tests {
         let expiry = ts_0 + ChronoDuration::days(14);
 
         for (bucket, front_iv) in [(ts_0, 0.50), (ts_1, 0.55)] {
-            store.store_option_mark_greeks_5m(option_mark_event(
+            store.store_option_mark_greeks_5m(
+                option_mark_event(
+                    bucket,
+                    &format!("LEGACY-{}-CALL", bucket.timestamp()),
+                    expiry,
+                    100.0,
+                    "CALL",
+                    100.0,
+                    Some(front_iv),
+                    None,
+                    None,
+                    Some(0.25),
+                ),
                 bucket,
-                &format!("LEGACY-{}-CALL", bucket.timestamp()),
-                expiry,
-                100.0,
-                "CALL",
-                100.0,
-                Some(front_iv),
-                None,
-                None,
-                Some(0.25),
-            ));
-            store.store_option_mark_greeks_5m(option_mark_event(
+            );
+            store.store_option_mark_greeks_5m(
+                option_mark_event(
+                    bucket,
+                    &format!("LEGACY-{}-PUT", bucket.timestamp()),
+                    expiry,
+                    100.0,
+                    "PUT",
+                    100.0,
+                    Some(front_iv),
+                    None,
+                    None,
+                    Some(-0.25),
+                ),
                 bucket,
-                &format!("LEGACY-{}-PUT", bucket.timestamp()),
-                expiry,
-                100.0,
-                "PUT",
-                100.0,
-                Some(front_iv),
-                None,
-                None,
-                Some(-0.25),
-            ));
+            );
         }
 
         let expected_bundle = store.build_window_bundle(
