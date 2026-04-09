@@ -14,7 +14,7 @@ use crate::sinks::{
 };
 use crate::state::checkpoints;
 use anyhow::{Context, Result};
-use chrono::{DateTime, Duration as ChronoDuration, Timelike, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, TimeZone, Timelike, Utc};
 use serde_json::json;
 use sqlx::Row;
 use std::collections::{BTreeMap, BTreeSet};
@@ -34,12 +34,96 @@ const OI_RATIO_BACKFILL_DAYS: i64 = 30;
 const OI_RATIO_FETCH_LIMIT: u16 = 500;
 const OPTIONS_SURFACE_POLL_INTERVAL_SECS: u64 = 15;
 const OPTIONS_SURFACE_LIVE_READY_GRACE_SECS: i64 = 20;
+const OPTIONS_SURFACE_MAX_RETRY_ATTEMPTS: u32 = 5;
 const OPTIONS_EXCHANGE_INFO_REFRESH_SECS: i64 = 3600;
 
 #[derive(Debug, Clone)]
 struct OptionsUniverseCache {
     refreshed_at: DateTime<Utc>,
     contracts: Vec<BinanceOptionSymbolInfo>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingOiRatioBucketState {
+    target_bucket: DateTime<Utc>,
+    first_attempt_at: DateTime<Utc>,
+    last_attempt_at: Option<DateTime<Utc>>,
+    next_attempt_at: DateTime<Utc>,
+    deadline_at: DateTime<Utc>,
+    attempt_count: u32,
+    latest_seen_oi_bucket: Option<DateTime<Utc>>,
+    latest_seen_global_bucket: Option<DateTime<Utc>>,
+    latest_seen_top_account_bucket: Option<DateTime<Utc>>,
+    latest_seen_top_position_bucket: Option<DateTime<Utc>>,
+    deadline_warning_emitted: bool,
+}
+
+impl PendingOiRatioBucketState {
+    fn new(target_bucket: DateTime<Utc>) -> Self {
+        let first_attempt_at = scheduled_oi_ratio_attempt_at(target_bucket, 1);
+        Self {
+            target_bucket,
+            first_attempt_at,
+            last_attempt_at: None,
+            next_attempt_at: first_attempt_at,
+            deadline_at: target_bucket + ChronoDuration::seconds(OI_RATIO_TOTAL_RETRY_BUDGET_SECS),
+            attempt_count: 0,
+            latest_seen_oi_bucket: None,
+            latest_seen_global_bucket: None,
+            latest_seen_top_account_bucket: None,
+            latest_seen_top_position_bucket: None,
+            deadline_warning_emitted: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PendingOptionsSurfaceBucketState {
+    target_bucket: DateTime<Utc>,
+    first_attempt_at: DateTime<Utc>,
+    last_attempt_at: Option<DateTime<Utc>>,
+    next_attempt_at: DateTime<Utc>,
+    deadline_at: DateTime<Utc>,
+    attempt_count: u32,
+    last_contract_count: usize,
+    last_mark_count: usize,
+    last_persisted_count: usize,
+}
+
+impl PendingOptionsSurfaceBucketState {
+    fn new(target_bucket: DateTime<Utc>) -> Self {
+        let first_attempt_at = scheduled_options_surface_attempt_at(target_bucket, 1);
+        Self {
+            target_bucket,
+            first_attempt_at,
+            last_attempt_at: None,
+            next_attempt_at: first_attempt_at,
+            deadline_at: scheduled_options_surface_attempt_at(
+                target_bucket,
+                OPTIONS_SURFACE_MAX_RETRY_ATTEMPTS,
+            ),
+            attempt_count: 0,
+            last_contract_count: 0,
+            last_mark_count: 0,
+            last_persisted_count: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct LiveOiRatioAttemptObservation {
+    bucket_set: Option<RatioBucketSet>,
+    latest_seen_oi_bucket: Option<DateTime<Utc>>,
+    latest_seen_global_bucket: Option<DateTime<Utc>>,
+    latest_seen_top_account_bucket: Option<DateTime<Utc>>,
+    latest_seen_top_position_bucket: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct OptionsSurfaceAttemptOutcome {
+    contract_count: usize,
+    mark_count: usize,
+    persisted_count: usize,
 }
 
 pub async fn run_funding_rate_backfill_loop(
@@ -186,6 +270,7 @@ pub async fn run_open_interest_ratio_loop(
     let mut last_common_bucket = load_latest_common_oi_ratio_bucket(&ctx.md_db_pool, &symbol)
         .await
         .unwrap_or(None);
+    let mut pending_live_bucket: Option<PendingOiRatioBucketState> = None;
     let mut current_ticker = interval(Duration::from_secs(OPEN_INTEREST_CURRENT_INTERVAL_SECS));
     current_ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut structure_ticker = interval(Duration::from_secs(OI_RATIO_STRUCTURE_POLL_INTERVAL_SECS));
@@ -243,6 +328,7 @@ pub async fn run_open_interest_ratio_loop(
                     &metrics,
                     &symbol,
                     &mut last_common_bucket,
+                    &mut pending_live_bucket,
                 ).await;
             }
         }
@@ -262,6 +348,7 @@ pub async fn run_options_surface_loop(
     let mut last_bucket = load_latest_option_mark_greeks_bucket(&ctx.md_db_pool, &symbol)
         .await
         .unwrap_or(None);
+    let mut pending_bucket: Option<PendingOptionsSurfaceBucketState> = None;
     let mut universe: Option<OptionsUniverseCache> = None;
     let mut ticker = interval(Duration::from_secs(OPTIONS_SURFACE_POLL_INTERVAL_SECS));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -276,27 +363,45 @@ pub async fn run_options_surface_loop(
 
     loop {
         ticker.tick().await;
-        let target_bucket = floor_to_5m(
+        let latest_ready_bucket = floor_to_5m(
             Utc::now() - ChronoDuration::seconds(OPTIONS_SURFACE_LIVE_READY_GRACE_SECS),
         );
-        if last_bucket == Some(target_bucket) {
+        if pending_bucket.is_none() {
+            let mut target_bucket = last_bucket
+                .map(|prev| prev + ChronoDuration::minutes(5))
+                .unwrap_or(latest_ready_bucket);
+            if target_bucket > latest_ready_bucket {
+                continue;
+            }
+            if let Some(prev) = last_bucket {
+                let expected_next = prev + ChronoDuration::minutes(5);
+                if latest_ready_bucket > expected_next && target_bucket < latest_ready_bucket {
+                    warn!(
+                        symbol = symbol,
+                        previous_bucket = %prev,
+                        target_bucket = %latest_ready_bucket,
+                        skipped_buckets = ((latest_ready_bucket - prev).num_minutes() / 5).saturating_sub(1),
+                        "options surface loop cannot reconstruct missed historical buckets from live-only endpoint; skipping gap to latest ready bucket"
+                    );
+                    target_bucket = latest_ready_bucket;
+                }
+            }
+            pending_bucket = Some(PendingOptionsSurfaceBucketState::new(target_bucket));
+        }
+
+        let now = Utc::now();
+        let Some(state) = pending_bucket.as_mut() else {
+            continue;
+        };
+        if now < state.next_attempt_at {
             continue;
         }
 
-        if let Some(prev) = last_bucket {
-            let expected_next = prev + ChronoDuration::minutes(5);
-            if target_bucket > expected_next {
-                warn!(
-                    symbol = symbol,
-                    previous_bucket = %prev,
-                    target_bucket = %target_bucket,
-                    skipped_buckets = ((target_bucket - prev).num_minutes() / 5).saturating_sub(1),
-                    "options surface loop cannot reconstruct missed historical buckets from live-only endpoint; skipping gap to latest ready bucket"
-                );
-            }
-        }
+        let target_bucket = state.target_bucket;
+        state.attempt_count += 1;
+        state.last_attempt_at = Some(now);
 
-        if let Err(err) = handle_options_surface_live_bucket(
+        let attempt = match handle_options_surface_live_bucket(
             &rest_client,
             &db_writer,
             &ops_writer,
@@ -309,16 +414,66 @@ pub async fn run_options_surface_loop(
         )
         .await
         {
-            warn!(
-                error = %err,
-                symbol = symbol,
-                target_bucket = %target_bucket,
-                "options surface live bucket fetch failed"
-            );
+            Ok(outcome) => {
+                state.last_contract_count = outcome.contract_count;
+                state.last_mark_count = outcome.mark_count;
+                state.last_persisted_count = outcome.persisted_count;
+                outcome
+            }
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    symbol = symbol,
+                    target_bucket = %target_bucket,
+                    attempt = state.attempt_count,
+                    "options surface live bucket fetch failed"
+                );
+                if now >= state.deadline_at
+                    || state.attempt_count >= OPTIONS_SURFACE_MAX_RETRY_ATTEMPTS
+                {
+                    warn!(
+                        symbol = symbol,
+                        target_bucket = %target_bucket,
+                        first_attempt_at = %state.first_attempt_at,
+                        attempt_count = state.attempt_count,
+                        "options surface live bucket exhausted retry window; advancing to next bucket"
+                    );
+                    last_bucket = Some(target_bucket);
+                    pending_bucket = None;
+                } else {
+                    state.next_attempt_at = scheduled_options_surface_attempt_at(
+                        target_bucket,
+                        state.attempt_count + 1,
+                    );
+                }
+                continue;
+            }
+        };
+
+        if options_surface_attempt_is_complete(&attempt) {
+            last_bucket = Some(target_bucket);
+            pending_bucket = None;
             continue;
         }
 
-        last_bucket = Some(target_bucket);
+        if now >= state.deadline_at || state.attempt_count >= OPTIONS_SURFACE_MAX_RETRY_ATTEMPTS {
+            warn!(
+                symbol = symbol,
+                target_bucket = %target_bucket,
+                first_attempt_at = %state.first_attempt_at,
+                attempt_count = state.attempt_count,
+                contract_count = attempt.contract_count,
+                mark_count = attempt.mark_count,
+                persisted_count = attempt.persisted_count,
+                "options surface live bucket ended with low coverage; advancing to next bucket"
+            );
+            last_bucket = Some(target_bucket);
+            pending_bucket = None;
+            continue;
+        }
+
+        state.next_attempt_at =
+            scheduled_options_surface_attempt_at(target_bucket, state.attempt_count + 1);
     }
 }
 
@@ -412,14 +567,18 @@ async fn handle_options_surface_live_bucket(
     symbol: &str,
     ts_bucket: DateTime<Utc>,
     universe: &mut Option<OptionsUniverseCache>,
-) -> Result<()> {
+) -> Result<OptionsSurfaceAttemptOutcome> {
     let contracts = refresh_options_universe_if_needed(rest_client, symbol, universe).await?;
     if contracts.is_empty() {
         warn!(
             symbol = symbol,
             "options surface universe is empty for symbol"
         );
-        return Ok(());
+        return Ok(OptionsSurfaceAttemptOutcome {
+            contract_count: 0,
+            mark_count: 0,
+            persisted_count: 0,
+        });
     }
 
     let index = rest_client.fetch_options_index_price(symbol).await?;
@@ -434,6 +593,7 @@ async fn handle_options_surface_live_bucket(
         .into_iter()
         .map(|row| (row.symbol.clone(), row))
         .collect::<BTreeMap<_, _>>();
+    let mark_count = mark_map.len();
 
     let mut persisted = 0usize;
     for contract in contracts {
@@ -463,10 +623,15 @@ async fn handle_options_surface_live_bucket(
         symbol = symbol,
         ts_bucket = %ts_bucket,
         contract_count = contracts.len(),
+        mark_count = mark_count,
         persisted_count = persisted,
         "options surface live bucket persisted"
     );
-    Ok(())
+    Ok(OptionsSurfaceAttemptOutcome {
+        contract_count: contracts.len(),
+        mark_count,
+        persisted_count: persisted,
+    })
 }
 
 async fn refresh_options_universe_if_needed<'a>(
@@ -581,7 +746,7 @@ async fn handle_premium_index(
     *last_premium_time = Some(premium_time);
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 struct RatioBucketSet {
     oi_hist: BinanceOpenInterestHistRecord,
     global_account: BinanceLongShortRatioRecord,
@@ -705,36 +870,81 @@ async fn handle_oi_ratio_live_bucket(
     metrics: &Arc<AppMetrics>,
     symbol: &str,
     last_common_bucket: &mut Option<DateTime<Utc>>,
+    pending_bucket: &mut Option<PendingOiRatioBucketState>,
 ) {
     let now = Utc::now();
-    let boundary_bucket = floor_to_5m(now);
-    if boundary_bucket + ChronoDuration::seconds(OI_RATIO_LIVE_READY_GRACE_SECS) > now {
-        return;
+    let latest_ready_bucket =
+        floor_to_5m(now - ChronoDuration::seconds(OI_RATIO_LIVE_READY_GRACE_SECS));
+
+    if pending_bucket.is_none() {
+        let next_target_bucket = last_common_bucket
+            .map(|ts| ts + ChronoDuration::minutes(5))
+            .unwrap_or(latest_ready_bucket);
+        if next_target_bucket > latest_ready_bucket {
+            return;
+        }
+        *pending_bucket = Some(PendingOiRatioBucketState::new(next_target_bucket));
     }
-    let Some(target_bucket) = boundary_bucket.checked_sub_signed(ChronoDuration::minutes(5)) else {
+
+    let Some(state) = pending_bucket.as_mut() else {
         return;
     };
-    if last_common_bucket
-        .map(|ts| ts >= target_bucket)
-        .unwrap_or(false)
-    {
+    if now < state.next_attempt_at {
         return;
     }
 
-    let bucket_set = match fetch_live_bucket_set(rest_client, symbol, target_bucket).await {
-        Ok(Some(value)) => value,
-        Ok(None) => {
-            return;
-        }
+    state.attempt_count += 1;
+    state.last_attempt_at = Some(now);
+    let target_bucket = state.target_bucket;
+
+    let observation = match fetch_live_bucket_set_attempt(rest_client, symbol, target_bucket).await
+    {
+        Ok(value) => value,
         Err(err) => {
             warn!(
                 error = %err,
                 symbol = symbol,
                 target_bucket = %target_bucket,
+                attempt = state.attempt_count,
                 "fetch live open interest / ratio bucket failed"
             );
+            if now >= state.deadline_at && !state.deadline_warning_emitted {
+                state.deadline_warning_emitted = true;
+                warn!(
+                    symbol = symbol,
+                    target_bucket = %target_bucket,
+                    first_attempt_at = %state.first_attempt_at,
+                    attempt_count = state.attempt_count,
+                    "open interest / ratio live bucket exceeded retry window; keeping bucket pending for later retries"
+                );
+            }
+            state.next_attempt_at = next_oi_ratio_retry_at(target_bucket, state.attempt_count + 1);
             return;
         }
+    };
+
+    state.latest_seen_oi_bucket = observation.latest_seen_oi_bucket;
+    state.latest_seen_global_bucket = observation.latest_seen_global_bucket;
+    state.latest_seen_top_account_bucket = observation.latest_seen_top_account_bucket;
+    state.latest_seen_top_position_bucket = observation.latest_seen_top_position_bucket;
+
+    let Some(bucket_set) = observation.bucket_set else {
+        if now >= state.deadline_at && !state.deadline_warning_emitted {
+            state.deadline_warning_emitted = true;
+            warn!(
+                symbol = symbol,
+                target_bucket = %target_bucket,
+                first_attempt_at = %state.first_attempt_at,
+                attempt_count = state.attempt_count,
+                latest_seen_oi_bucket = ?state.latest_seen_oi_bucket,
+                latest_seen_global_bucket = ?state.latest_seen_global_bucket,
+                latest_seen_top_account_bucket = ?state.latest_seen_top_account_bucket,
+                latest_seen_top_position_bucket = ?state.latest_seen_top_position_bucket,
+                "open interest / ratio live bucket missing aligned target after retry window; keeping bucket pending for later retries"
+            );
+        }
+        state.next_attempt_at = next_oi_ratio_retry_at(target_bucket, state.attempt_count + 1);
+        return;
     };
 
     if let Err(err) = persist_ratio_bucket_set(
@@ -753,8 +963,10 @@ async fn handle_oi_ratio_live_bucket(
             error = %err,
             symbol = symbol,
             target_bucket = %target_bucket,
+            attempt = state.attempt_count,
             "persist live open interest / ratio bucket failed"
         );
+        state.next_attempt_at = next_oi_ratio_retry_at(target_bucket, state.attempt_count + 1);
         return;
     }
 
@@ -765,7 +977,11 @@ async fn handle_oi_ratio_live_bucket(
             "/futures/data/openInterestHist + longShortRatios",
             "oi_ratio_live_5m",
             "reconcile",
-            json!({ "target_bucket": target_bucket.to_rfc3339() }),
+            json!({
+                "target_bucket": target_bucket.to_rfc3339(),
+                "attempt_count": state.attempt_count,
+                "first_attempt_at": state.first_attempt_at.to_rfc3339(),
+            }),
             Some(4),
             "success",
             None,
@@ -776,6 +992,7 @@ async fn handle_oi_ratio_live_bucket(
     }
 
     *last_common_bucket = Some(target_bucket);
+    *pending_bucket = None;
 }
 
 async fn backfill_recent_oi_ratio_history(
@@ -951,47 +1168,38 @@ async fn fetch_ratio_range(
     Ok(out.into_values().collect())
 }
 
-async fn fetch_live_bucket_set(
+async fn fetch_live_bucket_set_attempt(
     rest_client: &Arc<BinanceRestClient>,
     symbol: &str,
     target_bucket: DateTime<Utc>,
-) -> Result<Option<RatioBucketSet>> {
+) -> Result<LiveOiRatioAttemptObservation> {
     let target_ms = target_bucket.timestamp_millis();
-    let deadline = Utc::now() + ChronoDuration::seconds(OI_RATIO_TOTAL_RETRY_BUDGET_SECS);
-    let mut wait_secs = 10u64;
+    let oi_hist = rest_client
+        .fetch_open_interest_hist(symbol, "5m", None, None, 4)
+        .await?;
+    let global_ratio = rest_client
+        .fetch_global_long_short_account_ratio(symbol, "5m", None, None, 4)
+        .await?;
+    let top_account = rest_client
+        .fetch_top_long_short_account_ratio(symbol, "5m", None, None, 4)
+        .await?;
+    let top_position = rest_client
+        .fetch_top_long_short_position_ratio(symbol, "5m", None, None, 4)
+        .await?;
 
-    loop {
-        let oi_hist = rest_client
-            .fetch_open_interest_hist(symbol, "5m", None, None, 4)
-            .await?;
-        let global_ratio = rest_client
-            .fetch_global_long_short_account_ratio(symbol, "5m", None, None, 4)
-            .await?;
-        let top_account = rest_client
-            .fetch_top_long_short_account_ratio(symbol, "5m", None, None, 4)
-            .await?;
-        let top_position = rest_client
-            .fetch_top_long_short_position_ratio(symbol, "5m", None, None, 4)
-            .await?;
-
-        let bundle = live_bucket_set_from_target(
+    Ok(LiveOiRatioAttemptObservation {
+        bucket_set: live_bucket_set_from_target(
             &oi_hist,
             &global_ratio,
             &top_account,
             &top_position,
             target_ms,
-        );
-        if bundle.is_some() {
-            return Ok(bundle);
-        }
-
-        if Utc::now() >= deadline {
-            return Ok(None);
-        }
-
-        tokio::time::sleep(Duration::from_secs(wait_secs.min(60))).await;
-        wait_secs = (wait_secs * 2).min(60);
-    }
+        ),
+        latest_seen_oi_bucket: latest_oi_ratio_bucket_from_hist(&oi_hist),
+        latest_seen_global_bucket: latest_oi_ratio_bucket_from_ratio(&global_ratio),
+        latest_seen_top_account_bucket: latest_oi_ratio_bucket_from_ratio(&top_account),
+        latest_seen_top_position_bucket: latest_oi_ratio_bucket_from_ratio(&top_position),
+    })
 }
 
 fn live_bucket_set_from_target(
@@ -1019,6 +1227,62 @@ fn live_bucket_set_from_target(
             .find(|row| row.timestamp == target_ms)?
             .clone(),
     })
+}
+
+fn scheduled_oi_ratio_attempt_at(
+    target_bucket: DateTime<Utc>,
+    attempt_number: u32,
+) -> DateTime<Utc> {
+    let offset_secs = match attempt_number {
+        0 | 1 => OI_RATIO_LIVE_READY_GRACE_SECS,
+        2 => 45,
+        3 => 75,
+        4 => 105,
+        5 => 135,
+        n => 135 + ((n - 5) as i64 * 30),
+    };
+    target_bucket + ChronoDuration::seconds(offset_secs)
+}
+
+fn next_oi_ratio_retry_at(target_bucket: DateTime<Utc>, next_attempt_number: u32) -> DateTime<Utc> {
+    scheduled_oi_ratio_attempt_at(target_bucket, next_attempt_number)
+}
+
+fn scheduled_options_surface_attempt_at(
+    target_bucket: DateTime<Utc>,
+    attempt_number: u32,
+) -> DateTime<Utc> {
+    let offset_secs = match attempt_number {
+        0 | 1 => OPTIONS_SURFACE_LIVE_READY_GRACE_SECS,
+        2 => 35,
+        3 => 50,
+        4 => 65,
+        _ => 80,
+    };
+    target_bucket + ChronoDuration::seconds(offset_secs)
+}
+
+fn options_surface_attempt_is_complete(outcome: &OptionsSurfaceAttemptOutcome) -> bool {
+    if outcome.contract_count == 0 || outcome.mark_count == 0 || outcome.persisted_count == 0 {
+        return false;
+    }
+    outcome.persisted_count.saturating_mul(4) >= outcome.contract_count
+}
+
+fn latest_oi_ratio_bucket_from_hist(
+    rows: &[BinanceOpenInterestHistRecord],
+) -> Option<DateTime<Utc>> {
+    rows.iter()
+        .filter_map(|row| Utc.timestamp_millis_opt(row.timestamp).single())
+        .max()
+}
+
+fn latest_oi_ratio_bucket_from_ratio(
+    rows: &[BinanceLongShortRatioRecord],
+) -> Option<DateTime<Utc>> {
+    rows.iter()
+        .filter_map(|row| Utc.timestamp_millis_opt(row.timestamp).single())
+        .max()
 }
 
 fn align_ratio_buckets(

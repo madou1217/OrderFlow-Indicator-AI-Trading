@@ -1781,7 +1781,7 @@ impl StateStore {
                 outcome = self.store_long_short_ratio_5m(long_short_ratio);
             }
             MdData::OptionMarkGreeks5m(option_mark) => {
-                outcome.material_change = self.store_option_mark_greeks_5m(option_mark);
+                outcome = self.store_option_mark_greeks_5m(option_mark);
             }
         }
 
@@ -2433,7 +2433,7 @@ impl StateStore {
         IngestOutcome::default()
     }
 
-    fn store_option_mark_greeks_5m(&mut self, event: OptionMarkGreeks5mEvent) -> bool {
+    fn store_option_mark_greeks_5m(&mut self, event: OptionMarkGreeks5mEvent) -> IngestOutcome {
         let point = OptionMarkGreeksPoint {
             ts_bucket: event.ts_bucket,
             option_symbol: event.option_symbol,
@@ -2454,6 +2454,10 @@ impl StateStore {
             risk_free_interest: event.risk_free_interest,
         };
         let ts_bucket = point.ts_bucket;
+        let previous_latest_surface_bucket = self
+            .options_surface_5m_history
+            .back()
+            .map(|item| item.ts_bucket);
         let bucket_rows = self
             .option_mark_greeks_by_bucket_5m
             .entry(ts_bucket)
@@ -2461,7 +2465,26 @@ impl StateStore {
         let raw_changed = upsert_option_bucket_point(bucket_rows, point);
         let surface_changed = self.refresh_options_surface_bucket(ts_bucket);
         self.trim_options_surface_state();
-        raw_changed || surface_changed
+        let latest_surface_bucket = self
+            .options_surface_5m_history
+            .back()
+            .map(|item| item.ts_bucket);
+        if latest_surface_bucket != previous_latest_surface_bucket {
+            debug!(
+                ts_bucket = %ts_bucket,
+                latest_options_surface_bucket = ?latest_surface_bucket,
+                previous_latest_options_surface_bucket = ?previous_latest_surface_bucket,
+                "options surface bucket advanced"
+            );
+        }
+        if raw_changed || surface_changed {
+            return IngestOutcome {
+                material_change: true,
+                dirty_recompute_marked: self.mark_dirty_recompute_if_finalized(ts_bucket),
+                ..IngestOutcome::default()
+            };
+        }
+        IngestOutcome::default()
     }
 
     fn refresh_options_surface_bucket(&mut self, ts_bucket: DateTime<Utc>) -> bool {
@@ -5953,6 +5976,65 @@ mod tests {
                 .front()
                 .and_then(|point| point.atm_iv_front),
             Some(0.50)
+        );
+    }
+
+    #[test]
+    fn late_option_mark_update_marks_dirty_recompute_for_finalized_bucket() {
+        let mut store = StateStore::new("TESTUSDT".to_string(), 1_000.0);
+        let ts_bucket = Utc
+            .with_ymd_and_hms(2026, 3, 27, 6, 20, 0)
+            .single()
+            .unwrap();
+        let finalized_minute = ts_bucket + ChronoDuration::minutes(3);
+        let expiry = ts_bucket + ChronoDuration::days(14);
+
+        store.last_finalized_minute = Some(finalized_minute);
+
+        let first = store.store_option_mark_greeks_5m(option_mark_event(
+            ts_bucket,
+            "LATE-CALL",
+            expiry,
+            100.0,
+            "CALL",
+            100.0,
+            Some(0.55),
+            None,
+            None,
+            Some(0.25),
+        ));
+        assert!(first.material_change);
+        assert!(first.dirty_recompute_marked);
+
+        let second = store.store_option_mark_greeks_5m(option_mark_event(
+            ts_bucket,
+            "LATE-PUT",
+            expiry,
+            100.0,
+            "PUT",
+            100.0,
+            Some(0.60),
+            None,
+            None,
+            Some(-0.25),
+        ));
+        assert!(second.material_change);
+        assert!(second.dirty_recompute_marked);
+        assert_eq!(store.dirty_recompute_from, Some(ts_bucket));
+        assert_eq!(store.dirty_recompute_end, Some(finalized_minute));
+
+        let bundle = store.build_window_bundle(
+            finalized_minute,
+            MinuteWindowData::empty(MarketKind::Futures, finalized_minute),
+            MinuteWindowData::empty(MarketKind::Spot, finalized_minute),
+        );
+        assert_eq!(bundle.latest_options_surface_bucket, Some(ts_bucket));
+        assert_eq!(
+            bundle
+                .options_surface_5m
+                .last()
+                .map(|point| point.ts_bucket),
+            Some(ts_bucket)
         );
     }
 

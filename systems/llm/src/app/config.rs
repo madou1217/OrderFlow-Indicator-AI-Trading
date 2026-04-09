@@ -532,6 +532,8 @@ pub struct WorkflowConfig {
     pub enabled: bool,
     #[serde(default = "default_workflow_stage1_refresh_hours")]
     pub stage1_refresh_hours: Vec<u8>,
+    #[serde(default = "default_workflow_stage1_refresh_mins")]
+    pub stage1_refresh_mins: Vec<u8>,
     #[serde(default = "default_workflow_stage1_no_edge_retry_minutes")]
     pub stage1_no_edge_retry_minutes: Vec<u8>,
     #[serde(default = "default_workflow_stage2_review_minutes")]
@@ -553,6 +555,7 @@ impl Default for WorkflowConfig {
         Self {
             enabled: false,
             stage1_refresh_hours: default_workflow_stage1_refresh_hours(),
+            stage1_refresh_mins: default_workflow_stage1_refresh_mins(),
             stage1_no_edge_retry_minutes: default_workflow_stage1_no_edge_retry_minutes(),
             stage2_review_minutes: default_workflow_stage2_review_minutes(),
             state_dir: default_workflow_state_dir(),
@@ -939,6 +942,10 @@ fn default_bundle_consume_stale_secs() -> u64 {
 
 fn default_workflow_stage1_refresh_hours() -> Vec<u8> {
     vec![0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22]
+}
+
+fn default_workflow_stage1_refresh_mins() -> Vec<u8> {
+    vec![3]
 }
 
 fn default_workflow_stage1_no_edge_retry_minutes() -> Vec<u8> {
@@ -1747,6 +1754,10 @@ fn validate_config(cfg: &RootConfig) -> Result<()> {
     validate_schedule_hours(
         &cfg.llm.workflow.stage1_refresh_hours,
         "llm.workflow.stage1_refresh_hours",
+    )?;
+    validate_schedule_minutes(
+        &cfg.llm.workflow.stage1_refresh_mins,
+        "llm.workflow.stage1_refresh_mins",
     )?;
     validate_optional_schedule_minutes(
         &cfg.llm.workflow.stage1_no_edge_retry_minutes,

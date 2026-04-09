@@ -1538,7 +1538,9 @@ fn workflow_stage1_refresh_reason(
     }
     let hour = bundle.raw.ts_bucket.hour() as u8;
     let minute = bundle.raw.ts_bucket.minute() as u8;
-    if minute == 0 && config.llm.workflow.stage1_refresh_hours.contains(&hour) {
+    if config.llm.workflow.stage1_refresh_hours.contains(&hour)
+        && config.llm.workflow.stage1_refresh_mins.contains(&minute)
+    {
         return Some("scheduled_2h".to_string());
     }
     if stage1_no_edge_retry_due(config, bundle, workflow_state, stage1_output) {
@@ -9515,12 +9517,85 @@ mod tests {
     }
 
     #[test]
+    fn workflow_stage1_refresh_reason_uses_configured_minutes() {
+        let mut config = workflow_test_config();
+        config.llm.workflow.stage1_refresh_hours = vec![4];
+        config.llm.workflow.stage1_refresh_mins = vec![3];
+        let symbol = "ETHUSDT_SCHEDULED_MINUTE";
+        reset_startup_stage1_refresh_for_symbol(symbol);
+        mark_startup_stage1_refresh_consumed(symbol);
+
+        let on_schedule_ts = DateTime::parse_from_rfc3339("2026-03-28T04:03:00Z")
+            .expect("ts")
+            .with_timezone(&Utc);
+        let on_schedule_bundle = LatestBundle {
+            raw: MinuteBundleEnvelope {
+                msg_type: "bundle".to_string(),
+                routing_key: "test.route".to_string(),
+                symbol: symbol.to_string(),
+                ts_bucket: on_schedule_ts,
+                window_code: "15m".to_string(),
+                indicator_count: 0,
+                published_at: None,
+                indicators: json!({}),
+            },
+            indicators: json!({}),
+            missing_indicator_codes: vec![],
+            received_at: on_schedule_ts,
+        };
+        let state = WorkflowState {
+            symbol: symbol.to_string(),
+            pending_stage1_refresh_reason: None,
+            last_stage1_ts: Some(on_schedule_ts - ChronoDuration::hours(1)),
+            ..WorkflowState::default()
+        };
+
+        assert_eq!(
+            workflow_stage1_refresh_reason(
+                &config,
+                &on_schedule_bundle,
+                &state,
+                Some(&sample_stage1_output()),
+            )
+            .as_deref(),
+            Some("scheduled_2h")
+        );
+
+        let off_schedule_ts = DateTime::parse_from_rfc3339("2026-03-28T04:00:00Z")
+            .expect("ts")
+            .with_timezone(&Utc);
+        let off_schedule_bundle = LatestBundle {
+            raw: MinuteBundleEnvelope {
+                msg_type: "bundle".to_string(),
+                routing_key: "test.route".to_string(),
+                symbol: symbol.to_string(),
+                ts_bucket: off_schedule_ts,
+                window_code: "15m".to_string(),
+                indicator_count: 0,
+                published_at: None,
+                indicators: json!({}),
+            },
+            indicators: json!({}),
+            missing_indicator_codes: vec![],
+            received_at: off_schedule_ts,
+        };
+
+        assert!(workflow_stage1_refresh_reason(
+            &config,
+            &off_schedule_bundle,
+            &state,
+            Some(&sample_stage1_output()),
+        )
+        .is_none());
+    }
+
+    #[test]
     fn workflow_stage1_refresh_reason_triggers_on_scheduled_boundary() {
         let config = workflow_test_config();
         let symbol = "ETHUSDT_SCHEDULED";
         reset_startup_stage1_refresh_for_symbol(symbol);
         mark_startup_stage1_refresh_consumed(symbol);
-        let ts_bucket = DateTime::parse_from_rfc3339("2026-03-28T04:00:00Z")
+        let ts_bucket = DateTime::parse_from_rfc3339("2026-03-28T04:03:00Z")
             .expect("ts")
             .with_timezone(&Utc);
         let bundle = LatestBundle {
