@@ -36,7 +36,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio::task::JoinHandle;
 use tokio::time::{interval, Instant, MissedTickBehavior};
 use tracing::{debug, error, info, warn};
@@ -44,7 +44,7 @@ use uuid::Uuid;
 
 const STARTUP_BACKFILL_FALLBACK_LOOKBACK_MINUTES: i64 = 30;
 const STARTUP_BACKFILL_OVERLAP_MINUTES: i64 = 30;
-const MIN_REUSABLE_SNAPSHOT_HISTORY_MINUTES: i64 = 30 * 24 * 60;
+const MIN_RESTART_RECOVERY_HISTORY_MINUTES: i64 = 24 * 60;
 const STARTUP_BACKFILL_SAFETY_LAG_SECS: i64 = 10;
 const STARTUP_BACKFILL_MARKET: &str = "all";
 const STALE_DROP_REPORT_INTERVAL_SECS: u64 = 10;
@@ -276,6 +276,32 @@ struct PrepareMinuteTask {
     enqueued_at: Instant,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct KlineSupplementCacheKey {
+    market: &'static str,
+    interval_code: &'static str,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct KlineSupplementRequest {
+    key: KlineSupplementCacheKey,
+    older_than_open_time: DateTime<Utc>,
+    limit: usize,
+}
+
+#[derive(Debug, Default)]
+struct RuntimeHistorySupplementCache {
+    kline: RwLock<HashMap<KlineSupplementCacheKey, Vec<KlineHistoryBar>>>,
+    options_surface: RwLock<Vec<OptionsSurfacePoint>>,
+}
+
+impl RuntimeHistorySupplementCache {
+    async fn clear(&self) {
+        self.kline.write().await.clear();
+        self.options_surface.write().await.clear();
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MaterializeWorkerKind {
     Live,
@@ -481,6 +507,24 @@ fn live_catchup_requested(
         .live_catchup_progress_only_lag_minutes
         .max(1);
     live_backlog_minutes(next_minute, latest_confirmed_closed) >= lag_threshold_minutes
+}
+
+fn effective_live_commit_frontier_ts(
+    persisted_frontier_ts: Option<DateTime<Utc>>,
+    startup_replay_cutoff_bucket: Option<DateTime<Utc>>,
+    live_catchup_enabled: bool,
+) -> Option<DateTime<Utc>> {
+    if !live_catchup_enabled {
+        return persisted_frontier_ts;
+    }
+
+    let startup_frontier =
+        startup_replay_cutoff_bucket.map(|bucket| bucket - ChronoDuration::minutes(1));
+    match (persisted_frontier_ts, startup_frontier) {
+        (Some(persisted), Some(startup)) => Some(persisted.max(startup)),
+        (Some(persisted), None) => Some(persisted),
+        (None, startup) => startup,
+    }
 }
 
 fn round_up_minutes(value: i64, step: i64) -> i64 {
@@ -774,6 +818,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
     let mut stale_drop_by_msg_type: HashMap<String, u64> = HashMap::new();
     let mut stale_drop_last_report = Instant::now();
     let runtime_options = build_indicator_runtime_options(&ctx.config);
+    let supplement_cache = Arc::new(RuntimeHistorySupplementCache::default());
     state_store.set_divergence_runtime_options(
         runtime_options.divergence_sig_test_mode,
         runtime_options.divergence_bootstrap_b,
@@ -823,6 +868,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
             &ctx,
             metrics.clone(),
             dispatcher.as_ref(),
+            supplement_cache.as_ref(),
             &mut state_store,
             &mut scheduler,
             &runtime_options,
@@ -958,6 +1004,8 @@ pub async fn run(ctx: AppContext) -> Result<()> {
     let mut live_prepare_handle = Some(tokio::spawn(run_live_prepare_loop(
         ctx.clone(),
         state_store.clone(),
+        supplement_cache.clone(),
+        runtime_options.clone(),
         live_prepare_task_rx,
         live_prepare_minute_pending.clone(),
         live_ready_job_tx
@@ -971,6 +1019,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
             tokio::spawn(run_live_materialize_compute_loop(
                 ctx.clone(),
                 dispatcher.clone(),
+                supplement_cache.clone(),
                 runtime_options.clone(),
                 live_ready_job_rx.clone(),
                 live_computed_job_tx.clone(),
@@ -978,7 +1027,11 @@ pub async fn run(ctx: AppContext) -> Result<()> {
         })
         .collect::<Vec<_>>();
     drop(live_computed_job_tx);
-    let live_commit_initial_persisted_ts = ts_from_millis(metrics.snapshot().last_persisted_ts_ms);
+    let live_commit_initial_persisted_ts = effective_live_commit_frontier_ts(
+        ts_from_millis(metrics.snapshot().last_persisted_ts_ms),
+        startup_replay_cutoff_bucket,
+        ctx.config.indicator.live_catchup_progress_only_enabled,
+    );
     let mut live_commit_handle = Some(tokio::spawn(run_live_ordered_commit_loop(
         metrics.clone(),
         dispatcher.clone(),
@@ -994,6 +1047,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
         ctx.clone(),
         metrics.clone(),
         dispatcher.clone(),
+        supplement_cache.clone(),
         runtime_options.clone(),
         MaterializeWorkerKind::DirtyRecompute,
         dirty_ready_job_rx,
@@ -1500,6 +1554,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                         &ctx,
                         metrics.clone(),
                         dispatcher.as_ref(),
+                        supplement_cache.as_ref(),
                         &state_store,
                         &mut scheduler,
                         &runtime_options,
@@ -1676,6 +1731,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
             &ctx,
             metrics.clone(),
             dispatcher.as_ref(),
+            supplement_cache.as_ref(),
             &mut state_store,
             &mut scheduler,
             &runtime_options,
@@ -1990,6 +2046,7 @@ async fn shutdown_drain_and_persist(
     ctx: &Arc<AppContext>,
     metrics: Arc<AppMetrics>,
     dispatcher: &Dispatcher,
+    supplement_cache: &RuntimeHistorySupplementCache,
     state_store: &mut StateStore,
     scheduler: &mut WindowScheduler,
     runtime_options: &IndicatorRuntimeOptions,
@@ -2081,6 +2138,7 @@ async fn shutdown_drain_and_persist(
                 ctx,
                 metrics.clone(),
                 dispatcher,
+                supplement_cache,
                 state_store,
                 scheduler,
                 runtime_options,
@@ -2445,9 +2503,13 @@ fn snapshot_has_required_history(snap: &StateSnapshot) -> bool {
 fn required_snapshot_history_start_ts(snap: &StateSnapshot) -> DateTime<Utc> {
     let retention_floor =
         snap.last_finalized_ts - ChronoDuration::minutes((HISTORY_LIMIT_MINUTES as i64) - 1);
-    let rolling_history_floor =
-        snap.last_finalized_ts - ChronoDuration::minutes(MIN_REUSABLE_SNAPSHOT_HISTORY_MINUTES - 1);
-    retention_floor.max(rolling_history_floor)
+    let restart_floor =
+        snap.last_finalized_ts - ChronoDuration::minutes(MIN_RESTART_RECOVERY_HISTORY_MINUTES - 1);
+    let required_floor = snap
+        .effective_history_floor_ts
+        .map(|effective_floor| effective_floor.min(restart_floor))
+        .unwrap_or(restart_floor);
+    retention_floor.max(required_floor)
 }
 
 fn snapshot_history_reaches_required_start(
@@ -2470,7 +2532,7 @@ fn snapshot_history_covers_required_window(
 }
 
 fn minimum_startup_recovery_history_floor(to_ts: DateTime<Utc>) -> DateTime<Utc> {
-    to_ts - ChronoDuration::minutes(MIN_REUSABLE_SNAPSHOT_HISTORY_MINUTES)
+    to_ts - ChronoDuration::minutes(MIN_RESTART_RECOVERY_HISTORY_MINUTES)
 }
 
 fn expand_startup_backfill_to_minimum_recovery_window(
@@ -2772,9 +2834,7 @@ async fn abort_periodic_runtime_snapshot_handle(handle_slot: &mut Option<JoinHan
     }
 }
 
-pub async fn load_kline_history_supplement(
-    pool: &PgPool,
-    symbol: &str,
+fn build_kline_supplement_requests(
     history_futures: &[MinuteHistory],
     history_spot: &[MinuteHistory],
     bars_4h: usize,
@@ -2794,9 +2854,9 @@ pub async fn load_kline_history_supplement(
     fvg_db_bars_1d: usize,
     fvg_db_bars_3d: usize,
     current_minute_close: DateTime<Utc>,
-) -> KlineHistorySupplement {
+) -> Vec<KlineSupplementRequest> {
     if !fill_1d_from_db && !ema_fill_from_db && !fvg_fill_from_db && bars_4h == 0 {
-        return KlineHistorySupplement::default();
+        return Vec::new();
     }
 
     let fvg_needs_4h = fvg_fill_from_db && fvg_windows.iter().any(|code| code == "4h");
@@ -2858,160 +2918,254 @@ pub async fn load_kline_history_supplement(
         .max(if fvg_needs_4h { fvg_db_bars_4h } else { 0 });
     let required_spot_4h = bars_4h;
 
-    let in_mem_futures_count = in_mem_futures_1d.len();
-    let in_mem_spot_count = in_mem_spot_1d.len();
-    let in_mem_futures_4h_count = in_mem_futures_4h.len();
-    let in_mem_spot_4h_count = in_mem_spot_4h.len();
+    let futures_1d_missing = required_futures_1d.saturating_sub(in_mem_futures_1d.len());
+    let spot_1d_missing = required_spot_1d.saturating_sub(in_mem_spot_1d.len());
+    let futures_4h_missing = required_futures_4h.saturating_sub(in_mem_futures_4h.len());
+    let spot_4h_missing = required_spot_4h.saturating_sub(in_mem_spot_4h.len());
 
-    let futures_1d_missing = required_futures_1d.saturating_sub(in_mem_futures_count);
-    let spot_1d_missing = required_spot_1d.saturating_sub(in_mem_spot_count);
-    let futures_4h_missing = required_futures_4h.saturating_sub(in_mem_futures_4h_count);
-    let spot_4h_missing = required_spot_4h.saturating_sub(in_mem_spot_4h_count);
+    let mut requests = Vec::with_capacity(4);
+    if futures_1d_missing > 0 {
+        requests.push(KlineSupplementRequest {
+            key: KlineSupplementCacheKey {
+                market: "futures",
+                interval_code: "1d",
+            },
+            older_than_open_time: in_mem_futures_1d
+                .first()
+                .map(|bar| bar.open_time)
+                .unwrap_or(current_minute_close),
+            limit: futures_1d_missing,
+        });
+    }
+    if spot_1d_missing > 0 {
+        requests.push(KlineSupplementRequest {
+            key: KlineSupplementCacheKey {
+                market: "spot",
+                interval_code: "1d",
+            },
+            older_than_open_time: in_mem_spot_1d
+                .first()
+                .map(|bar| bar.open_time)
+                .unwrap_or(current_minute_close),
+            limit: spot_1d_missing,
+        });
+    }
+    if futures_4h_missing > 0 {
+        requests.push(KlineSupplementRequest {
+            key: KlineSupplementCacheKey {
+                market: "futures",
+                interval_code: "4h",
+            },
+            older_than_open_time: in_mem_futures_4h
+                .first()
+                .map(|bar| bar.open_time)
+                .unwrap_or(current_minute_close),
+            limit: futures_4h_missing,
+        });
+    }
+    if spot_4h_missing > 0 {
+        requests.push(KlineSupplementRequest {
+            key: KlineSupplementCacheKey {
+                market: "spot",
+                interval_code: "4h",
+            },
+            older_than_open_time: in_mem_spot_4h
+                .first()
+                .map(|bar| bar.open_time)
+                .unwrap_or(current_minute_close),
+            limit: spot_4h_missing,
+        });
+    }
 
-    if futures_1d_missing == 0
-        && spot_1d_missing == 0
-        && futures_4h_missing == 0
-        && spot_4h_missing == 0
+    requests
+}
+
+fn assign_kline_supplement_rows(
+    supplement: &mut KlineHistorySupplement,
+    key: KlineSupplementCacheKey,
+    rows: Vec<KlineHistoryBar>,
+) {
+    match (key.market, key.interval_code) {
+        ("futures", "4h") => supplement.futures_4h_db = rows,
+        ("futures", "1d") => supplement.futures_1d_db = rows,
+        ("spot", "4h") => supplement.spot_4h_db = rows,
+        ("spot", "1d") => supplement.spot_1d_db = rows,
+        _ => {}
+    }
+}
+
+fn select_recent_kline_supplement_rows(
+    rows: &[KlineHistoryBar],
+    older_than_open_time: DateTime<Utc>,
+    limit: usize,
+) -> Vec<KlineHistoryBar> {
+    if limit == 0 {
+        return Vec::new();
+    }
+
+    let mut selected = rows
+        .iter()
+        .rev()
+        .filter(|row| row.open_time < older_than_open_time)
+        .take(limit)
+        .cloned()
+        .collect::<Vec<_>>();
+    selected.reverse();
+    selected
+}
+
+fn merge_kline_supplement_rows(
+    existing: &[KlineHistoryBar],
+    fetched: Vec<KlineHistoryBar>,
+) -> Vec<KlineHistoryBar> {
+    let mut merged = existing.to_vec();
+    for row in fetched {
+        if merged.iter().any(|item| item.open_time == row.open_time) {
+            continue;
+        }
+        merged.push(row);
+    }
+    merged.sort_by_key(|row| row.open_time);
+    merged
+}
+
+async fn ensure_cached_kline_supplement_rows(
+    cache: &RuntimeHistorySupplementCache,
+    pool: &PgPool,
+    symbol: &str,
+    request: KlineSupplementRequest,
+) -> Vec<KlineHistoryBar> {
+    let cached = {
+        let guard = cache.kline.read().await;
+        guard
+            .get(&request.key)
+            .map(|rows| {
+                select_recent_kline_supplement_rows(
+                    rows,
+                    request.older_than_open_time,
+                    request.limit,
+                )
+            })
+            .unwrap_or_default()
+    };
+    if cached.len() >= request.limit {
+        return cached;
+    }
+
+    let fetch_before = cached
+        .first()
+        .map(|row| row.open_time)
+        .unwrap_or(request.older_than_open_time);
+    let missing = request.limit.saturating_sub(cached.len());
+    let fetched = match fetch_older_interval_bars(
+        pool,
+        symbol,
+        request.key.market,
+        request.key.interval_code,
+        fetch_before,
+        missing,
+    )
+    .await
     {
-        return KlineHistorySupplement::default();
+        Ok(rows) => rows,
+        Err(err) => {
+            warn!(
+                error = %err,
+                symbol = %symbol,
+                market = request.key.market,
+                interval_code = request.key.interval_code,
+                older_than_open_time = %request.older_than_open_time,
+                limit = request.limit,
+                "load kline supplement from DB failed"
+            );
+            Vec::new()
+        }
+    };
+
+    let merged = {
+        let mut guard = cache.kline.write().await;
+        let existing = guard.entry(request.key).or_default();
+        let merged = merge_kline_supplement_rows(existing, fetched);
+        *existing = merged.clone();
+        merged
+    };
+
+    select_recent_kline_supplement_rows(&merged, request.older_than_open_time, request.limit)
+}
+
+pub async fn load_kline_history_supplement(
+    pool: &PgPool,
+    symbol: &str,
+    history_futures: &[MinuteHistory],
+    history_spot: &[MinuteHistory],
+    bars_4h: usize,
+    bars_1d: usize,
+    bars_3d: usize,
+    bars_7d: usize,
+    bars_30d: usize,
+    fill_1d_from_db: bool,
+    ema_fill_from_db: bool,
+    ema_htf_windows: &[String],
+    ema_db_bars_4h: usize,
+    ema_db_bars_1d: usize,
+    ema_db_bars_3d: usize,
+    fvg_fill_from_db: bool,
+    fvg_windows: &[String],
+    fvg_db_bars_4h: usize,
+    fvg_db_bars_1d: usize,
+    fvg_db_bars_3d: usize,
+    current_minute_close: DateTime<Utc>,
+) -> KlineHistorySupplement {
+    let requests = build_kline_supplement_requests(
+        history_futures,
+        history_spot,
+        bars_4h,
+        bars_1d,
+        bars_3d,
+        bars_7d,
+        bars_30d,
+        fill_1d_from_db,
+        ema_fill_from_db,
+        ema_htf_windows,
+        ema_db_bars_4h,
+        ema_db_bars_1d,
+        ema_db_bars_3d,
+        fvg_fill_from_db,
+        fvg_windows,
+        fvg_db_bars_4h,
+        fvg_db_bars_1d,
+        fvg_db_bars_3d,
+        current_minute_close,
+    );
+    let mut supplement = KlineHistorySupplement::default();
+    for request in requests {
+        let rows = match fetch_older_interval_bars(
+            pool,
+            symbol,
+            request.key.market,
+            request.key.interval_code,
+            request.older_than_open_time,
+            request.limit,
+        )
+        .await
+        {
+            Ok(rows) => rows,
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    symbol = %symbol,
+                    market = request.key.market,
+                    interval_code = request.key.interval_code,
+                    older_than_open_time = %request.older_than_open_time,
+                    limit = request.limit,
+                    "load kline supplement from DB failed"
+                );
+                Vec::new()
+            }
+        };
+        assign_kline_supplement_rows(&mut supplement, request.key, rows);
     }
-
-    let futures_oldest_open = in_mem_futures_1d
-        .first()
-        .map(|b| b.open_time)
-        .unwrap_or(current_minute_close);
-    let spot_oldest_open = in_mem_spot_1d
-        .first()
-        .map(|b| b.open_time)
-        .unwrap_or(current_minute_close);
-    let futures_4h_oldest_open = in_mem_futures_4h
-        .first()
-        .map(|b| b.open_time)
-        .unwrap_or(current_minute_close);
-    let spot_4h_oldest_open = in_mem_spot_4h
-        .first()
-        .map(|b| b.open_time)
-        .unwrap_or(current_minute_close);
-
-    let futures_1d_db = if futures_1d_missing > 0 {
-        match fetch_older_interval_bars(
-            pool,
-            symbol,
-            "futures",
-            "1d",
-            futures_oldest_open,
-            futures_1d_missing,
-        )
-        .await
-        {
-            Ok(rows) => rows,
-            Err(err) => {
-                warn!(
-                    error = %err,
-                    symbol = %symbol,
-                    market = "futures",
-                    interval_code = "1d",
-                    limit = futures_1d_missing,
-                    "load kline supplement from DB failed"
-                );
-                Vec::new()
-            }
-        }
-    } else {
-        Vec::new()
-    };
-
-    let spot_1d_db = if spot_1d_missing > 0 {
-        match fetch_older_interval_bars(
-            pool,
-            symbol,
-            "spot",
-            "1d",
-            spot_oldest_open,
-            spot_1d_missing,
-        )
-        .await
-        {
-            Ok(rows) => rows,
-            Err(err) => {
-                warn!(
-                    error = %err,
-                    symbol = %symbol,
-                    market = "spot",
-                    interval_code = "1d",
-                    limit = spot_1d_missing,
-                    "load kline supplement from DB failed"
-                );
-                Vec::new()
-            }
-        }
-    } else {
-        Vec::new()
-    };
-
-    let futures_4h_db = if futures_4h_missing > 0 {
-        match fetch_older_interval_bars(
-            pool,
-            symbol,
-            "futures",
-            "4h",
-            futures_4h_oldest_open,
-            futures_4h_missing,
-        )
-        .await
-        {
-            Ok(rows) => rows,
-            Err(err) => {
-                warn!(
-                    error = %err,
-                    symbol = %symbol,
-                    market = "futures",
-                    interval_code = "4h",
-                    limit = futures_4h_missing,
-                    "load kline supplement from DB failed"
-                );
-                Vec::new()
-            }
-        }
-    } else {
-        Vec::new()
-    };
-
-    let spot_4h_db = if spot_4h_missing > 0 {
-        match fetch_older_interval_bars(
-            pool,
-            symbol,
-            "spot",
-            "4h",
-            spot_4h_oldest_open,
-            spot_4h_missing,
-        )
-        .await
-        {
-            Ok(rows) => rows,
-            Err(err) => {
-                warn!(
-                    error = %err,
-                    symbol = %symbol,
-                    market = "spot",
-                    interval_code = "4h",
-                    limit = spot_4h_missing,
-                    "load kline supplement from DB failed"
-                );
-                Vec::new()
-            }
-        }
-    } else {
-        Vec::new()
-    };
-
-    KlineHistorySupplement {
-        futures_4h_db,
-        futures_1d_db,
-        spot_4h_db,
-        spot_1d_db,
-        ..KlineHistorySupplement::default()
-    }
+    supplement
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -3166,6 +3320,335 @@ async fn load_options_surface_history_supplement(
             .or_else(|| existing_points.last().map(|point| point.ts_bucket)),
         points,
     )
+}
+
+fn select_recent_options_surface_points(
+    points: &[OptionsSurfacePoint],
+    exclusive_upper_bucket: Option<DateTime<Utc>>,
+    inclusive_upper_bucket: DateTime<Utc>,
+    limit: usize,
+) -> Vec<OptionsSurfacePoint> {
+    if limit == 0 {
+        return Vec::new();
+    }
+
+    let mut selected = points
+        .iter()
+        .rev()
+        .filter(|point| {
+            exclusive_upper_bucket
+                .map(|upper| point.ts_bucket < upper)
+                .unwrap_or(point.ts_bucket <= inclusive_upper_bucket)
+        })
+        .take(limit)
+        .cloned()
+        .collect::<Vec<_>>();
+    selected.reverse();
+    selected
+}
+
+fn merge_options_surface_points(
+    existing: &[OptionsSurfacePoint],
+    fetched: Vec<OptionsSurfacePoint>,
+) -> Vec<OptionsSurfacePoint> {
+    let mut merged = existing.to_vec();
+    for point in fetched {
+        if merged.iter().any(|item| item.ts_bucket == point.ts_bucket) {
+            continue;
+        }
+        merged.push(point);
+    }
+    merged.sort_by_key(|point| point.ts_bucket);
+    merged
+}
+
+async fn ensure_cached_options_surface_points(
+    cache: &RuntimeHistorySupplementCache,
+    pool: &PgPool,
+    symbol: &str,
+    existing_points: &[OptionsSurfacePoint],
+    current_minute_close: DateTime<Utc>,
+) -> (Option<DateTime<Utc>>, Vec<OptionsSurfacePoint>) {
+    let required_points = required_options_surface_history_points();
+    if required_points == 0 || existing_points.len() >= required_points {
+        return (
+            existing_points.last().map(|point| point.ts_bucket),
+            Vec::new(),
+        );
+    }
+
+    let limit = if existing_points.is_empty() {
+        required_points
+    } else {
+        required_points.saturating_sub(existing_points.len())
+    };
+    if limit == 0 {
+        return (
+            existing_points.last().map(|point| point.ts_bucket),
+            Vec::new(),
+        );
+    }
+
+    let exclusive_upper_bucket = existing_points.first().map(|point| point.ts_bucket);
+    let cached = {
+        let guard = cache.options_surface.read().await;
+        select_recent_options_surface_points(
+            &guard,
+            exclusive_upper_bucket,
+            current_minute_close,
+            limit,
+        )
+    };
+    if cached.len() >= limit {
+        return (
+            cached
+                .last()
+                .map(|point| point.ts_bucket)
+                .or_else(|| existing_points.last().map(|point| point.ts_bucket)),
+            cached,
+        );
+    }
+
+    let fetch_limit = limit.saturating_sub(cached.len());
+    let fetch_rows = if fetch_limit == 0 {
+        Vec::new()
+    } else if let Some(oldest_bucket) = cached
+        .first()
+        .map(|point| point.ts_bucket)
+        .or(exclusive_upper_bucket)
+    {
+        let rows_result: Result<Vec<OptionsSurfaceFeatureRow>> = sqlx::query_as(
+            r#"
+            SELECT
+                ts_bucket,
+                front_expiry_ts,
+                second_expiry_ts,
+                atm_strike_front,
+                atm_iv_front,
+                atm_iv_second,
+                atm_iv_30d_proxy,
+                rr_25d_front,
+                rr_25d_second,
+                skew_state,
+                term_structure_state
+            FROM feat.options_surface_feature
+            WHERE symbol = $1
+              AND bar_interval = interval '5 minutes'
+              AND ts_bucket < $2
+            ORDER BY ts_bucket DESC
+            LIMIT $3
+            "#,
+        )
+        .bind(symbol.to_uppercase())
+        .bind(oldest_bucket)
+        .bind(fetch_limit as i64)
+        .fetch_all(pool)
+        .await
+        .context("query options surface supplement before cached/oldest bucket");
+        match rows_result {
+            Ok(rows) => rows,
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    symbol = %symbol,
+                    current_points = existing_points.len(),
+                    required_points = required_points,
+                    current_minute_close = %current_minute_close,
+                    "load options surface supplement from DB failed"
+                );
+                Vec::new()
+            }
+        }
+    } else {
+        let rows_result: Result<Vec<OptionsSurfaceFeatureRow>> = sqlx::query_as(
+            r#"
+            SELECT
+                ts_bucket,
+                front_expiry_ts,
+                second_expiry_ts,
+                atm_strike_front,
+                atm_iv_front,
+                atm_iv_second,
+                atm_iv_30d_proxy,
+                rr_25d_front,
+                rr_25d_second,
+                skew_state,
+                term_structure_state
+            FROM feat.options_surface_feature
+            WHERE symbol = $1
+              AND bar_interval = interval '5 minutes'
+              AND ts_bucket <= $2
+            ORDER BY ts_bucket DESC
+            LIMIT $3
+            "#,
+        )
+        .bind(symbol.to_uppercase())
+        .bind(current_minute_close)
+        .bind(fetch_limit as i64)
+        .fetch_all(pool)
+        .await
+        .context("query latest options surface supplement for cache");
+        match rows_result {
+            Ok(rows) => rows,
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    symbol = %symbol,
+                    current_points = existing_points.len(),
+                    required_points = required_points,
+                    current_minute_close = %current_minute_close,
+                    "load options surface supplement from DB failed"
+                );
+                Vec::new()
+            }
+        }
+    };
+
+    let fetched = fetch_rows
+        .into_iter()
+        .map(|row| OptionsSurfacePoint {
+            ts_bucket: row.ts_bucket,
+            front_expiry_ts: row.front_expiry_ts,
+            second_expiry_ts: row.second_expiry_ts,
+            atm_strike_front: row.atm_strike_front,
+            atm_iv_front: row.atm_iv_front,
+            atm_iv_second: row.atm_iv_second,
+            atm_iv_30d_proxy: row.atm_iv_30d_proxy,
+            rr_25d_front: row.rr_25d_front,
+            rr_25d_second: row.rr_25d_second,
+            skew_state: row.skew_state,
+            term_structure_state: row.term_structure_state,
+        })
+        .collect::<Vec<_>>();
+
+    let merged = {
+        let mut guard = cache.options_surface.write().await;
+        let merged = merge_options_surface_points(&guard, fetched);
+        *guard = merged.clone();
+        merged
+    };
+
+    let selected = select_recent_options_surface_points(
+        &merged,
+        exclusive_upper_bucket,
+        current_minute_close,
+        limit,
+    );
+    (
+        selected
+            .last()
+            .map(|point| point.ts_bucket)
+            .or_else(|| existing_points.last().map(|point| point.ts_bucket)),
+        selected,
+    )
+}
+
+async fn prewarm_history_supplement_cache(
+    cache: &RuntimeHistorySupplementCache,
+    pool: &PgPool,
+    symbol: &str,
+    runtime_options: &IndicatorRuntimeOptions,
+    history_futures: &[MinuteHistory],
+    history_spot: &[MinuteHistory],
+    existing_options_points: &[OptionsSurfacePoint],
+    current_minute_close: DateTime<Utc>,
+) {
+    let requests = build_kline_supplement_requests(
+        history_futures,
+        history_spot,
+        runtime_options.kline_history_bars_4h,
+        runtime_options.kline_history_bars_1d,
+        runtime_options.kline_history_bars_3d,
+        runtime_options.kline_history_bars_7d,
+        runtime_options.kline_history_bars_30d,
+        runtime_options.kline_history_fill_1d_from_db,
+        runtime_options.ema_fill_from_db,
+        &runtime_options.ema_htf_windows,
+        runtime_options.ema_db_bars_4h,
+        runtime_options.ema_db_bars_1d,
+        runtime_options.ema_db_bars_3d,
+        runtime_options.fvg_fill_from_db,
+        &runtime_options.fvg_windows,
+        runtime_options.fvg_db_bars_4h,
+        runtime_options.fvg_db_bars_1d,
+        runtime_options.fvg_db_bars_3d,
+        current_minute_close,
+    );
+    for request in requests {
+        let _ = ensure_cached_kline_supplement_rows(cache, pool, symbol, request).await;
+    }
+    let _ = ensure_cached_options_surface_points(
+        cache,
+        pool,
+        symbol,
+        existing_options_points,
+        current_minute_close,
+    )
+    .await;
+}
+
+async fn load_kline_history_supplement_cached(
+    cache: &RuntimeHistorySupplementCache,
+    pool: &PgPool,
+    symbol: &str,
+    history_futures: &[MinuteHistory],
+    history_spot: &[MinuteHistory],
+    bars_4h: usize,
+    bars_1d: usize,
+    bars_3d: usize,
+    bars_7d: usize,
+    bars_30d: usize,
+    fill_1d_from_db: bool,
+    ema_fill_from_db: bool,
+    ema_htf_windows: &[String],
+    ema_db_bars_4h: usize,
+    ema_db_bars_1d: usize,
+    ema_db_bars_3d: usize,
+    fvg_fill_from_db: bool,
+    fvg_windows: &[String],
+    fvg_db_bars_4h: usize,
+    fvg_db_bars_1d: usize,
+    fvg_db_bars_3d: usize,
+    current_minute_close: DateTime<Utc>,
+) -> KlineHistorySupplement {
+    let requests = build_kline_supplement_requests(
+        history_futures,
+        history_spot,
+        bars_4h,
+        bars_1d,
+        bars_3d,
+        bars_7d,
+        bars_30d,
+        fill_1d_from_db,
+        ema_fill_from_db,
+        ema_htf_windows,
+        ema_db_bars_4h,
+        ema_db_bars_1d,
+        ema_db_bars_3d,
+        fvg_fill_from_db,
+        fvg_windows,
+        fvg_db_bars_4h,
+        fvg_db_bars_1d,
+        fvg_db_bars_3d,
+        current_minute_close,
+    );
+    let mut supplement = KlineHistorySupplement::default();
+    for request in requests {
+        let rows = ensure_cached_kline_supplement_rows(cache, pool, symbol, request).await;
+        assign_kline_supplement_rows(&mut supplement, request.key, rows);
+    }
+    supplement
+}
+
+async fn load_options_surface_history_supplement_cached(
+    cache: &RuntimeHistorySupplementCache,
+    pool: &PgPool,
+    symbol: &str,
+    existing_points: &[OptionsSurfacePoint],
+    current_minute_close: DateTime<Utc>,
+) -> (Option<DateTime<Utc>>, Vec<OptionsSurfacePoint>) {
+    ensure_cached_options_surface_points(cache, pool, symbol, existing_points, current_minute_close)
+        .await
 }
 
 fn floor_timestamp_to_interval_minutes(ts: DateTime<Utc>, interval_minutes: i64) -> DateTime<Utc> {
@@ -3975,6 +4458,7 @@ async fn materialize_repair_range(
     ctx: &Arc<AppContext>,
     metrics: Arc<AppMetrics>,
     dispatcher: &Dispatcher,
+    supplement_cache: &RuntimeHistorySupplementCache,
     state_store: &mut StateStore,
     runtime_options: &IndicatorRuntimeOptions,
     from_ts: DateTime<Utc>,
@@ -4016,8 +4500,15 @@ async fn materialize_repair_range(
         );
         while minute <= batch_end_ts {
             let window = state_store.finalize_minute(minute);
-            let snapshots =
-                process_window_bundle(ctx, dispatcher, runtime_options, window, mode).await?;
+            let snapshots = process_window_bundle(
+                ctx,
+                dispatcher,
+                supplement_cache,
+                runtime_options,
+                window,
+                mode,
+            )
+            .await?;
             metrics.inc_exported_window();
             if mode.persist_outputs() {
                 metrics.set_last_persisted_ts(Some(minute.timestamp_millis()));
@@ -4089,6 +4580,7 @@ async fn maybe_execute_live_catchup_cutover(
     ctx: &Arc<AppContext>,
     metrics: Arc<AppMetrics>,
     dispatcher: &Dispatcher,
+    supplement_cache: &RuntimeHistorySupplementCache,
     state_store: &Arc<Mutex<StateStore>>,
     scheduler: &mut WindowScheduler,
     runtime_options: &IndicatorRuntimeOptions,
@@ -4195,6 +4687,7 @@ async fn maybe_execute_live_catchup_cutover(
     let rewind_target_ts = repair_start_ts - ChronoDuration::minutes(1);
     metrics.set_last_persisted_ts(Some(rewind_target_ts.timestamp_millis()));
 
+    supplement_cache.clear().await;
     let (materialized_windows, repair_snapshot) = {
         let mut state_store = state_store.lock().await;
         state_store.rewind_finalized_state_from(repair_start_ts);
@@ -4204,6 +4697,7 @@ async fn maybe_execute_live_catchup_cutover(
             ctx,
             metrics.clone(),
             dispatcher,
+            supplement_cache,
             &mut state_store,
             runtime_options,
             repair_start_ts,
@@ -4434,6 +4928,7 @@ async fn process_ready_minutes(
     ctx: &Arc<AppContext>,
     metrics: Arc<AppMetrics>,
     dispatcher: &Dispatcher,
+    supplement_cache: &RuntimeHistorySupplementCache,
     state_store: &mut StateStore,
     scheduler: &mut WindowScheduler,
     runtime_options: &IndicatorRuntimeOptions,
@@ -4517,7 +5012,16 @@ async fn process_ready_minutes(
 
     for minute in scheduler.ready_minutes_through(ready_through_ts) {
         let window = state_store.finalize_minute(minute);
-        match process_window_bundle(ctx, dispatcher, runtime_options, window, dispatch_mode).await {
+        match process_window_bundle(
+            ctx,
+            dispatcher,
+            supplement_cache,
+            runtime_options,
+            window,
+            dispatch_mode,
+        )
+        .await
+        {
             Ok(snapshots) => {
                 metrics.inc_exported_window();
                 metrics.set_last_persisted_ts(Some(minute.timestamp_millis()));
@@ -4929,6 +5433,7 @@ async fn run_live_materialize_loop(
     ctx: Arc<AppContext>,
     metrics: Arc<AppMetrics>,
     dispatcher: Arc<Dispatcher>,
+    supplement_cache: Arc<RuntimeHistorySupplementCache>,
     runtime_options: IndicatorRuntimeOptions,
     worker_kind: MaterializeWorkerKind,
     mut ready_job_rx: mpsc::Receiver<ReadyMinuteJob>,
@@ -4941,6 +5446,7 @@ async fn run_live_materialize_loop(
         let result = process_window_bundle(
             &ctx,
             dispatcher.as_ref(),
+            supplement_cache.as_ref(),
             &runtime_options,
             job.bundle,
             job.mode,
@@ -4978,6 +5484,7 @@ async fn run_live_materialize_loop(
 async fn run_live_materialize_compute_loop(
     ctx: Arc<AppContext>,
     dispatcher: Arc<Dispatcher>,
+    supplement_cache: Arc<RuntimeHistorySupplementCache>,
     runtime_options: IndicatorRuntimeOptions,
     ready_job_rx: Arc<Mutex<mpsc::Receiver<ReadyMinuteJob>>>,
     computed_job_tx: mpsc::Sender<ComputedMinuteJob>,
@@ -4993,6 +5500,7 @@ async fn run_live_materialize_compute_loop(
         let artifacts = compute_window_bundle_artifacts(
             &ctx,
             dispatcher.as_ref(),
+            supplement_cache.as_ref(),
             &runtime_options,
             job.bundle,
             job.mode,
@@ -5086,6 +5594,8 @@ async fn commit_live_jobs_in_order(
 async fn run_live_prepare_loop(
     ctx: Arc<AppContext>,
     state_store: Arc<Mutex<StateStore>>,
+    supplement_cache: Arc<RuntimeHistorySupplementCache>,
+    runtime_options: IndicatorRuntimeOptions,
     mut prepare_task_rx: mpsc::Receiver<PrepareMinuteTask>,
     prepare_minute_pending: Arc<AtomicUsize>,
     ready_job_tx: mpsc::Sender<ReadyMinuteJob>,
@@ -5163,6 +5673,20 @@ async fn run_live_prepare_loop(
                     bundle,
                 });
             }
+        }
+
+        if let Some(first_job) = prepared_jobs.first() {
+            prewarm_history_supplement_cache(
+                supplement_cache.as_ref(),
+                &ctx.db_pool,
+                &ctx.config.indicator.symbol,
+                &runtime_options,
+                first_job.bundle.history_futures.as_ref(),
+                first_job.bundle.history_spot.as_ref(),
+                first_job.bundle.options_surface_5m.as_slice(),
+                first_job.ts_bucket + ChronoDuration::minutes(1),
+            )
+            .await;
         }
 
         for job in prepared_jobs {
@@ -5517,24 +6041,34 @@ fn replay_heatmap_hydration_batch_end(
 async fn process_window_bundle(
     ctx: &Arc<AppContext>,
     dispatcher: &Dispatcher,
+    supplement_cache: &RuntimeHistorySupplementCache,
     runtime_options: &IndicatorRuntimeOptions,
     window: crate::runtime::state_store::WindowBundle,
     mode: DispatchMode,
 ) -> Result<Vec<IndicatorSnapshotRow>> {
-    let artifacts =
-        compute_window_bundle_artifacts(ctx, dispatcher, runtime_options, window, mode).await?;
+    let artifacts = compute_window_bundle_artifacts(
+        ctx,
+        dispatcher,
+        supplement_cache,
+        runtime_options,
+        window,
+        mode,
+    )
+    .await?;
     dispatcher.persist_window_artifacts(artifacts).await
 }
 
 async fn compute_window_bundle_artifacts(
     ctx: &Arc<AppContext>,
     dispatcher: &Dispatcher,
+    supplement_cache: &RuntimeHistorySupplementCache,
     runtime_options: &IndicatorRuntimeOptions,
     window: crate::runtime::state_store::WindowBundle,
     mode: DispatchMode,
 ) -> Result<ProcessedWindowArtifacts> {
     let minute = window.ts_bucket;
-    let mut kline_history_supplement = load_kline_history_supplement(
+    let mut kline_history_supplement = load_kline_history_supplement_cached(
+        supplement_cache,
         &ctx.db_pool,
         &ctx.config.indicator.symbol,
         &window.history_futures,
@@ -5559,7 +6093,8 @@ async fn compute_window_bundle_artifacts(
     )
     .await;
     let (latest_options_surface_bucket, options_surface_5m) =
-        load_options_surface_history_supplement(
+        load_options_surface_history_supplement_cached(
+            supplement_cache,
             &ctx.db_pool,
             &ctx.config.indicator.symbol,
             &window.options_surface_5m,
@@ -5644,6 +6179,7 @@ async fn run_startup_backfill(
     ctx: &Arc<AppContext>,
     metrics: Arc<AppMetrics>,
     dispatcher: &Dispatcher,
+    supplement_cache: &RuntimeHistorySupplementCache,
     state_store: &mut StateStore,
     scheduler: &mut WindowScheduler,
     runtime_options: &IndicatorRuntimeOptions,
@@ -5678,14 +6214,14 @@ async fn run_startup_backfill(
     let to_ts = latest_confirmed_closed + ChronoDuration::minutes(1);
     let mut startup_max_catchup_minutes = ctx.config.indicator.startup_max_catchup_minutes;
     if startup_max_catchup_minutes > 0
-        && startup_max_catchup_minutes < MIN_REUSABLE_SNAPSHOT_HISTORY_MINUTES
+        && startup_max_catchup_minutes < MIN_RESTART_RECOVERY_HISTORY_MINUTES
     {
         warn!(
             configured_startup_max_catchup_minutes = startup_max_catchup_minutes,
-            enforced_startup_max_catchup_minutes = MIN_REUSABLE_SNAPSHOT_HISTORY_MINUTES,
-            "startup catch-up window raised to 30d to satisfy long-window indicators"
+            enforced_startup_max_catchup_minutes = MIN_RESTART_RECOVERY_HISTORY_MINUTES,
+            "startup catch-up window raised to the minimum restart recovery history"
         );
-        startup_max_catchup_minutes = MIN_REUSABLE_SNAPSHOT_HISTORY_MINUTES;
+        startup_max_catchup_minutes = MIN_RESTART_RECOVERY_HISTORY_MINUTES;
     }
     if startup_max_catchup_minutes > 0 {
         let catchup_floor = to_ts - ChronoDuration::minutes(startup_max_catchup_minutes);
@@ -5702,6 +6238,8 @@ async fn run_startup_backfill(
     }
 
     let mut snapshot_was_loaded = false;
+    let mut recovery_seed_restored = false;
+    let mut recovery_seed_last_finalized_ts = None;
     let mut checkpoint_resume_from_ts = None;
     if let Some(checkpoint) =
         try_load_startup_backfill_checkpoint(startup_checkpoint_path, &ctx.config.indicator.symbol)
@@ -5714,6 +6252,8 @@ async fn run_startup_backfill(
         );
         persisted_frontier_ts = checkpoint.persisted_frontier_ts.or(persisted_frontier_ts);
         snapshot_was_loaded = checkpoint.snapshot_was_loaded;
+        recovery_seed_last_finalized_ts = Some(checkpoint.snapshot.last_finalized_ts);
+        recovery_seed_restored = true;
         state_store.restore_from_snapshot(checkpoint.snapshot);
         info!(
             checkpoint_saved_at = %checkpoint.saved_at,
@@ -5735,6 +6275,8 @@ async fn run_startup_backfill(
                     .unwrap_or(SnapshotRecoverySeedKind::CanonicalReplay);
                 let snap_ts = snap.last_finalized_ts;
                 let canonical_recovery_start_ts = required_snapshot_history_start_ts(&snap);
+                recovery_seed_last_finalized_ts = Some(snap.last_finalized_ts);
+                recovery_seed_restored = true;
                 state_store.restore_from_snapshot(snap);
                 snapshot_was_loaded = true;
                 match recovery_seed_kind {
@@ -5769,6 +6311,8 @@ async fn run_startup_backfill(
                     .unwrap_or(SnapshotRecoverySeedKind::CanonicalReplay);
                 let snap_ts = snap.last_finalized_ts;
                 let canonical_recovery_start_ts = required_snapshot_history_start_ts(&snap);
+                recovery_seed_last_finalized_ts = Some(snap.last_finalized_ts);
+                recovery_seed_restored = true;
                 state_store.restore_from_snapshot(snap);
                 snapshot_was_loaded = true;
                 match recovery_seed_kind {
@@ -5808,7 +6352,7 @@ async fn run_startup_backfill(
                     info!(
                         original_from_ts = %from_ts,
                         minimum_recovery_floor = %minimum_recovery_floor,
-                        minimum_recovery_history_minutes = MIN_REUSABLE_SNAPSHOT_HISTORY_MINUTES,
+                        minimum_recovery_history_minutes = MIN_RESTART_RECOVERY_HISTORY_MINUTES,
                         "startup historical backfill expanded to rebuild minimum reusable restart history"
                     );
                     from_ts = minimum_recovery_floor;
@@ -5822,7 +6366,7 @@ async fn run_startup_backfill(
             info!(
                 original_from_ts = %from_ts,
                 minimum_recovery_floor = %minimum_recovery_floor,
-                minimum_recovery_history_minutes = MIN_REUSABLE_SNAPSHOT_HISTORY_MINUTES,
+                minimum_recovery_history_minutes = MIN_RESTART_RECOVERY_HISTORY_MINUTES,
                 "startup historical backfill expanded to rebuild minimum reusable restart history"
             );
             from_ts = minimum_recovery_floor;
@@ -5930,6 +6474,7 @@ async fn run_startup_backfill(
     };
     let startup_backfill_started_at = Instant::now();
     let mut last_progress_log_at = Instant::now();
+    let mut startup_changed_from_ts: Option<DateTime<Utc>> = None;
     let mut completed_windows = if window_from_ts > from_ts {
         ((window_from_ts - from_ts).num_minutes() / CANONICAL_REPLAY_FETCH_WINDOW_MINUTES).max(0)
             as usize
@@ -5986,7 +6531,15 @@ async fn run_startup_backfill(
                 match replay_row_to_engine_event(row) {
                     Ok(event) => {
                         metrics.inc_processed(event.event_ts.timestamp_millis());
-                        state_store.ingest(event);
+                        let bucket = logical_event_bucket_ts(&event);
+                        let outcome = state_store.ingest(event);
+                        if recovery_seed_restored && outcome.material_change {
+                            startup_changed_from_ts = Some(
+                                startup_changed_from_ts
+                                    .map(|previous| previous.min(bucket))
+                                    .unwrap_or(bucket),
+                            );
+                        }
                         total_rows += 1;
                         window_rows_processed += 1;
                     }
@@ -6145,7 +6698,8 @@ async fn run_startup_backfill(
     let history_replay_start_ts = history_continuous_start_ts.max(from_ts);
     let history_replay_end_ts = history_continuous_end_ts.min(to_ts - ChronoDuration::minutes(1));
 
-    if snapshot_was_loaded {
+    let startup_state_only_recovery = ctx.config.indicator.live_catchup_progress_only_enabled;
+    if !startup_state_only_recovery && snapshot_was_loaded {
         state_store.rewind_finalized_state_from(history_replay_start_ts);
         // Startup replay rows have already been ingested into canonical storage in
         // order to discover the continuity window. When resuming from a snapshot,
@@ -6156,9 +6710,15 @@ async fn run_startup_backfill(
         // cleared before we cut over to live processing.
         state_store.clear_dirty_recompute_state();
     }
-    state_store.set_effective_history_floor(Some(history_replay_start_ts));
+    if !recovery_seed_restored {
+        state_store.set_effective_history_floor(Some(history_replay_start_ts));
+    }
 
-    let repair_start_candidate = if snapshot_was_loaded {
+    let repair_start_candidate = if startup_state_only_recovery {
+        startup_changed_from_ts
+            .or_else(|| recovery_seed_last_finalized_ts.map(|ts| ts + ChronoDuration::minutes(1)))
+            .unwrap_or(history_replay_start_ts)
+    } else if snapshot_was_loaded {
         from_ts
     } else {
         persisted_frontier_ts
@@ -6217,11 +6777,18 @@ async fn run_startup_backfill(
         continuity_start_ts = %continuous_start_ts,
         continuity_end_ts = %continuous_end_ts,
         snapshot_was_loaded = snapshot_was_loaded,
+        recovery_seed_restored = recovery_seed_restored,
+        startup_changed_from_ts = ?startup_changed_from_ts,
         "startup backfill replay plan"
     );
 
-    if history_replay_start_ts <= warm_end_ts {
-        let mut minute = history_replay_start_ts;
+    let warm_start_ts = if startup_state_only_recovery && recovery_seed_restored {
+        repair_start_ts
+    } else {
+        history_replay_start_ts
+    };
+    if warm_start_ts <= warm_end_ts {
+        let mut minute = warm_start_ts;
         let mut warmed_minutes = 0usize;
         while minute <= warm_end_ts {
             state_store.advance_finalized_state(minute);
@@ -6240,7 +6807,7 @@ async fn run_startup_backfill(
             0,
         );
         info!(
-            warm_start_ts = %history_replay_start_ts,
+            warm_start_ts = %warm_start_ts,
             warm_end_ts = %warm_end_ts,
             "startup warm-state replay completed"
         );
@@ -6266,6 +6833,66 @@ async fn run_startup_backfill(
         options_raw_replayed_rows,
         "startup options surface recovery prepared"
     );
+
+    if startup_state_only_recovery {
+        supplement_cache.clear().await;
+        if recovery_seed_restored
+            && state_store
+                .last_finalized_minute()
+                .map(|last| repair_start_ts <= last)
+                .unwrap_or(false)
+        {
+            state_store.rewind_finalized_state_from(repair_start_ts);
+        }
+        state_store.clear_dirty_recompute_state();
+        state_store.clear_oi_ratio_patch_state();
+
+        let mut rebuilt_minutes = 0usize;
+        if repair_start_ts <= replay_end_ts {
+            let mut minute = repair_start_ts;
+            while minute <= replay_end_ts {
+                state_store.advance_finalized_state(minute);
+                rebuilt_minutes += 1;
+                if rebuilt_minutes % STARTUP_BACKFILL_YIELD_EVERY_MINUTES == 0 {
+                    tokio::task::yield_now().await;
+                }
+                minute += ChronoDuration::minutes(1);
+            }
+        }
+        refresh_runtime_observability_metrics(
+            &metrics,
+            state_store,
+            Some(repair_start_ts.min(replay_end_ts)),
+            Some(replay_end_ts),
+            0,
+            0,
+        );
+        scheduler.mark_emitted_through(replay_end_ts);
+        info!(
+            rebuild_start_ts = %repair_start_ts,
+            replay_end_ts = %replay_end_ts,
+            rebuilt_minutes = rebuilt_minutes,
+            recovery_seed_restored = recovery_seed_restored,
+            startup_changed_from_ts = ?startup_changed_from_ts,
+            persisted_frontier_ts = ?persisted_frontier_ts,
+            "startup historical backfill completed via state-only recovery"
+        );
+        return Ok(Some(replay_end_ts + ChronoDuration::minutes(1)));
+    }
+
+    supplement_cache.clear().await;
+    let startup_replay_snapshot = state_store.extract_snapshot();
+    prewarm_history_supplement_cache(
+        supplement_cache,
+        &ctx.db_pool,
+        &ctx.config.indicator.symbol,
+        runtime_options,
+        &startup_replay_snapshot.history_futures,
+        &startup_replay_snapshot.history_spot,
+        &startup_replay_snapshot.options_surface_5m,
+        repair_start_ts + ChronoDuration::minutes(1),
+    )
+    .await;
 
     let mut materialized_windows = 0usize;
     let mut last_computed: Vec<String> = Vec::new();
@@ -6300,6 +6927,7 @@ async fn run_startup_backfill(
             let snapshots = process_window_bundle(
                 ctx,
                 dispatcher,
+                supplement_cache,
                 runtime_options,
                 window,
                 DispatchMode::ReplayMaterialize,
@@ -8211,12 +8839,13 @@ mod tests {
     use super::{
         allow_live_tail_reconcile, allow_oi_ratio_patch_processing, build_backfill_sql,
         build_paged_backfill_sql, build_paged_backfill_sql_internal,
-        confirmed_repair_pipeline_idle, expand_startup_backfill_to_minimum_recovery_window,
-        find_long_null_price_run, handle_ingest_event,
-        hydrate_futures_orderbook_heatmaps_for_range_with_fetch, live_tail_reconcile_start_ts,
-        minimum_live_catchup_cutover_tail_minutes, minimum_startup_recovery_history_floor,
-        minute_exclusive_upper_bound, minute_history_is_strictly_contiguous,
-        replay_heatmap_hydration_batch_end, replay_row_after_cursor,
+        confirmed_repair_pipeline_idle, effective_live_commit_frontier_ts,
+        expand_startup_backfill_to_minimum_recovery_window, find_long_null_price_run,
+        handle_ingest_event, hydrate_futures_orderbook_heatmaps_for_range_with_fetch,
+        live_tail_reconcile_start_ts, minimum_live_catchup_cutover_tail_minutes,
+        minimum_startup_recovery_history_floor, minute_exclusive_upper_bound,
+        minute_history_is_strictly_contiguous, replay_heatmap_hydration_batch_end,
+        replay_row_after_cursor, required_snapshot_history_start_ts,
         save_startup_backfill_checkpoint, save_state_snapshot, shutdown_ready_through_candidate,
         snapshot_has_required_history, snapshot_is_reusable_recovery_seed,
         snapshot_null_price_run_reaches_recent_tail, startup_backfill_checkpoint_path,
@@ -8224,7 +8853,7 @@ mod tests {
         ConfirmedLateRepairController, LiveCanonicalRepairController, ReplayRow,
         SnapshotLoadOutcome, StartupBackfillCheckpoint, StartupBackfillProgress,
         FUNDING_BACKFILL_WINDOW_SQL, LIQ_BACKFILL_WINDOW_SQL,
-        LIVE_CANONICAL_TAIL_RECONCILE_LOOKBACK_MINUTES, MIN_REUSABLE_SNAPSHOT_HISTORY_MINUTES,
+        LIVE_CANONICAL_TAIL_RECONCILE_LOOKBACK_MINUTES, MIN_RESTART_RECOVERY_HISTORY_MINUTES,
         ORDERBOOK_BACKFILL_WINDOW_SQL_SCALAR, ORDERBOOK_BACKFILL_WINDOW_SQL_WITH_HEATMAP,
         STARTUP_BACKFILL_CHECKPOINT_VERSION, TRADE_BACKFILL_WINDOW_SQL,
     };
@@ -8557,7 +9186,7 @@ mod tests {
     }
 
     fn canonical_only_snapshot_fixture(last_finalized_ts: chrono::DateTime<Utc>) -> StateSnapshot {
-        let required_minutes = MIN_REUSABLE_SNAPSHOT_HISTORY_MINUTES - 1;
+        let required_minutes = MIN_RESTART_RECOVERY_HISTORY_MINUTES - 1;
         let history_start_ts = last_finalized_ts - ChronoDuration::minutes(required_minutes);
         let prototype_ts = Utc.with_ymd_and_hms(2026, 3, 29, 3, 0, 0).single().unwrap();
         let mut store = StateStore::new("TESTUSDT".to_string(), 1_000.0);
@@ -8784,6 +9413,25 @@ mod tests {
     }
 
     #[test]
+    fn effective_live_commit_frontier_uses_startup_cutoff_during_muted_catchup() {
+        let persisted = Utc.with_ymd_and_hms(2026, 4, 8, 12, 0, 0).single().unwrap();
+        let startup_cutoff = Utc.with_ymd_and_hms(2026, 4, 9, 3, 10, 0).single().unwrap();
+
+        assert_eq!(
+            effective_live_commit_frontier_ts(Some(persisted), Some(startup_cutoff), true),
+            Some(startup_cutoff - ChronoDuration::minutes(1))
+        );
+        assert_eq!(
+            effective_live_commit_frontier_ts(Some(startup_cutoff), Some(startup_cutoff), true),
+            Some(startup_cutoff)
+        );
+        assert_eq!(
+            effective_live_commit_frontier_ts(Some(persisted), Some(startup_cutoff), false),
+            Some(persisted)
+        );
+    }
+
+    #[test]
     fn confirmed_repair_controller_tracks_earliest_pending_minute() {
         let later = Utc
             .with_ymd_and_hms(2026, 3, 28, 3, 10, 0)
@@ -9002,7 +9650,7 @@ mod tests {
     fn snapshot_required_history_accepts_reusable_rolling_7d_window() {
         let last_finalized_ts = Utc.with_ymd_and_hms(2026, 3, 21, 3, 0, 0).single().unwrap();
         let effective_floor_ts = last_finalized_ts - ChronoDuration::minutes(90);
-        let required_minutes = MIN_REUSABLE_SNAPSHOT_HISTORY_MINUTES - 1;
+        let required_minutes = MIN_RESTART_RECOVERY_HISTORY_MINUTES - 1;
         let history_start_ts = last_finalized_ts - ChronoDuration::minutes(required_minutes);
         let history = (0..=required_minutes)
             .map(|offset| {
@@ -9039,6 +9687,30 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_required_history_accepts_recent_recovery_floor_above_minimum() {
+        let last_finalized_ts = Utc.with_ymd_and_hms(2026, 3, 21, 3, 0, 0).single().unwrap();
+        let effective_floor_ts = last_finalized_ts - ChronoDuration::minutes(3 * 24 * 60);
+        let required_minutes = (last_finalized_ts - effective_floor_ts).num_minutes();
+        let history = (0..=required_minutes)
+            .map(|offset| {
+                priced_history_row(effective_floor_ts + ChronoDuration::minutes(offset), 2000.0)
+            })
+            .collect::<Vec<_>>();
+        let snap = snapshot_fixture(
+            last_finalized_ts,
+            history.clone(),
+            history,
+            Some(effective_floor_ts),
+        );
+
+        assert!(snapshot_has_required_history(&snap));
+        assert_eq!(
+            required_snapshot_history_start_ts(&snap),
+            effective_floor_ts
+        );
+    }
+
+    #[test]
     fn snapshot_required_history_rejects_short_history_without_effective_floor() {
         let last_finalized_ts = Utc.with_ymd_and_hms(2026, 3, 21, 3, 0, 0).single().unwrap();
         let history_start_ts =
@@ -9065,7 +9737,7 @@ mod tests {
         assert_eq!(expanded, minimum_startup_recovery_history_floor(to_ts));
         assert_eq!(
             expanded,
-            to_ts - ChronoDuration::minutes(MIN_REUSABLE_SNAPSHOT_HISTORY_MINUTES)
+            to_ts - ChronoDuration::minutes(MIN_RESTART_RECOVERY_HISTORY_MINUTES)
         );
     }
 
@@ -9081,7 +9753,7 @@ mod tests {
     #[tokio::test]
     async fn stale_snapshot_is_accepted_as_recovery_seed() {
         let last_finalized_ts = Utc::now() - ChronoDuration::hours(30);
-        let required_minutes = MIN_REUSABLE_SNAPSHOT_HISTORY_MINUTES - 1;
+        let required_minutes = MIN_RESTART_RECOVERY_HISTORY_MINUTES - 1;
         let history_start_ts = last_finalized_ts - ChronoDuration::minutes(required_minutes);
         let history = (0..=required_minutes)
             .map(|offset| {
@@ -9235,7 +9907,7 @@ mod tests {
             symbol: "TESTUSDT".to_string(),
             saved_at: last_finalized_ts,
             from_ts: last_finalized_ts
-                - ChronoDuration::minutes(MIN_REUSABLE_SNAPSHOT_HISTORY_MINUTES - 1),
+                - ChronoDuration::minutes(MIN_RESTART_RECOVERY_HISTORY_MINUTES - 1),
             to_ts_exclusive: last_finalized_ts + ChronoDuration::minutes(1),
             next_canonical_window_from_ts: Some(last_finalized_ts + ChronoDuration::minutes(1)),
             snapshot_was_loaded: false,
