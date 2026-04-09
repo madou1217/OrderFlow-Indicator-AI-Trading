@@ -245,8 +245,6 @@ pub struct IndicatorConfig {
     pub live_drop_stale_enabled: bool,
     #[serde(default = "default_watermark_lateness_secs")]
     pub watermark_lateness_secs: i64,
-    #[serde(default = "default_confirm_lag_minutes")]
-    pub confirm_lag_minutes: i64,
     #[serde(default = "default_live_purge_on_start")]
     pub live_purge_on_start: bool,
     /// Legacy name: when enabled, live mode mutes historical persistence/publish
@@ -309,7 +307,6 @@ impl Default for IndicatorConfig {
             live_drop_stale_event_secs: default_live_drop_stale_event_secs(),
             live_drop_stale_enabled: default_live_drop_stale_enabled(),
             watermark_lateness_secs: default_watermark_lateness_secs(),
-            confirm_lag_minutes: default_confirm_lag_minutes(),
             live_purge_on_start: default_live_purge_on_start(),
             live_catchup_progress_only_enabled: false,
             live_catchup_progress_only_lag_minutes: default_live_catchup_progress_only_lag_minutes(
@@ -792,10 +789,6 @@ fn default_live_drop_stale_enabled() -> bool {
 
 fn default_watermark_lateness_secs() -> i64 {
     5
-}
-
-fn default_confirm_lag_minutes() -> i64 {
-    0
 }
 
 fn default_live_purge_on_start() -> bool {

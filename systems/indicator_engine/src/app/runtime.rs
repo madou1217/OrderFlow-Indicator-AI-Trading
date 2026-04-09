@@ -34,7 +34,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio::task::JoinHandle;
@@ -82,6 +82,8 @@ const PERIODIC_RUNTIME_SNAPSHOT_MIN_ADVANCE_MINUTES: i64 = 100;
 const MAX_CONSECUTIVE_NULL_PRICE_MINUTES_IN_SNAPSHOT: usize = 60;
 const MIN_RECENT_BARS_AFTER_NULL_RUN_IN_SNAPSHOT: usize = 1440;
 const STARTUP_BACKFILL_CHECKPOINT_VERSION: u32 = 1;
+
+static RUNTIME_SNAPSHOT_SAVE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 enum SnapshotLoadOutcome {
     Fresh(StateSnapshot),
@@ -571,16 +573,15 @@ fn round_up_minutes(value: i64, step: i64) -> i64 {
     ((value + step - 1) / step) * step
 }
 
-fn minimum_live_catchup_cutover_tail_minutes(confirm_lag_minutes: i64) -> i64 {
+fn minimum_live_catchup_cutover_tail_minutes() -> i64 {
     let base = STARTUP_BACKFILL_OVERLAP_MINUTES
         .max(LIVE_CANONICAL_TAIL_RECONCILE_LOOKBACK_MINUTES)
-        .max(confirm_lag_minutes.max(0))
         .max(1);
     round_up_minutes(base, OPTIONS_SURFACE_BUCKET_MINUTES)
 }
 
 fn configured_live_catchup_cutover_tail_minutes(config: &RootConfig) -> i64 {
-    let minimum = minimum_live_catchup_cutover_tail_minutes(config.indicator.confirm_lag_minutes);
+    let minimum = minimum_live_catchup_cutover_tail_minutes();
     let configured = config.indicator.live_catchup_cutover_tail_minutes;
     if configured > 0 {
         configured.max(minimum)
@@ -589,11 +590,8 @@ fn configured_live_catchup_cutover_tail_minutes(config: &RootConfig) -> i64 {
     }
 }
 
-fn confirmed_closed_minute(
-    latest_closed: DateTime<Utc>,
-    confirm_lag_minutes: i64,
-) -> DateTime<Utc> {
-    latest_closed - ChronoDuration::minutes(confirm_lag_minutes.max(0))
+fn confirmed_closed_minute(latest_closed: DateTime<Utc>) -> DateTime<Utc> {
+    latest_closed
 }
 
 fn allow_live_tail_reconcile(
@@ -877,7 +875,6 @@ pub async fn run(ctx: AppContext) -> Result<()> {
         startup_max_catchup_minutes = ctx.config.indicator.startup_max_catchup_minutes,
         stale_limit_secs = stale_limit_secs,
         watermark_lateness_secs = ctx.config.indicator.watermark_lateness_secs,
-        confirm_lag_minutes = ctx.config.indicator.confirm_lag_minutes,
         "indicator_engine started; press Ctrl+C to stop"
     );
 
@@ -1133,20 +1130,14 @@ pub async fn run(ctx: AppContext) -> Result<()> {
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
-                let cutoff = confirmed_closed_minute(
-                    scheduler.closed_minute(Utc::now()),
-                    ctx.config.indicator.confirm_lag_minutes,
-                );
+                let cutoff = confirmed_closed_minute(scheduler.closed_minute(Utc::now()));
                 info!(shutdown_closed_minute = %cutoff, "Ctrl+C received, shutting down");
                 shutdown_requested = true;
                 shutdown_closed_minute = Some(cutoff);
                 break;
             }
             _ = sigterm.recv() => {
-                let cutoff = confirmed_closed_minute(
-                    scheduler.closed_minute(Utc::now()),
-                    ctx.config.indicator.confirm_lag_minutes,
-                );
+                let cutoff = confirmed_closed_minute(scheduler.closed_minute(Utc::now()));
                 info!(shutdown_closed_minute = %cutoff, "SIGTERM received, shutting down");
                 shutdown_requested = true;
                 shutdown_closed_minute = Some(cutoff);
@@ -1267,10 +1258,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                 }
 
                 let latest_closed = scheduler.closed_minute(Utc::now());
-                let latest_confirmed_closed = confirmed_closed_minute(
-                    latest_closed,
-                    ctx.config.indicator.confirm_lag_minutes,
-                );
+                let latest_confirmed_closed = confirmed_closed_minute(latest_closed);
                 if let Some(repair_from_ts) = drain_result.confirmed_repair_from_ts {
                     if confirmed_repair_controller.mark_pending(repair_from_ts) {
                         warn!(
@@ -1759,12 +1747,8 @@ pub async fn run(ctx: AppContext) -> Result<()> {
     }
 
     if shutdown_requested {
-        let shutdown_closed_minute = shutdown_closed_minute.unwrap_or_else(|| {
-            confirmed_closed_minute(
-                scheduler.closed_minute(Utc::now()),
-                ctx.config.indicator.confirm_lag_minutes,
-            )
-        });
+        let shutdown_closed_minute = shutdown_closed_minute
+            .unwrap_or_else(|| confirmed_closed_minute(scheduler.closed_minute(Utc::now())));
         info!(
             shutdown_closed_minute = %shutdown_closed_minute,
             "stopping ingress and flushing ready indicator minutes before snapshot save"
@@ -2774,6 +2758,10 @@ async fn save_state_snapshot_and_clear_startup_checkpoint_on_success(
     snapshot_path: &str,
     startup_checkpoint_path: Option<&str>,
 ) -> anyhow::Result<()> {
+    let _save_guard = RUNTIME_SNAPSHOT_SAVE_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .await;
     save_state_snapshot(snap, snapshot_path).await?;
     remove_startup_backfill_checkpoint(startup_checkpoint_path);
     Ok(())
@@ -6273,11 +6261,9 @@ async fn run_startup_backfill(
     // Backfill must stop at a full-minute boundary so we never ingest a partial
     // minute from replay and then mix it with live stream data.  `fetch_backfill_batch`
     // uses `ts_bucket < to_ts_exclusive`, so partial minutes must round up to include
-    // the last fully closed bucket before `raw_to_ts`, then shift back by the
-    // configured confirm lag so startup only materializes already-confirmed minutes.
+    // the last fully closed bucket before `raw_to_ts`.
     let latest_safe_closed = minute_exclusive_upper_bound(raw_to_ts) - ChronoDuration::minutes(1);
-    let latest_confirmed_closed =
-        confirmed_closed_minute(latest_safe_closed, ctx.config.indicator.confirm_lag_minutes);
+    let latest_confirmed_closed = confirmed_closed_minute(latest_safe_closed);
     let to_ts = latest_confirmed_closed + ChronoDuration::minutes(1);
     let mut startup_max_catchup_minutes = ctx.config.indicator.startup_max_catchup_minutes;
     if startup_max_catchup_minutes > 0
@@ -6456,7 +6442,6 @@ async fn run_startup_backfill(
         info!(
             latest_confirmed_closed = %latest_confirmed_closed,
             unconfirmed_tail_start_ts = %unconfirmed_tail_start_ts,
-            confirm_lag_minutes = ctx.config.indicator.confirm_lag_minutes,
             exchange_name = %ctx.config.mq.exchanges.ind.name,
             "rewound persisted indicator tail beyond confirmed frontier during startup"
         );
@@ -6472,7 +6457,6 @@ async fn run_startup_backfill(
         info!(
             latest_confirmed_closed = %latest_confirmed_closed,
             unconfirmed_tail_start_ts = %unconfirmed_tail_start_ts,
-            confirm_lag_minutes = ctx.config.indicator.confirm_lag_minutes,
             "rewound in-memory finalized state beyond confirmed frontier during startup"
         );
     }
@@ -6520,7 +6504,6 @@ async fn run_startup_backfill(
         raw_to_ts = %raw_to_ts,
         latest_safe_closed = %latest_safe_closed,
         latest_confirmed_closed = %latest_confirmed_closed,
-        confirm_lag_minutes = ctx.config.indicator.confirm_lag_minutes,
         persisted_frontier_ts = ?persisted_frontier_ts,
         symbol = %ctx.config.indicator.symbol,
         fallback_lookback_minutes = STARTUP_BACKFILL_FALLBACK_LOOKBACK_MINUTES,
@@ -9507,26 +9490,17 @@ mod tests {
     }
 
     #[test]
-    fn confirmed_closed_minute_applies_confirm_lag() {
+    fn confirmed_closed_minute_matches_latest_closed_minute() {
         let latest_closed = Utc
             .with_ymd_and_hms(2026, 3, 21, 8, 24, 0)
             .single()
             .unwrap();
-        assert_eq!(
-            super::confirmed_closed_minute(latest_closed, 15),
-            Utc.with_ymd_and_hms(2026, 3, 21, 8, 9, 0).single().unwrap()
-        );
-        assert_eq!(
-            super::confirmed_closed_minute(latest_closed, -5),
-            latest_closed
-        );
+        assert_eq!(super::confirmed_closed_minute(latest_closed), latest_closed);
     }
 
     #[test]
     fn live_catchup_cutover_tail_respects_existing_overlap_and_5m_alignment() {
-        assert_eq!(minimum_live_catchup_cutover_tail_minutes(15), 35);
-        assert_eq!(minimum_live_catchup_cutover_tail_minutes(31), 35);
-        assert_eq!(minimum_live_catchup_cutover_tail_minutes(62), 65);
+        assert_eq!(minimum_live_catchup_cutover_tail_minutes(), 35);
     }
 
     #[test]
