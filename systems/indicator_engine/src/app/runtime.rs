@@ -493,6 +493,22 @@ fn live_backlog_minutes(next_minute: Option<DateTime<Utc>>, latest_closed: DateT
         .unwrap_or(0)
 }
 
+fn configured_live_catchup_enter_lag_minutes(config: &RootConfig) -> i64 {
+    config
+        .indicator
+        .live_catchup_progress_only_lag_minutes
+        .max(1)
+}
+
+fn configured_live_catchup_resume_lag_minutes(config: &RootConfig) -> i64 {
+    let enter_lag_minutes = configured_live_catchup_enter_lag_minutes(config);
+    config
+        .indicator
+        .live_catchup_resume_lag_minutes
+        .max(0)
+        .min(enter_lag_minutes.saturating_sub(1))
+}
+
 fn live_catchup_requested(
     config: &RootConfig,
     next_minute: Option<DateTime<Utc>>,
@@ -502,11 +518,29 @@ fn live_catchup_requested(
         return false;
     }
 
-    let lag_threshold_minutes = config
-        .indicator
-        .live_catchup_progress_only_lag_minutes
-        .max(1);
-    live_backlog_minutes(next_minute, latest_confirmed_closed) >= lag_threshold_minutes
+    live_backlog_minutes(next_minute, latest_confirmed_closed)
+        >= configured_live_catchup_enter_lag_minutes(config)
+}
+
+fn live_catchup_cutover_ready(
+    config: &RootConfig,
+    next_minute: Option<DateTime<Utc>>,
+    latest_confirmed_closed: DateTime<Utc>,
+    dirty_recompute_from_ts: Option<DateTime<Utc>>,
+    has_pending_oi_ratio_patch: bool,
+    pipeline_idle: bool,
+    oi_ratio_patch_task_running: bool,
+) -> bool {
+    if !config.indicator.live_catchup_progress_only_enabled {
+        return false;
+    }
+
+    live_backlog_minutes(next_minute, latest_confirmed_closed)
+        <= configured_live_catchup_resume_lag_minutes(config)
+        && dirty_recompute_from_ts.is_none()
+        && !has_pending_oi_ratio_patch
+        && pipeline_idle
+        && !oi_ratio_patch_task_running
 }
 
 fn effective_live_commit_frontier_ts(
@@ -1093,6 +1127,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
     } else {
         LivePublishState::Publishing
     };
+    let mut live_catchup_cutover_stable_since: Option<Instant> = None;
     let mut last_logged_live_publish_state: Option<LivePublishState> = None;
 
     loop {
@@ -1530,6 +1565,21 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                     matches!(live_publish_state, LivePublishState::MutedCatchup),
                 );
 
+                let repair_pipeline_idle = confirmed_repair_pipeline_idle(
+                    &live_prepare_minute_pending,
+                    &live_ready_job_pending,
+                    &dirty_ready_job_pending,
+                );
+                let cutover_ready = live_catchup_cutover_ready(
+                    ctx.config.as_ref(),
+                    next_minute,
+                    latest_confirmed_closed,
+                    frontier_snapshot.dirty_recompute_from_ts,
+                    has_pending_oi_ratio_patch,
+                    repair_pipeline_idle,
+                    oi_ratio_patch_task.is_some(),
+                );
+
                 if live_publish_state.publishing_enabled()
                     && live_catchup_requested(ctx.config.as_ref(), next_minute, latest_confirmed_closed)
                 {
@@ -1545,10 +1595,28 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                     }
                     snapshot_fanout_started = false;
                     live_publish_state = LivePublishState::MutedCatchup;
+                    live_catchup_cutover_stable_since = None;
                 }
 
+                if matches!(live_publish_state, LivePublishState::MutedCatchup) && cutover_ready {
+                    if live_catchup_cutover_stable_since.is_none() {
+                        live_catchup_cutover_stable_since = Some(Instant::now());
+                    }
+                } else {
+                    live_catchup_cutover_stable_since = None;
+                }
+
+                let cutover_stable_enough = live_catchup_cutover_stable_since
+                    .map(|stable_since| {
+                        stable_since.elapsed()
+                            >= Duration::from_secs(
+                                ctx.config.indicator.live_catchup_resume_stable_secs.max(1),
+                            )
+                    })
+                    .unwrap_or(false);
+
                 if matches!(live_publish_state, LivePublishState::MutedCatchup)
-                    && !live_catchup_requested(ctx.config.as_ref(), next_minute, latest_confirmed_closed)
+                    && cutover_stable_enough
                 {
                     if maybe_execute_live_catchup_cutover(
                         &ctx,
@@ -1572,6 +1640,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                     .is_some()
                     {
                         live_publish_state = LivePublishState::Publishing;
+                        live_catchup_cutover_stable_since = None;
                     }
                 }
 
@@ -1580,11 +1649,9 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                         state = ?live_publish_state,
                         dispatch_mode = ?live_publish_state.dispatch_mode(),
                         backlog_minutes = live_backlog_minutes(next_minute, latest_confirmed_closed),
-                        lag_threshold_minutes = ctx
-                            .config
-                            .indicator
-                            .live_catchup_progress_only_lag_minutes
-                            .max(1),
+                        enter_lag_threshold_minutes = configured_live_catchup_enter_lag_minutes(ctx.config.as_ref()),
+                        resume_lag_threshold_minutes = configured_live_catchup_resume_lag_minutes(ctx.config.as_ref()),
+                        resume_stable_secs = ctx.config.indicator.live_catchup_resume_stable_secs.max(1),
                         cutover_tail_minutes = configured_live_catchup_cutover_tail_minutes(ctx.config.as_ref()),
                         next_minute = ?next_minute,
                         latest_confirmed_closed = %latest_confirmed_closed,
@@ -8839,23 +8906,28 @@ mod tests {
     use super::{
         allow_live_tail_reconcile, allow_oi_ratio_patch_processing, build_backfill_sql,
         build_paged_backfill_sql, build_paged_backfill_sql_internal,
+        configured_live_catchup_enter_lag_minutes, configured_live_catchup_resume_lag_minutes,
         confirmed_repair_pipeline_idle, effective_live_commit_frontier_ts,
         expand_startup_backfill_to_minimum_recovery_window, find_long_null_price_run,
         handle_ingest_event, hydrate_futures_orderbook_heatmaps_for_range_with_fetch,
-        live_tail_reconcile_start_ts, minimum_live_catchup_cutover_tail_minutes,
-        minimum_startup_recovery_history_floor, minute_exclusive_upper_bound,
-        minute_history_is_strictly_contiguous, replay_heatmap_hydration_batch_end,
-        replay_row_after_cursor, required_snapshot_history_start_ts,
-        save_startup_backfill_checkpoint, save_state_snapshot, shutdown_ready_through_candidate,
-        snapshot_has_required_history, snapshot_is_reusable_recovery_seed,
-        snapshot_null_price_run_reaches_recent_tail, startup_backfill_checkpoint_path,
-        try_load_startup_backfill_checkpoint, try_load_state_snapshot, BackfillCursor,
-        ConfirmedLateRepairController, LiveCanonicalRepairController, ReplayRow,
-        SnapshotLoadOutcome, StartupBackfillCheckpoint, StartupBackfillProgress,
-        FUNDING_BACKFILL_WINDOW_SQL, LIQ_BACKFILL_WINDOW_SQL,
+        live_catchup_cutover_ready, live_catchup_requested, live_tail_reconcile_start_ts,
+        minimum_live_catchup_cutover_tail_minutes, minimum_startup_recovery_history_floor,
+        minute_exclusive_upper_bound, minute_history_is_strictly_contiguous,
+        replay_heatmap_hydration_batch_end, replay_row_after_cursor,
+        required_snapshot_history_start_ts, save_startup_backfill_checkpoint, save_state_snapshot,
+        shutdown_ready_through_candidate, snapshot_has_required_history,
+        snapshot_is_reusable_recovery_seed, snapshot_null_price_run_reaches_recent_tail,
+        startup_backfill_checkpoint_path, try_load_startup_backfill_checkpoint,
+        try_load_state_snapshot, BackfillCursor, ConfirmedLateRepairController,
+        LiveCanonicalRepairController, ReplayRow, SnapshotLoadOutcome, StartupBackfillCheckpoint,
+        StartupBackfillProgress, FUNDING_BACKFILL_WINDOW_SQL, LIQ_BACKFILL_WINDOW_SQL,
         LIVE_CANONICAL_TAIL_RECONCILE_LOOKBACK_MINUTES, MIN_RESTART_RECOVERY_HISTORY_MINUTES,
         ORDERBOOK_BACKFILL_WINDOW_SQL_SCALAR, ORDERBOOK_BACKFILL_WINDOW_SQL_WITH_HEATMAP,
         STARTUP_BACKFILL_CHECKPOINT_VERSION, TRADE_BACKFILL_WINDOW_SQL,
+    };
+    use crate::app::bootstrap::{
+        AppSection, DatabaseConfig, IndicatorConfig, MqConfig, MqExchangeConfig, MqExchanges,
+        RootConfig,
     };
     use crate::ingest::decoder::{
         AggFundingMark1mEvent, AggFundingPoint, AggHeatmapLevel, AggLiq1mEvent, AggLiqLevel,
@@ -8877,6 +8949,51 @@ mod tests {
     use uuid::Uuid;
 
     const MAX_CONSECUTIVE_NULL_PRICE_MINUTES_IN_SNAPSHOT: usize = 60;
+
+    fn test_root_config() -> RootConfig {
+        let exchange = MqExchangeConfig {
+            name: "test".to_string(),
+            kind: "topic".to_string(),
+            durable: true,
+        };
+        RootConfig {
+            app: AppSection {
+                name: "indicator_engine".to_string(),
+                env: "test".to_string(),
+                timezone: "UTC".to_string(),
+            },
+            database: DatabaseConfig {
+                host: "localhost".to_string(),
+                port: 5432,
+                database: "test".to_string(),
+                user: "test".to_string(),
+                password_env: "TEST_DB_PASSWORD".to_string(),
+                connect_timeout_secs: Some(5),
+                application_name: Some("indicator_engine_test".to_string()),
+                sslmode: None,
+                options: None,
+                pool: None,
+            },
+            indicator: IndicatorConfig::default(),
+            logging: Default::default(),
+            mq: MqConfig {
+                host: "localhost".to_string(),
+                port: 5672,
+                vhost: "/".to_string(),
+                user: "guest".to_string(),
+                password_env: "TEST_MQ_PASSWORD".to_string(),
+                heartbeat_secs: Some(30),
+                connection_timeout_secs: Some(5),
+                exchanges: MqExchanges {
+                    md_live: exchange.clone(),
+                    md_replay: exchange.clone(),
+                    ind: exchange.clone(),
+                    dlx: exchange,
+                },
+                queues: HashMap::new(),
+            },
+        }
+    }
 
     fn history_row(ts_bucket: chrono::DateTime<Utc>) -> MinuteHistory {
         MinuteHistory {
@@ -9410,6 +9527,88 @@ mod tests {
         assert_eq!(minimum_live_catchup_cutover_tail_minutes(15), 35);
         assert_eq!(minimum_live_catchup_cutover_tail_minutes(31), 35);
         assert_eq!(minimum_live_catchup_cutover_tail_minutes(62), 65);
+    }
+
+    #[test]
+    fn live_catchup_resume_lag_is_clamped_below_enter_threshold() {
+        let mut config = test_root_config();
+        config.indicator.live_catchup_progress_only_enabled = true;
+        config.indicator.live_catchup_progress_only_lag_minutes = 10;
+        config.indicator.live_catchup_resume_lag_minutes = 10;
+
+        assert_eq!(configured_live_catchup_enter_lag_minutes(&config), 10);
+        assert_eq!(configured_live_catchup_resume_lag_minutes(&config), 9);
+
+        config.indicator.live_catchup_progress_only_lag_minutes = 1;
+        config.indicator.live_catchup_resume_lag_minutes = 5;
+
+        assert_eq!(configured_live_catchup_enter_lag_minutes(&config), 1);
+        assert_eq!(configured_live_catchup_resume_lag_minutes(&config), 0);
+    }
+
+    #[test]
+    fn live_catchup_requested_uses_high_watermark_threshold() {
+        let mut config = test_root_config();
+        config.indicator.live_catchup_progress_only_enabled = true;
+        config.indicator.live_catchup_progress_only_lag_minutes = 10;
+        let latest_confirmed_closed = Utc.with_ymd_and_hms(2026, 4, 9, 8, 20, 0).single().unwrap();
+
+        assert!(!live_catchup_requested(
+            &config,
+            Some(Utc.with_ymd_and_hms(2026, 4, 9, 8, 15, 0).single().unwrap()),
+            latest_confirmed_closed,
+        ));
+        assert!(live_catchup_requested(
+            &config,
+            Some(Utc.with_ymd_and_hms(2026, 4, 9, 8, 10, 0).single().unwrap()),
+            latest_confirmed_closed,
+        ));
+    }
+
+    #[test]
+    fn live_catchup_cutover_ready_requires_low_watermark_and_idle_pipeline() {
+        let mut config = test_root_config();
+        config.indicator.live_catchup_progress_only_enabled = true;
+        config.indicator.live_catchup_progress_only_lag_minutes = 10;
+        config.indicator.live_catchup_resume_lag_minutes = 1;
+        let latest_confirmed_closed = Utc.with_ymd_and_hms(2026, 4, 9, 8, 20, 0).single().unwrap();
+
+        assert!(live_catchup_cutover_ready(
+            &config,
+            Some(Utc.with_ymd_and_hms(2026, 4, 9, 8, 19, 0).single().unwrap()),
+            latest_confirmed_closed,
+            None,
+            false,
+            true,
+            false,
+        ));
+        assert!(!live_catchup_cutover_ready(
+            &config,
+            Some(Utc.with_ymd_and_hms(2026, 4, 9, 8, 15, 0).single().unwrap()),
+            latest_confirmed_closed,
+            None,
+            false,
+            true,
+            false,
+        ));
+        assert!(!live_catchup_cutover_ready(
+            &config,
+            Some(Utc.with_ymd_and_hms(2026, 4, 9, 8, 19, 0).single().unwrap()),
+            latest_confirmed_closed,
+            Some(Utc.with_ymd_and_hms(2026, 4, 9, 8, 18, 0).single().unwrap()),
+            false,
+            true,
+            false,
+        ));
+        assert!(!live_catchup_cutover_ready(
+            &config,
+            Some(Utc.with_ymd_and_hms(2026, 4, 9, 8, 19, 0).single().unwrap()),
+            latest_confirmed_closed,
+            None,
+            false,
+            false,
+            false,
+        ));
     }
 
     #[test]
