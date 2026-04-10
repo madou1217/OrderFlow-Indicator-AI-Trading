@@ -2551,6 +2551,26 @@ fn startup_state_only_recovery_can_skip_warm_history(
         && recovery_seed_has_reusable_finalized_history
 }
 
+fn startup_checkpoint_canonical_replay_start_ts(
+    checkpoint_from_ts: DateTime<Utc>,
+    checkpoint_resume_from_ts: DateTime<Utc>,
+    to_ts: DateTime<Utc>,
+    recovery_seed_has_reusable_finalized_history: bool,
+) -> DateTime<Utc> {
+    if recovery_seed_has_reusable_finalized_history {
+        return checkpoint_resume_from_ts;
+    }
+
+    let minimum_recovery_floor =
+        expand_startup_backfill_to_minimum_recovery_window(checkpoint_from_ts, to_ts)
+            .unwrap_or(checkpoint_from_ts);
+    let overlap_floor = floor_minute(
+        checkpoint_resume_from_ts - ChronoDuration::minutes(STARTUP_BACKFILL_OVERLAP_MINUTES),
+    );
+
+    minimum_recovery_floor.min(overlap_floor)
+}
+
 fn snapshot_has_required_history_quiet(snap: &StateSnapshot) -> bool {
     let required_start_ts = required_snapshot_history_start_ts(snap);
     snapshot_history_covers_required_window(
@@ -6397,11 +6417,9 @@ async fn run_startup_backfill(
         try_load_startup_backfill_checkpoint(startup_checkpoint_path, &ctx.config.indicator.symbol)
     {
         from_ts = checkpoint.from_ts;
-        checkpoint_resume_from_ts = Some(
-            checkpoint
-                .next_canonical_window_from_ts
-                .unwrap_or(checkpoint.to_ts_exclusive),
-        );
+        let checkpoint_tail_resume_from_ts = checkpoint
+            .next_canonical_window_from_ts
+            .unwrap_or(checkpoint.to_ts_exclusive);
         persisted_frontier_ts = checkpoint.persisted_frontier_ts.or(persisted_frontier_ts);
         snapshot_was_loaded = checkpoint.snapshot_was_loaded;
         recovery_seed_last_finalized_ts = Some(checkpoint.snapshot.last_finalized_ts);
@@ -6409,6 +6427,14 @@ async fn run_startup_backfill(
             snapshot_has_reusable_finalized_history_for_fast_restart(&checkpoint.snapshot);
         recovery_seed_restored = true;
         state_store.restore_from_snapshot(checkpoint.snapshot);
+        let checkpoint_replay_start_ts = startup_checkpoint_canonical_replay_start_ts(
+            checkpoint.from_ts,
+            checkpoint_tail_resume_from_ts,
+            to_ts,
+            recovery_seed_has_reusable_finalized_history,
+        );
+        from_ts = from_ts.min(checkpoint_replay_start_ts);
+        checkpoint_resume_from_ts = Some(checkpoint_replay_start_ts);
         info!(
             checkpoint_saved_at = %checkpoint.saved_at,
             checkpoint_from_ts = %checkpoint.from_ts,
@@ -6419,6 +6445,17 @@ async fn run_startup_backfill(
             persisted_frontier_ts = ?persisted_frontier_ts,
             "startup backfill checkpoint loaded; resuming in-memory canonical replay state"
         );
+        if !recovery_seed_has_reusable_finalized_history
+            && checkpoint_replay_start_ts < checkpoint_tail_resume_from_ts
+        {
+            info!(
+                checkpoint_tail_resume_from_ts = %checkpoint_tail_resume_from_ts,
+                checkpoint_replay_start_ts = %checkpoint_replay_start_ts,
+                minimum_recovery_history_minutes = MIN_REUSABLE_FINALIZED_HISTORY_MINUTES,
+                overlap_minutes = STARTUP_BACKFILL_OVERLAP_MINUTES,
+                "startup checkpoint lacks reusable finalized history; restarting canonical replay before the checkpoint tail"
+            );
+        }
     } else if !snapshot_path.is_empty() {
         match try_load_state_snapshot(
             snapshot_path,
@@ -9040,15 +9077,16 @@ mod tests {
         shutdown_ready_through_candidate, snapshot_has_required_history,
         snapshot_has_reusable_finalized_history_for_fast_restart,
         snapshot_is_reusable_recovery_seed, snapshot_null_price_run_reaches_recent_tail,
-        startup_backfill_checkpoint_path, startup_state_only_recovery_can_skip_warm_history,
-        try_load_startup_backfill_checkpoint, try_load_state_snapshot, BackfillCursor,
-        ConfirmedLateRepairController, LiveCanonicalRepairController,
-        LiveCatchupCutoverStabilityTracker, ReplayRow, SnapshotLoadOutcome,
-        StartupBackfillCheckpoint, StartupBackfillProgress, FUNDING_BACKFILL_WINDOW_SQL,
-        LIQ_BACKFILL_WINDOW_SQL, LIVE_CANONICAL_TAIL_RECONCILE_LOOKBACK_MINUTES,
-        MIN_RESTART_RECOVERY_HISTORY_MINUTES, MIN_REUSABLE_FINALIZED_HISTORY_MINUTES,
-        ORDERBOOK_BACKFILL_WINDOW_SQL_SCALAR, ORDERBOOK_BACKFILL_WINDOW_SQL_WITH_HEATMAP,
-        STARTUP_BACKFILL_CHECKPOINT_VERSION, TRADE_BACKFILL_WINDOW_SQL,
+        startup_backfill_checkpoint_path, startup_checkpoint_canonical_replay_start_ts,
+        startup_state_only_recovery_can_skip_warm_history, try_load_startup_backfill_checkpoint,
+        try_load_state_snapshot, BackfillCursor, ConfirmedLateRepairController,
+        LiveCanonicalRepairController, LiveCatchupCutoverStabilityTracker, ReplayRow,
+        SnapshotLoadOutcome, StartupBackfillCheckpoint, StartupBackfillProgress,
+        FUNDING_BACKFILL_WINDOW_SQL, LIQ_BACKFILL_WINDOW_SQL,
+        LIVE_CANONICAL_TAIL_RECONCILE_LOOKBACK_MINUTES, MIN_RESTART_RECOVERY_HISTORY_MINUTES,
+        MIN_REUSABLE_FINALIZED_HISTORY_MINUTES, ORDERBOOK_BACKFILL_WINDOW_SQL_SCALAR,
+        ORDERBOOK_BACKFILL_WINDOW_SQL_WITH_HEATMAP, STARTUP_BACKFILL_CHECKPOINT_VERSION,
+        TRADE_BACKFILL_WINDOW_SQL,
     };
     use crate::app::bootstrap::{
         AppSection, DatabaseConfig, IndicatorConfig, MqConfig, MqExchangeConfig, MqExchanges,
@@ -9775,6 +9813,41 @@ mod tests {
         assert!(!startup_state_only_recovery_can_skip_warm_history(
             false, true, true
         ));
+    }
+
+    #[test]
+    fn startup_checkpoint_without_reusable_finalized_history_restarts_from_minimum_recovery_floor()
+    {
+        let to_ts = Utc.with_ymd_and_hms(2026, 4, 10, 0, 0, 0).single().unwrap();
+        let checkpoint_from_ts = to_ts - ChronoDuration::minutes(120);
+        let checkpoint_resume_from_ts = to_ts - ChronoDuration::minutes(5);
+
+        assert_eq!(
+            startup_checkpoint_canonical_replay_start_ts(
+                checkpoint_from_ts,
+                checkpoint_resume_from_ts,
+                to_ts,
+                false,
+            ),
+            minimum_startup_recovery_history_floor(to_ts)
+        );
+    }
+
+    #[test]
+    fn startup_checkpoint_with_reusable_finalized_history_keeps_tail_resume_point() {
+        let to_ts = Utc.with_ymd_and_hms(2026, 4, 10, 0, 0, 0).single().unwrap();
+        let checkpoint_from_ts = to_ts - ChronoDuration::days(7);
+        let checkpoint_resume_from_ts = to_ts - ChronoDuration::minutes(5);
+
+        assert_eq!(
+            startup_checkpoint_canonical_replay_start_ts(
+                checkpoint_from_ts,
+                checkpoint_resume_from_ts,
+                to_ts,
+                true,
+            ),
+            checkpoint_resume_from_ts
+        );
     }
 
     #[test]
