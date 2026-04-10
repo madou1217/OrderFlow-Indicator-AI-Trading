@@ -1655,7 +1655,6 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                         &snapshot_path,
                         startup_checkpoint_path.as_deref(),
                         latest_confirmed_closed,
-                        next_minute,
                         &frontier_snapshot,
                         &live_prepare_minute_pending,
                         &live_ready_job_pending,
@@ -4760,7 +4759,6 @@ async fn maybe_execute_live_catchup_cutover(
     snapshot_path: &str,
     startup_checkpoint_path: Option<&str>,
     latest_confirmed_closed: DateTime<Utc>,
-    next_minute: Option<DateTime<Utc>>,
     frontier_snapshot: &CanonicalFrontierSnapshot,
     live_prepare_minute_pending: &Arc<AtomicUsize>,
     live_ready_job_pending: &Arc<AtomicUsize>,
@@ -4775,12 +4773,6 @@ async fn maybe_execute_live_catchup_cutover(
             latest_confirmed_closed = %latest_confirmed_closed,
             "live catch-up cutover requires indicator.snapshot_file_path so dropped historical persistence can still recover safely after restart"
         );
-        return Ok(None);
-    }
-    if !next_minute
-        .map(|minute| minute > latest_confirmed_closed)
-        .unwrap_or(true)
-    {
         return Ok(None);
     }
     if !confirmed_repair_pipeline_idle(
@@ -9737,6 +9729,14 @@ mod tests {
         config.indicator.live_catchup_resume_lag_minutes = 1;
         let latest_confirmed_closed = Utc.with_ymd_and_hms(2026, 4, 9, 8, 20, 0).single().unwrap();
 
+        assert!(live_catchup_cutover_ready(
+            &config,
+            Some(latest_confirmed_closed),
+            latest_confirmed_closed,
+            None,
+            false,
+            false,
+        ));
         assert!(live_catchup_cutover_ready(
             &config,
             Some(Utc.with_ymd_and_hms(2026, 4, 9, 8, 19, 0).single().unwrap()),
