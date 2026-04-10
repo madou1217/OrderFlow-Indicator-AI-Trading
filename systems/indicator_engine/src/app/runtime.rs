@@ -2537,6 +2537,20 @@ fn snapshot_has_any_restart_recovery_state(snap: &StateSnapshot) -> bool {
         || !snap.history_spot.is_empty()
 }
 
+fn snapshot_has_reusable_finalized_history_for_fast_restart(snap: &StateSnapshot) -> bool {
+    snapshot_has_reusable_finalized_history_seed_quiet(snap)
+}
+
+fn startup_state_only_recovery_can_skip_warm_history(
+    startup_state_only_recovery: bool,
+    recovery_seed_restored: bool,
+    recovery_seed_has_reusable_finalized_history: bool,
+) -> bool {
+    startup_state_only_recovery
+        && recovery_seed_restored
+        && recovery_seed_has_reusable_finalized_history
+}
+
 fn snapshot_has_required_history_quiet(snap: &StateSnapshot) -> bool {
     let required_start_ts = required_snapshot_history_start_ts(snap);
     snapshot_history_covers_required_window(
@@ -2811,6 +2825,51 @@ async fn save_startup_backfill_checkpoint(
     path: &str,
 ) -> anyhow::Result<()> {
     save_gzip_json_atomic(checkpoint, path).await
+}
+
+async fn refresh_startup_backfill_checkpoint_with_finalized_history(
+    startup_backfill_progress: &Arc<Mutex<StartupBackfillProgress>>,
+    startup_checkpoint_path: Option<&str>,
+    symbol: &str,
+    state_store: &StateStore,
+    from_ts: DateTime<Utc>,
+    to_ts: DateTime<Utc>,
+    snapshot_was_loaded: bool,
+    persisted_frontier_ts: Option<DateTime<Utc>>,
+) -> anyhow::Result<()> {
+    let Some(path) = startup_checkpoint_path else {
+        return Ok(());
+    };
+
+    let snapshot = state_store.extract_snapshot();
+    let checkpoint = {
+        let mut progress = startup_backfill_progress.lock().await;
+        progress.record(
+            from_ts,
+            to_ts,
+            None,
+            snapshot_was_loaded,
+            persisted_frontier_ts,
+        );
+        progress.to_checkpoint(symbol, snapshot)
+    };
+
+    let Some(checkpoint) = checkpoint else {
+        return Ok(());
+    };
+
+    save_startup_backfill_checkpoint(&checkpoint, path)
+        .await
+        .with_context(|| format!("save startup backfill checkpoint path={path}"))?;
+    info!(
+        path = %path,
+        last_finalized_ts = %checkpoint.snapshot.last_finalized_ts,
+        futures_bars = checkpoint.snapshot.history_futures.len(),
+        spot_bars = checkpoint.snapshot.history_spot.len(),
+        canonical_minutes = checkpoint.snapshot.canonical_minutes.len(),
+        "startup backfill checkpoint refreshed with finalized warm history"
+    );
+    Ok(())
 }
 
 fn remove_startup_backfill_checkpoint(path: Option<&str>) {
@@ -6331,6 +6390,7 @@ async fn run_startup_backfill(
 
     let mut snapshot_was_loaded = false;
     let mut recovery_seed_restored = false;
+    let mut recovery_seed_has_reusable_finalized_history = false;
     let mut recovery_seed_last_finalized_ts = None;
     let mut checkpoint_resume_from_ts = None;
     if let Some(checkpoint) =
@@ -6345,6 +6405,8 @@ async fn run_startup_backfill(
         persisted_frontier_ts = checkpoint.persisted_frontier_ts.or(persisted_frontier_ts);
         snapshot_was_loaded = checkpoint.snapshot_was_loaded;
         recovery_seed_last_finalized_ts = Some(checkpoint.snapshot.last_finalized_ts);
+        recovery_seed_has_reusable_finalized_history =
+            snapshot_has_reusable_finalized_history_for_fast_restart(&checkpoint.snapshot);
         recovery_seed_restored = true;
         state_store.restore_from_snapshot(checkpoint.snapshot);
         info!(
@@ -6353,6 +6415,7 @@ async fn run_startup_backfill(
             checkpoint_to_ts_exclusive = %checkpoint.to_ts_exclusive,
             checkpoint_resume_from_ts = ?checkpoint_resume_from_ts,
             snapshot_was_loaded,
+            recovery_seed_has_reusable_finalized_history,
             persisted_frontier_ts = ?persisted_frontier_ts,
             "startup backfill checkpoint loaded; resuming in-memory canonical replay state"
         );
@@ -6368,6 +6431,10 @@ async fn run_startup_backfill(
                 let snap_ts = snap.last_finalized_ts;
                 let canonical_recovery_start_ts = required_snapshot_history_start_ts(&snap);
                 recovery_seed_last_finalized_ts = Some(snap.last_finalized_ts);
+                recovery_seed_has_reusable_finalized_history = matches!(
+                    recovery_seed_kind,
+                    SnapshotRecoverySeedKind::FinalizedHistory
+                );
                 recovery_seed_restored = true;
                 state_store.restore_from_snapshot(snap);
                 snapshot_was_loaded = true;
@@ -6404,6 +6471,10 @@ async fn run_startup_backfill(
                 let snap_ts = snap.last_finalized_ts;
                 let canonical_recovery_start_ts = required_snapshot_history_start_ts(&snap);
                 recovery_seed_last_finalized_ts = Some(snap.last_finalized_ts);
+                recovery_seed_has_reusable_finalized_history = matches!(
+                    recovery_seed_kind,
+                    SnapshotRecoverySeedKind::FinalizedHistory
+                );
                 recovery_seed_restored = true;
                 state_store.restore_from_snapshot(snap);
                 snapshot_was_loaded = true;
@@ -6867,11 +6938,16 @@ async fn run_startup_backfill(
         continuity_end_ts = %continuous_end_ts,
         snapshot_was_loaded = snapshot_was_loaded,
         recovery_seed_restored = recovery_seed_restored,
+        recovery_seed_has_reusable_finalized_history,
         startup_changed_from_ts = ?startup_changed_from_ts,
         "startup backfill replay plan"
     );
 
-    let warm_start_ts = if startup_state_only_recovery && recovery_seed_restored {
+    let warm_start_ts = if startup_state_only_recovery_can_skip_warm_history(
+        startup_state_only_recovery,
+        recovery_seed_restored,
+        recovery_seed_has_reusable_finalized_history,
+    ) {
         repair_start_ts
     } else {
         history_replay_start_ts
@@ -6957,11 +7033,23 @@ async fn run_startup_backfill(
             0,
         );
         scheduler.mark_emitted_through(replay_end_ts);
+        refresh_startup_backfill_checkpoint_with_finalized_history(
+            &startup_backfill_progress,
+            startup_checkpoint_path,
+            &ctx.config.indicator.symbol,
+            state_store,
+            from_ts,
+            to_ts,
+            snapshot_was_loaded,
+            persisted_frontier_ts,
+        )
+        .await?;
         info!(
             rebuild_start_ts = %repair_start_ts,
             replay_end_ts = %replay_end_ts,
             rebuilt_minutes = rebuilt_minutes,
             recovery_seed_restored = recovery_seed_restored,
+            recovery_seed_has_reusable_finalized_history,
             startup_changed_from_ts = ?startup_changed_from_ts,
             persisted_frontier_ts = ?persisted_frontier_ts,
             "startup historical backfill completed via state-only recovery"
@@ -7081,6 +7169,17 @@ async fn run_startup_backfill(
     }
 
     scheduler.mark_emitted_through(replay_end_ts);
+    refresh_startup_backfill_checkpoint_with_finalized_history(
+        &startup_backfill_progress,
+        startup_checkpoint_path,
+        &ctx.config.indicator.symbol,
+        state_store,
+        from_ts,
+        to_ts,
+        snapshot_was_loaded,
+        persisted_frontier_ts,
+    )
+    .await?;
 
     info!(
         total_rows = total_rows,
@@ -8939,16 +9038,17 @@ mod tests {
         replay_heatmap_hydration_batch_end, replay_row_after_cursor,
         required_snapshot_history_start_ts, save_startup_backfill_checkpoint, save_state_snapshot,
         shutdown_ready_through_candidate, snapshot_has_required_history,
+        snapshot_has_reusable_finalized_history_for_fast_restart,
         snapshot_is_reusable_recovery_seed, snapshot_null_price_run_reaches_recent_tail,
-        startup_backfill_checkpoint_path, try_load_startup_backfill_checkpoint,
-        try_load_state_snapshot, BackfillCursor, ConfirmedLateRepairController,
-        LiveCanonicalRepairController, LiveCatchupCutoverStabilityTracker, ReplayRow,
-        SnapshotLoadOutcome, StartupBackfillCheckpoint, StartupBackfillProgress,
-        FUNDING_BACKFILL_WINDOW_SQL, LIQ_BACKFILL_WINDOW_SQL,
-        LIVE_CANONICAL_TAIL_RECONCILE_LOOKBACK_MINUTES, MIN_RESTART_RECOVERY_HISTORY_MINUTES,
-        MIN_REUSABLE_FINALIZED_HISTORY_MINUTES, ORDERBOOK_BACKFILL_WINDOW_SQL_SCALAR,
-        ORDERBOOK_BACKFILL_WINDOW_SQL_WITH_HEATMAP, STARTUP_BACKFILL_CHECKPOINT_VERSION,
-        TRADE_BACKFILL_WINDOW_SQL,
+        startup_backfill_checkpoint_path, startup_state_only_recovery_can_skip_warm_history,
+        try_load_startup_backfill_checkpoint, try_load_state_snapshot, BackfillCursor,
+        ConfirmedLateRepairController, LiveCanonicalRepairController,
+        LiveCatchupCutoverStabilityTracker, ReplayRow, SnapshotLoadOutcome,
+        StartupBackfillCheckpoint, StartupBackfillProgress, FUNDING_BACKFILL_WINDOW_SQL,
+        LIQ_BACKFILL_WINDOW_SQL, LIVE_CANONICAL_TAIL_RECONCILE_LOOKBACK_MINUTES,
+        MIN_RESTART_RECOVERY_HISTORY_MINUTES, MIN_REUSABLE_FINALIZED_HISTORY_MINUTES,
+        ORDERBOOK_BACKFILL_WINDOW_SQL_SCALAR, ORDERBOOK_BACKFILL_WINDOW_SQL_WITH_HEATMAP,
+        STARTUP_BACKFILL_CHECKPOINT_VERSION, TRADE_BACKFILL_WINDOW_SQL,
     };
     use crate::app::bootstrap::{
         AppSection, DatabaseConfig, IndicatorConfig, MqConfig, MqExchangeConfig, MqExchanges,
@@ -9662,6 +9762,22 @@ mod tests {
     }
 
     #[test]
+    fn startup_state_only_recovery_skips_warm_history_only_for_reusable_finalized_seed() {
+        assert!(startup_state_only_recovery_can_skip_warm_history(
+            true, true, true
+        ));
+        assert!(!startup_state_only_recovery_can_skip_warm_history(
+            true, true, false
+        ));
+        assert!(!startup_state_only_recovery_can_skip_warm_history(
+            true, false, true
+        ));
+        assert!(!startup_state_only_recovery_can_skip_warm_history(
+            false, true, true
+        ));
+    }
+
+    #[test]
     fn effective_live_commit_frontier_uses_startup_cutoff_during_muted_catchup() {
         let persisted = Utc.with_ymd_and_hms(2026, 4, 8, 12, 0, 0).single().unwrap();
         let startup_cutoff = Utc.with_ymd_and_hms(2026, 4, 9, 3, 10, 0).single().unwrap();
@@ -10047,7 +10163,33 @@ mod tests {
 
         assert!(snap.history_futures.is_empty());
         assert!(snap.history_spot.is_empty());
+        assert!(!snapshot_has_reusable_finalized_history_for_fast_restart(
+            &snap
+        ));
         assert!(!snapshot_is_reusable_recovery_seed(&snap));
+    }
+
+    #[test]
+    fn reusable_rolling_7d_snapshot_is_fast_restart_history_seed() {
+        let last_finalized_ts = Utc.with_ymd_and_hms(2026, 3, 21, 3, 0, 0).single().unwrap();
+        let effective_floor_ts = last_finalized_ts - ChronoDuration::minutes(90);
+        let required_minutes = MIN_REUSABLE_FINALIZED_HISTORY_MINUTES - 1;
+        let history_start_ts = last_finalized_ts - ChronoDuration::minutes(required_minutes);
+        let history = (0..=required_minutes)
+            .map(|offset| {
+                priced_history_row(history_start_ts + ChronoDuration::minutes(offset), 2000.0)
+            })
+            .collect::<Vec<_>>();
+        let snap = snapshot_fixture(
+            last_finalized_ts,
+            history.clone(),
+            history,
+            Some(effective_floor_ts),
+        );
+
+        assert!(snapshot_has_reusable_finalized_history_for_fast_restart(
+            &snap
+        ));
     }
 
     #[tokio::test]
