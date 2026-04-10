@@ -575,8 +575,6 @@ fn live_catchup_cutover_ready(
     next_minute: Option<DateTime<Utc>>,
     latest_confirmed_closed: DateTime<Utc>,
     dirty_recompute_from_ts: Option<DateTime<Utc>>,
-    has_pending_oi_ratio_patch: bool,
-    oi_ratio_patch_task_running: bool,
 ) -> bool {
     if !config.indicator.live_catchup_progress_only_enabled {
         return false;
@@ -585,8 +583,6 @@ fn live_catchup_cutover_ready(
     live_backlog_minutes(next_minute, latest_confirmed_closed)
         <= configured_live_catchup_resume_lag_minutes(config)
         && dirty_recompute_from_ts.is_none()
-        && !has_pending_oi_ratio_patch
-        && !oi_ratio_patch_task_running
 }
 
 fn effective_live_commit_frontier_ts(
@@ -1607,8 +1603,6 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                     next_minute,
                     latest_confirmed_closed,
                     frontier_snapshot.dirty_recompute_from_ts,
-                    has_pending_oi_ratio_patch,
-                    oi_ratio_patch_task.is_some(),
                 );
 
                 if live_publish_state.publishing_enabled()
@@ -9722,7 +9716,7 @@ mod tests {
     }
 
     #[test]
-    fn live_catchup_cutover_ready_requires_low_watermark_and_clean_repair_state() {
+    fn live_catchup_cutover_ready_requires_low_watermark_and_clean_dirty_state() {
         let mut config = test_root_config();
         config.indicator.live_catchup_progress_only_enabled = true;
         config.indicator.live_catchup_progress_only_lag_minutes = 10;
@@ -9734,48 +9728,40 @@ mod tests {
             Some(latest_confirmed_closed),
             latest_confirmed_closed,
             None,
-            false,
-            false,
         ));
         assert!(live_catchup_cutover_ready(
             &config,
             Some(Utc.with_ymd_and_hms(2026, 4, 9, 8, 19, 0).single().unwrap()),
             latest_confirmed_closed,
             None,
-            false,
-            false,
         ));
         assert!(!live_catchup_cutover_ready(
             &config,
             Some(Utc.with_ymd_and_hms(2026, 4, 9, 8, 15, 0).single().unwrap()),
             latest_confirmed_closed,
             None,
-            false,
-            false,
         ));
         assert!(!live_catchup_cutover_ready(
             &config,
             Some(Utc.with_ymd_and_hms(2026, 4, 9, 8, 19, 0).single().unwrap()),
             latest_confirmed_closed,
             Some(Utc.with_ymd_and_hms(2026, 4, 9, 8, 18, 0).single().unwrap()),
-            false,
-            false,
         ));
-        assert!(!live_catchup_cutover_ready(
+    }
+
+    #[test]
+    fn live_catchup_cutover_ready_allows_pending_oi_ratio_patch_to_be_absorbed_by_cutover() {
+        let mut config = test_root_config();
+        config.indicator.live_catchup_progress_only_enabled = true;
+        config.indicator.live_catchup_progress_only_lag_minutes = 10;
+        config.indicator.live_catchup_resume_lag_minutes = 1;
+        let latest_confirmed_closed = Utc.with_ymd_and_hms(2026, 4, 9, 8, 20, 0).single().unwrap();
+
+        assert!(live_catchup_cutover_ready(
             &config,
             Some(Utc.with_ymd_and_hms(2026, 4, 9, 8, 19, 0).single().unwrap()),
             latest_confirmed_closed,
             None,
-            false,
-            true,
-        ));
-        assert!(!live_catchup_cutover_ready(
-            &config,
-            Some(Utc.with_ymd_and_hms(2026, 4, 9, 8, 19, 0).single().unwrap()),
-            latest_confirmed_closed,
-            None,
-            true,
-            false,
         ));
     }
 
