@@ -3,7 +3,7 @@ use crate::publish::ind_publisher::IndPublisher;
 use crate::publish::outbox_dispatcher::{identity_json_publish_payload, publish_amqp_message};
 use crate::storage::snapshot_writer::hydrate_snapshot_payload_values;
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use lapin::publisher_confirm::Confirmation;
 use serde_json::Value;
 use sqlx::{FromRow, PgPool};
@@ -14,6 +14,7 @@ use tracing::{info, warn};
 
 const SNAPSHOT_FANOUT_POLL_SECS: u64 = 5;
 const SNAPSHOT_FANOUT_MAX_MINUTES_PER_WAKE: usize = 4;
+const SNAPSHOT_FANOUT_REPAIR_MINUTES_RESERVED_PER_WAKE: usize = 1;
 const SNAPSHOT_FANOUT_WARN_MS: u128 = 2_000;
 
 #[derive(Clone)]
@@ -63,6 +64,20 @@ impl SnapshotFanoutProjector {
         .await
         .context("create idx_indicator_snapshot_symbol_ts")?;
 
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS ops.indicator_snapshot_fanout_repair_progress (
+                symbol TEXT PRIMARY KEY,
+                next_snapshot_ts TIMESTAMPTZ NOT NULL,
+                repair_end_snapshot_ts TIMESTAMPTZ NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("create ops.indicator_snapshot_fanout_repair_progress")?;
+
         Ok(())
     }
 
@@ -109,16 +124,66 @@ impl SnapshotFanoutProjector {
 
         loop {
             tick.tick().await;
-            for _ in 0..SNAPSHOT_FANOUT_MAX_MINUTES_PER_WAKE {
-                match self.project_next_minute().await {
-                    Ok(0) => break,
-                    Ok(_) => {}
+            let mut remaining_budget = SNAPSHOT_FANOUT_MAX_MINUTES_PER_WAKE;
+            let mut reserved_repair_budget =
+                SNAPSHOT_FANOUT_REPAIR_MINUTES_RESERVED_PER_WAKE.min(remaining_budget);
+            while remaining_budget > 0 {
+                let mut progressed = false;
+
+                if reserved_repair_budget > 0 {
+                    match self.project_next_repair_minute().await {
+                        Ok(0) => {}
+                        Ok(_) => {
+                            reserved_repair_budget -= 1;
+                            remaining_budget -= 1;
+                            progressed = true;
+                        }
+                        Err(err) => {
+                            warn!(
+                                error = %err,
+                                debug_error = ?err,
+                                symbol = %self.symbol,
+                                "indicator snapshot fanout repair batch failed"
+                            );
+                            break;
+                        }
+                    }
+                }
+                if progressed {
+                    continue;
+                }
+
+                match self.project_next_live_minute().await {
+                    Ok(0) => {}
+                    Ok(_) => {
+                        remaining_budget -= 1;
+                        progressed = true;
+                    }
                     Err(err) => {
                         warn!(
                             error = %err,
                             debug_error = ?err,
                             symbol = %self.symbol,
-                            "indicator snapshot fanout projector batch failed"
+                            "indicator snapshot fanout live batch failed"
+                        );
+                        break;
+                    }
+                }
+                if progressed {
+                    continue;
+                }
+
+                match self.project_next_repair_minute().await {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        remaining_budget -= 1;
+                    }
+                    Err(err) => {
+                        warn!(
+                            error = %err,
+                            debug_error = ?err,
+                            symbol = %self.symbol,
+                            "indicator snapshot fanout repair batch failed"
                         );
                         break;
                     }
@@ -127,7 +192,7 @@ impl SnapshotFanoutProjector {
         }
     }
 
-    async fn project_next_minute(&self) -> Result<usize> {
+    async fn project_next_live_minute(&self) -> Result<usize> {
         let symbol = self.symbol_upper();
         let last_published_ts = self.last_published_snapshot_ts().await?;
         let Some(next_ts) = sqlx::query_scalar::<_, DateTime<Utc>>(
@@ -149,6 +214,37 @@ impl SnapshotFanoutProjector {
             return Ok(0);
         };
 
+        let published_rows = self
+            .publish_snapshot_minute(&symbol, next_ts, "live")
+            .await?;
+        self.advance_progress(next_ts).await?;
+        Ok(published_rows.max(1))
+    }
+
+    async fn project_next_repair_minute(&self) -> Result<usize> {
+        let symbol = self.symbol_upper();
+        let Some(progress) = self.pending_repair_progress().await? else {
+            return Ok(0);
+        };
+        if progress.next_snapshot_ts > progress.repair_end_snapshot_ts {
+            self.clear_repair_progress().await?;
+            return Ok(0);
+        }
+
+        let published_rows = self
+            .publish_snapshot_minute(&symbol, progress.next_snapshot_ts, "repair")
+            .await?;
+        self.advance_repair_progress(progress.next_snapshot_ts, progress.repair_end_snapshot_ts)
+            .await?;
+        Ok(published_rows.max(1))
+    }
+
+    async fn publish_snapshot_minute(
+        &self,
+        symbol: &str,
+        ts_snapshot: DateTime<Utc>,
+        stream: &'static str,
+    ) -> Result<usize> {
         let started_at = Instant::now();
         let mut rows: Vec<SnapshotFanoutRow> = sqlx::query_as(
             r#"
@@ -159,11 +255,16 @@ impl SnapshotFanoutProjector {
             ORDER BY indicator_code, window_code
             "#,
         )
-        .bind(&symbol)
-        .bind(next_ts)
+        .bind(symbol)
+        .bind(ts_snapshot)
         .fetch_all(&self.pool)
         .await
-        .with_context(|| format!("load snapshot fanout rows symbol={} ts={}", symbol, next_ts))?;
+        .with_context(|| {
+            format!(
+                "load snapshot fanout rows symbol={} ts={}",
+                symbol, ts_snapshot
+            )
+        })?;
 
         let mut payloads = rows
             .iter()
@@ -175,7 +276,6 @@ impl SnapshotFanoutProjector {
         }
 
         if rows.is_empty() {
-            self.advance_progress(next_ts).await?;
             return Ok(0);
         }
 
@@ -187,7 +287,7 @@ impl SnapshotFanoutProjector {
         for row in &rows {
             let message = self.publisher.build_snapshot_message_from_parts(
                 row.ts_snapshot,
-                &symbol,
+                symbol,
                 &row.indicator_code,
                 &row.window_code,
                 &row.payload_json,
@@ -220,12 +320,12 @@ impl SnapshotFanoutProjector {
             }
         }
 
-        self.advance_progress(next_ts).await?;
         let total_ms = started_at.elapsed().as_millis();
         if total_ms >= SNAPSHOT_FANOUT_WARN_MS {
             warn!(
                 symbol = %symbol,
-                ts_snapshot = %next_ts,
+                ts_snapshot = %ts_snapshot,
+                stream = stream,
                 snapshot_count = rows.len(),
                 total_ms = total_ms,
                 "slow indicator snapshot fanout minute"
@@ -251,6 +351,20 @@ impl SnapshotFanoutProjector {
         Ok(ts)
     }
 
+    async fn pending_repair_progress(&self) -> Result<Option<SnapshotFanoutRepairProgressRow>> {
+        sqlx::query_as::<_, SnapshotFanoutRepairProgressRow>(
+            r#"
+            SELECT next_snapshot_ts, repair_end_snapshot_ts
+            FROM ops.indicator_snapshot_fanout_repair_progress
+            WHERE symbol = $1
+            "#,
+        )
+        .bind(self.symbol_upper())
+        .fetch_optional(&self.pool)
+        .await
+        .context("fetch indicator snapshot fanout repair progress row")
+    }
+
     async fn advance_progress(&self, ts_snapshot: DateTime<Utc>) -> Result<()> {
         sqlx::query(
             r#"
@@ -273,6 +387,46 @@ impl SnapshotFanoutProjector {
         Ok(())
     }
 
+    async fn advance_repair_progress(
+        &self,
+        next_snapshot_ts: DateTime<Utc>,
+        repair_end_snapshot_ts: DateTime<Utc>,
+    ) -> Result<()> {
+        if next_snapshot_ts >= repair_end_snapshot_ts {
+            self.clear_repair_progress().await?;
+            return Ok(());
+        }
+
+        sqlx::query(
+            r#"
+            UPDATE ops.indicator_snapshot_fanout_repair_progress
+            SET next_snapshot_ts = $2,
+                updated_at = now()
+            WHERE symbol = $1
+            "#,
+        )
+        .bind(self.symbol_upper())
+        .bind(next_snapshot_ts + ChronoDuration::minutes(1))
+        .execute(&self.pool)
+        .await
+        .context("advance indicator snapshot fanout repair progress")?;
+        Ok(())
+    }
+
+    async fn clear_repair_progress(&self) -> Result<()> {
+        sqlx::query(
+            r#"
+            DELETE FROM ops.indicator_snapshot_fanout_repair_progress
+            WHERE symbol = $1
+            "#,
+        )
+        .bind(self.symbol_upper())
+        .execute(&self.pool)
+        .await
+        .context("clear indicator snapshot fanout repair progress")?;
+        Ok(())
+    }
+
     fn symbol_upper(&self) -> String {
         self.symbol.to_uppercase()
     }
@@ -284,6 +438,12 @@ struct SnapshotFanoutRow {
     indicator_code: String,
     window_code: String,
     payload_json: Value,
+}
+
+#[derive(Debug, Clone, FromRow)]
+struct SnapshotFanoutRepairProgressRow {
+    next_snapshot_ts: DateTime<Utc>,
+    repair_end_snapshot_ts: DateTime<Utc>,
 }
 
 fn epoch_utc() -> DateTime<Utc> {

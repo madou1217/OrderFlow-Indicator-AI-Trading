@@ -125,7 +125,7 @@ pub async fn run_heartbeat_loop(ctx: Arc<AppContext>, metrics: Arc<AppMetrics>) 
         .bind(&ctx.producer_instance_id)
         .bind("indicator-engine")
         .bind(metrics_json)
-        .execute(&ctx.db_pool)
+        .execute(&ctx.ops_db_pool)
         .await
         {
             warn!(error = %err, "write indicator heartbeat failed");

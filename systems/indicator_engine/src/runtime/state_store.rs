@@ -413,6 +413,8 @@ pub struct CanonicalFrontierSnapshot {
     pub dirty_recompute_end_ts: Option<DateTime<Utc>>,
     pub oi_ratio_patch_from_ts: Option<DateTime<Utc>>,
     pub oi_ratio_patch_end_ts: Option<DateTime<Utc>>,
+    pub historical_materialization_from_ts: Option<DateTime<Utc>>,
+    pub historical_materialization_end_ts: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1304,6 +1306,9 @@ pub struct StateStore {
     oi_ratio_patch_end: Option<DateTime<Utc>>,
     oi_ratio_patch_mark_total: u64,
     oi_ratio_patch_extends_backward_total: u64,
+    historical_materialization_from: Option<DateTime<Utc>>,
+    historical_materialization_end: Option<DateTime<Utc>>,
+    deferred_derived_indicator_refresh_pending: bool,
     last_finalized_minute: Option<DateTime<Utc>>,
     divergence_sig_test_mode: crate::indicators::context::DivergenceSigTestMode,
     divergence_bootstrap_b: usize,
@@ -1364,6 +1369,9 @@ impl StateStore {
             oi_ratio_patch_end: None,
             oi_ratio_patch_mark_total: 0,
             oi_ratio_patch_extends_backward_total: 0,
+            historical_materialization_from: None,
+            historical_materialization_end: None,
+            deferred_derived_indicator_refresh_pending: false,
             last_finalized_minute: None,
             divergence_sig_test_mode: crate::indicators::context::DivergenceSigTestMode::Threshold,
             divergence_bootstrap_b: 200,
@@ -1438,6 +1446,9 @@ impl StateStore {
         self.oi_ratio_patch_end = None;
         self.oi_ratio_patch_mark_total = 0;
         self.oi_ratio_patch_extends_backward_total = 0;
+        self.historical_materialization_from = None;
+        self.historical_materialization_end = None;
+        self.deferred_derived_indicator_refresh_pending = false;
         self.last_finalized_minute = None;
     }
 
@@ -1454,6 +1465,77 @@ impl StateStore {
     pub fn clear_oi_ratio_patch_state(&mut self) {
         self.oi_ratio_patch_from = None;
         self.oi_ratio_patch_end = None;
+    }
+
+    pub fn mark_historical_materialization_pending(
+        &mut self,
+        from_ts: DateTime<Utc>,
+        to_ts_inclusive: DateTime<Utc>,
+    ) {
+        if from_ts > to_ts_inclusive {
+            return;
+        }
+
+        self.historical_materialization_from = Some(
+            self.historical_materialization_from
+                .map(|existing| existing.min(from_ts))
+                .unwrap_or(from_ts),
+        );
+        self.historical_materialization_end = Some(
+            self.historical_materialization_end
+                .map(|existing| existing.max(to_ts_inclusive))
+                .unwrap_or(to_ts_inclusive),
+        );
+    }
+
+    pub fn has_pending_historical_materialization(&self) -> bool {
+        self.historical_materialization_from.is_some()
+    }
+
+    pub fn pending_historical_materialization_range(
+        &self,
+    ) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+        Some((
+            self.historical_materialization_from?,
+            self.historical_materialization_end?,
+        ))
+    }
+
+    pub fn pending_historical_materialization_batch_range(
+        &self,
+        max_batch: usize,
+    ) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+        let (start, end) = self.pending_historical_materialization_range()?;
+        let batch_span = Duration::minutes(max_batch.max(1) as i64 - 1);
+        Some((start, end.min(start + batch_span)))
+    }
+
+    pub fn advance_historical_materialization_through(
+        &mut self,
+        through_ts: DateTime<Utc>,
+    ) -> bool {
+        let Some(start) = self.historical_materialization_from else {
+            return false;
+        };
+        let Some(end) = self.historical_materialization_end else {
+            self.historical_materialization_from = None;
+            return false;
+        };
+        if through_ts < start {
+            return false;
+        }
+        if through_ts >= end {
+            self.clear_historical_materialization_state();
+            return true;
+        }
+
+        self.historical_materialization_from = Some(through_ts + Duration::minutes(1));
+        true
+    }
+
+    pub fn clear_historical_materialization_state(&mut self) {
+        self.historical_materialization_from = None;
+        self.historical_materialization_end = None;
     }
 
     pub fn reset_for_new_continuous_segment(&mut self, start: DateTime<Utc>) {
@@ -1579,6 +1661,8 @@ impl StateStore {
             dirty_recompute_end_ts: self.dirty_recompute_end,
             oi_ratio_patch_from_ts: self.oi_ratio_patch_from,
             oi_ratio_patch_end_ts: self.oi_ratio_patch_end,
+            historical_materialization_from_ts: self.historical_materialization_from,
+            historical_materialization_end_ts: self.historical_materialization_end,
             ..CanonicalFrontierSnapshot::default()
         };
 
@@ -1842,6 +1926,7 @@ impl StateStore {
             self.refresh_incremental_indicator_event_caches(ts_bucket);
         }
         self.rebuild_incremental_indicator_outputs();
+        self.deferred_derived_indicator_refresh_pending = false;
     }
 
     pub fn rebuild_finalized_state_range(
@@ -1876,6 +1961,11 @@ impl StateStore {
             self.refresh_incremental_indicator_event_caches(ts_bucket);
             self.refresh_incremental_indicator_outputs(ts_bucket);
         }
+        self.deferred_derived_indicator_refresh_pending = !refresh_derived_indicator_state;
+    }
+
+    pub fn has_pending_deferred_derived_indicator_refresh(&self) -> bool {
+        self.deferred_derived_indicator_refresh_pending
     }
 
     fn take_dirty_recompute_batch_range(
@@ -3474,6 +3564,7 @@ impl StateStore {
         Self::truncate_shared_suffix(&mut self.funding_points_recent_shared, start, |row| row.ts);
         Self::truncate_shared_suffix(&mut self.mark_points_recent_shared, start, |row| row.ts);
         self.rebuild_incremental_indicator_outputs();
+        self.deferred_derived_indicator_refresh_pending = false;
     }
 
     fn record_funding_state(
@@ -3654,6 +3745,8 @@ impl StateStore {
                     inputs: inputs.clone(),
                 })
                 .collect(),
+            historical_materialization_from_ts: self.historical_materialization_from,
+            historical_materialization_end_ts: self.historical_materialization_end,
         }
     }
 
@@ -3680,6 +3773,8 @@ impl StateStore {
             option_mark_greeks_5m_buckets,
             options_surface_5m,
             canonical_minutes,
+            historical_materialization_from_ts,
+            historical_materialization_end_ts,
             ..
         } = snap;
 
@@ -3741,6 +3836,8 @@ impl StateStore {
             .into_iter()
             .map(|minute| (minute.ts_bucket.timestamp(), minute.inputs))
             .collect();
+        self.historical_materialization_from = historical_materialization_from_ts;
+        self.historical_materialization_end = historical_materialization_end_ts;
         self.trim_options_surface_state();
         self.rebuild_incremental_recent_7d_payloads();
         // CVD must be derived from history tail (not stored value) to ensure accuracy.
@@ -4067,6 +4164,10 @@ pub struct StateSnapshot {
     pub options_surface_5m: Vec<OptionsSurfacePoint>,
     #[serde(default)]
     pub canonical_minutes: Vec<CanonicalMinuteSnapshot>,
+    #[serde(default)]
+    pub historical_materialization_from_ts: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub historical_materialization_end_ts: Option<DateTime<Utc>>,
 }
 
 pub fn floor_minute(ts: DateTime<Utc>) -> DateTime<Utc> {
@@ -5418,6 +5519,54 @@ mod tests {
             full_avwap.xmk_avwap_gap_f_minus_s
         );
         assert_eq!(deferred_avwap.zavwap_gap, full_avwap.zavwap_gap);
+    }
+
+    #[test]
+    fn deferred_derived_refresh_pending_tracks_state_only_progress() {
+        let ts = Utc.with_ymd_and_hms(2026, 3, 6, 5, 0, 0).single().unwrap();
+        let mut store = StateStore::new("TESTUSDT".to_string(), 1_000.0);
+
+        store.ingest(agg_trade_event(ts, 1.0, 0.5, 0.2));
+        store.ingest(agg_trade_event_spot(ts, 1.0, 0.5, 0.2));
+        store.ingest(agg_orderbook_event(ts, 4, 4, 0.1));
+        store.ingest(agg_orderbook_event_spot(ts, 4, 4, 0.1));
+        store.ingest(agg_liq_event(ts, 10.0));
+        store.ingest(agg_funding_mark_event(ts, 45, 2000.0, 0.01));
+
+        store.advance_finalized_state_without_derived_refresh(ts);
+        assert!(store.has_pending_deferred_derived_indicator_refresh());
+
+        store.rebuild_deferred_derived_indicator_state();
+        assert!(!store.has_pending_deferred_derived_indicator_refresh());
+    }
+
+    #[test]
+    fn historical_materialization_range_merges_and_advances() {
+        let ts_1 = Utc.with_ymd_and_hms(2026, 3, 6, 5, 0, 0).single().unwrap();
+        let ts_2 = ts_1 + ChronoDuration::minutes(4);
+        let ts_3 = ts_1 + ChronoDuration::minutes(10);
+        let ts_4 = ts_1 + ChronoDuration::minutes(15);
+        let mut store = StateStore::new("TESTUSDT".to_string(), 1_000.0);
+
+        store.mark_historical_materialization_pending(ts_2, ts_3);
+        store.mark_historical_materialization_pending(ts_1, ts_4);
+        assert_eq!(
+            store.pending_historical_materialization_range(),
+            Some((ts_1, ts_4))
+        );
+        assert_eq!(
+            store.pending_historical_materialization_batch_range(3),
+            Some((ts_1, ts_1 + ChronoDuration::minutes(2)))
+        );
+
+        assert!(store.advance_historical_materialization_through(ts_1 + ChronoDuration::minutes(5)));
+        assert_eq!(
+            store.pending_historical_materialization_range(),
+            Some((ts_1 + ChronoDuration::minutes(6), ts_4))
+        );
+
+        assert!(store.advance_historical_materialization_through(ts_4));
+        assert!(!store.has_pending_historical_materialization());
     }
 
     #[test]

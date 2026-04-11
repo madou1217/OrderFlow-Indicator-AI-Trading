@@ -12,6 +12,7 @@ use crate::ingest::mq_consumer;
 use crate::ingest::watermark::floor_minute;
 use crate::observability::heartbeat;
 use crate::observability::metrics::AppMetrics;
+use crate::publish::durable_intent_relay::DurableIntentRelay;
 use crate::publish::ind_publisher::IndPublisher;
 use crate::publish::outbox_dispatcher::OutboxDispatcher;
 use crate::publish::snapshot_fanout_projector::SnapshotFanoutProjector;
@@ -45,7 +46,9 @@ use uuid::Uuid;
 const STARTUP_BACKFILL_FALLBACK_LOOKBACK_MINUTES: i64 = 30;
 const STARTUP_BACKFILL_OVERLAP_MINUTES: i64 = 30;
 const MIN_RESTART_RECOVERY_HISTORY_MINUTES: i64 = 24 * 60;
-const MIN_REUSABLE_FINALIZED_HISTORY_MINUTES: i64 = 7 * 24 * 60;
+// Live consumers currently rely on long-window state up to 30d (for example AVWAP),
+// so restart recovery must preserve that horizon before publish can resume safely.
+const MIN_REUSABLE_FINALIZED_HISTORY_MINUTES: i64 = 30 * 24 * 60;
 const STARTUP_BACKFILL_SAFETY_LAG_SECS: i64 = 10;
 const STARTUP_BACKFILL_MARKET: &str = "all";
 const STALE_DROP_REPORT_INTERVAL_SECS: u64 = 10;
@@ -55,6 +58,7 @@ const PREPARE_INGEST_QUEUE_CAPACITY: usize = 150_000;
 const INGEST_DRAIN_PER_TICK_LIMIT: usize = 25_000;
 const DIRTY_RECOMPUTE_BATCH_SIZE: usize = 5;
 const DIRTY_RECOMPUTE_WINDOW_BUDGET_PER_TICK: usize = 50;
+const ASYNC_HISTORICAL_MATERIALIZE_BATCH_SIZE: usize = 60;
 const OI_RATIO_PATCH_BATCH_SIZE: usize = 6;
 const OI_RATIO_PATCH_WINDOW_BUDGET_PER_TICK: usize = 24;
 const PROCESS_READY_MINUTES_WARN_MS: u128 = 2_000;
@@ -160,6 +164,7 @@ impl StartupBackfillProgress {
 
 async fn build_publish_db_pool(config: &Arc<RootConfig>) -> Result<PgPool> {
     let mut publish_cfg = (**config).clone();
+    publish_cfg.database = publish_cfg.database.ops_endpoint();
     let base_name = publish_cfg
         .database
         .application_name
@@ -234,47 +239,6 @@ impl LivePublishState {
 }
 
 #[derive(Debug, Default)]
-struct LiveCatchupCutoverStabilityTracker {
-    consecutive_stable_minutes: u64,
-    last_stable_confirmed_minute: Option<DateTime<Utc>>,
-}
-
-impl LiveCatchupCutoverStabilityTracker {
-    fn reset(&mut self) {
-        self.consecutive_stable_minutes = 0;
-        self.last_stable_confirmed_minute = None;
-    }
-
-    fn observe_confirmed_minute(&mut self, latest_confirmed_closed: DateTime<Utc>) {
-        match self.last_stable_confirmed_minute {
-            Some(last_seen) if latest_confirmed_closed <= last_seen => {}
-            Some(last_seen)
-                if latest_confirmed_closed - last_seen == ChronoDuration::minutes(1) =>
-            {
-                self.consecutive_stable_minutes = self.consecutive_stable_minutes.saturating_add(1);
-                self.last_stable_confirmed_minute = Some(latest_confirmed_closed);
-            }
-            Some(_) => {
-                self.consecutive_stable_minutes = 1;
-                self.last_stable_confirmed_minute = Some(latest_confirmed_closed);
-            }
-            None => {
-                self.consecutive_stable_minutes = 1;
-                self.last_stable_confirmed_minute = Some(latest_confirmed_closed);
-            }
-        }
-    }
-
-    fn stable_enough(&self, required_minutes: u64) -> bool {
-        self.consecutive_stable_minutes >= required_minutes.max(1)
-    }
-
-    fn observed_minutes(&self) -> u64 {
-        self.consecutive_stable_minutes
-    }
-}
-
-#[derive(Debug, Default)]
 struct LiveCanonicalRepairController {
     last_gap_repair_attempt_at: Option<Instant>,
     last_gap_repair_minute: Option<DateTime<Utc>>,
@@ -321,6 +285,54 @@ struct PrepareMinuteTask {
     enqueued_at: Instant,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct HistoricalMaterializationBatchResult {
+    from_ts: DateTime<Utc>,
+    to_ts: DateTime<Utc>,
+    materialized_windows: usize,
+}
+
+async fn abort_historical_materialize_handle(
+    handle_slot: &mut Option<JoinHandle<Result<HistoricalMaterializationBatchResult>>>,
+    reason: &'static str,
+) {
+    let Some(handle) = handle_slot.take() else {
+        return;
+    };
+    handle.abort();
+    match handle.await {
+        Ok(Ok(result)) => {
+            warn!(
+                reason = reason,
+                from_ts = %result.from_ts,
+                to_ts = %result.to_ts,
+                materialized_windows = result.materialized_windows,
+                "dropping completed async historical materialization batch due to newer state repair"
+            );
+        }
+        Ok(Err(err)) => {
+            warn!(
+                error = %err,
+                reason = reason,
+                "async historical materialization batch failed while being aborted"
+            );
+        }
+        Err(err) if err.is_cancelled() => {
+            info!(
+                reason = reason,
+                "aborted async historical materialization batch"
+            );
+        }
+        Err(err) => {
+            warn!(
+                error = %err,
+                reason = reason,
+                "async historical materialization batch join failed while being aborted"
+            );
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct KlineSupplementCacheKey {
     market: &'static str,
@@ -336,8 +348,33 @@ struct KlineSupplementRequest {
 
 #[derive(Debug, Default)]
 struct RuntimeHistorySupplementCache {
-    kline: RwLock<HashMap<KlineSupplementCacheKey, Vec<KlineHistoryBar>>>,
+    kline: RwLock<HashMap<KlineSupplementCacheKey, KlineSupplementCacheEntry>>,
     options_surface: RwLock<Vec<OptionsSurfacePoint>>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct KlineSupplementCacheEntry {
+    rows: Vec<KlineHistoryBar>,
+    history_exhausted: bool,
+}
+
+impl KlineSupplementCacheEntry {
+    fn effective_limit(
+        &self,
+        older_than_open_time: DateTime<Utc>,
+        requested_limit: usize,
+    ) -> usize {
+        if !self.history_exhausted {
+            return requested_limit;
+        }
+
+        requested_limit.min(
+            self.rows
+                .iter()
+                .filter(|row| row.open_time < older_than_open_time)
+                .count(),
+        )
+    }
 }
 
 impl RuntimeHistorySupplementCache {
@@ -573,10 +610,6 @@ fn configured_live_catchup_resume_lag_minutes(config: &RootConfig) -> i64 {
         .live_catchup_resume_lag_minutes
         .max(0)
         .min(enter_lag_minutes.saturating_sub(1))
-}
-
-fn configured_live_catchup_resume_stable_minutes(config: &RootConfig) -> u64 {
-    config.indicator.live_catchup_resume_stable_minutes.max(1)
 }
 
 fn live_catchup_requested(
@@ -896,8 +929,19 @@ pub async fn run(ctx: AppContext) -> Result<()> {
         publisher.clone(),
     ));
     let publish_db_pool = build_publish_db_pool(&ctx.config).await?;
+    let durable_intent_relay = DurableIntentRelay::new(
+        ctx.db_pool.clone(),
+        publish_db_pool.clone(),
+        ctx.config.mq.exchanges.ind.name.clone(),
+        publisher.clone(),
+    );
+    durable_intent_relay
+        .ensure_schema()
+        .await
+        .context("ensure indicator durable intent relay schema")?;
     let outbox_dispatcher = OutboxDispatcher::new(
         publish_db_pool.clone(),
+        ctx.db_pool.clone(),
         ctx.mq.clone(),
         ctx.config.mq.exchanges.ind.name.clone(),
         publisher.clone(),
@@ -907,7 +951,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
         .await
         .context("ensure indicator bundle outbox schema")?;
     let snapshot_fanout_projector = SnapshotFanoutProjector::new(
-        publish_db_pool,
+        ctx.db_pool.clone(),
         ctx.mq.clone(),
         publisher.clone(),
         ctx.config.indicator.symbol.clone(),
@@ -1171,8 +1215,12 @@ pub async fn run(ctx: AppContext) -> Result<()> {
         dirty_ready_job_rx,
         dirty_ready_job_pending.clone(),
     )));
+    let mut historical_materialize_handle: Option<
+        JoinHandle<Result<HistoricalMaterializationBatchResult>>,
+    > = None;
 
     let mut startup_cutover_completed = startup_replay_cutoff_bucket.is_none();
+    let relay_handle = tokio::spawn(async move { durable_intent_relay.run_loop().await });
     let outbox_handle = tokio::spawn(async move { outbox_dispatcher.run_loop().await });
     let mut snapshot_fanout_handle: Option<JoinHandle<Result<()>>> = None;
     let mut snapshot_fanout_started = false;
@@ -1206,12 +1254,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
     let mut live_repair_controller = LiveCanonicalRepairController::default();
     let mut confirmed_repair_controller = ConfirmedLateRepairController::default();
     let mut oi_ratio_patch_task: Option<OiRatioPatchTask> = None;
-    let mut live_publish_state = if ctx.config.indicator.live_catchup_progress_only_enabled {
-        LivePublishState::MutedCatchup
-    } else {
-        LivePublishState::Publishing
-    };
-    let mut live_catchup_cutover_stability = LiveCatchupCutoverStabilityTracker::default();
+    let mut live_publish_state = LivePublishState::Publishing;
     let mut last_logged_live_publish_state: Option<LivePublishState> = None;
 
     loop {
@@ -1283,6 +1326,15 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                 poll_materialize_handle(
                     &mut dirty_materialize_handle,
                     MaterializeWorkerKind::DirtyRecompute,
+                )
+                .await?;
+                poll_historical_materialize_handle(
+                    &ctx,
+                    &dispatcher,
+                    &state_store,
+                    &snapshot_path,
+                    startup_checkpoint_path.as_deref(),
+                    &mut historical_materialize_handle,
                 )
                 .await?;
 
@@ -1619,6 +1671,11 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                         "confirmed_repair_pending",
                     )
                     .await;
+                    abort_historical_materialize_handle(
+                        &mut historical_materialize_handle,
+                        "confirmed_repair_pending",
+                    )
+                    .await;
                     let repaired = maybe_execute_confirmed_repair_replay(
                         &ctx,
                         metrics.clone(),
@@ -1731,24 +1788,17 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                         handle.abort();
                         let _ = handle.await;
                     }
+                    abort_historical_materialize_handle(
+                        &mut historical_materialize_handle,
+                        "live_catchup_enter",
+                    )
+                    .await;
                     snapshot_fanout_started = false;
                     live_publish_state = LivePublishState::MutedCatchup;
-                    live_catchup_cutover_stability.reset();
                 }
-
-                if matches!(live_publish_state, LivePublishState::MutedCatchup) && cutover_ready {
-                    live_catchup_cutover_stability
-                        .observe_confirmed_minute(latest_confirmed_closed);
-                } else {
-                    live_catchup_cutover_stability.reset();
-                }
-
-                let cutover_stable_enough = live_catchup_cutover_stability.stable_enough(
-                    configured_live_catchup_resume_stable_minutes(ctx.config.as_ref()),
-                );
 
                 if matches!(live_publish_state, LivePublishState::MutedCatchup)
-                    && cutover_stable_enough
+                    && cutover_ready
                     && repair_pipeline_idle
                 {
                     if maybe_execute_live_catchup_cutover(
@@ -1778,20 +1828,22 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                     .is_some()
                     {
                         live_publish_state = LivePublishState::Publishing;
-                        live_catchup_cutover_stability.reset();
                     }
                 }
 
                 if last_logged_live_publish_state != Some(live_publish_state) {
+                    let historical_materialization_range = {
+                        let state_store = state_store.lock().await;
+                        state_store.pending_historical_materialization_range()
+                    };
                     info!(
                         state = ?live_publish_state,
                         dispatch_mode = ?live_publish_state.dispatch_mode(),
                         backlog_minutes = live_backlog_minutes(next_minute, latest_confirmed_closed),
                         enter_lag_threshold_minutes = configured_live_catchup_enter_lag_minutes(ctx.config.as_ref()),
                         resume_lag_threshold_minutes = configured_live_catchup_resume_lag_minutes(ctx.config.as_ref()),
-                        resume_stable_minutes = configured_live_catchup_resume_stable_minutes(ctx.config.as_ref()),
-                        observed_stable_minutes = live_catchup_cutover_stability.observed_minutes(),
                         cutover_tail_minutes = configured_live_catchup_cutover_tail_minutes(ctx.config.as_ref()),
+                        historical_materialization_range = ?historical_materialization_range,
                         next_minute = ?next_minute,
                         latest_confirmed_closed = %latest_confirmed_closed,
                         "indicator live output state changed"
@@ -1799,7 +1851,10 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                     last_logged_live_publish_state = Some(live_publish_state);
                 }
 
-                if live_publish_state.publishing_enabled() && !snapshot_fanout_started {
+                if live_publish_state.publishing_enabled()
+                    && startup_cutover_completed
+                    && !snapshot_fanout_started
+                {
                     let persisted_ts = ts_from_millis(metrics.snapshot().last_persisted_ts_ms);
                     let fanout_reference_ts = ready_through_ts.or(Some(latest_confirmed_closed));
                     if snapshot_fanout_start_ready(persisted_ts, fanout_reference_ts) {
@@ -1888,6 +1943,23 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                         )?;
                     }
                 }
+                maybe_spawn_historical_materialization_batch(
+                    &ctx,
+                    metrics.clone(),
+                    dispatcher.clone(),
+                    &state_store,
+                    &runtime_options,
+                    &live_prepare_minute_pending,
+                    &live_ready_job_pending,
+                    &dirty_ready_job_pending,
+                    &mut historical_materialize_handle,
+                    live_publish_state,
+                    startup_cutover_completed,
+                    next_minute,
+                    latest_confirmed_closed,
+                    oi_ratio_patch_task.is_none(),
+                )
+                .await?;
             }
         }
     }
@@ -1918,6 +1990,11 @@ pub async fn run(ctx: AppContext) -> Result<()> {
             MaterializeWorkerKind::DirtyRecompute,
         )
         .await;
+        if let Some(handle) = historical_materialize_handle.take() {
+            handle.abort();
+            let _ = handle.await;
+        }
+        relay_handle.abort();
         outbox_handle.abort();
         if let Some(handle) = snapshot_fanout_handle.take() {
             handle.abort();
@@ -2002,6 +2079,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
             handle.abort();
             let _ = handle.await;
         }
+        relay_handle.abort();
         outbox_handle.abort();
         if let Some(handle) = snapshot_fanout_handle.take() {
             handle.abort();
@@ -2036,6 +2114,11 @@ pub async fn run(ctx: AppContext) -> Result<()> {
         handle.abort();
         let _ = handle.await;
     }
+    if let Some(handle) = historical_materialize_handle.take() {
+        handle.abort();
+        let _ = handle.await;
+    }
+    relay_handle.abort();
     outbox_handle.abort();
     if let Some(handle) = snapshot_fanout_handle.take() {
         handle.abort();
@@ -3320,20 +3403,23 @@ async fn ensure_cached_kline_supplement_rows(
     symbol: &str,
     request: KlineSupplementRequest,
 ) -> Vec<KlineHistoryBar> {
-    let cached = {
+    let (cached, effective_limit, history_exhausted) = {
         let guard = cache.kline.read().await;
         guard
             .get(&request.key)
-            .map(|rows| {
-                select_recent_kline_supplement_rows(
-                    rows,
+            .map(|entry| {
+                let effective_limit =
+                    entry.effective_limit(request.older_than_open_time, request.limit);
+                let selected = select_recent_kline_supplement_rows(
+                    &entry.rows,
                     request.older_than_open_time,
-                    request.limit,
-                )
+                    effective_limit,
+                );
+                (selected, effective_limit, entry.history_exhausted)
             })
-            .unwrap_or_default()
+            .unwrap_or_else(|| (Vec::new(), request.limit, false))
     };
-    if cached.len() >= request.limit {
+    if effective_limit == 0 || cached.len() >= effective_limit || history_exhausted {
         return cached;
     }
 
@@ -3341,7 +3427,7 @@ async fn ensure_cached_kline_supplement_rows(
         .first()
         .map(|row| row.open_time)
         .unwrap_or(request.older_than_open_time);
-    let missing = request.limit.saturating_sub(cached.len());
+    let missing = effective_limit.saturating_sub(cached.len());
     let fetched = match fetch_older_interval_bars(
         pool,
         symbol,
@@ -3367,15 +3453,30 @@ async fn ensure_cached_kline_supplement_rows(
         }
     };
 
+    let history_exhausted = fetched.len() < missing;
     let merged = {
         let mut guard = cache.kline.write().await;
-        let existing = guard.entry(request.key).or_default();
-        let merged = merge_kline_supplement_rows(existing, fetched);
-        *existing = merged.clone();
+        let entry = guard.entry(request.key).or_default();
+        let merged = merge_kline_supplement_rows(&entry.rows, fetched);
+        entry.rows = merged.clone();
+        if history_exhausted {
+            entry.history_exhausted = true;
+        }
         merged
     };
 
-    select_recent_kline_supplement_rows(&merged, request.older_than_open_time, request.limit)
+    let effective_limit = if history_exhausted {
+        request.limit.min(
+            merged
+                .iter()
+                .filter(|row| row.open_time < request.older_than_open_time)
+                .count(),
+        )
+    } else {
+        effective_limit
+    };
+
+    select_recent_kline_supplement_rows(&merged, request.older_than_open_time, effective_limit)
 }
 
 pub async fn load_kline_history_supplement(
@@ -4357,6 +4458,8 @@ fn maybe_warn_runtime_stall(
         dirty_recompute_end_ts = ?frontier_snapshot.dirty_recompute_end_ts,
         oi_ratio_patch_from_ts = ?frontier_snapshot.oi_ratio_patch_from_ts,
         oi_ratio_patch_end_ts = ?frontier_snapshot.oi_ratio_patch_end_ts,
+        historical_materialization_from_ts = ?frontier_snapshot.historical_materialization_from_ts,
+        historical_materialization_end_ts = ?frontier_snapshot.historical_materialization_end_ts,
         last_finalized_minute_ts = ?frontier_snapshot.last_finalized_minute_ts,
         effective_history_floor_ts = ?frontier_snapshot.effective_history_floor_ts,
         next_minute_present = next_minute_presence.minute_present,
@@ -4741,7 +4844,7 @@ async fn save_repair_completed_snapshot(
 
 async fn materialize_repair_range(
     ctx: &Arc<AppContext>,
-    metrics: Arc<AppMetrics>,
+    metrics: Option<Arc<AppMetrics>>,
     dispatcher: &Dispatcher,
     supplement_cache: &RuntimeHistorySupplementCache,
     state_store: &mut StateStore,
@@ -4775,14 +4878,16 @@ async fn materialize_repair_range(
         )
         .await?;
 
-        refresh_runtime_observability_metrics(
-            &metrics,
-            state_store,
-            Some(minute),
-            Some(to_ts_inclusive),
-            0,
-            0,
-        );
+        if let Some(metrics) = metrics.as_ref() {
+            refresh_runtime_observability_metrics(
+                metrics,
+                state_store,
+                Some(minute),
+                Some(to_ts_inclusive),
+                0,
+                0,
+            );
+        }
         while minute <= batch_end_ts {
             let window = state_store.finalize_minute(minute);
             let snapshots = process_window_bundle(
@@ -4794,9 +4899,11 @@ async fn materialize_repair_range(
                 mode,
             )
             .await?;
-            metrics.inc_exported_window();
-            if mode.persist_outputs() {
-                metrics.set_last_persisted_ts(Some(minute.timestamp_millis()));
+            if let Some(metrics) = metrics.as_ref() {
+                metrics.inc_exported_window();
+                if mode.persist_outputs() {
+                    metrics.set_last_persisted_ts(Some(minute.timestamp_millis()));
+                }
             }
             materialized_windows += 1;
             first_materialized_bucket.get_or_insert(minute);
@@ -4864,11 +4971,11 @@ async fn materialize_repair_range(
 async fn maybe_execute_live_catchup_cutover(
     ctx: &Arc<AppContext>,
     metrics: Arc<AppMetrics>,
-    dispatcher: &Dispatcher,
+    _dispatcher: &Dispatcher,
     supplement_cache: &RuntimeHistorySupplementCache,
     state_store: &Arc<Mutex<StateStore>>,
     scheduler: &mut WindowScheduler,
-    runtime_options: &IndicatorRuntimeOptions,
+    _runtime_options: &IndicatorRuntimeOptions,
     snapshot_path: &str,
     startup_checkpoint_path: Option<&str>,
     latest_confirmed_closed: DateTime<Utc>,
@@ -4959,38 +5066,38 @@ async fn maybe_execute_live_catchup_cutover(
         return Ok(None);
     };
 
-    dispatcher
-        .rewind_persisted_tail(
-            &ctx.config.indicator.symbol,
-            repair_start_ts,
-            &ctx.config.mq.exchanges.ind.name,
-        )
-        .await?;
-    let rewind_target_ts = repair_start_ts - ChronoDuration::minutes(1);
-    metrics.set_last_persisted_ts(Some(rewind_target_ts.timestamp_millis()));
-
     supplement_cache.clear().await;
-    let (materialized_windows, repair_snapshot) = {
+    let (rebuilt_minutes, pending_historical_range, repair_snapshot) = {
         let mut state_store = state_store.lock().await;
-        state_store.rewind_finalized_state_from(repair_start_ts);
+        if state_store
+            .last_finalized_minute()
+            .map(|last| repair_start_ts <= last)
+            .unwrap_or(false)
+        {
+            state_store.rewind_finalized_state_from(repair_start_ts);
+        }
         state_store.clear_dirty_recompute_state();
         state_store.clear_oi_ratio_patch_state();
-        let materialized_windows = materialize_repair_range(
+        let rebuilt_minutes = rebuild_repair_state_range(
             ctx,
-            metrics.clone(),
-            dispatcher,
-            supplement_cache,
             &mut state_store,
-            runtime_options,
             repair_start_ts,
             repair_ready_through_ts,
-            DispatchMode::CutoverReplay,
-            "live catchup cutover materialization",
+            "live catchup state cutover",
         )
         .await?;
+        if state_store.has_pending_deferred_derived_indicator_refresh() {
+            state_store.rebuild_deferred_derived_indicator_state();
+        }
         state_store.clear_dirty_recompute_state();
         state_store.clear_oi_ratio_patch_state();
-        (materialized_windows, state_store.extract_snapshot())
+        state_store
+            .mark_historical_materialization_pending(repair_start_ts, repair_ready_through_ts);
+        (
+            rebuilt_minutes,
+            state_store.pending_historical_materialization_range(),
+            state_store.extract_snapshot(),
+        )
     };
 
     save_repair_completed_snapshot(
@@ -4999,13 +5106,9 @@ async fn maybe_execute_live_catchup_cutover(
         startup_checkpoint_path,
         repair_start_ts,
         repair_ready_through_ts,
-        "live_catchup_cutover",
+        "live_catchup_state_cutover",
     )
     .await?;
-    dispatcher
-        .set_snapshot_fanout_progress(&ctx.config.indicator.symbol, repair_ready_through_ts)
-        .await?;
-    metrics.set_last_persisted_ts(Some(repair_ready_through_ts.timestamp_millis()));
 
     info!(
         repair_start_ts = %repair_start_ts,
@@ -5017,8 +5120,9 @@ async fn maybe_execute_live_catchup_cutover(
         canonical_ingested_rows = canonical_stats.ingested_rows,
         canonical_changed_rows = canonical_stats.changed_rows,
         canonical_changed_minutes = canonical_stats.changed_minute_count(),
-        materialized_windows = materialized_windows,
-        "live catch-up cutover completed; live publish can resume from canonicalized tail"
+        rebuilt_minutes = rebuilt_minutes,
+        historical_materialization_range = ?pending_historical_range,
+        "live catch-up cutover completed; live publish can resume after state-only tail repair"
     );
     Ok(Some(repair_ready_through_ts))
 }
@@ -5093,7 +5197,7 @@ async fn maybe_execute_confirmed_repair_replay(
         )
         .await?;
 
-    let (rebuilt_minutes, repair_snapshot) = {
+    let (rebuilt_minutes, pending_historical_range, repair_snapshot) = {
         let mut state_store = state_store.lock().await;
         state_store.rewind_finalized_state_from(repair_start_ts);
         state_store.clear_dirty_recompute_state();
@@ -5108,7 +5212,13 @@ async fn maybe_execute_confirmed_repair_replay(
         .await?;
         state_store.clear_dirty_recompute_state();
         state_store.clear_oi_ratio_patch_state();
-        (rebuilt_minutes, state_store.extract_snapshot())
+        state_store
+            .mark_historical_materialization_pending(repair_start_ts, repair_ready_through_ts);
+        (
+            rebuilt_minutes,
+            state_store.pending_historical_materialization_range(),
+            state_store.extract_snapshot(),
+        )
     };
 
     save_repair_completed_snapshot(
@@ -5127,6 +5237,7 @@ async fn maybe_execute_confirmed_repair_replay(
         repair_ready_through_ts = %repair_ready_through_ts,
         latest_confirmed_closed = %latest_confirmed_closed,
         rebuilt_minutes = rebuilt_minutes,
+        historical_materialization_range = ?pending_historical_range,
         "confirmed late canonical correction repaired via state-only rebuild"
     );
     Ok(true)
@@ -6121,6 +6232,212 @@ async fn drain_materialize_handle(
     }
 }
 
+fn build_shadow_state_store_from_snapshot(
+    ctx: &Arc<AppContext>,
+    runtime_options: &IndicatorRuntimeOptions,
+    snapshot: StateSnapshot,
+) -> StateStore {
+    let mut state_store = StateStore::new(
+        ctx.config.indicator.symbol.to_uppercase(),
+        ctx.config.indicator.whale_threshold_usdt,
+    );
+    state_store.set_divergence_runtime_options(
+        runtime_options.divergence_sig_test_mode,
+        runtime_options.divergence_bootstrap_b,
+        runtime_options.divergence_bootstrap_block_len,
+        runtime_options.divergence_p_value_threshold,
+    );
+    state_store
+        .set_incremental_runtime_options(build_incremental_indicator_config(runtime_options));
+    state_store.restore_from_snapshot(snapshot);
+    state_store
+}
+
+async fn run_historical_materialization_batch(
+    ctx: Arc<AppContext>,
+    dispatcher: Arc<Dispatcher>,
+    runtime_options: IndicatorRuntimeOptions,
+    snapshot: StateSnapshot,
+    from_ts: DateTime<Utc>,
+    to_ts: DateTime<Utc>,
+) -> Result<HistoricalMaterializationBatchResult> {
+    let mut shadow_store = build_shadow_state_store_from_snapshot(&ctx, &runtime_options, snapshot);
+    if shadow_store
+        .last_finalized_minute()
+        .map(|last| from_ts <= last)
+        .unwrap_or(false)
+    {
+        shadow_store.rewind_finalized_state_from(from_ts);
+    }
+    shadow_store.clear_dirty_recompute_state();
+    shadow_store.clear_oi_ratio_patch_state();
+    let local_supplement_cache = RuntimeHistorySupplementCache::default();
+    dispatcher
+        .clear_persisted_range_for_repair(
+            &ctx.config.indicator.symbol,
+            from_ts,
+            to_ts,
+            &ctx.config.mq.exchanges.ind.name,
+        )
+        .await?;
+    let materialized_windows = materialize_repair_range(
+        &ctx,
+        None,
+        dispatcher.as_ref(),
+        &local_supplement_cache,
+        &mut shadow_store,
+        &runtime_options,
+        from_ts,
+        to_ts,
+        DispatchMode::CutoverReplay,
+        "async historical materialization",
+    )
+    .await?;
+    Ok(HistoricalMaterializationBatchResult {
+        from_ts,
+        to_ts,
+        materialized_windows,
+    })
+}
+
+async fn poll_historical_materialize_handle(
+    ctx: &Arc<AppContext>,
+    dispatcher: &Arc<Dispatcher>,
+    state_store: &Arc<Mutex<StateStore>>,
+    snapshot_path: &str,
+    startup_checkpoint_path: Option<&str>,
+    handle_slot: &mut Option<JoinHandle<Result<HistoricalMaterializationBatchResult>>>,
+) -> Result<()> {
+    if !handle_slot
+        .as_ref()
+        .map(|handle| handle.is_finished())
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
+
+    let handle = handle_slot
+        .take()
+        .expect("finished historical materialization handle must exist");
+    let result = match handle.await {
+        Ok(Ok(result)) => result,
+        Ok(Err(err)) => {
+            return Err(err).context("async historical materialization batch failed");
+        }
+        Err(err) => {
+            return Err(err).context("async historical materialization batch join failed");
+        }
+    };
+
+    dispatcher
+        .mark_snapshot_fanout_repair_pending(
+            &ctx.config.indicator.symbol,
+            result.from_ts,
+            result.to_ts,
+        )
+        .await?;
+
+    let (remaining_range, completed_snapshot) = {
+        let mut state_store = state_store.lock().await;
+        state_store.advance_historical_materialization_through(result.to_ts);
+        let remaining_range = state_store.pending_historical_materialization_range();
+        let completed_snapshot = if remaining_range.is_none() {
+            Some(state_store.extract_snapshot())
+        } else {
+            None
+        };
+        (remaining_range, completed_snapshot)
+    };
+
+    if let Some(snapshot) = completed_snapshot {
+        save_repair_completed_snapshot(
+            &snapshot,
+            snapshot_path,
+            startup_checkpoint_path,
+            result.from_ts,
+            result.to_ts,
+            "async_historical_materialization_complete",
+        )
+        .await?;
+    }
+
+    info!(
+        from_ts = %result.from_ts,
+        to_ts = %result.to_ts,
+        materialized_windows = result.materialized_windows,
+        remaining_range = ?remaining_range,
+        symbol = %ctx.config.indicator.symbol,
+        "async historical indicator materialization batch completed"
+    );
+
+    Ok(())
+}
+
+async fn maybe_spawn_historical_materialization_batch(
+    ctx: &Arc<AppContext>,
+    metrics: Arc<AppMetrics>,
+    dispatcher: Arc<Dispatcher>,
+    state_store: &Arc<Mutex<StateStore>>,
+    runtime_options: &IndicatorRuntimeOptions,
+    live_prepare_minute_pending: &Arc<AtomicUsize>,
+    live_ready_job_pending: &Arc<AtomicUsize>,
+    dirty_ready_job_pending: &Arc<AtomicUsize>,
+    handle_slot: &mut Option<JoinHandle<Result<HistoricalMaterializationBatchResult>>>,
+    live_publish_state: LivePublishState,
+    startup_cutover_completed: bool,
+    next_minute: Option<DateTime<Utc>>,
+    latest_confirmed_closed: DateTime<Utc>,
+    oi_ratio_patch_idle: bool,
+) -> Result<()> {
+    if handle_slot.is_some()
+        || !live_publish_state.publishing_enabled()
+        || !startup_cutover_completed
+        || !oi_ratio_patch_idle
+        || !confirmed_repair_pipeline_idle(
+            live_prepare_minute_pending,
+            live_ready_job_pending,
+            dirty_ready_job_pending,
+        )
+        || live_backlog_minutes(next_minute, latest_confirmed_closed)
+            > configured_live_catchup_resume_lag_minutes(ctx.config.as_ref())
+    {
+        return Ok(());
+    }
+
+    let batch = {
+        let state_store = state_store.lock().await;
+        if state_store.has_pending_dirty_recompute() || state_store.has_pending_oi_ratio_patch() {
+            return Ok(());
+        }
+        state_store
+            .pending_historical_materialization_batch_range(ASYNC_HISTORICAL_MATERIALIZE_BATCH_SIZE)
+            .map(|range| (range, state_store.extract_snapshot()))
+    };
+    let Some(((from_ts, to_ts), snapshot)) = batch else {
+        return Ok(());
+    };
+
+    info!(
+        from_ts = %from_ts,
+        to_ts = %to_ts,
+        batch_minutes = (to_ts - from_ts).num_minutes().max(0) + 1,
+        symbol = %ctx.config.indicator.symbol,
+        persisted_frontier_ts = ?ts_from_millis(metrics.snapshot().last_persisted_ts_ms),
+        "scheduling async historical indicator materialization batch"
+    );
+
+    *handle_slot = Some(tokio::spawn(run_historical_materialization_batch(
+        ctx.clone(),
+        dispatcher,
+        runtime_options.clone(),
+        snapshot,
+        from_ts,
+        to_ts,
+    )));
+
+    Ok(())
+}
+
 async fn enqueue_live_ready_jobs(
     ctx: &Arc<AppContext>,
     metrics: Arc<AppMetrics>,
@@ -6167,25 +6484,46 @@ async fn enqueue_live_ready_jobs(
     }
 
     if !ready_minutes.is_empty() {
-        let enqueued = try_enqueue_prepare_minute_task(
-            live_prepare_task_tx,
-            live_prepare_minute_pending,
-            PrepareMinuteTask {
-                minutes: ready_minutes.clone(),
-                mode: dispatch_mode,
-                enqueued_at: Instant::now(),
-            },
-        )?;
-        if !enqueued {
-            return Ok(());
-        }
-        for minute in ready_minutes {
-            scheduler.mark_emitted_through(minute);
-            live_windows_enqueued += 1;
-            if first_bucket.is_none() {
-                first_bucket = Some(minute);
+        if matches!(dispatch_mode, DispatchMode::LiveCatchup) {
+            let mut state_store = state_store.lock().await;
+            let first_ready = ready_minutes.first().copied();
+            let last_ready = ready_minutes.last().copied();
+            for (idx, minute) in ready_minutes.into_iter().enumerate() {
+                state_store.advance_finalized_state_without_derived_refresh(minute);
+                scheduler.mark_emitted_through(minute);
+                live_windows_enqueued += 1;
+                if first_bucket.is_none() {
+                    first_bucket = Some(minute);
+                }
+                last_bucket = Some(minute);
+                if (idx + 1) % STARTUP_BACKFILL_YIELD_EVERY_MINUTES == 0 {
+                    tokio::task::yield_now().await;
+                }
             }
-            last_bucket = Some(minute);
+            if let (Some(first_ready), Some(last_ready)) = (first_ready, last_ready) {
+                state_store.mark_historical_materialization_pending(first_ready, last_ready);
+            }
+        } else {
+            let enqueued = try_enqueue_prepare_minute_task(
+                live_prepare_task_tx,
+                live_prepare_minute_pending,
+                PrepareMinuteTask {
+                    minutes: ready_minutes.clone(),
+                    mode: dispatch_mode,
+                    enqueued_at: Instant::now(),
+                },
+            )?;
+            if !enqueued {
+                return Ok(());
+            }
+            for minute in ready_minutes {
+                scheduler.mark_emitted_through(minute);
+                live_windows_enqueued += 1;
+                if first_bucket.is_none() {
+                    first_bucket = Some(minute);
+                }
+                last_bucket = Some(minute);
+            }
         }
     }
 
@@ -6920,25 +7258,6 @@ async fn run_startup_backfill(
             "startup backfill replay ingest window complete"
         );
         window_from_ts = window_to_ts;
-        {
-            let mut progress = startup_backfill_progress.lock().await;
-            progress.record(
-                from_ts,
-                to_ts,
-                Some(window_from_ts),
-                snapshot_was_loaded,
-                persisted_frontier_ts,
-            );
-            if let (Some(path), Some(checkpoint)) = (
-                startup_checkpoint_path,
-                progress
-                    .to_checkpoint(&ctx.config.indicator.symbol, state_store.extract_snapshot()),
-            ) {
-                save_startup_backfill_checkpoint(&checkpoint, path)
-                    .await
-                    .with_context(|| format!("save startup backfill checkpoint path={path}"))?;
-            }
-        }
     }
     {
         let mut progress = startup_backfill_progress.lock().await;
@@ -7051,9 +7370,10 @@ async fn run_startup_backfill(
         floor_timestamp_to_interval_minutes(repair_start_ts, OPTIONS_SURFACE_BUCKET_MINUTES);
     let options_replay_to_ts_exclusive = replay_end_ts + ChronoDuration::minutes(1);
 
-    if persisted_frontier_ts
-        .map(|frontier| repair_start_ts <= frontier)
-        .unwrap_or(false)
+    if !startup_state_only_recovery
+        && persisted_frontier_ts
+            .map(|frontier| repair_start_ts <= frontier)
+            .unwrap_or(false)
     {
         let rewind_target_ts = repair_start_ts - ChronoDuration::minutes(1);
         dispatcher
@@ -7172,6 +7492,9 @@ async fn run_startup_backfill(
                 minute += ChronoDuration::minutes(1);
             }
             state_store.rebuild_deferred_derived_indicator_state();
+        }
+        if replay_start_ts <= replay_end_ts {
+            state_store.mark_historical_materialization_pending(replay_start_ts, replay_end_ts);
         }
         refresh_runtime_observability_metrics(
             &metrics,
@@ -9177,33 +9500,32 @@ mod tests {
         allow_live_tail_reconcile, allow_oi_ratio_patch_processing, build_backfill_sql,
         build_paged_backfill_sql, build_paged_backfill_sql_internal,
         configured_live_catchup_enter_lag_minutes, configured_live_catchup_resume_lag_minutes,
-        configured_live_catchup_resume_stable_minutes, confirmed_repair_pipeline_idle,
-        effective_live_commit_frontier_ts, expand_startup_backfill_to_minimum_recovery_window,
-        find_long_null_price_run, handle_ingest_event,
-        hydrate_futures_orderbook_heatmaps_for_range_with_fetch, live_catchup_cutover_ready,
-        live_catchup_requested, live_tail_reconcile_start_ts,
+        confirmed_repair_pipeline_idle, effective_live_commit_frontier_ts,
+        expand_startup_backfill_to_minimum_recovery_window, find_long_null_price_run,
+        handle_ingest_event, hydrate_futures_orderbook_heatmaps_for_range_with_fetch,
+        live_catchup_cutover_ready, live_catchup_requested, live_tail_reconcile_start_ts,
         minimum_live_catchup_cutover_tail_minutes, minimum_startup_recovery_history_floor,
         minute_exclusive_upper_bound, minute_history_is_strictly_contiguous,
         replay_heatmap_hydration_batch_end, replay_row_after_cursor,
         required_snapshot_history_start_ts, save_startup_backfill_checkpoint, save_state_snapshot,
-        shutdown_ready_through_candidate, snapshot_has_required_history,
-        snapshot_has_reusable_finalized_history_for_fast_restart,
+        select_recent_kline_supplement_rows, shutdown_ready_through_candidate,
+        snapshot_has_required_history, snapshot_has_reusable_finalized_history_for_fast_restart,
         snapshot_is_reusable_recovery_seed, snapshot_null_price_run_reaches_recent_tail,
         startup_backfill_checkpoint_path, startup_checkpoint_canonical_replay_start_ts,
         startup_state_only_recovery_can_skip_warm_history, try_load_startup_backfill_checkpoint,
         try_load_state_snapshot, BackfillCursor, ConfirmedLateRepairController,
-        LiveCanonicalRepairController, LiveCatchupCutoverStabilityTracker, ReplayRow,
-        SnapshotLoadOutcome, StartupBackfillCheckpoint, StartupBackfillProgress,
-        FUNDING_BACKFILL_WINDOW_SQL, LIQ_BACKFILL_WINDOW_SQL,
-        LIVE_CANONICAL_TAIL_RECONCILE_LOOKBACK_MINUTES, MIN_RESTART_RECOVERY_HISTORY_MINUTES,
-        MIN_REUSABLE_FINALIZED_HISTORY_MINUTES, ORDERBOOK_BACKFILL_WINDOW_SQL_SCALAR,
-        ORDERBOOK_BACKFILL_WINDOW_SQL_WITH_HEATMAP, STARTUP_BACKFILL_CHECKPOINT_VERSION,
-        TRADE_BACKFILL_WINDOW_SQL,
+        KlineSupplementCacheEntry, LiveCanonicalRepairController, ReplayRow, SnapshotLoadOutcome,
+        StartupBackfillCheckpoint, StartupBackfillProgress, FUNDING_BACKFILL_WINDOW_SQL,
+        LIQ_BACKFILL_WINDOW_SQL, LIVE_CANONICAL_TAIL_RECONCILE_LOOKBACK_MINUTES,
+        MIN_RESTART_RECOVERY_HISTORY_MINUTES, MIN_REUSABLE_FINALIZED_HISTORY_MINUTES,
+        ORDERBOOK_BACKFILL_WINDOW_SQL_SCALAR, ORDERBOOK_BACKFILL_WINDOW_SQL_WITH_HEATMAP,
+        STARTUP_BACKFILL_CHECKPOINT_VERSION, TRADE_BACKFILL_WINDOW_SQL,
     };
     use crate::app::bootstrap::{
         AppSection, DatabaseConfig, IndicatorConfig, MqConfig, MqExchangeConfig, MqExchanges,
         RootConfig,
     };
+    use crate::indicators::context::KlineHistoryBar;
     use crate::ingest::decoder::{
         AggFundingMark1mEvent, AggFundingPoint, AggHeatmapLevel, AggLiq1mEvent, AggLiqLevel,
         AggMarkPoint, AggOrderbook1mEvent, AggTrade1mEvent, AggVpinSnapshot, AggWhaleStats,
@@ -9248,6 +9570,12 @@ mod tests {
                 sslmode: None,
                 options: None,
                 pool: None,
+                md: None,
+                ops: None,
+                session_init_sql: Vec::new(),
+                statement_timeout_ms: None,
+                lock_timeout_ms: None,
+                idle_in_transaction_session_timeout_ms: None,
             },
             indicator: IndicatorConfig::default(),
             logging: Default::default(),
@@ -9345,6 +9673,22 @@ mod tests {
             event_ts,
             published_at: event_ts,
             data,
+        }
+    }
+
+    fn kline_bar(open_time: chrono::DateTime<Utc>) -> KlineHistoryBar {
+        KlineHistoryBar {
+            open_time,
+            close_time: open_time + ChronoDuration::days(1),
+            open: Some(100.0),
+            high: Some(110.0),
+            low: Some(90.0),
+            close: Some(105.0),
+            volume_base: 1.0,
+            volume_quote: 100.0,
+            is_closed: true,
+            minutes_covered: 1440,
+            expected_minutes: 1440,
         }
     }
 
@@ -9574,6 +9918,8 @@ mod tests {
             option_mark_greeks_5m_buckets: Vec::new(),
             options_surface_5m: Vec::new(),
             canonical_minutes: Vec::new(),
+            historical_materialization_from_ts: None,
+            historical_materialization_end_ts: None,
         }
     }
 
@@ -9813,16 +10159,6 @@ mod tests {
     }
 
     #[test]
-    fn live_catchup_resume_stable_minutes_has_minimum_of_one() {
-        let mut config = test_root_config();
-        config.indicator.live_catchup_resume_stable_minutes = 0;
-        assert_eq!(configured_live_catchup_resume_stable_minutes(&config), 1);
-
-        config.indicator.live_catchup_resume_stable_minutes = 5;
-        assert_eq!(configured_live_catchup_resume_stable_minutes(&config), 5);
-    }
-
-    #[test]
     fn live_catchup_requested_uses_high_watermark_threshold() {
         let mut config = test_root_config();
         config.indicator.live_catchup_progress_only_enabled = true;
@@ -9892,23 +10228,51 @@ mod tests {
     }
 
     #[test]
-    fn live_catchup_cutover_stability_tracks_consecutive_confirmed_minutes() {
-        let mut tracker = LiveCatchupCutoverStabilityTracker::default();
-        let m1 = Utc.with_ymd_and_hms(2026, 4, 9, 8, 20, 0).single().unwrap();
-        let m2 = Utc.with_ymd_and_hms(2026, 4, 9, 8, 21, 0).single().unwrap();
-        let m4 = Utc.with_ymd_and_hms(2026, 4, 9, 8, 23, 0).single().unwrap();
+    fn exhausted_kline_supplement_cache_caps_limit_to_available_history() {
+        let older_than_open_time = Utc.with_ymd_and_hms(2026, 4, 3, 0, 0, 0).single().unwrap();
+        let mut entry = KlineSupplementCacheEntry::default();
+        entry.history_exhausted = true;
+        entry.rows = (0..32)
+            .map(|offset| {
+                kline_bar(
+                    Utc.with_ymd_and_hms(2026, 3, 2, 0, 0, 0).single().unwrap()
+                        + ChronoDuration::days(offset),
+                )
+            })
+            .collect();
 
-        tracker.observe_confirmed_minute(m1);
-        tracker.observe_confirmed_minute(m1);
-        assert_eq!(tracker.observed_minutes(), 1);
+        assert_eq!(entry.effective_limit(older_than_open_time, 7_672), 32);
+        let selected = select_recent_kline_supplement_rows(
+            &entry.rows,
+            older_than_open_time,
+            entry.effective_limit(older_than_open_time, 7_672),
+        );
+        assert_eq!(selected.len(), 32);
+    }
 
-        tracker.observe_confirmed_minute(m2);
-        assert_eq!(tracker.observed_minutes(), 2);
+    #[test]
+    fn exhausted_kline_supplement_cache_caps_limit_per_request_cutoff() {
+        let older_than_open_time = Utc.with_ymd_and_hms(2026, 3, 4, 0, 0, 0).single().unwrap();
+        let mut entry = KlineSupplementCacheEntry::default();
+        entry.history_exhausted = true;
+        entry.rows = vec![
+            kline_bar(Utc.with_ymd_and_hms(2026, 3, 1, 0, 0, 0).single().unwrap()),
+            kline_bar(Utc.with_ymd_and_hms(2026, 3, 2, 0, 0, 0).single().unwrap()),
+            kline_bar(Utc.with_ymd_and_hms(2026, 3, 3, 0, 0, 0).single().unwrap()),
+            kline_bar(Utc.with_ymd_and_hms(2026, 3, 4, 0, 0, 0).single().unwrap()),
+        ];
 
-        tracker.observe_confirmed_minute(m4);
-        assert_eq!(tracker.observed_minutes(), 1);
-        assert!(tracker.stable_enough(1));
-        assert!(!tracker.stable_enough(2));
+        assert_eq!(entry.effective_limit(older_than_open_time, 100), 3);
+        let selected = select_recent_kline_supplement_rows(
+            &entry.rows,
+            older_than_open_time,
+            entry.effective_limit(older_than_open_time, 100),
+        );
+        assert_eq!(selected.len(), 3);
+        assert_eq!(
+            selected.last().map(|row| row.open_time),
+            Some(Utc.with_ymd_and_hms(2026, 3, 3, 0, 0, 0).single().unwrap())
+        );
     }
 
     #[test]
@@ -10197,7 +10561,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_required_history_accepts_reusable_rolling_7d_window() {
+    fn snapshot_required_history_accepts_reusable_rolling_30d_window() {
         let last_finalized_ts = Utc.with_ymd_and_hms(2026, 3, 21, 3, 0, 0).single().unwrap();
         let effective_floor_ts = last_finalized_ts - ChronoDuration::minutes(90);
         let required_minutes = MIN_REUSABLE_FINALIZED_HISTORY_MINUTES - 1;
@@ -10239,7 +10603,7 @@ mod tests {
     #[test]
     fn snapshot_required_history_accepts_effective_floor_older_than_reusable_minimum() {
         let last_finalized_ts = Utc.with_ymd_and_hms(2026, 3, 21, 3, 0, 0).single().unwrap();
-        let effective_floor_ts = last_finalized_ts - ChronoDuration::minutes(10 * 24 * 60);
+        let effective_floor_ts = last_finalized_ts - ChronoDuration::minutes(31 * 24 * 60);
         let required_minutes = (last_finalized_ts - effective_floor_ts).num_minutes();
         let history = (0..=required_minutes)
             .map(|offset| {

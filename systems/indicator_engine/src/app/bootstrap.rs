@@ -55,6 +55,18 @@ pub struct DatabaseConfig {
     pub sslmode: Option<String>,
     pub options: Option<String>,
     pub pool: Option<DbPoolConfig>,
+    #[serde(default)]
+    pub md: Option<DatabaseEndpointOverride>,
+    #[serde(default)]
+    pub ops: Option<DatabaseEndpointOverride>,
+    #[serde(default)]
+    pub session_init_sql: Vec<String>,
+    #[serde(default)]
+    pub statement_timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub lock_timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub idle_in_transaction_session_timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -65,6 +77,20 @@ pub struct DbPoolConfig {
     pub idle_timeout_secs: Option<u64>,
     pub max_lifetime_secs: Option<u64>,
     pub test_before_acquire: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct DatabaseEndpointOverride {
+    pub host: Option<String>,
+    pub port: Option<u16>,
+    pub database: Option<String>,
+    pub user: Option<String>,
+    pub password_env: Option<String>,
+    pub connect_timeout_secs: Option<u64>,
+    pub application_name: Option<String>,
+    pub sslmode: Option<String>,
+    pub options: Option<String>,
+    pub pool: Option<DbPoolConfig>,
 }
 
 impl DatabaseConfig {
@@ -98,6 +124,57 @@ impl DatabaseConfig {
         }
 
         uri
+    }
+
+    pub fn main_endpoint(&self) -> Self {
+        self.with_override(None)
+    }
+
+    pub fn ops_endpoint(&self) -> Self {
+        self.with_override(self.ops.as_ref())
+    }
+
+    fn with_override(&self, override_cfg: Option<&DatabaseEndpointOverride>) -> Self {
+        let mut merged = self.clone();
+        merged.md = None;
+        merged.ops = None;
+
+        let Some(override_cfg) = override_cfg else {
+            return merged;
+        };
+
+        if let Some(v) = &override_cfg.host {
+            merged.host = v.clone();
+        }
+        if let Some(v) = override_cfg.port {
+            merged.port = v;
+        }
+        if let Some(v) = &override_cfg.database {
+            merged.database = v.clone();
+        }
+        if let Some(v) = &override_cfg.user {
+            merged.user = v.clone();
+        }
+        if let Some(v) = &override_cfg.password_env {
+            merged.password_env = v.clone();
+        }
+        if let Some(v) = override_cfg.connect_timeout_secs {
+            merged.connect_timeout_secs = Some(v);
+        }
+        if let Some(v) = &override_cfg.application_name {
+            merged.application_name = Some(v.clone());
+        }
+        if let Some(v) = &override_cfg.sslmode {
+            merged.sslmode = Some(v.clone());
+        }
+        if let Some(v) = &override_cfg.options {
+            merged.options = Some(v.clone());
+        }
+        if let Some(v) = &override_cfg.pool {
+            merged.pool = Some(v.clone());
+        }
+
+        merged
     }
 }
 
@@ -247,9 +324,9 @@ pub struct IndicatorConfig {
     pub watermark_lateness_secs: i64,
     #[serde(default = "default_live_purge_on_start")]
     pub live_purge_on_start: bool,
-    /// Legacy name: when enabled, live mode mutes historical persistence/publish
-    /// while backlog is large, then performs an automatic cutover repair before
-    /// resuming live publish.
+    /// When enabled, large live backlog switches the runtime into state-only
+    /// catch-up: finalized state keeps advancing, but historical indicator
+    /// persistence is deferred to an async sidecar once live publish resumes.
     #[serde(default)]
     pub live_catchup_progress_only_enabled: bool,
     /// Enter muted catch-up whenever the next un-emitted minute lags the
@@ -260,12 +337,11 @@ pub struct IndicatorConfig {
     /// backlog shrinks to this lower-watermark lag.
     #[serde(default = "default_live_catchup_resume_lag_minutes")]
     pub live_catchup_resume_lag_minutes: i64,
-    /// Require the low-watermark catch-up conditions to remain stable for this
-    /// many consecutive confirmed minutes before triggering automatic cutover
-    /// replay.
+    /// Deprecated no-op retained for config compatibility. Live reopens as soon
+    /// as the catch-up state is correct and the live pipeline is safe to switch.
     #[serde(default = "default_live_catchup_resume_stable_minutes")]
     pub live_catchup_resume_stable_minutes: u64,
-    /// Canonical tail window to durable-rebuild during automatic live cutover.
+    /// Canonical tail window to state-rebuild during automatic live cutover.
     /// 0 means derive the minimum safe window from current repair/lookback rules.
     #[serde(default)]
     pub live_catchup_cutover_tail_minutes: i64,
@@ -836,6 +912,7 @@ fn default_slow_sql_threshold_ms() -> u64 {
 pub struct AppContext {
     pub config: Arc<RootConfig>,
     pub db_pool: PgPool,
+    pub ops_db_pool: PgPool,
     pub mq: Arc<AmqpConnectionManager>,
     pub indicator_queues: Vec<String>,
     pub producer_instance_id: String,
@@ -1001,6 +1078,7 @@ pub async fn bootstrap() -> Result<AppContext> {
     );
 
     let db_pool = build_db_pool(&config).await?;
+    let ops_db_pool = build_ops_db_pool(&config).await?;
 
     let mq = Arc::new(AmqpConnectionManager::connect(config.mq.amqp_uri()).await?);
 
@@ -1035,6 +1113,7 @@ pub async fn bootstrap() -> Result<AppContext> {
     Ok(AppContext {
         config,
         db_pool,
+        ops_db_pool,
         mq,
         indicator_queues,
         producer_instance_id,
@@ -1069,10 +1148,35 @@ fn collect_indicator_queue_configs(config: &RootConfig) -> Result<Vec<(String, M
 }
 
 pub async fn build_db_pool(config: &RootConfig) -> Result<PgPool> {
-    let connect_timeout = config.database.connect_timeout_secs.unwrap_or(10);
-    let uri = config.database.postgres_uri();
-    let pool_cfg = config.database.pool.as_ref();
-    let slow_sql_threshold_ms = config.logging.slow_sql_threshold_ms.max(1);
+    build_db_pool_from_database_config(&config.database.main_endpoint(), &config.logging)
+        .await
+        .context("build main db pool")
+}
+
+pub async fn build_ops_db_pool(config: &RootConfig) -> Result<PgPool> {
+    let mut ops_db = config.database.ops_endpoint();
+    let base_name = ops_db
+        .application_name
+        .clone()
+        .unwrap_or_else(|| "indicator_engine".to_string());
+    if ops_db.application_name.is_none()
+        || ops_db.application_name == config.database.application_name
+    {
+        ops_db.application_name = Some(format!("{base_name}_ops"));
+    }
+    build_db_pool_from_database_config(&ops_db, &config.logging)
+        .await
+        .context("build ops db pool")
+}
+
+async fn build_db_pool_from_database_config(
+    database: &DatabaseConfig,
+    logging: &LoggingConfig,
+) -> Result<PgPool> {
+    let connect_timeout = database.connect_timeout_secs.unwrap_or(10);
+    let uri = database.postgres_uri();
+    let pool_cfg = database.pool.as_ref();
+    let slow_sql_threshold_ms = logging.slow_sql_threshold_ms.max(1);
 
     let max_connections = pool_cfg.and_then(|p| p.max_connections).unwrap_or(20);
     let min_connections = pool_cfg.and_then(|p| p.min_connections).unwrap_or(2);
@@ -1096,12 +1200,26 @@ pub async fn build_db_pool(config: &RootConfig) -> Result<PgPool> {
         pool_options = pool_options.max_lifetime(Some(Duration::from_secs(v)));
     }
 
+    let session_statements = database_session_init_statements(database);
+    if !session_statements.is_empty() {
+        let session_statements = Arc::new(session_statements);
+        pool_options = pool_options.after_connect(move |conn, _meta| {
+            let session_statements = session_statements.clone();
+            Box::pin(async move {
+                for statement in session_statements.iter() {
+                    sqlx::query(statement).execute(&mut *conn).await?;
+                }
+                Ok(())
+            })
+        });
+    }
+
     let mut connect_options: PgConnectOptions = uri.parse().context("parse postgres uri")?;
     connect_options = connect_options.log_slow_statements(
         LevelFilter::Warn,
         Duration::from_millis(slow_sql_threshold_ms),
     );
-    connect_options = if config.logging.sql_log {
+    connect_options = if logging.sql_log {
         connect_options.log_statements(LevelFilter::Debug)
     } else {
         connect_options.log_statements(LevelFilter::Off)
@@ -1119,11 +1237,28 @@ pub async fn build_db_pool(config: &RootConfig) -> Result<PgPool> {
 
     info!(
         slow_sql_threshold_ms = slow_sql_threshold_ms,
-        sql_log = config.logging.sql_log,
+        sql_log = logging.sql_log,
         "indicator db sql logging policy applied"
     );
 
     Ok(pool)
+}
+
+fn database_session_init_statements(database: &DatabaseConfig) -> Vec<String> {
+    let mut statements = database.session_init_sql.clone();
+    if let Some(v) = database.statement_timeout_ms {
+        statements.push(format!("SET statement_timeout = '{}ms'", v));
+    }
+    if let Some(v) = database.lock_timeout_ms {
+        statements.push(format!("SET lock_timeout = '{}ms'", v));
+    }
+    if let Some(v) = database.idle_in_transaction_session_timeout_ms {
+        statements.push(format!(
+            "SET idle_in_transaction_session_timeout = '{}ms'",
+            v
+        ));
+    }
+    statements
 }
 
 async fn declare_topology(channel: &Channel, mq: &MqConfig) -> Result<()> {

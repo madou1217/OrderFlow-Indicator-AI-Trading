@@ -34,6 +34,7 @@ const OUTBOX_MAX_BATCHES_PER_WAKE: usize = 32;
 #[derive(Clone)]
 pub struct OutboxDispatcher {
     pool: PgPool,
+    main_pool: PgPool,
     mq: Arc<AmqpConnectionManager>,
     exchange_name: String,
     publisher: IndPublisher,
@@ -42,12 +43,14 @@ pub struct OutboxDispatcher {
 impl OutboxDispatcher {
     pub fn new(
         pool: PgPool,
+        main_pool: PgPool,
         mq: Arc<AmqpConnectionManager>,
         exchange_name: String,
         publisher: IndPublisher,
     ) -> Self {
         Self {
             pool,
+            main_pool,
             mq,
             exchange_name,
             publisher,
@@ -145,6 +148,14 @@ impl OutboxDispatcher {
         if row_count == 0 {
             return Ok(0);
         }
+        let (rows, stale_outbox_ids) = self.filter_live_intent_rows(rows).await?;
+        if !stale_outbox_ids.is_empty() {
+            self.delete_ops_rows_by_outbox_ids(&stale_outbox_ids)
+                .await?;
+        }
+        if rows.is_empty() {
+            return Ok(row_count);
+        }
         let mut sent_ids: Vec<i64> = Vec::with_capacity(rows.len());
         let channel = self
             .mq
@@ -202,9 +213,9 @@ impl OutboxDispatcher {
         }
         let publish_and_confirm_ms = publish_started_at.elapsed().as_millis();
 
-        let delete_started_at = Instant::now();
-        self.delete_sent_batch(&sent_ids).await?;
-        let delete_ms = delete_started_at.elapsed().as_millis();
+        let mark_sent_started_at = Instant::now();
+        self.mark_sent_batch(&sent_ids).await?;
+        let delete_ms = mark_sent_started_at.elapsed().as_millis();
         let total_ms = started_at.elapsed().as_millis();
         if claim_ms >= OUTBOX_CLAIM_WARN_MS || total_ms >= OUTBOX_DISPATCH_WARN_MS {
             warn!(
@@ -246,6 +257,7 @@ impl OutboxDispatcher {
             WHERE o.outbox_id = picked.outbox_id
             RETURNING
                 o.outbox_id,
+                o.source_intent_id,
                 o.exchange_name,
                 o.routing_key,
                 o.message_id,
@@ -268,20 +280,102 @@ impl OutboxDispatcher {
         })
     }
 
-    async fn delete_sent_batch(&self, outbox_ids: &[i64]) -> Result<()> {
+    async fn mark_sent_batch(&self, outbox_ids: &[i64]) -> Result<()> {
         if outbox_ids.is_empty() {
             return Ok(());
         }
 
         sqlx::query(
             r#"
-            WITH delivered AS (
+            UPDATE ops.indicator_bundle_outbox
+            SET status = 'sent',
+                available_at = now(),
+                error_text = NULL
+            WHERE outbox_id = ANY($1::BIGINT[])
+            "#,
+        )
+        .bind(outbox_ids)
+        .execute(&self.pool)
+        .await
+        .context("mark delivered indicator bundle outbox rows sent")?;
+        Ok(())
+    }
+
+    async fn filter_live_intent_rows(
+        &self,
+        rows: Vec<OutboxRow>,
+    ) -> Result<(Vec<OutboxRow>, Vec<i64>)> {
+        if rows.is_empty() {
+            return Ok((rows, Vec::new()));
+        }
+
+        let live_intent_ids = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT intent_id
+            FROM ops.indicator_bundle_intent
+            WHERE intent_id = ANY($1::BIGINT[])
+            "#,
+        )
+        .bind(
+            rows.iter()
+                .filter_map(|row| row.source_intent_id)
+                .collect::<Vec<_>>(),
+        )
+        .fetch_all(&self.main_pool)
+        .await
+        .context("load live durable intent ids for ops outbox batch")?
+        .into_iter()
+        .collect::<std::collections::HashSet<_>>();
+        let live_message_ids = sqlx::query_scalar::<_, uuid::Uuid>(
+            r#"
+            SELECT message_id
+            FROM ops.indicator_bundle_intent
+            WHERE message_id = ANY($1::UUID[])
+            "#,
+        )
+        .bind(
+            rows.iter()
+                .filter(|row| row.source_intent_id.is_none())
+                .map(|row| row.message_id)
+                .collect::<Vec<_>>(),
+        )
+        .fetch_all(&self.main_pool)
+        .await
+        .context("load live durable intent message ids for legacy ops outbox batch")?
+        .into_iter()
+        .collect::<std::collections::HashSet<_>>();
+
+        let mut live_rows = Vec::with_capacity(rows.len());
+        let mut stale_outbox_ids = Vec::new();
+        for row in rows {
+            let is_live = match row.source_intent_id {
+                Some(intent_id) => live_intent_ids.contains(&intent_id),
+                None => live_message_ids.contains(&row.message_id),
+            };
+            if is_live {
+                live_rows.push(row);
+            } else {
+                stale_outbox_ids.push(row.outbox_id);
+            }
+        }
+
+        Ok((live_rows, stale_outbox_ids))
+    }
+
+    async fn delete_ops_rows_by_outbox_ids(&self, outbox_ids: &[i64]) -> Result<()> {
+        if outbox_ids.is_empty() {
+            return Ok(());
+        }
+
+        sqlx::query(
+            r#"
+            WITH doomed AS (
                 DELETE FROM ops.indicator_bundle_outbox
                 WHERE outbox_id = ANY($1::BIGINT[])
                 RETURNING symbol, ts_bucket
             )
             DELETE FROM ops.indicator_bundle_payload_cache p
-            USING delivered d
+            USING doomed d
             WHERE p.symbol = d.symbol
               AND p.ts_bucket = d.ts_bucket
             "#,
@@ -289,7 +383,7 @@ impl OutboxDispatcher {
         .bind(outbox_ids)
         .execute(&self.pool)
         .await
-        .context("delete delivered indicator bundle outbox rows and payload cache")?;
+        .context("delete stale indicator bundle outbox rows and payload cache")?;
         Ok(())
     }
 
@@ -390,7 +484,7 @@ impl OutboxDispatcher {
         )
         .bind(symbol.to_uppercase())
         .bind(ts_bucket)
-        .fetch_all(&self.pool)
+        .fetch_all(&self.main_pool)
         .await
         .context("fetch snapshot rows for minute bundle rebuild")?;
 
@@ -398,7 +492,7 @@ impl OutboxDispatcher {
             .iter()
             .map(|row| row.payload_json.clone())
             .collect::<Vec<_>>();
-        hydrate_snapshot_payload_values(&self.pool, &mut payloads).await?;
+        hydrate_snapshot_payload_values(&self.main_pool, &mut payloads).await?;
         for (row, payload_json) in rows.iter_mut().zip(payloads.into_iter()) {
             row.payload_json = payload_json;
         }
@@ -492,6 +586,7 @@ pub async fn ensure_indicator_bundle_outbox_schema(pool: &PgPool) -> Result<()> 
         r#"
         CREATE TABLE IF NOT EXISTS ops.indicator_bundle_outbox (
             outbox_id BIGSERIAL PRIMARY KEY,
+            source_intent_id BIGINT,
             status TEXT NOT NULL DEFAULT 'pending',
             available_at TIMESTAMPTZ NOT NULL DEFAULT now(),
             retry_count INTEGER NOT NULL DEFAULT 0,
@@ -511,7 +606,7 @@ pub async fn ensure_indicator_bundle_outbox_schema(pool: &PgPool) -> Result<()> 
             CONSTRAINT indicator_bundle_outbox_schema_version_pos_chk
                 CHECK (schema_version > 0),
             CONSTRAINT indicator_bundle_outbox_status_chk
-                CHECK (status IN ('pending', 'sending', 'failed', 'dead'))
+                CHECK (status IN ('pending', 'sending', 'failed', 'dead', 'sent'))
         )
         "#,
     )
@@ -520,6 +615,7 @@ pub async fn ensure_indicator_bundle_outbox_schema(pool: &PgPool) -> Result<()> 
     .context("create ops.indicator_bundle_outbox")?;
 
     for ddl in [
+        "ALTER TABLE ops.indicator_bundle_outbox ADD COLUMN IF NOT EXISTS source_intent_id BIGINT",
         "ALTER TABLE ops.indicator_bundle_outbox ADD COLUMN IF NOT EXISTS symbol TEXT",
         "ALTER TABLE ops.indicator_bundle_outbox ADD COLUMN IF NOT EXISTS ts_bucket TIMESTAMPTZ",
         "ALTER TABLE ops.indicator_bundle_outbox ADD COLUMN IF NOT EXISTS indicator_count INTEGER",
@@ -546,7 +642,9 @@ pub async fn ensure_indicator_bundle_outbox_schema(pool: &PgPool) -> Result<()> 
         CREATE OR REPLACE FUNCTION ops.notify_indicator_bundle_outbox_ready()
         RETURNS trigger LANGUAGE plpgsql AS $$
         BEGIN
-            PERFORM pg_notify('indicator_bundle_outbox_ready', NEW.exchange_name);
+            IF TG_OP = 'INSERT' OR NEW.status = 'pending' THEN
+                PERFORM pg_notify('indicator_bundle_outbox_ready', NEW.exchange_name);
+            END IF;
             RETURN NEW;
         END;
         $$;
@@ -569,7 +667,7 @@ pub async fn ensure_indicator_bundle_outbox_schema(pool: &PgPool) -> Result<()> 
     sqlx::query(
         r#"
         CREATE TRIGGER trg_indicator_bundle_outbox_notify
-        AFTER INSERT ON ops.indicator_bundle_outbox
+        AFTER INSERT OR UPDATE ON ops.indicator_bundle_outbox
         FOR EACH ROW EXECUTE FUNCTION ops.notify_indicator_bundle_outbox_ready()
         "#,
     )
@@ -620,6 +718,7 @@ pub(crate) async fn publish_amqp_message(
 #[derive(Debug, Clone, FromRow)]
 struct OutboxRow {
     outbox_id: i64,
+    source_intent_id: Option<i64>,
     exchange_name: String,
     routing_key: String,
     message_id: uuid::Uuid,

@@ -464,6 +464,29 @@ impl Dispatcher {
             .await
     }
 
+    pub async fn clear_persisted_range_for_repair(
+        &self,
+        symbol: &str,
+        repair_start_ts: chrono::DateTime<chrono::Utc>,
+        repair_end_ts: chrono::DateTime<chrono::Utc>,
+        exchange_name: &str,
+    ) -> Result<()> {
+        self.snapshot_writer
+            .clear_persisted_range_for_repair(symbol, repair_start_ts, repair_end_ts, exchange_name)
+            .await
+    }
+
+    pub async fn mark_snapshot_fanout_repair_pending(
+        &self,
+        symbol: &str,
+        repair_start_ts: chrono::DateTime<chrono::Utc>,
+        repair_end_ts: chrono::DateTime<chrono::Utc>,
+    ) -> Result<()> {
+        self.snapshot_writer
+            .mark_snapshot_fanout_repair_pending(symbol, repair_start_ts, repair_end_ts)
+            .await
+    }
+
     pub async fn suppress_repair_bundle_publish_tail(
         &self,
         symbol: &str,

@@ -1,4 +1,5 @@
 use crate::indicators::context::IndicatorSnapshotRow;
+use crate::publish::durable_intent_relay::ensure_indicator_bundle_intent_schema;
 use crate::publish::ind_publisher::BundleOutboxMessage;
 use crate::runtime::state_store::floor_minute;
 use anyhow::{Context, Result};
@@ -47,6 +48,8 @@ impl SnapshotWriter {
     }
 
     pub async fn ensure_schema(&self) -> Result<()> {
+        ensure_indicator_bundle_intent_schema(&self.pool).await?;
+
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS feat.indicator_snapshot_blob (
@@ -192,6 +195,20 @@ impl SnapshotWriter {
         .await
         .context("create feat.v_indicator_snapshot_hydrated")?;
 
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS ops.indicator_snapshot_fanout_repair_progress (
+                symbol TEXT PRIMARY KEY,
+                next_snapshot_ts TIMESTAMPTZ NOT NULL,
+                repair_end_snapshot_ts TIMESTAMPTZ NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("create ops.indicator_snapshot_fanout_repair_progress")?;
+
         Ok(())
     }
 
@@ -327,10 +344,7 @@ impl SnapshotWriter {
             .context("begin indicator progress+outbox tx")?;
         let begin_ms = begin_started_at.elapsed().as_millis();
         let enqueue_started_at = Instant::now();
-        // Live minute bundles remain reconstructible from feat.indicator_snapshot,
-        // so we can skip the extra payload-cache blob write on the hot path and
-        // let the outbox dispatcher rebuild on cache miss.
-        enqueue_outbox_batch_in_tx(&mut tx, messages, false).await?;
+        enqueue_intent_batch_in_tx(&mut tx, messages).await?;
         let enqueue_ms = enqueue_started_at.elapsed().as_millis();
         let progress_started_at = Instant::now();
         upsert_indicator_progress(&mut tx, symbol, ts_bucket).await?;
@@ -365,11 +379,11 @@ impl SnapshotWriter {
             .pool
             .begin()
             .await
-            .context("begin indicator repair outbox tx")?;
-        enqueue_outbox_batch_in_tx(&mut tx, messages, true).await?;
+            .context("begin indicator repair intent tx")?;
+        enqueue_intent_batch_in_tx(&mut tx, messages).await?;
         tx.commit()
             .await
-            .context("commit indicator repair outbox tx")?;
+            .context("commit indicator repair intent tx")?;
         Ok(())
     }
 
@@ -459,6 +473,46 @@ impl SnapshotWriter {
         Ok(())
     }
 
+    pub async fn mark_snapshot_fanout_repair_pending(
+        &self,
+        symbol: &str,
+        repair_start_ts: DateTime<Utc>,
+        repair_end_ts: DateTime<Utc>,
+    ) -> Result<()> {
+        if repair_start_ts > repair_end_ts {
+            return Ok(());
+        }
+
+        sqlx::query(
+            r#"
+            INSERT INTO ops.indicator_snapshot_fanout_repair_progress (
+                symbol,
+                next_snapshot_ts,
+                repair_end_snapshot_ts
+            )
+            VALUES ($1, $2, $3)
+            ON CONFLICT (symbol)
+            DO UPDATE SET
+                next_snapshot_ts = LEAST(
+                    ops.indicator_snapshot_fanout_repair_progress.next_snapshot_ts,
+                    EXCLUDED.next_snapshot_ts
+                ),
+                repair_end_snapshot_ts = GREATEST(
+                    ops.indicator_snapshot_fanout_repair_progress.repair_end_snapshot_ts,
+                    EXCLUDED.repair_end_snapshot_ts
+                ),
+                updated_at = now()
+            "#,
+        )
+        .bind(symbol.to_uppercase())
+        .bind(repair_start_ts)
+        .bind(repair_end_ts)
+        .execute(&self.pool)
+        .await
+        .context("mark indicator snapshot fanout repair range pending")?;
+        Ok(())
+    }
+
     pub async fn suppress_repair_bundle_publish_tail(
         &self,
         symbol: &str,
@@ -474,14 +528,10 @@ impl SnapshotWriter {
 
         sqlx::query(
             r#"
-            DELETE FROM ops.indicator_bundle_outbox
+            DELETE FROM ops.indicator_bundle_intent
             WHERE exchange_name = $1
-              AND COALESCE(NULLIF(upper(symbol), ''), upper(payload_json->>'symbol')) = $2
-              AND COALESCE(
-                    ts_bucket,
-                    NULLIF(payload_json->>'ts_bucket', '')::timestamptz,
-                    NULLIF(payload_json->>'event_ts', '')::timestamptz
-                  ) >= $3
+              AND upper(symbol) = $2
+              AND ts_bucket >= $3
             "#,
         )
         .bind(exchange_name)
@@ -489,24 +539,153 @@ impl SnapshotWriter {
         .bind(repair_start_ts)
         .execute(&mut *tx)
         .await
-        .context("delete indicator bundle outbox tail for repair publish suppression")?;
-
-        sqlx::query(
-            r#"
-            DELETE FROM ops.indicator_bundle_payload_cache
-            WHERE symbol = $1
-              AND ts_bucket >= $2
-            "#,
-        )
-        .bind(&symbol_upper)
-        .bind(repair_start_ts)
-        .execute(&mut *tx)
-        .await
-        .context("delete indicator bundle payload cache tail for repair publish suppression")?;
+        .context("delete indicator durable intent tail for repair publish suppression")?;
 
         tx.commit()
             .await
             .context("commit indicator repair publish suppression tx")?;
+        Ok(())
+    }
+
+    pub async fn clear_persisted_range_for_repair(
+        &self,
+        symbol: &str,
+        repair_start_ts: DateTime<Utc>,
+        repair_end_ts: DateTime<Utc>,
+        exchange_name: &str,
+    ) -> Result<()> {
+        if repair_start_ts > repair_end_ts {
+            return Ok(());
+        }
+
+        let deriv_feature_repair_start_ts =
+            floor_timestamp_to_interval_minutes(repair_start_ts, DERIV_FEATURE_BUCKET_MINUTES);
+        let deriv_feature_repair_end_ts =
+            floor_timestamp_to_interval_minutes(repair_end_ts, DERIV_FEATURE_BUCKET_MINUTES);
+        let symbol_upper = symbol.to_uppercase();
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("begin bounded indicator persisted repair cleanup tx")?;
+
+        sqlx::query(
+            r#"
+            DELETE FROM ops.indicator_bundle_intent
+            WHERE exchange_name = $1
+              AND upper(symbol) = $2
+              AND ts_bucket >= $3
+              AND ts_bucket <= $4
+            "#,
+        )
+        .bind(exchange_name)
+        .bind(&symbol_upper)
+        .bind(repair_start_ts)
+        .bind(repair_end_ts)
+        .execute(&mut *tx)
+        .await
+        .context("delete bounded indicator durable intent range for async repair")?;
+
+        sqlx::query(
+            r#"
+            DELETE FROM ops.outbox_event
+            WHERE exchange_name = $1
+              AND upper(payload_json->>'symbol') = $2
+              AND COALESCE(
+                    NULLIF(payload_json->>'ts_bucket', '')::timestamptz,
+                    NULLIF(payload_json->>'event_ts', '')::timestamptz
+                  ) >= $3
+              AND COALESCE(
+                    NULLIF(payload_json->>'ts_bucket', '')::timestamptz,
+                    NULLIF(payload_json->>'event_ts', '')::timestamptz
+                  ) <= $4
+            "#,
+        )
+        .bind(exchange_name)
+        .bind(&symbol_upper)
+        .bind(repair_start_ts)
+        .bind(repair_end_ts)
+        .execute(&mut *tx)
+        .await
+        .context("delete bounded indicator outbox range for async repair")?;
+
+        sqlx::query(
+            r#"
+            DELETE FROM feat.indicator_snapshot
+            WHERE symbol = $1
+              AND ts_snapshot >= $2
+              AND ts_snapshot <= $3
+            "#,
+        )
+        .bind(&symbol_upper)
+        .bind(repair_start_ts)
+        .bind(repair_end_ts)
+        .execute(&mut *tx)
+        .await
+        .context("delete bounded feat.indicator_snapshot range for async repair")?;
+
+        for (table, ts_col) in [
+            ("feat.indicator_level_value", "ts_snapshot"),
+            ("feat.liquidation_density_level", "ts_snapshot"),
+            ("feat.trade_flow_feature", "ts_bucket"),
+            ("feat.orderbook_feature", "ts_bucket"),
+            ("feat.funding_feature", "ts_bucket"),
+            ("feat.avwap_feature", "ts_bucket"),
+            ("feat.cvd_pack", "ts_bucket"),
+            ("feat.whale_trade_rollup", "ts_bucket"),
+            ("feat.funding_change_event", "ts_change"),
+        ] {
+            let query = format!(
+                "DELETE FROM {table} WHERE symbol = $1 AND {ts_col} >= $2 AND {ts_col} <= $3"
+            );
+            sqlx::query(&query)
+                .bind(&symbol_upper)
+                .bind(repair_start_ts)
+                .bind(repair_end_ts)
+                .execute(&mut *tx)
+                .await
+                .with_context(|| format!("delete bounded {table} range for async repair"))?;
+        }
+
+        for table in [
+            "feat.open_interest_feature",
+            "feat.long_short_ratio_feature",
+            "feat.options_surface_feature",
+        ] {
+            let query = format!(
+                "DELETE FROM {table} WHERE symbol = $1 AND ts_bucket >= $2 AND ts_bucket <= $3"
+            );
+            sqlx::query(&query)
+                .bind(&symbol_upper)
+                .bind(deriv_feature_repair_start_ts)
+                .bind(deriv_feature_repair_end_ts)
+                .execute(&mut *tx)
+                .await
+                .with_context(|| format!("delete bounded {table} range for async repair"))?;
+        }
+
+        for table in [
+            "evt.indicator_event",
+            "evt.divergence_event",
+            "evt.absorption_event",
+            "evt.initiation_event",
+            "evt.exhaustion_event",
+        ] {
+            let query = format!(
+                "DELETE FROM {table} WHERE symbol = $1 AND COALESCE(event_available_ts, ts_event_end, ts_event_start) >= $2 AND COALESCE(event_available_ts, ts_event_end, ts_event_start) <= $3"
+            );
+            sqlx::query(&query)
+                .bind(&symbol_upper)
+                .bind(repair_start_ts)
+                .bind(repair_end_ts)
+                .execute(&mut *tx)
+                .await
+                .with_context(|| format!("delete bounded {table} range for async repair"))?;
+        }
+
+        tx.commit()
+            .await
+            .context("commit bounded indicator persisted repair cleanup tx")?;
         Ok(())
     }
 
@@ -528,14 +707,10 @@ impl SnapshotWriter {
 
         sqlx::query(
             r#"
-            DELETE FROM ops.indicator_bundle_outbox
+            DELETE FROM ops.indicator_bundle_intent
             WHERE exchange_name = $1
-              AND COALESCE(NULLIF(upper(symbol), ''), upper(payload_json->>'symbol')) = $2
-              AND COALESCE(
-                    ts_bucket,
-                    NULLIF(payload_json->>'ts_bucket', '')::timestamptz,
-                    NULLIF(payload_json->>'event_ts', '')::timestamptz
-                  ) >= $3
+              AND upper(symbol) = $2
+              AND ts_bucket >= $3
             "#,
         )
         .bind(exchange_name)
@@ -543,20 +718,7 @@ impl SnapshotWriter {
         .bind(repair_start_ts)
         .execute(&mut *tx)
         .await
-        .context("delete indicator bundle outbox tail for overlap repair")?;
-
-        sqlx::query(
-            r#"
-            DELETE FROM ops.indicator_bundle_payload_cache
-            WHERE symbol = $1
-              AND ts_bucket >= $2
-            "#,
-        )
-        .bind(&symbol_upper)
-        .bind(repair_start_ts)
-        .execute(&mut *tx)
-        .await
-        .context("delete indicator bundle payload cache tail for overlap repair")?;
+        .context("delete indicator durable intent tail for overlap repair")?;
 
         sqlx::query(
             r#"
@@ -675,70 +837,26 @@ impl SnapshotWriter {
     }
 }
 
-async fn enqueue_outbox_batch_in_tx(
+async fn enqueue_intent_batch_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     messages: &[BundleOutboxMessage],
-    write_payload_cache: bool,
 ) -> Result<()> {
     if messages.is_empty() {
         return Ok(());
     }
 
-    if write_payload_cache {
-        let published_at = Utc::now();
-        let payload_bytes = messages
-            .iter()
-            .map(|message| message.payload_bytes_with_published_at(published_at))
-            .collect::<Result<Vec<_>>>()?;
-
-        let mut payload_builder = QueryBuilder::<Postgres>::new(
-            r#"
-            INSERT INTO ops.indicator_bundle_payload_cache (
-                symbol, ts_bucket, schema_version, indicator_count, payload_encoding, payload_bytes
-            )
-            "#,
-        );
-
-        payload_builder.push_values(
-            messages.iter().zip(payload_bytes.iter()),
-            |mut b, (message, payload_bytes)| {
-                b.push_bind(&message.symbol)
-                    .push_bind(message.ts_bucket)
-                    .push_bind(message.schema_version)
-                    .push_bind(message.indicator_count)
-                    .push_bind(&message.payload_encoding)
-                    .push_bind(payload_bytes);
-            },
-        );
-
-        payload_builder.push(
-            r#"
-            ON CONFLICT (symbol, ts_bucket)
-            DO UPDATE SET
-                schema_version = EXCLUDED.schema_version,
-                indicator_count = EXCLUDED.indicator_count,
-                payload_encoding = EXCLUDED.payload_encoding,
-                payload_bytes = EXCLUDED.payload_bytes,
-                created_at = now()
-            "#,
-        );
-        payload_builder
-            .build()
-            .execute(tx.as_mut())
-            .await
-            .with_context(|| {
-                format!(
-                    "upsert indicator bundle payload cache count={}",
-                    messages.len()
-                )
-            })?;
-    }
-
     let mut builder = QueryBuilder::<Postgres>::new(
         r#"
-        INSERT INTO ops.indicator_bundle_outbox (
-            exchange_name, routing_key, message_id, schema_version, headers_json,
-            symbol, ts_bucket, indicator_count, payload_json
+        INSERT INTO ops.indicator_bundle_intent (
+            exchange_name,
+            routing_key,
+            message_id,
+            schema_version,
+            headers_json,
+            symbol,
+            ts_bucket,
+            indicator_count,
+            payload_json
         )
         "#,
     );
@@ -755,14 +873,28 @@ async fn enqueue_outbox_batch_in_tx(
             .push_bind(&message.payload_json);
     });
 
-    builder.push(" ON CONFLICT DO NOTHING");
+    builder.push(
+        r#"
+        ON CONFLICT (message_id)
+        DO UPDATE SET
+            exchange_name = EXCLUDED.exchange_name,
+            routing_key = EXCLUDED.routing_key,
+            schema_version = EXCLUDED.schema_version,
+            headers_json = EXCLUDED.headers_json,
+            symbol = EXCLUDED.symbol,
+            ts_bucket = EXCLUDED.ts_bucket,
+            indicator_count = EXCLUDED.indicator_count,
+            payload_json = EXCLUDED.payload_json,
+            relayed_at = NULL
+        "#,
+    );
     builder
         .build()
         .execute(tx.as_mut())
         .await
         .with_context(|| {
             format!(
-                "batch insert indicator outbox messages count={}",
+                "batch upsert indicator durable intents count={}",
                 messages.len()
             )
         })?;
