@@ -1543,6 +1543,27 @@ impl StateStore {
         latest_ready
     }
 
+    pub fn first_incomplete_canonical_minute_from(
+        &self,
+        start: DateTime<Utc>,
+        max_ts: DateTime<Utc>,
+    ) -> Option<(DateTime<Utc>, CanonicalMinutePresence)> {
+        if start > max_ts {
+            return None;
+        }
+
+        let mut cur = start;
+        while cur <= max_ts {
+            let presence = self.canonical_minute_presence(cur);
+            if !presence.complete_under_current_policy() {
+                return Some((cur, presence));
+            }
+            cur += Duration::minutes(1);
+        }
+
+        None
+    }
+
     pub fn canonical_minute_presence(&self, ts_bucket: DateTime<Utc>) -> CanonicalMinutePresence {
         canonical_minute_presence(self.canonical_minutes.get(&ts_bucket.timestamp()))
     }
@@ -1791,21 +1812,36 @@ impl StateStore {
     pub fn finalize_minute(&mut self, ts_bucket: DateTime<Utc>) -> WindowBundle {
         let futures = self.finalize_market(MarketKind::Futures, ts_bucket);
         let spot = self.finalize_market(MarketKind::Spot, ts_bucket);
-        self.finish_finalize_minute_state(ts_bucket);
+        self.finish_finalize_minute_state(ts_bucket, true);
         self.build_window_bundle(ts_bucket, futures, spot)
     }
 
     pub fn finalize_minute_for_live_job(&mut self, ts_bucket: DateTime<Utc>) -> WindowBundle {
         let futures = self.finalize_market(MarketKind::Futures, ts_bucket);
         let spot = self.finalize_market(MarketKind::Spot, ts_bucket);
-        self.finish_finalize_minute_state(ts_bucket);
+        self.finish_finalize_minute_state(ts_bucket, true);
         self.build_live_window_bundle(ts_bucket, futures, spot)
     }
 
     pub fn advance_finalized_state(&mut self, ts_bucket: DateTime<Utc>) {
         let _ = self.finalize_market(MarketKind::Futures, ts_bucket);
         let _ = self.finalize_market(MarketKind::Spot, ts_bucket);
-        self.finish_finalize_minute_state(ts_bucket);
+        self.finish_finalize_minute_state(ts_bucket, true);
+    }
+
+    pub fn advance_finalized_state_without_derived_refresh(&mut self, ts_bucket: DateTime<Utc>) {
+        let _ = self.finalize_market(MarketKind::Futures, ts_bucket);
+        let _ = self.finalize_market(MarketKind::Spot, ts_bucket);
+        self.finish_finalize_minute_state(ts_bucket, false);
+    }
+
+    pub fn rebuild_deferred_derived_indicator_state(&mut self) {
+        self.divergence_all_events = Arc::new(Vec::new());
+        self.exhaustion_all_events = Arc::new(Vec::new());
+        if let Some(ts_bucket) = self.last_finalized_minute {
+            self.refresh_incremental_indicator_event_caches(ts_bucket);
+        }
+        self.rebuild_incremental_indicator_outputs();
     }
 
     pub fn rebuild_finalized_state_range(
@@ -1827,13 +1863,19 @@ impl StateStore {
         rebuilt
     }
 
-    fn finish_finalize_minute_state(&mut self, ts_bucket: DateTime<Utc>) {
+    fn finish_finalize_minute_state(
+        &mut self,
+        ts_bucket: DateTime<Utc>,
+        refresh_derived_indicator_state: bool,
+    ) {
         self.apply_canonical_funding_minute(ts_bucket);
         self.last_finalized_minute = Some(ts_bucket);
         self.trim_replay_retention(ts_bucket);
         self.prune_recent_7d_payloads(ts_bucket);
-        self.refresh_incremental_indicator_event_caches(ts_bucket);
-        self.refresh_incremental_indicator_outputs(ts_bucket);
+        if refresh_derived_indicator_state {
+            self.refresh_incremental_indicator_event_caches(ts_bucket);
+            self.refresh_incremental_indicator_outputs(ts_bucket);
+        }
     }
 
     fn take_dirty_recompute_batch_range(
@@ -3706,12 +3748,7 @@ impl StateStore {
         self.cvd_spot = self.history_spot.back().map(|h| h.cvd).unwrap_or(0.0);
         // last_finalized_minute also derived from history tail.
         self.last_finalized_minute = self.history_futures.back().map(|h| h.ts_bucket);
-        self.divergence_all_events = Arc::new(Vec::new());
-        self.exhaustion_all_events = Arc::new(Vec::new());
-        if let Some(ts_bucket) = self.last_finalized_minute {
-            self.refresh_incremental_indicator_event_caches(ts_bucket);
-        }
-        self.rebuild_incremental_indicator_outputs();
+        self.rebuild_deferred_derived_indicator_state();
     }
 
     fn rebuild_incremental_recent_7d_payloads(&mut self) {
@@ -4514,6 +4551,7 @@ mod tests {
     };
     use super::{minute_window_from_history_row, MinuteWindowData, StateSnapshot, StateStore};
     use crate::indicators::context::{OptionMarkGreeksPoint, OptionsSurfacePoint};
+    use crate::indicators::shared::incremental::IncrementalIndicatorConfig;
     use crate::ingest::decoder::{
         AggFundingMark1mEvent, AggFundingPoint, AggHeatmapLevel, AggLiq1mEvent, AggLiqLevel,
         AggMarkPoint, AggOrderbook1mEvent, AggProfileLevel, AggTrade1mEvent, AggVpinSnapshot,
@@ -5240,6 +5278,149 @@ mod tests {
     }
 
     #[test]
+    fn deferred_derived_indicator_rebuild_matches_full_per_minute_refresh() {
+        let ts_1 = Utc.with_ymd_and_hms(2026, 3, 6, 5, 0, 0).single().unwrap();
+        let mut full_store = StateStore::new("TESTUSDT".to_string(), 1_000.0);
+        let mut deferred_store = StateStore::new("TESTUSDT".to_string(), 1_000.0);
+
+        for store in [&mut full_store, &mut deferred_store] {
+            store.set_incremental_runtime_options(IncrementalIndicatorConfig::default());
+            for minute_offset in 0..12 {
+                let ts = ts_1 + ChronoDuration::minutes(minute_offset);
+                let buy_qty = 1.0 + minute_offset as f64 * 0.3;
+                let sell_qty = 0.4 + minute_offset as f64 * 0.1;
+                let vpin = 0.15 + minute_offset as f64 * 0.01;
+                store.ingest(agg_trade_event(ts, buy_qty, sell_qty, vpin));
+                store.ingest(agg_trade_event_spot(
+                    ts,
+                    buy_qty * 0.9,
+                    sell_qty * 0.95,
+                    vpin * 0.8,
+                ));
+                store.ingest(agg_orderbook_event(
+                    ts,
+                    4 + minute_offset,
+                    4 + minute_offset,
+                    0.1 + minute_offset as f64 * 0.01,
+                ));
+                store.ingest(agg_orderbook_event_spot(
+                    ts,
+                    5 + minute_offset,
+                    3 + minute_offset,
+                    0.08 + minute_offset as f64 * 0.01,
+                ));
+                store.ingest(agg_liq_event(ts, 10.0 + minute_offset as f64));
+                store.ingest(agg_funding_mark_event(
+                    ts,
+                    30 + minute_offset,
+                    2000.0 + minute_offset as f64,
+                    -0.0010 + minute_offset as f64 * 0.00001,
+                ));
+            }
+        }
+
+        for minute_offset in 0..12 {
+            let ts = ts_1 + ChronoDuration::minutes(minute_offset);
+            let _ = full_store.finalize_minute(ts);
+            deferred_store.advance_finalized_state_without_derived_refresh(ts);
+        }
+        full_store.rebuild_deferred_derived_indicator_state();
+        deferred_store.rebuild_deferred_derived_indicator_state();
+
+        assert_eq!(
+            deferred_store.divergence_all_events.as_ref(),
+            full_store.divergence_all_events.as_ref()
+        );
+        assert_eq!(
+            deferred_store.exhaustion_all_events.as_ref(),
+            full_store.exhaustion_all_events.as_ref()
+        );
+
+        let full_outputs = full_store.incremental_indicator_state.outputs();
+        let deferred_outputs = deferred_store.incremental_indicator_state.outputs();
+        assert_eq!(
+            deferred_outputs.funding_snapshot,
+            full_outputs.funding_snapshot
+        );
+        assert_eq!(deferred_outputs.avwap_snapshot, full_outputs.avwap_snapshot);
+        assert_eq!(deferred_outputs.tpo_snapshot, full_outputs.tpo_snapshot);
+        assert_eq!(deferred_outputs.rvwap_snapshot, full_outputs.rvwap_snapshot);
+        assert_eq!(
+            deferred_outputs.high_volume_pulse_snapshot,
+            full_outputs.high_volume_pulse_snapshot
+        );
+
+        assert_eq!(
+            deferred_outputs.funding_feature_windows.len(),
+            full_outputs.funding_feature_windows.len()
+        );
+        for (minutes, deferred_feature) in &deferred_outputs.funding_feature_windows {
+            let full_feature = full_outputs
+                .funding_feature_windows
+                .get(minutes)
+                .expect("matching funding feature window");
+            assert_eq!(
+                deferred_feature.funding_current,
+                full_feature.funding_current
+            );
+            assert_eq!(
+                deferred_feature.funding_current_effective_ts,
+                full_feature.funding_current_effective_ts
+            );
+            assert_eq!(deferred_feature.funding_twa, full_feature.funding_twa);
+            assert_eq!(
+                deferred_feature.mark_price_last,
+                full_feature.mark_price_last
+            );
+            assert_eq!(
+                deferred_feature.mark_price_last_ts,
+                full_feature.mark_price_last_ts
+            );
+            assert_eq!(
+                deferred_feature.mark_price_twap,
+                full_feature.mark_price_twap
+            );
+            assert_eq!(
+                deferred_feature.index_price_last,
+                full_feature.index_price_last
+            );
+            assert_eq!(deferred_feature.changes_json, full_feature.changes_json);
+        }
+
+        let deferred_avwap = deferred_outputs
+            .avwap_feature
+            .as_ref()
+            .expect("deferred avwap feature");
+        let full_avwap = full_outputs
+            .avwap_feature
+            .as_ref()
+            .expect("full avwap feature");
+        assert_eq!(deferred_avwap.anchor_ts, full_avwap.anchor_ts);
+        assert_eq!(deferred_avwap.avwap_fut, full_avwap.avwap_fut);
+        assert_eq!(deferred_avwap.avwap_spot, full_avwap.avwap_spot);
+        assert_eq!(deferred_avwap.fut_last_price, full_avwap.fut_last_price);
+        assert_eq!(deferred_avwap.fut_mark_price, full_avwap.fut_mark_price);
+        assert_eq!(
+            deferred_avwap.price_minus_avwap_fut,
+            full_avwap.price_minus_avwap_fut
+        );
+        assert_eq!(
+            deferred_avwap.price_minus_spot_avwap_fut,
+            full_avwap.price_minus_spot_avwap_fut
+        );
+        assert_eq!(
+            deferred_avwap.price_minus_spot_avwap_futmark,
+            full_avwap.price_minus_spot_avwap_futmark
+        );
+        assert_eq!(deferred_avwap.avwap_gap_fs, full_avwap.avwap_gap_fs);
+        assert_eq!(
+            deferred_avwap.xmk_avwap_gap_f_minus_s,
+            full_avwap.xmk_avwap_gap_f_minus_s
+        );
+        assert_eq!(deferred_avwap.zavwap_gap, full_avwap.zavwap_gap);
+    }
+
+    #[test]
     fn canonical_minute_presence_reports_missing_required_sources() {
         let mut store = StateStore::new("TESTUSDT".to_string(), 1_000.0);
         let ts = Utc.with_ymd_and_hms(2026, 3, 6, 5, 0, 0).single().unwrap();
@@ -5257,6 +5438,31 @@ mod tests {
         assert!(presence.trade_spot);
         assert!(!presence.orderbook_spot);
         assert!(!presence.complete_under_current_policy());
+        assert_eq!(presence.missing_required_sources(), vec!["orderbook_spot"]);
+    }
+
+    #[test]
+    fn first_incomplete_canonical_minute_from_finds_future_gap() {
+        let mut store = StateStore::new("TESTUSDT".to_string(), 1_000.0);
+        let start = Utc.with_ymd_and_hms(2026, 3, 6, 5, 0, 0).single().unwrap();
+        let gap_ts = start + ChronoDuration::minutes(2);
+
+        for minute_offset in 0..4 {
+            let ts = start + ChronoDuration::minutes(minute_offset);
+            store.ingest(agg_trade_event(ts, 1.0, 0.5, 0.2));
+            store.ingest(agg_orderbook_event(ts, 4, 4, 0.1));
+            store.ingest(agg_funding_mark_event(ts, 45, 2000.0, 0.01));
+            store.ingest(agg_trade_event_spot(ts, 1.0, 0.5, 0.2));
+            if ts != gap_ts {
+                store.ingest(agg_orderbook_event_spot(ts, 4, 4, 0.1));
+            }
+        }
+
+        let (blocked_ts, presence) = store
+            .first_incomplete_canonical_minute_from(start, start + ChronoDuration::minutes(3))
+            .expect("expected to find the first incomplete canonical minute");
+        assert_eq!(blocked_ts, gap_ts);
+        assert!(presence.minute_present);
         assert_eq!(presence.missing_required_sources(), vec!["orderbook_spot"]);
     }
 

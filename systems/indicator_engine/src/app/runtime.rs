@@ -279,6 +279,7 @@ struct LiveCanonicalRepairController {
     last_gap_repair_attempt_at: Option<Instant>,
     last_gap_repair_minute: Option<DateTime<Utc>>,
     last_tail_reconcile_at: Option<Instant>,
+    deferred_gap_minutes: BTreeSet<DateTime<Utc>>,
 }
 
 #[derive(Debug, Default)]
@@ -373,10 +374,10 @@ struct QueuedIngestEvent {
 }
 
 impl LiveCanonicalRepairController {
-    fn gap_repair_due(&self, next_minute: DateTime<Utc>) -> bool {
+    fn gap_repair_due(&self, blocked_minute: DateTime<Utc>) -> bool {
         match (self.last_gap_repair_minute, self.last_gap_repair_attempt_at) {
             (Some(prev_minute), Some(last_attempt))
-                if prev_minute == next_minute
+                if prev_minute == blocked_minute
                     && last_attempt.elapsed()
                         < Duration::from_secs(LIVE_CANONICAL_GAP_REPAIR_RETRY_SECS) =>
             {
@@ -386,9 +387,30 @@ impl LiveCanonicalRepairController {
         }
     }
 
-    fn mark_gap_repair_attempt(&mut self, next_minute: DateTime<Utc>) {
-        self.last_gap_repair_minute = Some(next_minute);
+    fn mark_gap_repair_attempt(&mut self, blocked_minute: DateTime<Utc>) {
+        self.last_gap_repair_minute = Some(blocked_minute);
         self.last_gap_repair_attempt_at = Some(Instant::now());
+    }
+
+    fn mark_deferred_gap(&mut self, blocked_minute: DateTime<Utc>) {
+        self.deferred_gap_minutes.insert(blocked_minute);
+    }
+
+    fn has_deferred_gap(&self, blocked_minute: DateTime<Utc>) -> bool {
+        self.deferred_gap_minutes.contains(&blocked_minute)
+    }
+
+    fn deferred_gap_from_ts(&self) -> Option<DateTime<Utc>> {
+        self.deferred_gap_minutes.iter().next().copied()
+    }
+
+    fn clear_deferred_gaps_through(&mut self, through_ts: DateTime<Utc>) {
+        while let Some(blocked_minute) = self.deferred_gap_minutes.iter().next().copied() {
+            if blocked_minute > through_ts {
+                break;
+            }
+            self.deferred_gap_minutes.remove(&blocked_minute);
+        }
     }
 
     fn tail_reconcile_due(&self) -> bool {
@@ -660,6 +682,31 @@ fn confirmed_repair_pipeline_idle(
     live_prepare_minute_pending.load(Ordering::Acquire) == 0
         && live_ready_job_pending.load(Ordering::Acquire) == 0
         && dirty_ready_job_pending.load(Ordering::Acquire) == 0
+}
+
+fn live_gap_repair_scan_end_ts(
+    next_minute: DateTime<Utc>,
+    latest_confirmed_closed: DateTime<Utc>,
+    latest_contiguous_complete_minute_ts: Option<DateTime<Utc>>,
+) -> DateTime<Utc> {
+    latest_contiguous_complete_minute_ts
+        .map(|ts| ts.min(latest_confirmed_closed).max(next_minute))
+        .unwrap_or(next_minute.min(latest_confirmed_closed))
+}
+
+fn defer_or_skip_blocked_live_gap(
+    controller: &mut LiveCanonicalRepairController,
+    scheduler: &mut WindowScheduler,
+    next_minute: Option<DateTime<Utc>>,
+    blocked_minute: DateTime<Utc>,
+) -> bool {
+    controller.mark_deferred_gap(blocked_minute);
+    if next_minute == Some(blocked_minute) {
+        scheduler.mark_emitted_through(blocked_minute);
+        return true;
+    }
+
+    false
 }
 
 pub fn build_indicator_runtime_options(
@@ -1310,100 +1357,166 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                 }
                 let next_minute_before_repairs = scheduler.next_minute_to_emit();
                 if startup_cutover_completed && confirmed_repair_controller.pending_from_ts().is_none() {
-                    if let Some(next_minute) = next_minute_before_repairs {
-                        let next_minute_presence = {
+                    if let Some(next_minute) =
+                        next_minute_before_repairs.filter(|ts| *ts <= latest_confirmed_closed)
+                    {
+                        let blocked_gap = {
                             let state_store = state_store.lock().await;
-                            state_store.canonical_minute_presence(next_minute)
-                        };
-                        if next_minute <= latest_confirmed_closed
-                            && !next_minute_presence.complete_under_current_policy()
-                            && live_repair_controller.gap_repair_due(next_minute)
-                        {
-                            live_repair_controller.mark_gap_repair_attempt(next_minute);
-                            let repair_to_ts =
-                                latest_confirmed_closed + ChronoDuration::minutes(1);
-                            let mut state_store = state_store.lock().await;
-                            match ingest_canonical_range_from_db(
-                                &ctx.db_pool,
-                                &ctx.config.indicator.symbol,
-                                &metrics,
-                                &mut state_store,
-                                &mut scheduler,
+                            let frontier_snapshot = state_store.canonical_frontier_snapshot();
+                            let scan_end_ts = live_gap_repair_scan_end_ts(
                                 next_minute,
-                                repair_to_ts,
-                                startup_backfill_batch_size,
-                                "live_gap_repair",
-                            )
-                            .await
+                                latest_confirmed_closed,
+                                frontier_snapshot.latest_contiguous_complete_minute_ts,
+                            );
+                            state_store
+                                .first_incomplete_canonical_minute_from(next_minute, scan_end_ts)
+                                .map(|(blocked_minute, blocked_presence)| {
+                                    (
+                                        blocked_minute,
+                                        blocked_presence,
+                                        scan_end_ts,
+                                        frontier_snapshot.latest_contiguous_complete_minute_ts,
+                                    )
+                                })
+                        };
+
+                        if let Some((
+                            blocked_minute,
+                            blocked_presence_before,
+                            scan_end_ts,
+                            latest_contiguous_complete_minute_ts,
+                        )) = blocked_gap
+                        {
+                            if blocked_minute == next_minute
+                                && live_repair_controller.has_deferred_gap(blocked_minute)
                             {
-                                Ok(stats) => {
-                                    if let Some(repair_from_ts) = stats.confirmed_repair_from_ts {
-                                        if confirmed_repair_controller.mark_pending(repair_from_ts)
-                                        {
-                                            warn!(
-                                                repair_start_ts = %repair_from_ts,
-                                                latest_confirmed_closed = %latest_confirmed_closed,
+                                scheduler.mark_emitted_through(blocked_minute);
+                                warn!(
+                                    reason = "live_gap_repair",
+                                    blocked_minute = %blocked_minute,
+                                    next_minute = %next_minute,
+                                    latest_closed = %latest_closed,
+                                    latest_confirmed_closed = %latest_confirmed_closed,
+                                    scan_end_ts = %scan_end_ts,
+                                    latest_complete_canonical_ts = ?latest_contiguous_complete_minute_ts,
+                                    missing_required_before = %format_missing_required_sources(&blocked_presence_before),
+                                    "skipping previously deferred leading canonical gap minute in muted catch-up; cutover will replay from the earliest deferred gap"
+                                );
+                            } else if live_repair_controller.gap_repair_due(blocked_minute) {
+                                live_repair_controller.mark_gap_repair_attempt(blocked_minute);
+                                let repair_to_ts =
+                                    latest_confirmed_closed + ChronoDuration::minutes(1);
+                                let mut state_store = state_store.lock().await;
+                                match ingest_canonical_range_from_db(
+                                    &ctx.db_pool,
+                                    &ctx.config.indicator.symbol,
+                                    &metrics,
+                                    &mut state_store,
+                                    &mut scheduler,
+                                    blocked_minute,
+                                    repair_to_ts,
+                                    startup_backfill_batch_size,
+                                    "live_gap_repair",
+                                )
+                                .await
+                                {
+                                    Ok(stats) => {
+                                        if let Some(repair_from_ts) = stats.confirmed_repair_from_ts {
+                                            if confirmed_repair_controller.mark_pending(repair_from_ts)
+                                            {
+                                                warn!(
+                                                    repair_start_ts = %repair_from_ts,
+                                                    latest_confirmed_closed = %latest_confirmed_closed,
+                                                    reason = "live_gap_repair",
+                                                    "confirmed late canonical correction queued for state-only rebuild repair"
+                                                );
+                                            }
+                                        }
+                                        let blocked_presence_after =
+                                            state_store.canonical_minute_presence(blocked_minute);
+                                        let healed = blocked_presence_after
+                                            .complete_under_current_policy();
+                                        let healed_ready_through = if healed {
+                                            state_store.latest_contiguous_complete_canonical_minute_from(
+                                                blocked_minute,
+                                                latest_confirmed_closed,
+                                            )
+                                        } else {
+                                            None
+                                        };
+                                        if let Some(healed_ready_through) = healed_ready_through {
+                                            live_repair_controller
+                                                .clear_deferred_gaps_through(healed_ready_through);
+                                        }
+                                        if healed {
+                                            info!(
                                                 reason = "live_gap_repair",
-                                                "confirmed late canonical correction queued for state-only rebuild repair"
+                                                blocked_minute = %blocked_minute,
+                                                next_minute = %next_minute,
+                                                scan_end_ts = %scan_end_ts,
+                                                to_ts_exclusive = %repair_to_ts,
+                                                latest_closed = %latest_closed,
+                                                latest_confirmed_closed = %latest_confirmed_closed,
+                                                fetched_rows = stats.fetched_rows,
+                                                ingested_rows = stats.ingested_rows,
+                                                touched_minutes = stats.touched_minute_count(),
+                                                first_bucket = ?stats.first_bucket,
+                                                last_bucket = ?stats.last_bucket,
+                                                blocked_minute_complete_before = blocked_presence_before.complete_under_current_policy(),
+                                                blocked_minute_complete_after = blocked_presence_after.complete_under_current_policy(),
+                                                ready_through_after = ?healed_ready_through,
+                                                missing_required_before = %format_missing_required_sources(&blocked_presence_before),
+                                                missing_required_after = %format_missing_required_sources(&blocked_presence_after),
+                                                "live canonical gap repair completed"
+                                            );
+                                        } else {
+                                            let skipped_leading_gap = defer_or_skip_blocked_live_gap(
+                                                &mut live_repair_controller,
+                                                &mut scheduler,
+                                                next_minute_before_repairs,
+                                                blocked_minute,
+                                            );
+                                            warn!(
+                                                reason = "live_gap_repair",
+                                                blocked_minute = %blocked_minute,
+                                                next_minute = %next_minute,
+                                                scan_end_ts = %scan_end_ts,
+                                                to_ts_exclusive = %repair_to_ts,
+                                                latest_closed = %latest_closed,
+                                                latest_confirmed_closed = %latest_confirmed_closed,
+                                                fetched_rows = stats.fetched_rows,
+                                                ingested_rows = stats.ingested_rows,
+                                                touched_minutes = stats.touched_minute_count(),
+                                                missing_required_before = %format_missing_required_sources(&blocked_presence_before),
+                                                missing_required_after = %format_missing_required_sources(&blocked_presence_after),
+                                                skipped_leading_gap = skipped_leading_gap,
+                                                deferred_gap_from_ts = ?live_repair_controller.deferred_gap_from_ts(),
+                                                "live canonical gap repair did not heal the blocked minute; deferring cutover replay from the earliest blocked gap"
                                             );
                                         }
                                     }
-                                    let next_minute_presence_after =
-                                        state_store.canonical_minute_presence(next_minute);
-                                    let healed = next_minute_presence_after
-                                        .complete_under_current_policy();
-                                    let healed_ready_through = if healed {
-                                        state_store.latest_contiguous_complete_canonical_minute_from(
-                                            next_minute,
-                                            latest_confirmed_closed,
-                                        )
-                                    } else {
-                                        None
-                                    };
-                                    if stats.ingested_rows > 0 || healed {
-                                        info!(
-                                            reason = "live_gap_repair",
-                                            from_ts = %next_minute,
-                                            to_ts_exclusive = %repair_to_ts,
-                                            latest_closed = %latest_closed,
-                                            latest_confirmed_closed = %latest_confirmed_closed,
-                                            fetched_rows = stats.fetched_rows,
-                                            ingested_rows = stats.ingested_rows,
-                                            touched_minutes = stats.touched_minute_count(),
-                                            first_bucket = ?stats.first_bucket,
-                                            last_bucket = ?stats.last_bucket,
-                                            next_minute_complete_before = next_minute_presence.complete_under_current_policy(),
-                                            next_minute_complete_after = next_minute_presence_after.complete_under_current_policy(),
-                                            ready_through_after = ?healed_ready_through,
-                                            missing_required_before = %format_missing_required_sources(&next_minute_presence),
-                                            missing_required_after = %format_missing_required_sources(&next_minute_presence_after),
-                                            "live canonical gap repair completed"
+                                    Err(err) => {
+                                        let skipped_leading_gap = defer_or_skip_blocked_live_gap(
+                                            &mut live_repair_controller,
+                                            &mut scheduler,
+                                            next_minute_before_repairs,
+                                            blocked_minute,
                                         );
-                                    } else {
                                         warn!(
+                                            error = %err,
                                             reason = "live_gap_repair",
-                                            from_ts = %next_minute,
+                                            blocked_minute = %blocked_minute,
+                                            next_minute = %next_minute,
+                                            scan_end_ts = %scan_end_ts,
                                             to_ts_exclusive = %repair_to_ts,
                                             latest_closed = %latest_closed,
                                             latest_confirmed_closed = %latest_confirmed_closed,
-                                            fetched_rows = stats.fetched_rows,
-                                            ingested_rows = stats.ingested_rows,
-                                            next_minute_complete_after = next_minute_presence_after.complete_under_current_policy(),
-                                            missing_required_after = %format_missing_required_sources(&next_minute_presence_after),
-                                            "live canonical gap repair found no new rows"
+                                            missing_required_before = %format_missing_required_sources(&blocked_presence_before),
+                                            skipped_leading_gap = skipped_leading_gap,
+                                            deferred_gap_from_ts = ?live_repair_controller.deferred_gap_from_ts(),
+                                            "live canonical gap repair failed; deferring cutover replay from the earliest blocked gap"
                                         );
                                     }
-                                }
-                                Err(err) => {
-                                    warn!(
-                                        error = %err,
-                                        reason = "live_gap_repair",
-                                        from_ts = %next_minute,
-                                        to_ts_exclusive = %repair_to_ts,
-                                        latest_closed = %latest_closed,
-                                        latest_confirmed_closed = %latest_confirmed_closed,
-                                        "live canonical gap repair failed"
-                                    );
                                 }
                             }
                         }
@@ -1650,12 +1763,18 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                         startup_checkpoint_path.as_deref(),
                         latest_confirmed_closed,
                         &frontier_snapshot,
+                        live_repair_controller.deferred_gap_from_ts(),
                         &live_prepare_minute_pending,
                         &live_ready_job_pending,
                         &dirty_ready_job_pending,
                         &mut oi_ratio_patch_task,
                     )
                     .await?
+                    .map(|repair_ready_through_ts| {
+                        live_repair_controller
+                            .clear_deferred_gaps_through(repair_ready_through_ts);
+                        repair_ready_through_ts
+                    })
                     .is_some()
                     {
                         live_publish_state = LivePublishState::Publishing;
@@ -4754,6 +4873,7 @@ async fn maybe_execute_live_catchup_cutover(
     startup_checkpoint_path: Option<&str>,
     latest_confirmed_closed: DateTime<Utc>,
     frontier_snapshot: &CanonicalFrontierSnapshot,
+    deferred_gap_from_ts: Option<DateTime<Utc>>,
     live_prepare_minute_pending: &Arc<AtomicUsize>,
     live_ready_job_pending: &Arc<AtomicUsize>,
     dirty_ready_job_pending: &Arc<AtomicUsize>,
@@ -4788,6 +4908,9 @@ async fn maybe_execute_live_catchup_cutover(
     }
     if let Some(oi_patch_from_ts) = frontier_snapshot.oi_ratio_patch_from_ts {
         repair_start_ts = repair_start_ts.min(oi_patch_from_ts);
+    }
+    if let Some(deferred_gap_from_ts) = deferred_gap_from_ts {
+        repair_start_ts = repair_start_ts.min(deferred_gap_from_ts);
     }
     if let Some(history_floor_ts) = frontier_snapshot.effective_history_floor_ts {
         repair_start_ts = repair_start_ts.max(history_floor_ts);
@@ -4889,6 +5012,7 @@ async fn maybe_execute_live_catchup_cutover(
         repair_ready_through_ts = %repair_ready_through_ts,
         latest_confirmed_closed = %latest_confirmed_closed,
         tail_minutes = tail_minutes,
+        deferred_gap_from_ts = ?deferred_gap_from_ts,
         canonical_fetched_rows = canonical_stats.fetched_rows,
         canonical_ingested_rows = canonical_stats.ingested_rows,
         canonical_changed_rows = canonical_stats.changed_rows,
@@ -6979,13 +7103,14 @@ async fn run_startup_backfill(
         let mut minute = warm_start_ts;
         let mut warmed_minutes = 0usize;
         while minute <= warm_end_ts {
-            state_store.advance_finalized_state(minute);
+            state_store.advance_finalized_state_without_derived_refresh(minute);
             warmed_minutes += 1;
             if warmed_minutes % STARTUP_BACKFILL_YIELD_EVERY_MINUTES == 0 {
                 tokio::task::yield_now().await;
             }
             minute += ChronoDuration::minutes(1);
         }
+        state_store.rebuild_deferred_derived_indicator_state();
         refresh_runtime_observability_metrics(
             &metrics,
             state_store,
@@ -7039,13 +7164,14 @@ async fn run_startup_backfill(
         if repair_start_ts <= replay_end_ts {
             let mut minute = repair_start_ts;
             while minute <= replay_end_ts {
-                state_store.advance_finalized_state(minute);
+                state_store.advance_finalized_state_without_derived_refresh(minute);
                 rebuilt_minutes += 1;
                 if rebuilt_minutes % STARTUP_BACKFILL_YIELD_EVERY_MINUTES == 0 {
                     tokio::task::yield_now().await;
                 }
                 minute += ChronoDuration::minutes(1);
             }
+            state_store.rebuild_deferred_derived_indicator_state();
         }
         refresh_runtime_observability_metrics(
             &metrics,
@@ -10486,6 +10612,46 @@ mod tests {
         controller.mark_gap_repair_attempt(blocking_minute);
         assert!(!controller.gap_repair_due(blocking_minute));
         assert!(controller.gap_repair_due(next_minute));
+    }
+
+    #[tokio::test]
+    async fn deferred_live_gap_is_only_skipped_once_it_reaches_the_leading_frontier() {
+        let blocked_minute = Utc
+            .with_ymd_and_hms(2026, 3, 23, 12, 10, 0)
+            .single()
+            .unwrap();
+        let mut controller = LiveCanonicalRepairController::default();
+        let mut scheduler = WindowScheduler::new(0);
+        scheduler.mark_emitted_through(blocked_minute - ChronoDuration::minutes(2));
+
+        let next_minute_before_future_skip = scheduler.next_minute_to_emit();
+        let skipped_future_gap = super::defer_or_skip_blocked_live_gap(
+            &mut controller,
+            &mut scheduler,
+            next_minute_before_future_skip,
+            blocked_minute,
+        );
+        assert!(!skipped_future_gap);
+        assert_eq!(
+            scheduler.next_minute_to_emit(),
+            Some(blocked_minute - ChronoDuration::minutes(1))
+        );
+        assert_eq!(controller.deferred_gap_from_ts(), Some(blocked_minute));
+
+        scheduler.mark_emitted_through(blocked_minute - ChronoDuration::minutes(1));
+        let next_minute_before_leading_skip = scheduler.next_minute_to_emit();
+        let skipped_leading_gap = super::defer_or_skip_blocked_live_gap(
+            &mut controller,
+            &mut scheduler,
+            next_minute_before_leading_skip,
+            blocked_minute,
+        );
+        assert!(skipped_leading_gap);
+        assert_eq!(
+            scheduler.next_minute_to_emit(),
+            Some(blocked_minute + ChronoDuration::minutes(1))
+        );
+        assert_eq!(controller.deferred_gap_from_ts(), Some(blocked_minute));
     }
 
     #[tokio::test]
