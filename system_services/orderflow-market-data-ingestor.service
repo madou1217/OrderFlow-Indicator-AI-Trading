@@ -9,7 +9,7 @@ User=ubuntu
 Group=ubuntu
 WorkingDirectory=/data
 EnvironmentFile=-/etc/default/orderflow-common
-ExecStart=/home/ubuntu/.cargo/bin/cargo run -p market_data_ingestor
+ExecStart=/data/target/release/market_data_ingestor
 Restart=always
 RestartSec=5
 
