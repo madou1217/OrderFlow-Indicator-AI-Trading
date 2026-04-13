@@ -1398,11 +1398,24 @@ pub async fn run(ctx: AppContext) -> Result<()> {
 
                 let latest_closed = scheduler.closed_minute(Utc::now());
                 let latest_confirmed_closed = confirmed_closed_minute(latest_closed);
+                let effective_confirmed_closed = if !startup_cutover_completed {
+                    let last_canonical_minute_ts = {
+                        let state_store = state_store.lock().await;
+                        state_store
+                            .canonical_frontier_snapshot()
+                            .last_canonical_minute_ts
+                    };
+                    last_canonical_minute_ts
+                        .map(|ts| ts.min(latest_confirmed_closed))
+                        .unwrap_or(latest_confirmed_closed)
+                } else {
+                    latest_confirmed_closed
+                };
                 if let Some(repair_from_ts) = drain_result.confirmed_repair_from_ts {
                     if confirmed_repair_controller.mark_pending(repair_from_ts) {
                         warn!(
                             repair_start_ts = %repair_from_ts,
-                            latest_confirmed_closed = %latest_confirmed_closed,
+                            latest_confirmed_closed = %effective_confirmed_closed,
                             "confirmed late canonical correction queued for state-only rebuild repair"
                         );
                     }
@@ -1410,14 +1423,14 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                 let next_minute_before_repairs = scheduler.next_minute_to_emit();
                 if startup_cutover_completed && confirmed_repair_controller.pending_from_ts().is_none() {
                     if let Some(next_minute) =
-                        next_minute_before_repairs.filter(|ts| *ts <= latest_confirmed_closed)
+                        next_minute_before_repairs.filter(|ts| *ts <= effective_confirmed_closed)
                     {
                         let blocked_gap = {
                             let state_store = state_store.lock().await;
                             let frontier_snapshot = state_store.canonical_frontier_snapshot();
                             let scan_end_ts = live_gap_repair_scan_end_ts(
                                 next_minute,
-                                latest_confirmed_closed,
+                                effective_confirmed_closed,
                                 frontier_snapshot.latest_contiguous_complete_minute_ts,
                             );
                             state_store
@@ -1448,7 +1461,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                                     blocked_minute = %blocked_minute,
                                     next_minute = %next_minute,
                                     latest_closed = %latest_closed,
-                                    latest_confirmed_closed = %latest_confirmed_closed,
+                                    latest_confirmed_closed = %effective_confirmed_closed,
                                     scan_end_ts = %scan_end_ts,
                                     latest_complete_canonical_ts = ?latest_contiguous_complete_minute_ts,
                                     missing_required_before = %format_missing_required_sources(&blocked_presence_before),
@@ -1457,7 +1470,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                             } else if live_repair_controller.gap_repair_due(blocked_minute) {
                                 live_repair_controller.mark_gap_repair_attempt(blocked_minute);
                                 let repair_to_ts =
-                                    latest_confirmed_closed + ChronoDuration::minutes(1);
+                                    effective_confirmed_closed + ChronoDuration::minutes(1);
                                 let mut state_store = state_store.lock().await;
                                 match ingest_canonical_range_from_db(
                                     &ctx.db_pool,
@@ -1478,7 +1491,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                                             {
                                                 warn!(
                                                     repair_start_ts = %repair_from_ts,
-                                                    latest_confirmed_closed = %latest_confirmed_closed,
+                                                    latest_confirmed_closed = %effective_confirmed_closed,
                                                     reason = "live_gap_repair",
                                                     "confirmed late canonical correction queued for state-only rebuild repair"
                                                 );
@@ -1491,7 +1504,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                                         let healed_ready_through = if healed {
                                             state_store.latest_contiguous_complete_canonical_minute_from(
                                                 blocked_minute,
-                                                latest_confirmed_closed,
+                                                effective_confirmed_closed,
                                             )
                                         } else {
                                             None
@@ -1508,7 +1521,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                                                 scan_end_ts = %scan_end_ts,
                                                 to_ts_exclusive = %repair_to_ts,
                                                 latest_closed = %latest_closed,
-                                                latest_confirmed_closed = %latest_confirmed_closed,
+                                                latest_confirmed_closed = %effective_confirmed_closed,
                                                 fetched_rows = stats.fetched_rows,
                                                 ingested_rows = stats.ingested_rows,
                                                 touched_minutes = stats.touched_minute_count(),
@@ -1535,7 +1548,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                                                 scan_end_ts = %scan_end_ts,
                                                 to_ts_exclusive = %repair_to_ts,
                                                 latest_closed = %latest_closed,
-                                                latest_confirmed_closed = %latest_confirmed_closed,
+                                                latest_confirmed_closed = %effective_confirmed_closed,
                                                 fetched_rows = stats.fetched_rows,
                                                 ingested_rows = stats.ingested_rows,
                                                 touched_minutes = stats.touched_minute_count(),
@@ -1562,7 +1575,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                                             scan_end_ts = %scan_end_ts,
                                             to_ts_exclusive = %repair_to_ts,
                                             latest_closed = %latest_closed,
-                                            latest_confirmed_closed = %latest_confirmed_closed,
+                                            latest_confirmed_closed = %effective_confirmed_closed,
                                             missing_required_before = %format_missing_required_sources(&blocked_presence_before),
                                             skipped_leading_gap = skipped_leading_gap,
                                             deferred_gap_from_ts = ?live_repair_controller.deferred_gap_from_ts(),
@@ -1585,7 +1598,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                                 && allow_live_tail_reconcile(
                                     &state_store,
                                     next_minute_before_repairs,
-                                    latest_confirmed_closed,
+                                    effective_confirmed_closed,
                                 )
                         };
                         if allow_tail_reconcile {
@@ -1622,7 +1635,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                                         {
                                             warn!(
                                                 repair_start_ts = %repair_from_ts,
-                                                latest_confirmed_closed = %latest_confirmed_closed,
+                                                latest_confirmed_closed = %effective_confirmed_closed,
                                                 reason = "live_tail_reconcile",
                                                 "confirmed late canonical correction queued for state-only rebuild repair"
                                             );
@@ -1685,7 +1698,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                         &runtime_options,
                         &snapshot_path,
                         startup_checkpoint_path.as_deref(),
-                        latest_confirmed_closed,
+                        effective_confirmed_closed,
                         &live_prepare_minute_pending,
                         &live_ready_job_pending,
                         &dirty_ready_job_pending,
@@ -1728,7 +1741,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                         let ready_through_ts = next_minute.and_then(|minute| {
                             state_store.latest_contiguous_complete_canonical_minute_from(
                                 minute,
-                                latest_confirmed_closed,
+                                effective_confirmed_closed,
                             )
                         });
                         let frontier_snapshot = refresh_runtime_observability_metrics(
@@ -1750,7 +1763,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                         )
                     };
                 let allow_oi_ratio_patches =
-                    allow_oi_ratio_patch_processing(next_minute, latest_confirmed_closed);
+                    allow_oi_ratio_patch_processing(next_minute, effective_confirmed_closed);
                 maybe_warn_runtime_stall(
                     &mut stall_detector,
                     &metrics,
@@ -1771,12 +1784,12 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                 let cutover_ready = live_catchup_cutover_ready(
                     ctx.config.as_ref(),
                     next_minute,
-                    latest_confirmed_closed,
+                    effective_confirmed_closed,
                     frontier_snapshot.dirty_recompute_from_ts,
                 );
 
                 if live_publish_state.publishing_enabled()
-                    && live_catchup_requested(ctx.config.as_ref(), next_minute, latest_confirmed_closed)
+                    && live_catchup_requested(ctx.config.as_ref(), next_minute, effective_confirmed_closed)
                 {
                     abort_oi_ratio_patch_task_shared(
                         &mut oi_ratio_patch_task,
@@ -1811,7 +1824,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                         &runtime_options,
                         &snapshot_path,
                         startup_checkpoint_path.as_deref(),
-                        latest_confirmed_closed,
+                        effective_confirmed_closed,
                         &frontier_snapshot,
                         live_repair_controller.deferred_gap_from_ts(),
                         &live_prepare_minute_pending,
@@ -1839,13 +1852,13 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                     info!(
                         state = ?live_publish_state,
                         dispatch_mode = ?live_publish_state.dispatch_mode(),
-                        backlog_minutes = live_backlog_minutes(next_minute, latest_confirmed_closed),
+                        backlog_minutes = live_backlog_minutes(next_minute, effective_confirmed_closed),
                         enter_lag_threshold_minutes = configured_live_catchup_enter_lag_minutes(ctx.config.as_ref()),
                         resume_lag_threshold_minutes = configured_live_catchup_resume_lag_minutes(ctx.config.as_ref()),
                         cutover_tail_minutes = configured_live_catchup_cutover_tail_minutes(ctx.config.as_ref()),
                         historical_materialization_range = ?historical_materialization_range,
                         next_minute = ?next_minute,
-                        latest_confirmed_closed = %latest_confirmed_closed,
+                        latest_confirmed_closed = %effective_confirmed_closed,
                         "indicator live output state changed"
                     );
                     last_logged_live_publish_state = Some(live_publish_state);
@@ -1856,7 +1869,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                     && !snapshot_fanout_started
                 {
                     let persisted_ts = ts_from_millis(metrics.snapshot().last_persisted_ts_ms);
-                    let fanout_reference_ts = ready_through_ts.or(Some(latest_confirmed_closed));
+                    let fanout_reference_ts = ready_through_ts.or(Some(effective_confirmed_closed));
                     if snapshot_fanout_start_ready(persisted_ts, fanout_reference_ts) {
                         snapshot_fanout_projector
                             .initialize_progress_if_absent()
@@ -1956,7 +1969,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                     live_publish_state,
                     startup_cutover_completed,
                     next_minute,
-                    latest_confirmed_closed,
+                    effective_confirmed_closed,
                     oi_ratio_patch_task.is_none(),
                 )
                 .await?;

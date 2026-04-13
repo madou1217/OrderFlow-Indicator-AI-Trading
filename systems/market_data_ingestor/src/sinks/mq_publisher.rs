@@ -65,17 +65,13 @@ impl MqPublisher {
         &self,
         event: &NormalizedMdEvent,
     ) -> Result<Vec<OutboxRecord>> {
-        // Backfill data is emitted to replay exchange for dedicated replay consumers.
-        // Aggregate backfill also goes to live exchange so live indicator consumers can
-        // immediately observe repaired/late minute chunks.
+        // Backfill data is emitted to replay exchange only. Live consumers should
+        // only see post-backfill, real-time data.
         if event.backfill_in_progress {
-            let mut records = Vec::with_capacity(2);
-            records.push(self.build_outbox_record_for_exchange(event, &self.replay_exchange_name)?);
-            if event.msg_type.starts_with("md.agg.") {
-                records
-                    .push(self.build_outbox_record_for_exchange(event, &self.live_exchange_name)?);
-            }
-            return Ok(records);
+            return Ok(vec![self.build_outbox_record_for_exchange(
+                event,
+                &self.replay_exchange_name,
+            )?]);
         }
 
         // Live mode emits to live exchange only. Replay should be produced by md_replayer.
