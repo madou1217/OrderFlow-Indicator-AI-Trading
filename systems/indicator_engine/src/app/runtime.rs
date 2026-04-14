@@ -2807,6 +2807,30 @@ fn startup_state_only_recovery_can_skip_warm_history(
         && recovery_seed_has_reusable_finalized_history
 }
 
+fn rewind_recovery_seed_for_startup_warm_replay(
+    state_store: &mut StateStore,
+    recovery_seed_restored: bool,
+    warm_start_ts: DateTime<Utc>,
+    warm_end_ts: DateTime<Utc>,
+) -> bool {
+    if !recovery_seed_restored || warm_start_ts > warm_end_ts {
+        return false;
+    }
+
+    if state_store
+        .last_finalized_minute()
+        .map(|last| warm_start_ts <= last)
+        .unwrap_or(false)
+    {
+        state_store.rewind_finalized_state_from(warm_start_ts);
+        state_store.clear_dirty_recompute_state();
+        state_store.clear_oi_ratio_patch_state();
+        return true;
+    }
+
+    false
+}
+
 fn startup_checkpoint_canonical_replay_start_ts(
     checkpoint_from_ts: DateTime<Utc>,
     checkpoint_resume_from_ts: DateTime<Utc>,
@@ -7494,6 +7518,18 @@ async fn run_startup_backfill(
     } else {
         history_replay_start_ts
     };
+    if rewind_recovery_seed_for_startup_warm_replay(
+        state_store,
+        recovery_seed_restored,
+        warm_start_ts,
+        warm_end_ts,
+    ) {
+        info!(
+            warm_start_ts = %warm_start_ts,
+            warm_end_ts = %warm_end_ts,
+            "rewound restored finalized state before startup warm replay"
+        );
+    }
     if warm_start_ts <= warm_end_ts {
         let mut minute = warm_start_ts;
         let mut warmed_minutes = 0usize;
@@ -9583,9 +9619,9 @@ mod tests {
         minute_exclusive_upper_bound, minute_history_is_strictly_contiguous,
         replay_heatmap_hydration_batch_end, replay_row_after_cursor,
         required_snapshot_history_start_ts, resolved_live_commit_next_ts,
-        save_startup_backfill_checkpoint, save_state_snapshot, select_recent_kline_supplement_rows,
-        shutdown_ready_through_candidate, snapshot_has_required_history,
-        snapshot_has_reusable_finalized_history_for_fast_restart,
+        rewind_recovery_seed_for_startup_warm_replay, save_startup_backfill_checkpoint,
+        save_state_snapshot, select_recent_kline_supplement_rows, shutdown_ready_through_candidate,
+        snapshot_has_required_history, snapshot_has_reusable_finalized_history_for_fast_restart,
         snapshot_is_reusable_recovery_seed, snapshot_null_price_run_reaches_recent_tail,
         stale_live_pending_minutes, startup_backfill_checkpoint_path,
         startup_checkpoint_canonical_replay_start_ts,
@@ -10034,6 +10070,48 @@ mod tests {
         snap
     }
 
+    fn run_startup_state_only_restart_cycle(
+        snapshot: StateSnapshot,
+        warm_start_ts: chrono::DateTime<Utc>,
+        warm_end_ts: chrono::DateTime<Utc>,
+        repair_start_ts: chrono::DateTime<Utc>,
+        replay_end_ts: chrono::DateTime<Utc>,
+    ) -> StateSnapshot {
+        let mut state_store = StateStore::new("TESTUSDT".to_string(), 1_000.0);
+        state_store.restore_from_snapshot(snapshot);
+
+        let _ = rewind_recovery_seed_for_startup_warm_replay(
+            &mut state_store,
+            true,
+            warm_start_ts,
+            warm_end_ts,
+        );
+
+        let mut minute = warm_start_ts;
+        while minute <= warm_end_ts {
+            state_store.advance_finalized_state_without_derived_refresh(minute);
+            minute += ChronoDuration::minutes(1);
+        }
+
+        if state_store
+            .last_finalized_minute()
+            .map(|last| repair_start_ts <= last)
+            .unwrap_or(false)
+        {
+            state_store.rewind_finalized_state_from(repair_start_ts);
+        }
+        state_store.clear_dirty_recompute_state();
+        state_store.clear_oi_ratio_patch_state();
+
+        let mut minute = repair_start_ts;
+        while minute <= replay_end_ts {
+            state_store.advance_finalized_state_without_derived_refresh(minute);
+            minute += ChronoDuration::minutes(1);
+        }
+
+        state_store.extract_snapshot()
+    }
+
     #[test]
     fn startup_backfill_sql_filters_canonical_rows_by_ts_bucket() {
         let sql = build_backfill_sql(false, false);
@@ -10366,6 +10444,84 @@ mod tests {
         assert!(!startup_state_only_recovery_can_skip_warm_history(
             false, true, true
         ));
+    }
+
+    #[test]
+    fn startup_warm_replay_rewinds_restored_seed_before_replaying_history() {
+        let history_start_ts = Utc
+            .with_ymd_and_hms(2026, 4, 8, 10, 36, 0)
+            .single()
+            .unwrap();
+        let replay_end_ts = history_start_ts + ChronoDuration::minutes(10);
+        let repair_start_ts = history_start_ts + ChronoDuration::minutes(5);
+        let warm_end_ts = repair_start_ts - ChronoDuration::minutes(1);
+        let history = (0..=10)
+            .map(|offset| {
+                priced_history_row(history_start_ts + ChronoDuration::minutes(offset), 2000.0)
+            })
+            .collect::<Vec<_>>();
+        let snap = snapshot_fixture(replay_end_ts, history.clone(), history, None);
+        let mut state_store = StateStore::new("TESTUSDT".to_string(), 1_000.0);
+        state_store.restore_from_snapshot(snap);
+
+        assert_eq!(state_store.history_futures_len(), 11);
+        assert_eq!(state_store.last_finalized_minute(), Some(replay_end_ts));
+        assert!(rewind_recovery_seed_for_startup_warm_replay(
+            &mut state_store,
+            true,
+            history_start_ts,
+            warm_end_ts,
+        ));
+        assert_eq!(state_store.history_futures_len(), 0);
+        assert_eq!(state_store.last_finalized_minute(), None);
+    }
+
+    #[test]
+    fn repeated_startup_state_only_recovery_keeps_history_len_stable() {
+        let history_start_ts = Utc
+            .with_ymd_and_hms(2026, 4, 8, 10, 36, 0)
+            .single()
+            .unwrap();
+        let replay_end_ts = history_start_ts + ChronoDuration::minutes(10);
+        let repair_start_ts = history_start_ts + ChronoDuration::minutes(5);
+        let warm_end_ts = repair_start_ts - ChronoDuration::minutes(1);
+        let history = (0..=10)
+            .map(|offset| {
+                priced_history_row(history_start_ts + ChronoDuration::minutes(offset), 2000.0)
+            })
+            .collect::<Vec<_>>();
+        let original_len = history.len();
+        let initial_snapshot =
+            snapshot_fixture(replay_end_ts, history.clone(), history.clone(), None);
+
+        let first_snapshot = run_startup_state_only_restart_cycle(
+            initial_snapshot.clone(),
+            history_start_ts,
+            warm_end_ts,
+            repair_start_ts,
+            replay_end_ts,
+        );
+        let second_snapshot = run_startup_state_only_restart_cycle(
+            first_snapshot.clone(),
+            history_start_ts,
+            warm_end_ts,
+            repair_start_ts,
+            replay_end_ts,
+        );
+
+        for snapshot in [&first_snapshot, &second_snapshot] {
+            assert_eq!(snapshot.history_futures.len(), original_len);
+            assert_eq!(snapshot.history_spot.len(), original_len);
+            assert_eq!(
+                snapshot.history_futures.first().map(|row| row.ts_bucket),
+                Some(history_start_ts)
+            );
+            assert_eq!(
+                snapshot.history_futures.last().map(|row| row.ts_bucket),
+                Some(replay_end_ts)
+            );
+            assert_eq!(snapshot.last_finalized_ts, replay_end_ts);
+        }
     }
 
     #[test]
