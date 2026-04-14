@@ -34,7 +34,7 @@ use sqlx::{postgres::PgRow, PgPool, Row};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::{mpsc, Mutex, RwLock};
@@ -658,6 +658,46 @@ fn effective_live_commit_frontier_ts(
     }
 }
 
+fn resolved_live_commit_next_ts(
+    current_next_commit_ts: Option<DateTime<Utc>>,
+    pending_first_ts: Option<DateTime<Utc>>,
+    frontier_override_ts: Option<DateTime<Utc>>,
+) -> Option<DateTime<Utc>> {
+    let mut next_commit_ts = current_next_commit_ts.or(pending_first_ts);
+
+    let Some(frontier_override_ts) = frontier_override_ts else {
+        return next_commit_ts;
+    };
+
+    let candidate_next_ts = frontier_override_ts + ChronoDuration::minutes(1);
+    let can_advance = pending_first_ts
+        .map(|pending_first_ts| pending_first_ts >= candidate_next_ts)
+        .unwrap_or(true);
+    if can_advance {
+        next_commit_ts = Some(
+            next_commit_ts
+                .map(|current| current.max(candidate_next_ts))
+                .unwrap_or(candidate_next_ts),
+        );
+    }
+
+    next_commit_ts
+}
+
+fn stale_live_pending_minutes<T>(
+    next_commit_ts: Option<DateTime<Utc>>,
+    pending: &BTreeMap<DateTime<Utc>, T>,
+) -> Vec<DateTime<Utc>> {
+    let Some(next_commit_ts) = next_commit_ts else {
+        return Vec::new();
+    };
+
+    pending
+        .range(..next_commit_ts)
+        .map(|(ts_bucket, _)| *ts_bucket)
+        .collect()
+}
+
 fn round_up_minutes(value: i64, step: i64) -> i64 {
     if value <= 0 {
         return 0;
@@ -1194,12 +1234,14 @@ pub async fn run(ctx: AppContext) -> Result<()> {
         startup_replay_cutoff_bucket,
         ctx.config.indicator.live_catchup_progress_only_enabled,
     );
+    let live_commit_frontier_override_ts_ms = Arc::new(AtomicI64::new(0));
     let mut live_commit_handle = Some(tokio::spawn(run_live_ordered_commit_loop(
         metrics.clone(),
         dispatcher.clone(),
         live_computed_job_rx,
         live_ready_job_pending.clone(),
         live_commit_initial_persisted_ts,
+        live_commit_frontier_override_ts_ms.clone(),
     )));
     let (dirty_ready_job_tx_raw, dirty_ready_job_rx) =
         mpsc::channel(DIRTY_READY_JOB_QUEUE_CAPACITY);
@@ -1706,7 +1748,11 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                         &mut oi_ratio_patch_task,
                     )
                     .await?;
-                    if repaired || confirmed_repair_controller.pending_from_ts().is_some() {
+                    if let Some(repair_ready_through_ts) = repaired {
+                        live_commit_frontier_override_ts_ms
+                            .store(repair_ready_through_ts.timestamp_millis(), Ordering::Release);
+                    }
+                    if repaired.is_some() || confirmed_repair_controller.pending_from_ts().is_some() {
                         continue;
                     }
                 }
@@ -1834,6 +1880,8 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                     )
                     .await?
                     .map(|repair_ready_through_ts| {
+                        live_commit_frontier_override_ts_ms
+                            .store(repair_ready_through_ts.timestamp_millis(), Ordering::Release);
                         live_repair_controller
                             .clear_deferred_gaps_through(repair_ready_through_ts);
                         repair_ready_through_ts
@@ -5155,9 +5203,9 @@ async fn maybe_execute_confirmed_repair_replay(
     dirty_ready_job_pending: &Arc<AtomicUsize>,
     repair_controller: &mut ConfirmedLateRepairController,
     oi_ratio_patch_task: &mut Option<OiRatioPatchTask>,
-) -> Result<bool> {
+) -> Result<Option<DateTime<Utc>>> {
     let Some(repair_start_ts) = repair_controller.pending_from_ts() else {
-        return Ok(false);
+        return Ok(None);
     };
 
     let live_prepare_pending = live_prepare_minute_pending.load(Ordering::Acquire);
@@ -5178,7 +5226,7 @@ async fn maybe_execute_confirmed_repair_replay(
                 "confirmed late canonical correction is waiting for the live pipeline to drain before state rebuild"
             );
         }
-        return Ok(false);
+        return Ok(None);
     }
 
     let repair_ready_through_ts = {
@@ -5196,7 +5244,7 @@ async fn maybe_execute_confirmed_repair_replay(
                 "confirmed late canonical correction is waiting for a contiguous confirmed replay window"
             );
         }
-        return Ok(false);
+        return Ok(None);
     };
 
     abort_oi_ratio_patch_task_shared(oi_ratio_patch_task, state_store, "confirmed_repair_replay")
@@ -5253,7 +5301,7 @@ async fn maybe_execute_confirmed_repair_replay(
         historical_materialization_range = ?pending_historical_range,
         "confirmed late canonical correction repaired via state-only rebuild"
     );
-    Ok(true)
+    Ok(Some(repair_ready_through_ts))
 }
 
 async fn maybe_execute_shutdown_confirmed_repair_replay(
@@ -5933,6 +5981,7 @@ async fn run_live_ordered_commit_loop(
     mut computed_job_rx: mpsc::Receiver<ComputedMinuteJob>,
     live_ready_job_pending: Arc<AtomicUsize>,
     initial_last_persisted_ts: Option<DateTime<Utc>>,
+    live_commit_frontier_override_ts_ms: Arc<AtomicI64>,
 ) -> Result<()> {
     let mut next_commit_ts = initial_last_persisted_ts.map(|ts| ts + ChronoDuration::minutes(1));
     let mut pending = BTreeMap::<DateTime<Utc>, ComputedMinuteJob>::new();
@@ -5945,19 +5994,18 @@ async fn run_live_ordered_commit_loop(
             &live_ready_job_pending,
             &mut next_commit_ts,
             &mut pending,
+            live_commit_frontier_override_ts_ms.as_ref(),
         )
         .await?;
     }
 
-    if next_commit_ts.is_none() {
-        next_commit_ts = pending.keys().next().copied();
-    }
     commit_live_jobs_in_order(
         &metrics,
         dispatcher.as_ref(),
         &live_ready_job_pending,
         &mut next_commit_ts,
         &mut pending,
+        live_commit_frontier_override_ts_ms.as_ref(),
     )
     .await?;
     if !pending.is_empty() {
@@ -5976,9 +6024,23 @@ async fn commit_live_jobs_in_order(
     live_ready_job_pending: &Arc<AtomicUsize>,
     next_commit_ts: &mut Option<DateTime<Utc>>,
     pending: &mut BTreeMap<DateTime<Utc>, ComputedMinuteJob>,
+    live_commit_frontier_override_ts_ms: &AtomicI64,
 ) -> Result<()> {
-    if next_commit_ts.is_none() {
-        *next_commit_ts = pending.keys().next().copied();
+    *next_commit_ts = resolved_live_commit_next_ts(
+        *next_commit_ts,
+        pending.keys().next().copied(),
+        ts_from_millis(live_commit_frontier_override_ts_ms.load(Ordering::Acquire)),
+    );
+    for stale_ts in stale_live_pending_minutes(*next_commit_ts, pending) {
+        let _stale_job = pending
+            .remove(&stale_ts)
+            .expect("stale live pending minute must exist");
+        live_ready_job_pending.fetch_sub(1, Ordering::AcqRel);
+        warn!(
+            ts_bucket = %stale_ts,
+            next_commit_ts = ?*next_commit_ts,
+            "dropping stale live minute superseded by ordered commit frontier"
+        );
     }
     while let Some(expected_ts) = *next_commit_ts {
         let Some(job) = pending.remove(&expected_ts) else {
@@ -9520,11 +9582,13 @@ mod tests {
         minimum_live_catchup_cutover_tail_minutes, minimum_startup_recovery_history_floor,
         minute_exclusive_upper_bound, minute_history_is_strictly_contiguous,
         replay_heatmap_hydration_batch_end, replay_row_after_cursor,
-        required_snapshot_history_start_ts, save_startup_backfill_checkpoint, save_state_snapshot,
-        select_recent_kline_supplement_rows, shutdown_ready_through_candidate,
-        snapshot_has_required_history, snapshot_has_reusable_finalized_history_for_fast_restart,
+        required_snapshot_history_start_ts, resolved_live_commit_next_ts,
+        save_startup_backfill_checkpoint, save_state_snapshot, select_recent_kline_supplement_rows,
+        shutdown_ready_through_candidate, snapshot_has_required_history,
+        snapshot_has_reusable_finalized_history_for_fast_restart,
         snapshot_is_reusable_recovery_seed, snapshot_null_price_run_reaches_recent_tail,
-        startup_backfill_checkpoint_path, startup_checkpoint_canonical_replay_start_ts,
+        stale_live_pending_minutes, startup_backfill_checkpoint_path,
+        startup_checkpoint_canonical_replay_start_ts,
         startup_state_only_recovery_can_skip_warm_history, try_load_startup_backfill_checkpoint,
         try_load_state_snapshot, BackfillCursor, ConfirmedLateRepairController,
         KlineSupplementCacheEntry, LiveCanonicalRepairController, ReplayRow, SnapshotLoadOutcome,
@@ -10356,6 +10420,83 @@ mod tests {
             effective_live_commit_frontier_ts(Some(persisted), Some(startup_cutoff), false),
             Some(persisted)
         );
+    }
+
+    #[test]
+    fn resolved_live_commit_next_ts_advances_after_state_only_repair() {
+        let current_next = Utc
+            .with_ymd_and_hms(2026, 4, 13, 8, 43, 0)
+            .single()
+            .unwrap();
+        let repair_ready_through = Utc
+            .with_ymd_and_hms(2026, 4, 13, 8, 54, 0)
+            .single()
+            .unwrap();
+        let first_pending_live = Utc
+            .with_ymd_and_hms(2026, 4, 13, 8, 55, 0)
+            .single()
+            .unwrap();
+
+        assert_eq!(
+            resolved_live_commit_next_ts(
+                Some(current_next),
+                Some(first_pending_live),
+                Some(repair_ready_through),
+            ),
+            Some(first_pending_live)
+        );
+    }
+
+    #[test]
+    fn resolved_live_commit_next_ts_does_not_skip_real_pending_gap() {
+        let current_next = Utc
+            .with_ymd_and_hms(2026, 4, 13, 8, 43, 0)
+            .single()
+            .unwrap();
+        let repair_ready_through = Utc
+            .with_ymd_and_hms(2026, 4, 13, 8, 54, 0)
+            .single()
+            .unwrap();
+        let unexpected_pending = Utc
+            .with_ymd_and_hms(2026, 4, 13, 8, 50, 0)
+            .single()
+            .unwrap();
+
+        assert_eq!(
+            resolved_live_commit_next_ts(
+                Some(current_next),
+                Some(unexpected_pending),
+                Some(repair_ready_through),
+            ),
+            Some(current_next)
+        );
+    }
+
+    #[test]
+    fn stale_live_pending_minutes_returns_only_minutes_before_frontier() {
+        let minute_21 = Utc
+            .with_ymd_and_hms(2026, 4, 13, 22, 21, 0)
+            .single()
+            .unwrap();
+        let minute_22 = Utc
+            .with_ymd_and_hms(2026, 4, 13, 22, 22, 0)
+            .single()
+            .unwrap();
+        let minute_23 = Utc
+            .with_ymd_and_hms(2026, 4, 13, 22, 23, 0)
+            .single()
+            .unwrap();
+        let mut pending = BTreeMap::new();
+        pending.insert(minute_21, ());
+        pending.insert(minute_23, ());
+
+        assert_eq!(
+            stale_live_pending_minutes(Some(minute_23), &pending),
+            vec![minute_21]
+        );
+        assert!(stale_live_pending_minutes(Some(minute_21), &pending).is_empty());
+        assert!(stale_live_pending_minutes(None, &pending).is_empty());
+        assert!(!stale_live_pending_minutes(Some(minute_22), &pending).is_empty());
     }
 
     #[test]
