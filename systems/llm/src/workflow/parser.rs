@@ -322,6 +322,25 @@ fn hydrate_legacy_target_prices(path: &mut CurrentPath) {
     path.realization_plan = None;
 }
 
+fn normalize_target_zone_tp_price(zone: &mut TargetZone) {
+    if !zone.tp_price.is_finite() || !zone.low.is_finite() || !zone.high.is_finite() {
+        return;
+    }
+    if zone.low > zone.high {
+        return;
+    }
+    if zone.tp_price + f64::EPSILON < zone.low {
+        zone.tp_price = zone.low;
+    } else if zone.tp_price - f64::EPSILON > zone.high {
+        zone.tp_price = zone.high;
+    }
+}
+
+fn normalize_target_prices(path: &mut CurrentPath) {
+    normalize_target_zone_tp_price(&mut path.first_path_target);
+    normalize_target_zone_tp_price(&mut path.next_path_target);
+}
+
 fn validate_target_zone(field: &str, zone: &TargetZone) -> Result<()> {
     if !zone.tp_price.is_finite() {
         return Err(anyhow!("{field}.tp_price must be finite"));
@@ -401,6 +420,7 @@ pub fn parse_stage1_output(value: Value) -> Result<Stage1Output> {
                 return Err(anyhow!("current_path.side must be LONG or SHORT"));
             }
             hydrate_legacy_target_prices(path);
+            normalize_target_prices(path);
             if !ALLOWED_RISK_GRADES.contains(&path.risk_grade.as_str()) {
                 return Err(anyhow!(
                     "risk_grade must be one of [aligned_trend, countertrend_repair, high_conflict_repair]"
@@ -1374,6 +1394,25 @@ mod tests {
             Some("medium")
         );
         assert!(parsed.current_path.is_some());
+    }
+
+    #[test]
+    fn stage1_parser_clamps_target_tp_prices_back_into_target_zones() {
+        let mut sample = sample_stage1_output();
+        let path = sample.current_path.as_mut().expect("path");
+        path.first_path_target.low = 74899.9;
+        path.first_path_target.high = 74900.0;
+        path.first_path_target.tp_price = 74880.0;
+        path.next_path_target.low = 74900.0;
+        path.next_path_target.high = 75485.63;
+        path.next_path_target.tp_price = 76000.0;
+
+        let value = serde_json::to_value(sample).expect("encode");
+        let parsed = parse_stage1_output(value).expect("parse");
+        let parsed_path = parsed.current_path.as_ref().expect("path");
+
+        assert_eq!(parsed_path.first_path_target.tp_price, 74899.9);
+        assert_eq!(parsed_path.next_path_target.tp_price, 75485.63);
     }
 
     #[test]
