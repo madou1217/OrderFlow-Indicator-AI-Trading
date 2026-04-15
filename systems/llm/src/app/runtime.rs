@@ -1609,6 +1609,23 @@ fn workflow_stage2_review_due(
     config.llm.workflow.stage2_review_minutes.contains(&minute)
 }
 
+fn workflow_stage2b_review_due(
+    config: &RootConfig,
+    bundle: &LatestBundle,
+    stage1_refreshed_this_bundle: bool,
+    stage1_refresh_blocking: bool,
+    trading_state: &TradingStateSnapshot,
+) -> bool {
+    if stage1_refresh_blocking || !trading_state.has_active_positions {
+        return false;
+    }
+    if stage1_refreshed_this_bundle {
+        return true;
+    }
+    let minute = bundle.raw.ts_bucket.minute() as u8;
+    config.llm.workflow.stage2_review_minutes.contains(&minute)
+}
+
 fn startup_stage1_immediate_stage2a_due(
     stage1_refresh_reason: Option<&str>,
     stage1_refreshed_this_bundle: bool,
@@ -5905,13 +5922,21 @@ async fn invoke_workflow_bundle_models(
         Some(&stage1_output),
         &trading_state,
     );
+    let stage2b_review_due = workflow_stage2b_review_due(
+        &config,
+        &bundle,
+        stage1_refreshed_this_bundle,
+        stage1_refresh_blocking,
+        &trading_state,
+    );
     let stage2_review_due = startup_immediate_stage2a_due
         || workflow_stage2_review_due(
             &config,
             &bundle,
             Some(&stage1_output),
             stage1_refresh_blocking,
-        );
+        )
+        || stage2b_review_due;
 
     if stage2_review_due {
         if let Some(_stage2_guard) = try_acquire_workflow_stage(&symbol, WorkflowStageKind::Stage2)
@@ -5963,8 +5988,10 @@ async fn invoke_workflow_bundle_models(
                         &entry_snapshots,
                     );
                 let stage2b_live_position_count = trading_state.active_positions.len();
-                let should_run_stage2a =
-                    startup_immediate_stage2a_due || dispatch_flags.should_run_stage2a;
+                let should_run_stage2a = (startup_immediate_stage2a_due
+                    || dispatch_flags.should_run_stage2a)
+                    && stage1_output.monitoring_status == "active"
+                    && stage1_output.current_path.is_some();
                 let stage2b_dispatch_enabled = stage2b_live_position_count > 0;
                 let stage2b_context_count = stage2b_contexts.len();
                 let should_run_stage2b = stage2b_dispatch_enabled && stage2b_context_count > 0;
@@ -9973,6 +10000,102 @@ mod tests {
             &bundle,
             Some(&stage1_output),
             false,
+        ));
+    }
+
+    #[test]
+    fn workflow_stage2b_review_due_runs_for_live_positions_even_when_stage1_is_no_edge() {
+        let config = workflow_test_config();
+        let ts_bucket = DateTime::parse_from_rfc3339("2026-03-28T05:15:00Z")
+            .expect("ts")
+            .with_timezone(&Utc);
+        let bundle = LatestBundle {
+            raw: MinuteBundleEnvelope {
+                msg_type: "bundle".to_string(),
+                routing_key: "test.route".to_string(),
+                symbol: "ETHUSDT".to_string(),
+                ts_bucket,
+                window_code: "1m".to_string(),
+                indicator_count: 0,
+                published_at: None,
+                indicators: json!({}),
+            },
+            indicators: json!({}),
+            missing_indicator_codes: vec![],
+            received_at: ts_bucket,
+        };
+        let trading_state = TradingStateSnapshot {
+            symbol: "ETHUSDT".to_string(),
+            has_active_context: true,
+            has_active_positions: true,
+            has_open_orders: false,
+            active_positions: vec![crate::execution::binance::ActivePositionSnapshot {
+                position_side: "SHORT".to_string(),
+                position_amt: -0.382,
+                entry_price: 2319.8,
+                mark_price: 2321.0,
+                unrealized_pnl: -0.45,
+                leverage: 8,
+            }],
+            open_orders: vec![],
+            total_wallet_balance: 100.0,
+            available_balance: 90.0,
+        };
+
+        assert!(workflow_stage2b_review_due(
+            &config,
+            &bundle,
+            false,
+            false,
+            &trading_state,
+        ));
+    }
+
+    #[test]
+    fn workflow_stage2b_review_due_runs_immediately_after_stage1_refresh_for_live_positions() {
+        let config = workflow_test_config();
+        let ts_bucket = DateTime::parse_from_rfc3339("2026-03-28T05:14:00Z")
+            .expect("ts")
+            .with_timezone(&Utc);
+        let bundle = LatestBundle {
+            raw: MinuteBundleEnvelope {
+                msg_type: "bundle".to_string(),
+                routing_key: "test.route".to_string(),
+                symbol: "ETHUSDT".to_string(),
+                ts_bucket,
+                window_code: "1m".to_string(),
+                indicator_count: 0,
+                published_at: None,
+                indicators: json!({}),
+            },
+            indicators: json!({}),
+            missing_indicator_codes: vec![],
+            received_at: ts_bucket,
+        };
+        let trading_state = TradingStateSnapshot {
+            symbol: "ETHUSDT".to_string(),
+            has_active_context: true,
+            has_active_positions: true,
+            has_open_orders: false,
+            active_positions: vec![crate::execution::binance::ActivePositionSnapshot {
+                position_side: "SHORT".to_string(),
+                position_amt: -0.382,
+                entry_price: 2319.8,
+                mark_price: 2329.0,
+                unrealized_pnl: -3.5,
+                leverage: 8,
+            }],
+            open_orders: vec![],
+            total_wallet_balance: 100.0,
+            available_balance: 90.0,
+        };
+
+        assert!(workflow_stage2b_review_due(
+            &config,
+            &bundle,
+            true,
+            false,
+            &trading_state,
         ));
     }
 
