@@ -27,19 +27,8 @@ impl Indicator for I19KlineHistory {
             ("30d", ctx.kline_history_bars_30d),
         ];
 
-        let futures_1d_records = merge_interval_bar_records(
-            &ctx.kline_history_futures_1d_db,
-            &build_interval_bar_records(
-                &ctx.history_futures,
-                1440,
-                usize::MAX,
-                current_minute_close,
-            ),
-        );
-        let spot_1d_records = merge_interval_bar_records(
-            &ctx.kline_history_spot_1d_db,
-            &build_interval_bar_records(&ctx.history_spot, 1440, usize::MAX, current_minute_close),
-        );
+        let futures_1d_records = merged_daily_bar_records(ctx, true, current_minute_close);
+        let spot_1d_records = merged_daily_bar_records(ctx, false, current_minute_close);
 
         let mut intervals = serde_json::Map::new();
         for (interval_code, limit) in interval_specs {
@@ -55,25 +44,31 @@ impl Indicator for I19KlineHistory {
                         current_minute_close,
                     )
                 }
-                "4h" => build_interval_bars_with_db(
-                    &ctx.history_futures,
-                    &ctx.kline_history_futures_4h_db,
-                    interval_minutes,
+                "4h" => bars_to_json_limited(
+                    merge_interval_bar_records(
+                        &ctx.kline_history_futures_4h_db,
+                        &in_memory_interval_bar_records(
+                            ctx,
+                            &ctx.history_futures,
+                            interval_code,
+                            true,
+                            current_minute_close,
+                        ),
+                    ),
                     limit,
-                    current_minute_close,
                 ),
-                "1d" if ctx.kline_history_fill_1d_from_db => build_interval_bars_with_db(
-                    &ctx.history_futures,
-                    &ctx.kline_history_futures_1d_db,
-                    interval_minutes,
+                "1d" if ctx.kline_history_fill_1d_from_db => {
+                    bars_to_json_limited(futures_1d_records.clone(), limit)
+                }
+                _ => bars_to_json_limited(
+                    in_memory_interval_bar_records(
+                        ctx,
+                        &ctx.history_futures,
+                        interval_code,
+                        true,
+                        current_minute_close,
+                    ),
                     limit,
-                    current_minute_close,
-                ),
-                _ => build_interval_bars(
-                    &ctx.history_futures,
-                    interval_minutes,
-                    limit,
-                    current_minute_close,
                 ),
             };
             let spot_bars = match interval_code {
@@ -85,25 +80,31 @@ impl Indicator for I19KlineHistory {
                         current_minute_close,
                     )
                 }
-                "4h" => build_interval_bars_with_db(
-                    &ctx.history_spot,
-                    &ctx.kline_history_spot_4h_db,
-                    interval_minutes,
+                "4h" => bars_to_json_limited(
+                    merge_interval_bar_records(
+                        &ctx.kline_history_spot_4h_db,
+                        &in_memory_interval_bar_records(
+                            ctx,
+                            &ctx.history_spot,
+                            interval_code,
+                            false,
+                            current_minute_close,
+                        ),
+                    ),
                     limit,
-                    current_minute_close,
                 ),
-                "1d" if ctx.kline_history_fill_1d_from_db => build_interval_bars_with_db(
-                    &ctx.history_spot,
-                    &ctx.kline_history_spot_1d_db,
-                    interval_minutes,
+                "1d" if ctx.kline_history_fill_1d_from_db => {
+                    bars_to_json_limited(spot_1d_records.clone(), limit)
+                }
+                _ => bars_to_json_limited(
+                    in_memory_interval_bar_records(
+                        ctx,
+                        &ctx.history_spot,
+                        interval_code,
+                        false,
+                        current_minute_close,
+                    ),
                     limit,
-                    current_minute_close,
-                ),
-                _ => build_interval_bars(
-                    &ctx.history_spot,
-                    interval_minutes,
-                    limit,
-                    current_minute_close,
                 ),
             };
 
@@ -136,6 +137,50 @@ impl Indicator for I19KlineHistory {
             }),
         )
     }
+}
+
+pub(crate) fn in_memory_interval_bar_records(
+    ctx: &IndicatorContext,
+    history: &[MinuteHistory],
+    interval_code: &str,
+    is_futures: bool,
+    current_minute_close: DateTime<Utc>,
+) -> Vec<KlineHistoryBar> {
+    if interval_code != "1m" {
+        let cached = if is_futures {
+            ctx.incremental_outputs
+                .htf_bar_cache
+                .futures_records(interval_code)
+        } else {
+            ctx.incremental_outputs
+                .htf_bar_cache
+                .spot_records(interval_code)
+        };
+        if let Some(records) = cached {
+            return records.to_vec();
+        }
+    }
+
+    let Some(interval_minutes) = window_code_minutes(interval_code) else {
+        return Vec::new();
+    };
+    build_interval_bar_records(history, interval_minutes, usize::MAX, current_minute_close)
+}
+
+pub(crate) fn merged_daily_bar_records(
+    ctx: &IndicatorContext,
+    is_futures: bool,
+    current_minute_close: DateTime<Utc>,
+) -> Vec<KlineHistoryBar> {
+    let (history, db_rows) = if is_futures {
+        (&ctx.history_futures, &ctx.kline_history_futures_1d_db)
+    } else {
+        (&ctx.history_spot, &ctx.kline_history_spot_1d_db)
+    };
+    merge_interval_bar_records(
+        db_rows,
+        &in_memory_interval_bar_records(ctx, history, "1d", is_futures, current_minute_close),
+    )
 }
 
 #[derive(Clone)]
@@ -281,10 +326,17 @@ fn build_interval_bars(
     limit: usize,
     current_minute_close: DateTime<Utc>,
 ) -> Vec<serde_json::Value> {
-    build_interval_bar_records(history, interval_minutes, limit, current_minute_close)
-        .into_iter()
-        .map(bar_to_json)
-        .collect()
+    bars_to_json_limited(
+        build_interval_bar_records(history, interval_minutes, usize::MAX, current_minute_close),
+        limit,
+    )
+}
+
+fn bars_to_json_limited(mut bars: Vec<KlineHistoryBar>, limit: usize) -> Vec<serde_json::Value> {
+    if bars.len() > limit {
+        bars = bars.split_off(bars.len() - limit);
+    }
+    bars.into_iter().map(bar_to_json).collect()
 }
 
 pub fn build_interval_bar_records_from_records(
@@ -373,7 +425,7 @@ fn build_interval_bars_with_db(
     bars
 }
 
-fn merge_interval_bar_records(
+pub(crate) fn merge_interval_bar_records(
     db_bars: &[KlineHistoryBar],
     in_mem_bars: &[KlineHistoryBar],
 ) -> Vec<KlineHistoryBar> {
@@ -393,7 +445,7 @@ fn merge_interval_bar_records(
     merged.into_values().collect()
 }
 
-fn minute_bar_to_record(bar: &MinuteHistory) -> KlineHistoryBar {
+pub(crate) fn minute_bar_to_record(bar: &MinuteHistory) -> KlineHistoryBar {
     let open_time = bar.ts_bucket;
     let close_time = open_time + Duration::minutes(1);
     KlineHistoryBar {
@@ -427,7 +479,7 @@ fn bar_has_full_coverage(bar: &KlineHistoryBar) -> bool {
     bar.minutes_covered >= bar.expected_minutes.max(1)
 }
 
-fn bar_is_closed(
+pub(crate) fn bar_is_closed(
     close_time: DateTime<Utc>,
     current_minute_close: DateTime<Utc>,
     minutes_covered: i64,
@@ -446,7 +498,7 @@ fn should_preserve_existing_bar(existing: &KlineHistoryBar, candidate: &KlineHis
         || existing.minutes_covered > candidate.minutes_covered
 }
 
-fn apply_record_to_bar(target: &mut KlineHistoryBar, source: &KlineHistoryBar) {
+pub(crate) fn apply_record_to_bar(target: &mut KlineHistoryBar, source: &KlineHistoryBar) {
     if target.open.is_none() {
         target.open = source.open;
     }
@@ -480,7 +532,7 @@ fn bar_to_json(bar: KlineHistoryBar) -> serde_json::Value {
     })
 }
 
-fn floor_to_interval(ts: DateTime<Utc>, interval_minutes: i64) -> DateTime<Utc> {
+pub(crate) fn floor_to_interval(ts: DateTime<Utc>, interval_minutes: i64) -> DateTime<Utc> {
     let secs = interval_minutes * 60;
     let aligned = ts.timestamp().div_euclid(secs) * secs;
     DateTime::<Utc>::from_timestamp(aligned, 0).unwrap_or(ts)

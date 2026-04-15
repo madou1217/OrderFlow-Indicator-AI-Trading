@@ -9,9 +9,10 @@ use crate::indicators::shared::event_views::{
 use crate::indicators::shared::market_structure::{
     stacked_imbalance_flags, value_area_key_levels_ticks,
 };
-use crate::runtime::state_store::tick_to_price;
-use chrono::Duration;
+use crate::runtime::state_store::{tick_to_price, MinuteHistory};
+use chrono::{DateTime, Duration, Utc};
 use serde_json::{json, Map, Value};
+use std::collections::VecDeque;
 
 const TICK_SIZE: f64 = 0.01;
 const EPSILON_BREAK_TICKS: f64 = 2.0;
@@ -20,6 +21,8 @@ const ZDELTA_MIN: f64 = 1.5;
 const RDELTA_MIN: f64 = 0.20;
 const MIN_FOLLOW_MINUTES: usize = 5;
 const HOLD_BREAK_TICKS: f64 = 1.0;
+pub(crate) const INITIATION_INCREMENTAL_LOOKBACK_MINUTES: i64 =
+    ZDELTA_LOOKBACK as i64 + MIN_FOLLOW_MINUTES as i64 + 5;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct InitiationEventData {
@@ -48,13 +51,474 @@ pub(crate) struct InitiationEventData {
     pub payload: Value,
 }
 
-fn compute_initiation_all_history(ctx: &IndicatorContext) -> Vec<InitiationEventData> {
-    let series = ctx.basic_event_history_series();
+#[derive(Debug, Clone)]
+struct InitiationDerivedMinute {
+    seq: usize,
+    ts_bucket: DateTime<Utc>,
+    high: f64,
+    low: f64,
+    close: f64,
+    delta: f64,
+    rdelta: f64,
+    spot_rdelta: f64,
+    spot_cvd: f64,
+    spot_whale_notional: f64,
+    vah: f64,
+    val: f64,
+    stacked_buy: bool,
+    stacked_sell: bool,
+    zdelta: f64,
+}
+
+#[derive(Debug, Clone)]
+struct InitiationPendingCandidate {
+    direction: i16,
+    start_seq: usize,
+    pivot_price: f64,
+    z_delta: f64,
+    follow_through_delta_sum: f64,
+    min_close_post_break: f64,
+    max_close_post_break: f64,
+    min_low: f64,
+    max_high: f64,
+    event_price_low: f64,
+    event_price_high: f64,
+}
+
+#[derive(Debug, Clone)]
+struct InitiationCachedEvent {
+    required_start_ts: DateTime<Utc>,
+    event: InitiationEventData,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct InitiationEventStateMachine {
+    minutes: VecDeque<InitiationDerivedMinute>,
+    delta_window: VecDeque<(usize, f64)>,
+    delta_window_sum: f64,
+    delta_window_sumsq: f64,
+    pending: VecDeque<InitiationPendingCandidate>,
+    events: VecDeque<InitiationCachedEvent>,
+    last_ts: Option<DateTime<Utc>>,
+    vah_ffill: Option<f64>,
+    val_ffill: Option<f64>,
+    next_seq: usize,
+}
+
+impl InitiationEventStateMachine {
+    pub(crate) fn rebuild(
+        &mut self,
+        history_futures: &[MinuteHistory],
+        history_spot: &[MinuteHistory],
+    ) {
+        *self = Self::default();
+        let (history_futures, history_spot) = aligned_event_histories(history_futures, history_spot);
+        for (fut, spot) in history_futures.iter().zip(history_spot.iter()) {
+            self.append_pair(fut, spot);
+        }
+        self.last_ts = history_futures.last().map(|row| row.ts_bucket);
+    }
+
+    pub(crate) fn sync(
+        &mut self,
+        history_futures: &[MinuteHistory],
+        history_spot: &[MinuteHistory],
+    ) {
+        let (history_futures, history_spot) = aligned_event_histories(history_futures, history_spot);
+        let Some(first_ts) = history_futures.first().map(|row| row.ts_bucket) else {
+            *self = Self::default();
+            return;
+        };
+        let last_ts = history_futures.last().map(|row| row.ts_bucket).unwrap_or(first_ts);
+        match self.last_ts {
+            None => {
+                self.rebuild(history_futures, history_spot);
+                return;
+            }
+            Some(prev_last_ts) if prev_last_ts >= last_ts => {
+                self.rebuild(history_futures, history_spot);
+                return;
+            }
+            Some(_) => {}
+        }
+        self.prune_before(first_ts);
+        let start_idx = lower_bound_history_ts(history_futures, self.last_ts.unwrap() + Duration::minutes(1));
+        if start_idx == 0 && self.minutes.is_empty() {
+            self.rebuild(history_futures, history_spot);
+            return;
+        }
+        for (fut, spot) in history_futures[start_idx..].iter().zip(history_spot[start_idx..].iter()) {
+            self.append_pair(fut, spot);
+        }
+        self.last_ts = Some(last_ts);
+    }
+
+    pub(crate) fn events(&self) -> Vec<InitiationEventData> {
+        self.events.iter().map(|entry| entry.event.clone()).collect()
+    }
+
+    fn prune_before(&mut self, first_ts: DateTime<Utc>) {
+        while self
+            .minutes
+            .front()
+            .map(|row| row.ts_bucket < first_ts)
+            .unwrap_or(false)
+        {
+            if let Some(removed) = self.minutes.pop_front() {
+                if self
+                    .delta_window
+                    .front()
+                    .map(|(seq, _)| *seq == removed.seq)
+                    .unwrap_or(false)
+                {
+                    self.delta_window.pop_front();
+                    self.delta_window_sum -= removed.delta;
+                    self.delta_window_sumsq -= removed.delta * removed.delta;
+                }
+            }
+        }
+        while self
+            .events
+            .front()
+            .map(|entry| entry.required_start_ts < first_ts)
+            .unwrap_or(false)
+        {
+            self.events.pop_front();
+        }
+        while self
+            .pending
+            .front()
+            .map(|candidate| {
+                self.offset_of(candidate.start_seq)
+                    .and_then(|idx| self.minutes.get(idx))
+                    .map(|row| row.ts_bucket < first_ts)
+                    .unwrap_or(true)
+            })
+            .unwrap_or(false)
+        {
+            self.pending.pop_front();
+        }
+    }
+
+    fn append_pair(&mut self, fut: &MinuteHistory, spot: &MinuteHistory) {
+        let high = fut.high_price.or(fut.last_price).unwrap_or(0.0);
+        let low = fut.low_price.or(fut.last_price).unwrap_or(0.0);
+        let close = fut
+            .close_price
+            .or(fut.last_price)
+            .or(fut.open_price)
+            .unwrap_or(0.0);
+        if let Some((val_tick, vah_tick, _)) = value_area_key_levels_ticks(&fut.profile) {
+            self.val_ffill = Some(tick_to_price(val_tick));
+            self.vah_ffill = Some(tick_to_price(vah_tick));
+        }
+        let (stacked_buy, stacked_sell) = stacked_imbalance_flags(&fut.profile);
+
+        self.delta_window.push_back((self.next_seq, fut.delta));
+        self.delta_window_sum += fut.delta;
+        self.delta_window_sumsq += fut.delta * fut.delta;
+        if self.delta_window.len() > ZDELTA_LOOKBACK {
+            if let Some((_, removed)) = self.delta_window.pop_front() {
+                self.delta_window_sum -= removed;
+                self.delta_window_sumsq -= removed * removed;
+            }
+        }
+        let zdelta = if self.delta_window.len() == ZDELTA_LOOKBACK {
+            let mean = self.delta_window_sum / ZDELTA_LOOKBACK as f64;
+            let var =
+                (self.delta_window_sumsq / ZDELTA_LOOKBACK as f64 - mean * mean).max(0.0);
+            (fut.delta - mean) / (var.sqrt() + 1e-12)
+        } else {
+            0.0
+        };
+
+        let spot_close = spot
+            .close_price
+            .or(spot.last_price)
+            .or(spot.open_price)
+            .unwrap_or(0.0);
+        let minute = InitiationDerivedMinute {
+            seq: self.next_seq,
+            ts_bucket: fut.ts_bucket,
+            high,
+            low,
+            close,
+            delta: fut.delta,
+            rdelta: fut.relative_delta,
+            spot_rdelta: spot.relative_delta,
+            spot_cvd: spot.cvd,
+            spot_whale_notional: spot.delta * spot_close,
+            vah: self.vah_ffill.unwrap_or(high),
+            val: self.val_ffill.unwrap_or(low),
+            stacked_buy,
+            stacked_sell,
+            zdelta,
+        };
+        self.next_seq += 1;
+        self.minutes.push_back(minute);
+        let seq = self.minutes.back().map(|row| row.seq).unwrap_or_default();
+        self.update_pending(seq);
+        self.maybe_start_candidate(seq);
+    }
+
+    fn update_pending(&mut self, current_seq: usize) {
+        let Some(current_idx) = self.offset_of(current_seq) else {
+            return;
+        };
+        let Some(current) = self.minutes.get(current_idx).cloned() else {
+            return;
+        };
+        let mut retained = VecDeque::new();
+        while let Some(mut candidate) = self.pending.pop_front() {
+            if current_seq <= candidate.start_seq {
+                retained.push_back(candidate);
+                continue;
+            }
+            candidate.follow_through_delta_sum += current.delta;
+            candidate.min_close_post_break = candidate.min_close_post_break.min(current.close);
+            candidate.max_close_post_break = candidate.max_close_post_break.max(current.close);
+            candidate.min_low = candidate.min_low.min(current.low);
+            candidate.max_high = candidate.max_high.max(current.high);
+            candidate.event_price_low = candidate.event_price_low.min(current.low);
+            candidate.event_price_high = candidate.event_price_high.max(current.high);
+
+            if current_seq < candidate.start_seq + MIN_FOLLOW_MINUTES {
+                retained.push_back(candidate);
+                continue;
+            }
+            if let Some(event) = self.build_event(&candidate, current_seq) {
+                self.events.push_back(event);
+            }
+        }
+        self.pending = retained
+            .into_iter()
+            .filter(|candidate| current_seq < candidate.start_seq + MIN_FOLLOW_MINUTES)
+            .collect();
+    }
+
+    fn maybe_start_candidate(&mut self, seq: usize) {
+        let Some(idx) = self.offset_of(seq) else {
+            return;
+        };
+        let Some(current) = self.minutes.get(idx) else {
+            return;
+        };
+        if idx == 0 {
+            return;
+        };
+        let Some(prev) = self.minutes.get(idx - 1) else {
+            return;
+        };
+        if self.delta_window.len() < ZDELTA_LOOKBACK {
+            return;
+        }
+
+        let range = (current.high - current.low).max(TICK_SIZE);
+        let clv_bull = (current.close - current.low) / (range + 1e-12);
+        let clv_bear = (current.high - current.close) / (range + 1e-12);
+        let eps_break = EPSILON_BREAK_TICKS * TICK_SIZE;
+
+        let cand_bull = current.close > current.vah + eps_break
+            && prev.close <= prev.vah + eps_break
+            && current.zdelta >= ZDELTA_MIN
+            && current.rdelta >= RDELTA_MIN
+            && current.stacked_buy
+            && clv_bull >= 0.70;
+        let cand_bear = current.close < current.val - eps_break
+            && prev.close >= prev.val - eps_break
+            && current.zdelta <= -ZDELTA_MIN
+            && current.rdelta <= -RDELTA_MIN
+            && current.stacked_sell
+            && clv_bear >= 0.70;
+        let direction = match (cand_bull, cand_bear) {
+            (true, false) => 1,
+            (false, true) => -1,
+            _ => 0,
+        };
+        if direction == 0 {
+            return;
+        }
+        self.pending.push_back(InitiationPendingCandidate {
+            direction,
+            start_seq: seq,
+            pivot_price: if direction > 0 { current.vah } else { current.val },
+            z_delta: current.zdelta,
+            follow_through_delta_sum: current.delta,
+            min_close_post_break: f64::INFINITY,
+            max_close_post_break: f64::NEG_INFINITY,
+            min_low: current.low,
+            max_high: current.high,
+            event_price_low: current.low,
+            event_price_high: current.high,
+        });
+    }
+
+    fn build_event(
+        &self,
+        candidate: &InitiationPendingCandidate,
+        confirm_seq: usize,
+    ) -> Option<InitiationCachedEvent> {
+        let start_idx = self.offset_of(candidate.start_seq)?;
+        let confirm_idx = self.offset_of(confirm_seq)?;
+        let start = self.minutes.get(start_idx)?;
+        let confirm = self.minutes.get(confirm_idx)?;
+        if confirm_seq != candidate.start_seq + MIN_FOLLOW_MINUTES {
+            return None;
+        }
+        let eps_hold = HOLD_BREAK_TICKS * TICK_SIZE;
+        let follow_through_hold_ok = if candidate.direction > 0 {
+            candidate.min_close_post_break >= start.vah - eps_hold
+                && candidate.follow_through_delta_sum > 0.0
+        } else {
+            candidate.max_close_post_break <= start.val + eps_hold
+                && candidate.follow_through_delta_sum < 0.0
+        };
+        if !follow_through_hold_ok {
+            return None;
+        }
+
+        let group = self
+            .minutes
+            .iter()
+            .skip(start_idx)
+            .take(confirm_idx - start_idx + 1)
+            .collect::<Vec<_>>();
+        let n_g = group.len() as f64;
+        let rd_mean = group.iter().map(|row| row.rdelta).sum::<f64>() / n_g;
+        let break_mag = if candidate.direction > 0 {
+            (start.close - start.vah) / TICK_SIZE
+        } else {
+            (start.val - start.close) / TICK_SIZE
+        };
+        let follow_through_max_adverse_excursion_ticks = if candidate.direction > 0 {
+            ((start.vah - candidate.min_low).max(0.0)) / TICK_SIZE
+        } else {
+            ((candidate.max_high - start.val).max(0.0)) / TICK_SIZE
+        };
+        let spot_rd_mean = group.iter().map(|row| row.spot_rdelta).sum::<f64>() / n_g;
+        let spot_cvd_change = confirm.spot_cvd - start.spot_cvd;
+        let spot_break_confirm =
+            (candidate.direction as f64 * spot_rd_mean) >= 0.05
+                && (candidate.direction as f64 * spot_cvd_change) >= 0.0;
+        let spot_whale_confirm = group
+            .iter()
+            .map(|row| row.spot_whale_notional)
+            .sum::<f64>()
+            * candidate.direction as f64
+            > 0.0;
+        let score = 0.30 * clip01(candidate.z_delta.abs() / 3.0)
+            + 0.30 * clip01(rd_mean.abs() / 0.5)
+            + 0.20 * clip01(break_mag.abs() / 6.0)
+            + 0.20 * clip01(n_g / (MIN_FOLLOW_MINUTES as f64 + 1.0));
+
+        let event_type = if candidate.direction > 0 {
+            "bullish_initiation"
+        } else {
+            "bearish_initiation"
+        };
+        let start_ts = start.ts_bucket;
+        let confirm_ts = confirm.ts_bucket + Duration::minutes(1);
+        let end_ts = confirm_ts;
+        Some(InitiationCachedEvent {
+            required_start_ts: start_ts - Duration::minutes((ZDELTA_LOOKBACK - 1) as i64),
+            event: InitiationEventData {
+                direction: candidate.direction,
+                event_type: event_type.to_string(),
+                start_ts,
+                end_ts,
+                confirm_ts,
+                pivot_price: candidate.pivot_price,
+                price_low: candidate.event_price_low,
+                price_high: candidate.event_price_high,
+                z_delta: candidate.z_delta,
+                rdelta_mean: rd_mean,
+                break_mag_ticks: break_mag,
+                min_follow_required_minutes: MIN_FOLLOW_MINUTES as i32,
+                follow_through_minutes: (confirm_seq - candidate.start_seq) as i32,
+                follow_through_end_ts: confirm.ts_bucket + Duration::minutes(1),
+                follow_through_delta_sum: candidate.follow_through_delta_sum,
+                follow_through_hold_ok,
+                follow_through_max_adverse_excursion_ticks,
+                spot_break_confirm,
+                spot_rdelta_1m_mean: spot_rd_mean,
+                spot_cvd_change,
+                spot_whale_break_confirm: spot_whale_confirm,
+                score,
+                payload: json!({
+                    "event_start_ts": start_ts.to_rfc3339(),
+                    "event_end_ts": end_ts.to_rfc3339(),
+                    "event_available_ts": confirm_ts.to_rfc3339(),
+                    "pivot_price": candidate.pivot_price,
+                    "price_low": candidate.event_price_low,
+                    "price_high": candidate.event_price_high,
+                    "z_delta": candidate.z_delta,
+                    "rdelta_mean": rd_mean,
+                    "break_mag_ticks": break_mag,
+                    "min_follow_required_minutes": MIN_FOLLOW_MINUTES,
+                    "follow_through_minutes": confirm_seq - candidate.start_seq,
+                    "follow_through_end_ts": (confirm.ts_bucket + Duration::minutes(1)).to_rfc3339(),
+                    "follow_through_delta_sum": candidate.follow_through_delta_sum,
+                    "follow_through_hold_ok": follow_through_hold_ok,
+                    "follow_through_max_adverse_excursion_ticks": follow_through_max_adverse_excursion_ticks,
+                    "spot_break_confirm": spot_break_confirm,
+                    "spot_rdelta_1m_mean": spot_rd_mean,
+                    "spot_cvd_change": spot_cvd_change,
+                    "spot_whale_break_confirm": spot_whale_confirm,
+                    "strength_score_xmk": 0.80 * score
+                        + 0.15 * clip01(candidate.direction as f64 * spot_rd_mean)
+                        + 0.05 * if spot_whale_confirm { 1.0 } else { 0.0 },
+                    "sig_pass": true
+                }),
+            },
+        })
+    }
+
+    fn offset_of(&self, seq: usize) -> Option<usize> {
+        let first_seq = self.minutes.front()?.seq;
+        let idx = seq.checked_sub(first_seq)?;
+        (idx < self.minutes.len()).then_some(idx)
+    }
+}
+
+fn aligned_event_histories<'a>(
+    history_futures: &'a [MinuteHistory],
+    history_spot: &'a [MinuteHistory],
+) -> (&'a [MinuteHistory], &'a [MinuteHistory]) {
+    let n = history_futures.len().min(history_spot.len());
+    (
+        &history_futures[history_futures.len().saturating_sub(n)..],
+        &history_spot[history_spot.len().saturating_sub(n)..],
+    )
+}
+
+fn lower_bound_history_ts(history: &[MinuteHistory], target: DateTime<Utc>) -> usize {
+    let mut lo = 0usize;
+    let mut hi = history.len();
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if history[mid].ts_bucket < target {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
+}
+
+#[cfg(test)]
+pub(crate) fn compute_initiation_all_history_from_histories(
+    history_futures: &[MinuteHistory],
+    history_spot: &[MinuteHistory],
+) -> Vec<InitiationEventData> {
+    let series = crate::indicators::context::BasicEventHistorySeries::from_histories(
+        history_futures,
+        history_spot,
+    );
     let n = series.n;
     if n < ZDELTA_LOOKBACK + MIN_FOLLOW_MINUTES + 3 {
         return Vec::new();
     }
-    let fut = &ctx.history_futures[ctx.history_futures.len() - n..];
+    let fut = &history_futures[history_futures.len().saturating_sub(n)..];
     let high = &series.high;
     let low = &series.low;
     let close = &series.close;
@@ -257,15 +721,9 @@ fn compute_initiation_all_history(ctx: &IndicatorContext) -> Vec<InitiationEvent
     out
 }
 
-pub(crate) fn detect_initiation_all_history(
-    ctx: &IndicatorContext,
-) -> std::sync::Arc<Vec<InitiationEventData>> {
-    ctx.initiation_all_events_or_init(compute_initiation_all_history)
-}
-
 pub(crate) fn detect_initiation_events(ctx: &IndicatorContext) -> Vec<InitiationEventData> {
     let current_available_ts = ctx.ts_bucket + Duration::minutes(1);
-    detect_initiation_all_history(ctx)
+    ctx.initiation_all_events()
         .iter()
         .filter(|event| event.confirm_ts == current_available_ts)
         .cloned()
@@ -412,7 +870,7 @@ impl Indicator for I07Initiation {
     }
 
     fn evaluate(&self, ctx: &IndicatorContext) -> IndicatorComputation {
-        let all_events = detect_initiation_all_history(ctx);
+        let all_events = ctx.initiation_all_events();
         let window_view = build_event_window_view(
             ctx.ts_bucket,
             all_events
@@ -450,8 +908,8 @@ impl Indicator for I07Initiation {
 #[cfg(test)]
 mod tests {
     use super::{
-        compute_initiation_all_history, detect_initiation_all_history, detect_initiation_events,
-        initiation_event_json, InitiationEventData,
+        compute_initiation_all_history_from_histories, detect_initiation_events,
+        initiation_event_json, InitiationEventData, InitiationEventStateMachine,
     };
     use crate::indicators::context::{
         DivergenceSigTestMode, IndicatorContext, IndicatorSharedCaches,
@@ -771,9 +1229,25 @@ mod tests {
             history_spot,
         );
 
-        let direct = compute_initiation_all_history(&ctx);
-        let cached = detect_initiation_all_history(&ctx);
+        let direct =
+            compute_initiation_all_history_from_histories(&ctx.history_futures, &ctx.history_spot);
+        ctx.shared_caches
+            .seed_initiation_all_events(Arc::new(direct.clone()));
+        let cached = ctx.initiation_all_events();
         assert_eq!(direct, *cached);
+
+        let history_futures = ctx.history_futures.as_ref().clone();
+        let history_spot = ctx.history_spot.as_ref().clone();
+
+        let mut rebuilt_machine = InitiationEventStateMachine::default();
+        rebuilt_machine.rebuild(&history_futures, &history_spot);
+        assert_eq!(direct, rebuilt_machine.events());
+
+        let mut streaming_machine = InitiationEventStateMachine::default();
+        for end in 0..history_futures.len() {
+            streaming_machine.sync(&history_futures[..=end], &history_spot[..=end]);
+        }
+        assert_eq!(direct, streaming_machine.events());
 
         let expected_current = direct
             .iter()

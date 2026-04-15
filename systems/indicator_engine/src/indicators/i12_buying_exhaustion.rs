@@ -7,8 +7,9 @@ use crate::indicators::shared::event_views::{
     build_event_window_view, build_recent_7d_payload, merge_payload_fields,
 };
 use crate::runtime::state_store::MinuteHistory;
-use chrono::Duration;
+use chrono::{DateTime, Duration, Utc};
 use serde_json::{json, Map, Value};
+use std::collections::VecDeque;
 
 const TICK_SIZE: f64 = 0.01;
 const PIVOT_LEFT: usize = 3;
@@ -54,6 +55,482 @@ pub(crate) struct ExhaustionEventData {
     pub payload: Value,
 }
 
+#[derive(Debug, Clone)]
+struct ExhaustionDerivedMinute {
+    seq: usize,
+    ts_bucket: DateTime<Utc>,
+    high: f64,
+    low: f64,
+    close: f64,
+    delta: f64,
+    rdelta: f64,
+    spot_cvd: f64,
+    spot_whale_notional: f64,
+}
+
+#[derive(Debug, Clone)]
+struct ExhaustionPivot {
+    seq: usize,
+}
+
+#[derive(Debug, Clone)]
+struct ExhaustionPendingCandidate {
+    direction: i16,
+    pivot_seq_1: usize,
+    pivot_seq_2: usize,
+}
+
+#[derive(Debug, Clone)]
+struct ExhaustionCachedEvent {
+    required_start_ts: DateTime<Utc>,
+    event: ExhaustionEventData,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ExhaustionEventStateMachine {
+    minutes: VecDeque<ExhaustionDerivedMinute>,
+    pending: VecDeque<ExhaustionPendingCandidate>,
+    events: VecDeque<ExhaustionCachedEvent>,
+    last_high_pivot: Option<ExhaustionPivot>,
+    last_low_pivot: Option<ExhaustionPivot>,
+    last_ts: Option<DateTime<Utc>>,
+    next_seq: usize,
+}
+
+impl ExhaustionEventStateMachine {
+    pub(crate) fn rebuild(
+        &mut self,
+        history_futures: &[MinuteHistory],
+        history_spot: &[MinuteHistory],
+    ) {
+        *self = Self::default();
+        let (history_futures, history_spot) = aligned_event_histories(history_futures, history_spot);
+        for (fut, spot) in history_futures.iter().zip(history_spot.iter()) {
+            self.append_pair(fut, spot);
+        }
+        self.last_ts = history_futures.last().map(|row| row.ts_bucket);
+    }
+
+    pub(crate) fn sync(
+        &mut self,
+        history_futures: &[MinuteHistory],
+        history_spot: &[MinuteHistory],
+    ) {
+        let (history_futures, history_spot) = aligned_event_histories(history_futures, history_spot);
+        let Some(first_ts) = history_futures.first().map(|row| row.ts_bucket) else {
+            *self = Self::default();
+            return;
+        };
+        let last_ts = history_futures.last().map(|row| row.ts_bucket).unwrap_or(first_ts);
+        match self.last_ts {
+            None => {
+                self.rebuild(history_futures, history_spot);
+                return;
+            }
+            Some(prev_last_ts) if prev_last_ts >= last_ts => {
+                self.rebuild(history_futures, history_spot);
+                return;
+            }
+            Some(_) => {}
+        }
+        self.prune_before(first_ts);
+        let start_idx = lower_bound_history_ts(history_futures, self.last_ts.unwrap() + Duration::minutes(1));
+        if start_idx == 0 && self.minutes.is_empty() {
+            self.rebuild(history_futures, history_spot);
+            return;
+        }
+        for (fut, spot) in history_futures[start_idx..].iter().zip(history_spot[start_idx..].iter()) {
+            self.append_pair(fut, spot);
+        }
+        self.last_ts = Some(last_ts);
+    }
+
+    pub(crate) fn events(&self) -> Vec<ExhaustionEventData> {
+        self.events.iter().map(|entry| entry.event.clone()).collect()
+    }
+
+    fn prune_before(&mut self, first_ts: DateTime<Utc>) {
+        while self
+            .minutes
+            .front()
+            .map(|row| row.ts_bucket < first_ts)
+            .unwrap_or(false)
+        {
+            self.minutes.pop_front();
+        }
+        while self
+            .events
+            .front()
+            .map(|entry| {
+                entry.required_start_ts < first_ts || entry.event.start_ts < first_ts
+            })
+            .unwrap_or(false)
+        {
+            self.events.pop_front();
+        }
+        while self
+            .pending
+            .front()
+            .map(|candidate| self.offset_of(candidate.pivot_seq_1).is_none())
+            .unwrap_or(false)
+        {
+            self.pending.pop_front();
+        }
+        if self
+            .last_high_pivot
+            .as_ref()
+            .map(|pivot| self.offset_of(pivot.seq).is_none())
+            .unwrap_or(false)
+        {
+            self.last_high_pivot = None;
+        }
+        if self
+            .last_low_pivot
+            .as_ref()
+            .map(|pivot| self.offset_of(pivot.seq).is_none())
+            .unwrap_or(false)
+        {
+            self.last_low_pivot = None;
+        }
+    }
+
+    fn append_pair(&mut self, fut: &MinuteHistory, spot: &MinuteHistory) {
+        let high = fut.high_price.or(fut.last_price).unwrap_or(0.0);
+        let low = fut.low_price.or(fut.last_price).unwrap_or(0.0);
+        let close = fut
+            .close_price
+            .or(fut.last_price)
+            .or(fut.open_price)
+            .unwrap_or(0.0);
+        let spot_close = spot
+            .close_price
+            .or(spot.last_price)
+            .or(spot.open_price)
+            .unwrap_or(0.0);
+        let seq = self.next_seq;
+        self.minutes.push_back(ExhaustionDerivedMinute {
+            seq,
+            ts_bucket: fut.ts_bucket,
+            high,
+            low,
+            close,
+            delta: fut.delta,
+            rdelta: fut.relative_delta,
+            spot_cvd: spot.cvd,
+            spot_whale_notional: spot.delta * spot_close,
+        });
+        self.update_pending(seq);
+        self.maybe_confirm_pivot(seq, true);
+        self.maybe_confirm_pivot(seq, false);
+        self.next_seq += 1;
+    }
+
+    fn update_pending(&mut self, current_seq: usize) {
+        let Some(current_idx) = self.offset_of(current_seq) else {
+            return;
+        };
+        let Some(current) = self.minutes.get(current_idx) else {
+            return;
+        };
+        let mut retained = VecDeque::new();
+        while let Some(candidate) = self.pending.pop_front() {
+            if current_seq <= candidate.pivot_seq_2 {
+                retained.push_back(candidate);
+                continue;
+            }
+            let Some(pivot_idx) = self.offset_of(candidate.pivot_seq_2) else {
+                continue;
+            };
+            let Some(pivot) = self.minutes.get(pivot_idx) else {
+                continue;
+            };
+            let eps_confirm = EPSILON_CONFIRM_TICKS * TICK_SIZE;
+            let confirmed = if candidate.direction < 0 {
+                current.close <= pivot.low - eps_confirm
+            } else {
+                current.close >= pivot.high + eps_confirm
+            };
+            if confirmed {
+                if let Some(event) = self.build_event(&candidate, current_seq) {
+                    self.events.push_back(event);
+                }
+                continue;
+            }
+            if current_seq < candidate.pivot_seq_2 + CONFIRM_BARS {
+                retained.push_back(candidate);
+            }
+        }
+        self.pending = retained;
+    }
+
+    fn maybe_confirm_pivot(&mut self, current_seq: usize, is_high: bool) {
+        if current_seq < PIVOT_RIGHT {
+            return;
+        }
+        let pivot_seq = current_seq - PIVOT_RIGHT;
+        let Some(pivot_idx) = self.offset_of(pivot_seq) else {
+            return;
+        };
+        if pivot_idx < PIVOT_LEFT || pivot_idx + PIVOT_RIGHT >= self.minutes.len() {
+            return;
+        }
+        let is_pivot = if is_high {
+            let pivot_high = self.minutes[pivot_idx].high;
+            let left_max = self
+                .minutes
+                .iter()
+                .skip(pivot_idx - PIVOT_LEFT)
+                .take(PIVOT_LEFT)
+                .map(|row| row.high)
+                .fold(f64::NEG_INFINITY, f64::max);
+            let right_max = self
+                .minutes
+                .iter()
+                .skip(pivot_idx + 1)
+                .take(PIVOT_RIGHT)
+                .map(|row| row.high)
+                .fold(f64::NEG_INFINITY, f64::max);
+            pivot_high > left_max && pivot_high >= right_max
+        } else {
+            let pivot_low = self.minutes[pivot_idx].low;
+            let left_min = self
+                .minutes
+                .iter()
+                .skip(pivot_idx - PIVOT_LEFT)
+                .take(PIVOT_LEFT)
+                .map(|row| row.low)
+                .fold(f64::INFINITY, f64::min);
+            let right_min = self
+                .minutes
+                .iter()
+                .skip(pivot_idx + 1)
+                .take(PIVOT_RIGHT)
+                .map(|row| row.low)
+                .fold(f64::INFINITY, f64::min);
+            pivot_low < left_min && pivot_low <= right_min
+        };
+        if !is_pivot {
+            return;
+        }
+        let current_pivot = ExhaustionPivot { seq: pivot_seq };
+        if is_high {
+            if let Some(prev) = self.last_high_pivot.clone() {
+                self.maybe_start_candidate(&prev, &current_pivot, true);
+            }
+            self.last_high_pivot = Some(current_pivot);
+        } else {
+            if let Some(prev) = self.last_low_pivot.clone() {
+                self.maybe_start_candidate(&prev, &current_pivot, false);
+            }
+            self.last_low_pivot = Some(current_pivot);
+        }
+    }
+
+    fn maybe_start_candidate(
+        &mut self,
+        pivot_1: &ExhaustionPivot,
+        pivot_2: &ExhaustionPivot,
+        is_high: bool,
+    ) {
+        let Some(idx_1) = self.offset_of(pivot_1.seq) else {
+            return;
+        };
+        let Some(idx_2) = self.offset_of(pivot_2.seq) else {
+            return;
+        };
+        let Some(first) = self.minutes.get(idx_1) else {
+            return;
+        };
+        let Some(second) = self.minutes.get(idx_2) else {
+            return;
+        };
+        let leg_minutes = (second.ts_bucket - first.ts_bucket).num_minutes();
+        if !(MIN_LEG_GAP_MINUTES..=MAX_LEG_GAP_MINUTES).contains(&leg_minutes) {
+            return;
+        }
+        let range = (second.high - second.low).max(TICK_SIZE);
+        let eps_price = EPSILON_PRICE_TICKS * TICK_SIZE;
+        let valid = if is_high {
+            let reject_top = (second.high - second.close) / (range + 1e-12);
+            second.high >= first.high + eps_price
+                && second.delta <= first.delta - EPSILON_DELTA
+                && second.rdelta <= first.rdelta - EPSILON_RDELTA
+                && reject_top >= ETA_REJECT
+        } else {
+            let reject_bottom = (second.close - second.low) / (range + 1e-12);
+            second.low <= first.low - eps_price
+                && second.delta >= first.delta + EPSILON_DELTA
+                && second.rdelta >= first.rdelta + EPSILON_RDELTA
+                && reject_bottom >= ETA_REJECT
+        };
+        if !valid {
+            return;
+        }
+        self.pending.push_back(ExhaustionPendingCandidate {
+            direction: if is_high { -1 } else { 1 },
+            pivot_seq_1: pivot_1.seq,
+            pivot_seq_2: pivot_2.seq,
+        });
+    }
+
+    fn build_event(
+        &self,
+        candidate: &ExhaustionPendingCandidate,
+        confirm_seq: usize,
+    ) -> Option<ExhaustionCachedEvent> {
+        let idx_1 = self.offset_of(candidate.pivot_seq_1)?;
+        let idx_2 = self.offset_of(candidate.pivot_seq_2)?;
+        let confirm_idx = self.offset_of(confirm_seq)?;
+        let first = self.minutes.get(idx_1)?;
+        let second = self.minutes.get(idx_2)?;
+        let confirm = self.minutes.get(confirm_idx)?;
+        let range = (second.high - second.low).max(TICK_SIZE);
+        let confirm_speed = 1.0 / ((confirm_seq - candidate.pivot_seq_2) as f64).max(1.0);
+        let (event_type, pivot_price, price_push, delta_change, rdelta_change, reject_ratio, base_score) =
+            if candidate.direction < 0 {
+                let reject_top = (second.high - second.close) / (range + 1e-12);
+                let price_push = (second.high - first.high) / TICK_SIZE;
+                let delta_drop = first.delta - second.delta;
+                let rdelta_drop = first.rdelta - second.rdelta;
+                (
+                    "buying_exhaustion",
+                    second.high,
+                    price_push,
+                    second.delta - first.delta,
+                    second.rdelta - first.rdelta,
+                    reject_top,
+                    0.30 * clip01(price_push / 10.0)
+                        + 0.25 * clip01(delta_drop / (3.0 * EPSILON_DELTA))
+                        + 0.20 * clip01(rdelta_drop / (3.0 * EPSILON_RDELTA))
+                        + 0.15 * clip01((reject_top - ETA_REJECT) / (1.0 - ETA_REJECT))
+                        + 0.10 * clip01(confirm_speed * CONFIRM_BARS as f64),
+                )
+            } else {
+                let reject_bottom = (second.close - second.low) / (range + 1e-12);
+                let price_push = (first.low - second.low) / TICK_SIZE;
+                let delta_lift = second.delta - first.delta;
+                let rdelta_lift = second.rdelta - first.rdelta;
+                (
+                    "selling_exhaustion",
+                    second.low,
+                    price_push,
+                    second.delta - first.delta,
+                    second.rdelta - first.rdelta,
+                    reject_bottom,
+                    0.30 * clip01(price_push / 10.0)
+                        + 0.25 * clip01(delta_lift / (3.0 * EPSILON_DELTA))
+                        + 0.20 * clip01(rdelta_lift / (3.0 * EPSILON_RDELTA))
+                        + 0.15 * clip01((reject_bottom - ETA_REJECT) / (1.0 - ETA_REJECT))
+                        + 0.10 * clip01(confirm_speed * CONFIRM_BARS as f64),
+                )
+            };
+        let spot_cvd_push = confirm.spot_cvd - second.spot_cvd;
+        let spot_whale_push = self
+            .minutes
+            .iter()
+            .skip(idx_2)
+            .take(confirm_idx - idx_2 + 1)
+            .map(|row| row.spot_whale_notional)
+            .sum::<f64>();
+        let (spot_continuation_risk, spot_exhaustion_confirm) = if candidate.direction < 0 {
+            (
+                spot_cvd_push > THETA_BUY_CVD || spot_whale_push > THETA_BUY_WHALE,
+                spot_cvd_push <= THETA_BUY_CVD && spot_whale_push <= THETA_BUY_WHALE,
+            )
+        } else {
+            (
+                spot_cvd_push < THETA_SELL_CVD || spot_whale_push < THETA_SELL_WHALE,
+                spot_cvd_push >= THETA_SELL_CVD && spot_whale_push >= THETA_SELL_WHALE,
+            )
+        };
+        let final_score = clip01(
+            base_score
+                * (1.0 - LAMBDA_SPOT_PENALTY * if spot_continuation_risk { 1.0 } else { 0.0 })
+                + (1.0 - base_score) * 0.10 * if spot_exhaustion_confirm { 1.0 } else { 0.0 },
+        );
+        let start_ts = first.ts_bucket;
+        let confirm_ts = confirm.ts_bucket + Duration::minutes(1);
+        let end_ts = confirm_ts;
+        Some(ExhaustionCachedEvent {
+            required_start_ts: first.ts_bucket - Duration::minutes(PIVOT_LEFT as i64),
+            event: ExhaustionEventData {
+                direction: candidate.direction,
+                event_type: event_type.to_string(),
+                start_ts,
+                end_ts,
+                confirm_ts,
+                pivot_price,
+                pivot_ts_1: first.ts_bucket,
+                pivot_ts_2: second.ts_bucket,
+                pivot_confirm_ts_1: first.ts_bucket + Duration::minutes(PIVOT_RIGHT as i64),
+                pivot_confirm_ts_2: second.ts_bucket + Duration::minutes(PIVOT_RIGHT as i64),
+                price_push_ticks: price_push,
+                delta_change,
+                rdelta_change,
+                reject_ratio,
+                confirm_speed,
+                spot_cvd_push_post_pivot: spot_cvd_push,
+                spot_whale_push_post_pivot: spot_whale_push,
+                spot_continuation_risk,
+                spot_exhaustion_confirm,
+                score: final_score,
+                payload: json!({
+                    "event_start_ts": start_ts.to_rfc3339(),
+                    "event_end_ts": end_ts.to_rfc3339(),
+                    "event_available_ts": confirm_ts.to_rfc3339(),
+                    "pivot_price": pivot_price,
+                    "pivot_ts_1": first.ts_bucket.to_rfc3339(),
+                    "pivot_ts_2": second.ts_bucket.to_rfc3339(),
+                    "pivot_confirm_ts_1": (first.ts_bucket + Duration::minutes(PIVOT_RIGHT as i64)).to_rfc3339(),
+                    "pivot_confirm_ts_2": (second.ts_bucket + Duration::minutes(PIVOT_RIGHT as i64)).to_rfc3339(),
+                    "price_push_ticks": price_push,
+                    "reject_ratio": reject_ratio,
+                    "confirm_speed": confirm_speed,
+                    "spot_cvd_push_post_pivot": spot_cvd_push,
+                    "spot_whale_push_post_pivot": spot_whale_push,
+                    "spot_continuation_risk": spot_continuation_risk,
+                    "spot_exhaustion_confirm": spot_exhaustion_confirm,
+                    "strength_score_xmk": final_score,
+                    "exhaustion_quality_score": final_score,
+                    "sig_pass": true
+                }),
+            },
+        })
+    }
+
+    fn offset_of(&self, seq: usize) -> Option<usize> {
+        let first_seq = self.minutes.front()?.seq;
+        let idx = seq.checked_sub(first_seq)?;
+        (idx < self.minutes.len()).then_some(idx)
+    }
+}
+
+fn aligned_event_histories<'a>(
+    history_futures: &'a [MinuteHistory],
+    history_spot: &'a [MinuteHistory],
+) -> (&'a [MinuteHistory], &'a [MinuteHistory]) {
+    let n = history_futures.len().min(history_spot.len());
+    (
+        &history_futures[history_futures.len().saturating_sub(n)..],
+        &history_spot[history_spot.len().saturating_sub(n)..],
+    )
+}
+
+fn lower_bound_history_ts(history: &[MinuteHistory], target: DateTime<Utc>) -> usize {
+    let mut lo = 0usize;
+    let mut hi = history.len();
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if history[mid].ts_bucket < target {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
+}
+
+#[cfg(test)]
 pub(crate) fn compute_exhaustion_all_history_from_histories(
     history_futures: &[MinuteHistory],
     history_spot: &[MinuteHistory],
@@ -107,16 +584,6 @@ pub(crate) fn compute_exhaustion_all_history_from_histories(
         last_idx,
     ));
     out
-}
-
-fn compute_exhaustion_all_history(ctx: &IndicatorContext) -> Vec<ExhaustionEventData> {
-    compute_exhaustion_all_history_from_histories(&ctx.history_futures, &ctx.history_spot)
-}
-
-pub(crate) fn detect_exhaustion_all_history(
-    ctx: &IndicatorContext,
-) -> std::sync::Arc<Vec<ExhaustionEventData>> {
-    ctx.exhaustion_all_events_or_init(compute_exhaustion_all_history)
 }
 
 pub(crate) fn exhaustion_event_json(
@@ -507,7 +974,7 @@ impl Indicator for I12BuyingExhaustion {
 
     fn evaluate(&self, ctx: &IndicatorContext) -> IndicatorComputation {
         let all_events = ctx
-            .exhaustion_all_events_or_init(compute_exhaustion_all_history)
+            .exhaustion_all_events()
             .iter()
             .filter(|e| e.event_type == "buying_exhaustion")
             .cloned()
@@ -551,8 +1018,9 @@ impl Indicator for I12BuyingExhaustion {
 #[cfg(test)]
 mod tests {
     use super::{
-        compute_exhaustion_all_history, detect_buying_events, detect_exhaustion_all_history,
-        detect_selling_events, exhaustion_event_json, ExhaustionEventData,
+        compute_exhaustion_all_history_from_histories, detect_buying_events, detect_selling_events,
+        exhaustion_event_json, ExhaustionEventData,
+        ExhaustionEventStateMachine,
     };
     use crate::indicators::context::{
         DivergenceSigTestMode, IndicatorContext, IndicatorSharedCaches,
@@ -924,8 +1392,23 @@ mod tests {
             .collect::<Vec<_>>();
         let ctx = test_ctx(base + Duration::minutes(15), history_futures, history_spot);
 
-        let direct = compute_exhaustion_all_history(&ctx);
-        let cached = detect_exhaustion_all_history(&ctx);
+        let direct =
+            compute_exhaustion_all_history_from_histories(&ctx.history_futures, &ctx.history_spot);
+        ctx.shared_caches
+            .seed_exhaustion_all_events(Arc::new(direct.clone()));
+        let cached = ctx.exhaustion_all_events();
         assert_eq!(direct, *cached);
+
+        let history_futures = ctx.history_futures.as_ref().clone();
+        let history_spot = ctx.history_spot.as_ref().clone();
+        let mut rebuilt_machine = ExhaustionEventStateMachine::default();
+        rebuilt_machine.rebuild(&history_futures, &history_spot);
+        assert_eq!(direct, rebuilt_machine.events());
+
+        let mut streaming_machine = ExhaustionEventStateMachine::default();
+        for end in 0..history_futures.len() {
+            streaming_machine.sync(&history_futures[..=end], &history_spot[..=end]);
+        }
+        assert_eq!(direct, streaming_machine.events());
     }
 }

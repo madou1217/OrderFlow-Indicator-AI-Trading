@@ -1009,15 +1009,15 @@ fn validate_position_management_plan(
     expected_context_key: &str,
     expected_path_id: &str,
 ) -> Result<()> {
-    let current_stage1_path = stage1_output
+    let path_matches_live_context = plan.path_id == expected_path_id;
+    let path_matches_current_stage1 = stage1_output
         .current_path
         .as_ref()
-        .ok_or_else(|| anyhow!("Stage2B requires Stage1 current_path"))?;
-    let path_matches_live_context = plan.path_id == expected_path_id;
-    let path_matches_current_stage1 = plan.path_id == current_stage1_path.id;
+        .map(|current_stage1_path| plan.path_id == current_stage1_path.id)
+        .unwrap_or(false);
     if !path_matches_live_context && !path_matches_current_stage1 {
         return Err(anyhow!(
-            "position_management_plan.path_id must match the current Stage2B context path_id or Stage1 current_path.id"
+            "position_management_plan.path_id must match the current Stage2B context path_id or Stage1 current_path.id when present"
         ));
     }
     if plan.exposure_state != "in_position" {
@@ -1905,6 +1905,45 @@ mod tests {
                 .expect("current_path")
                 .id
         );
+    }
+
+    #[test]
+    fn stage2b_parser_allows_management_when_stage1_has_no_current_path() {
+        let mut stage1_output = sample_stage1_output();
+        stage1_output.monitoring_status = "no_edge".to_string();
+        stage1_output.current_path = None;
+        let value = json!({
+            "stage2b_decision": "MANAGE_POSITION",
+            "position_management_plan": {
+                "path_id": "legacy_path",
+                "exposure_state": "in_position",
+                "path_live_assessment": "invalidated",
+                "path_assessment_reason": "the refreshed stage1 output no longer carries a live path, so flatten the stale legacy position",
+                "actions": [{
+                    "action_type": "exit_full",
+                    "context_key": "ctx_1",
+                    "path_id": "legacy_path",
+                    "trigger_condition": {
+                        "trigger_type": "price_below",
+                        "trigger_price": 1990.0
+                    },
+                    "execution_price": 1989.5,
+                    "add_ratio": null,
+                    "reuse_current_entry_template": null,
+                    "reduce_ratio": null,
+                    "new_stop_loss": null,
+                    "reuse_current_bracket_template": null,
+                    "take_profit_1": null,
+                    "take_profit_2": null,
+                    "reason": "flatten the stale legacy path"
+                }],
+                "management_note": "manage the live legacy position even when stage1 is no_edge"
+            }
+        });
+
+        let parsed =
+            parse_stage2b_output(value, &stage1_output, "ctx_1", "legacy_path").expect("parse");
+        assert_eq!(parsed.position_management_plan.path_id, "legacy_path");
     }
 
     #[test]

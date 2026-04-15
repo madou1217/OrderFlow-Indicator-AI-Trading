@@ -9,9 +9,10 @@ use crate::indicators::shared::event_views::{
 use crate::indicators::shared::market_structure::{
     stacked_imbalance_flags, value_area_key_levels_ticks,
 };
-use crate::runtime::state_store::tick_to_price;
-use chrono::Duration;
+use crate::runtime::state_store::{tick_to_price, MinuteHistory};
+use chrono::{DateTime, Duration, Utc};
 use serde_json::{json, Map, Value};
+use std::collections::VecDeque;
 
 const TICK_SIZE: f64 = 0.01;
 const ETA_REJECT: f64 = 0.70;
@@ -23,6 +24,8 @@ const CONFIRM_BARS: usize = 3;
 const MAX_EVENT_MINUTES: usize = 30;
 const THETA_RD_SPOT: f64 = 0.15;
 const THETA_WHALE_SPOT: f64 = 100_000.0;
+pub(crate) const ABSORPTION_INCREMENTAL_LOOKBACK_MINUTES: i64 =
+    1_440 + MAX_EVENT_MINUTES as i64 + CONFIRM_BARS as i64 + 5;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct AbsorptionEventData {
@@ -51,14 +54,537 @@ pub(crate) struct AbsorptionEventData {
     pub payload: Value,
 }
 
-fn compute_absorption_all_history(ctx: &IndicatorContext) -> Vec<AbsorptionEventData> {
-    let series = ctx.basic_event_history_series();
+#[derive(Debug, Clone)]
+struct AbsorptionDerivedMinute {
+    seq: usize,
+    ts_bucket: DateTime<Utc>,
+    open: f64,
+    high: f64,
+    low: f64,
+    close: f64,
+    delta: f64,
+    rdelta: f64,
+    spot_rdelta: f64,
+    spot_cvd: f64,
+    spot_whale_notional: f64,
+    stacked_buy: bool,
+    stacked_sell: bool,
+    reject_bull: f64,
+    reject_bear: f64,
+    d_low_key: f64,
+    d_high_key: f64,
+    sign: i16,
+}
+
+#[derive(Debug, Clone)]
+struct AbsorptionGroupState {
+    direction: i16,
+    start_seq: usize,
+    end_seq: usize,
+    end_ts: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+struct AbsorptionCachedEvent {
+    required_start_ts: DateTime<Utc>,
+    event: AbsorptionEventData,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct AbsorptionEventStateMachine {
+    minutes: VecDeque<AbsorptionDerivedMinute>,
+    rolling_highs: VecDeque<(usize, f64)>,
+    rolling_lows: VecDeque<(usize, f64)>,
+    pending_groups: VecDeque<AbsorptionGroupState>,
+    active_group: Option<AbsorptionGroupState>,
+    events: VecDeque<AbsorptionCachedEvent>,
+    avwap_ffill: Option<f64>,
+    val_ffill: Option<f64>,
+    vah_ffill: Option<f64>,
+    poc_ffill: Option<f64>,
+    last_ts: Option<DateTime<Utc>>,
+    next_seq: usize,
+}
+
+impl AbsorptionEventStateMachine {
+    pub(crate) fn rebuild(
+        &mut self,
+        history_futures: &[MinuteHistory],
+        history_spot: &[MinuteHistory],
+    ) {
+        *self = Self::default();
+        let (history_futures, history_spot) = aligned_event_histories(history_futures, history_spot);
+        for (fut, spot) in history_futures.iter().zip(history_spot.iter()) {
+            self.append_pair(fut, spot);
+        }
+        self.last_ts = history_futures.last().map(|row| row.ts_bucket);
+    }
+
+    pub(crate) fn sync(
+        &mut self,
+        history_futures: &[MinuteHistory],
+        history_spot: &[MinuteHistory],
+    ) {
+        let (history_futures, history_spot) = aligned_event_histories(history_futures, history_spot);
+        let Some(first_ts) = history_futures.first().map(|row| row.ts_bucket) else {
+            *self = Self::default();
+            return;
+        };
+        let last_ts = history_futures.last().map(|row| row.ts_bucket).unwrap_or(first_ts);
+        match self.last_ts {
+            None => {
+                self.rebuild(history_futures, history_spot);
+                return;
+            }
+            Some(prev_last_ts) if prev_last_ts >= last_ts => {
+                self.rebuild(history_futures, history_spot);
+                return;
+            }
+            Some(_) => {}
+        }
+        self.prune_before(first_ts);
+        let start_idx = lower_bound_history_ts(history_futures, self.last_ts.unwrap() + Duration::minutes(1));
+        if start_idx == 0 && self.minutes.is_empty() {
+            self.rebuild(history_futures, history_spot);
+            return;
+        }
+        for (fut, spot) in history_futures[start_idx..].iter().zip(history_spot[start_idx..].iter()) {
+            self.append_pair(fut, spot);
+        }
+        self.last_ts = Some(last_ts);
+    }
+
+    pub(crate) fn events(&self) -> Vec<AbsorptionEventData> {
+        self.events.iter().map(|entry| entry.event.clone()).collect()
+    }
+
+    fn prune_before(&mut self, first_ts: DateTime<Utc>) {
+        while self
+            .minutes
+            .front()
+            .map(|row| row.ts_bucket < first_ts)
+            .unwrap_or(false)
+        {
+            if let Some(removed) = self.minutes.pop_front() {
+                while self
+                    .rolling_highs
+                    .front()
+                    .map(|(seq, _)| *seq == removed.seq)
+                    .unwrap_or(false)
+                {
+                    self.rolling_highs.pop_front();
+                }
+                while self
+                    .rolling_lows
+                    .front()
+                    .map(|(seq, _)| *seq == removed.seq)
+                    .unwrap_or(false)
+                {
+                    self.rolling_lows.pop_front();
+                }
+            }
+        }
+        while self
+            .events
+            .front()
+            .map(|entry| {
+                entry.required_start_ts < first_ts || entry.event.start_ts < first_ts
+            })
+            .unwrap_or(false)
+        {
+            self.events.pop_front();
+        }
+        while self
+            .pending_groups
+            .front()
+            .map(|group| self.offset_of(group.start_seq).is_none())
+            .unwrap_or(false)
+        {
+            self.pending_groups.pop_front();
+        }
+    }
+
+    fn append_pair(&mut self, fut: &MinuteHistory, spot: &MinuteHistory) {
+        let seq = self.next_seq;
+        let open = fut
+            .open_price
+            .or(fut.close_price)
+            .or(fut.last_price)
+            .unwrap_or(0.0);
+        let high = fut
+            .high_price
+            .or(fut.close_price)
+            .or(fut.last_price)
+            .or(fut.open_price)
+            .unwrap_or(0.0);
+        let low = fut
+            .low_price
+            .or(fut.close_price)
+            .or(fut.last_price)
+            .or(fut.open_price)
+            .unwrap_or(0.0);
+        let close = fut
+            .close_price
+            .or(fut.last_price)
+            .or(fut.open_price)
+            .unwrap_or(0.0);
+        if let Some(value) = fut.avwap_minute {
+            self.avwap_ffill = Some(value);
+        }
+        if let Some((val_tick, vah_tick, poc_tick)) = value_area_key_levels_ticks(&fut.profile) {
+            self.val_ffill = Some(tick_to_price(val_tick));
+            self.vah_ffill = Some(tick_to_price(vah_tick));
+            self.poc_ffill = Some(tick_to_price(poc_tick));
+        }
+        let (stacked_buy, stacked_sell) = stacked_imbalance_flags(&fut.profile);
+        let prev_session_high = self.rolling_highs.front().map(|(_, value)| *value);
+        let prev_session_low = self.rolling_lows.front().map(|(_, value)| *value);
+        let avwap = self.avwap_ffill.unwrap_or(close);
+        let val = self.val_ffill.unwrap_or(low);
+        let vah = self.vah_ffill.unwrap_or(high);
+        let poc = self.poc_ffill.unwrap_or(close);
+        let range = (high - low).max(0.0);
+        let reject_bull = (close - low) / (range + 1e-12);
+        let reject_bear = (high - close) / (range + 1e-12);
+        let keys = [
+            vah,
+            val,
+            poc,
+            avwap,
+            prev_session_high.unwrap_or(vah),
+            prev_session_low.unwrap_or(val),
+        ];
+        let d_low_key = keys
+            .iter()
+            .map(|key| (low - *key).abs() / TICK_SIZE)
+            .fold(f64::INFINITY, f64::min);
+        let d_high_key = keys
+            .iter()
+            .map(|key| (high - *key).abs() / TICK_SIZE)
+            .fold(f64::INFINITY, f64::min);
+        let cand_bull = stacked_sell
+            && range >= MIN_RANGE_TICKS * TICK_SIZE
+            && fut.relative_delta <= -RDELTA_ABS_MIN
+            && close > open
+            && reject_bull >= ETA_REJECT
+            && d_low_key <= KEY_DIST_TICKS;
+        let cand_bear = stacked_buy
+            && range >= MIN_RANGE_TICKS * TICK_SIZE
+            && fut.relative_delta >= RDELTA_ABS_MIN
+            && close < open
+            && reject_bear >= ETA_REJECT
+            && d_high_key <= KEY_DIST_TICKS;
+        let sign = match (cand_bull, cand_bear) {
+            (true, false) => 1,
+            (false, true) => -1,
+            _ => 0,
+        };
+
+        self.advance_groups(seq, fut.ts_bucket, sign);
+
+        let spot_close = spot
+            .close_price
+            .or(spot.last_price)
+            .or(spot.open_price)
+            .unwrap_or(0.0);
+        self.minutes.push_back(AbsorptionDerivedMinute {
+            seq,
+            ts_bucket: fut.ts_bucket,
+            open,
+            high,
+            low,
+            close,
+            delta: fut.delta,
+            rdelta: fut.relative_delta,
+            spot_rdelta: spot.relative_delta,
+            spot_cvd: spot.cvd,
+            spot_whale_notional: spot.delta * spot_close,
+            stacked_buy,
+            stacked_sell,
+            reject_bull,
+            reject_bear,
+            d_low_key,
+            d_high_key,
+            sign,
+        });
+        self.update_pending_groups(seq);
+        self.push_prev_session_value(seq, high, true);
+        self.push_prev_session_value(seq, low, false);
+        self.next_seq += 1;
+    }
+
+    fn advance_groups(&mut self, seq: usize, ts_bucket: DateTime<Utc>, sign: i16) {
+        let mut finalized = None;
+        if let Some(active) = self.active_group.as_mut() {
+            let gap = (ts_bucket - active.end_ts).num_minutes();
+            let can_extend = sign != 0
+                && active.direction == sign
+                && gap <= MERGE_GAP_MINUTES
+                && (seq - active.start_seq + 1) <= MAX_EVENT_MINUTES;
+            if can_extend {
+                active.end_seq = seq;
+                active.end_ts = ts_bucket;
+                return;
+            }
+            finalized = self.active_group.take();
+        }
+        if let Some(group) = finalized {
+            self.pending_groups.push_back(group);
+        }
+        if sign != 0 {
+            self.active_group = Some(AbsorptionGroupState {
+                direction: sign,
+                start_seq: seq,
+                end_seq: seq,
+                end_ts: ts_bucket,
+            });
+        }
+    }
+
+    fn update_pending_groups(&mut self, current_seq: usize) {
+        let mut retained = VecDeque::new();
+        while let Some(group) = self.pending_groups.pop_front() {
+            if current_seq < group.end_seq + CONFIRM_BARS {
+                retained.push_back(group);
+                continue;
+            }
+            if let Some(event) = self.build_event(&group) {
+                self.events.push_back(event);
+            }
+        }
+        self.pending_groups = retained;
+    }
+
+    fn build_event(&self, group: &AbsorptionGroupState) -> Option<AbsorptionCachedEvent> {
+        let start_idx = self.offset_of(group.start_seq)?;
+        let end_idx = self.offset_of(group.end_seq)?;
+        self.offset_of(group.end_seq + CONFIRM_BARS)?;
+        let group_rows = self
+            .minutes
+            .iter()
+            .skip(start_idx)
+            .take(end_idx - start_idx + 1)
+            .collect::<Vec<_>>();
+        let future_rows = self
+            .minutes
+            .iter()
+            .skip(end_idx + 1)
+            .take(CONFIRM_BARS)
+            .collect::<Vec<_>>();
+        if future_rows.len() < CONFIRM_BARS {
+            return None;
+        }
+
+        let l_g = group_rows
+            .iter()
+            .map(|row| row.low)
+            .fold(f64::INFINITY, f64::min);
+        let h_g = group_rows
+            .iter()
+            .map(|row| row.high)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let r_g = (h_g - l_g).max(TICK_SIZE);
+        let lows_future_min = future_rows
+            .iter()
+            .map(|row| row.low)
+            .fold(f64::INFINITY, f64::min);
+        let highs_future_max = future_rows
+            .iter()
+            .map(|row| row.high)
+            .fold(f64::NEG_INFINITY, f64::max);
+
+        let mut confirm_seq = None;
+        for future in &future_rows {
+            let ok = if group.direction > 0 {
+                future.close >= l_g + 0.5 * r_g && lows_future_min >= l_g - TICK_SIZE
+            } else {
+                future.close <= h_g - 0.5 * r_g && highs_future_max <= h_g + TICK_SIZE
+            };
+            if ok {
+                confirm_seq = Some(future.seq);
+                break;
+            }
+        }
+        let confirm_seq = confirm_seq?;
+        let confirm_idx = self.offset_of(confirm_seq)?;
+        let confirm_row = self.minutes.get(confirm_idx)?;
+        let n_g = group_rows.len() as f64;
+        let rd_mean = group_rows.iter().map(|row| row.rdelta).sum::<f64>() / n_g;
+        let reject_g = if group.direction > 0 {
+            group_rows.iter().map(|row| row.reject_bull).sum::<f64>() / n_g
+        } else {
+            group_rows.iter().map(|row| row.reject_bear).sum::<f64>() / n_g
+        };
+        let d_key = if group.direction > 0 {
+            group_rows
+                .iter()
+                .map(|row| row.d_low_key)
+                .fold(f64::INFINITY, f64::min)
+        } else {
+            group_rows
+                .iter()
+                .map(|row| row.d_high_key)
+                .fold(f64::INFINITY, f64::min)
+        };
+        let score = 0.35 * clip01(rd_mean.abs() / 0.5)
+            + 0.35 * clip01((reject_g - ETA_REJECT) / (1.0 - ETA_REJECT))
+            + 0.20 * clip01(1.0 - d_key / KEY_DIST_TICKS)
+            + 0.10 * clip01(n_g / 5.0);
+        let spot_rd_mean = group_rows.iter().map(|row| row.spot_rdelta).sum::<f64>() / n_g;
+        let spot_cvd_push = confirm_row.spot_cvd - group_rows.last()?.spot_cvd;
+        let spot_whale_push = self
+            .minutes
+            .iter()
+            .skip(start_idx)
+            .take(confirm_idx - start_idx + 1)
+            .map(|row| row.spot_whale_notional)
+            .sum::<f64>();
+        let spot_flow_confirm = clip01((group.direction as f64 * spot_rd_mean) / (THETA_RD_SPOT + 1e-12));
+        let spot_whale_confirm =
+            clip01((group.direction as f64 * spot_whale_push) / (THETA_WHALE_SPOT + 1e-12));
+        let score_xmk = 0.85 * score + 0.10 * spot_flow_confirm + 0.05 * spot_whale_confirm;
+        let event_type = if group.direction > 0 {
+            "bullish_absorption"
+        } else {
+            "bearish_absorption"
+        };
+        let pivot_price = if group.direction > 0 { l_g } else { h_g };
+        let delta_sum = group_rows.iter().map(|row| row.delta).sum::<f64>();
+        let stacked_buy_imbalance = group_rows.iter().any(|row| row.stacked_buy);
+        let stacked_sell_imbalance = group_rows.iter().any(|row| row.stacked_sell);
+        let spot_confirm = spot_flow_confirm > 0.0 || spot_whale_confirm > 0.0;
+        let start_ts = group_rows.first()?.ts_bucket;
+        let end_ts = group_rows.last()?.ts_bucket + Duration::minutes(1);
+        let confirm_ts = confirm_row.ts_bucket + Duration::minutes(1);
+        let trigger_side = if group.direction > 0 { "sell" } else { "buy" };
+        Some(AbsorptionCachedEvent {
+            required_start_ts: start_ts - Duration::minutes(1_440),
+            event: AbsorptionEventData {
+                direction: group.direction,
+                event_type: event_type.to_string(),
+                trigger_side: trigger_side.to_string(),
+                start_ts,
+                end_ts,
+                confirm_ts,
+                pivot_price,
+                price_low: l_g,
+                price_high: h_g,
+                delta_sum,
+                rdelta_mean: rd_mean,
+                reject_ratio: reject_g,
+                key_distance_ticks: d_key,
+                stacked_buy_imbalance,
+                stacked_sell_imbalance,
+                spot_rdelta_1m_mean: spot_rd_mean,
+                spot_cvd_1m_change: spot_cvd_push,
+                spot_flow_confirm_score: spot_flow_confirm,
+                spot_whale_confirm_score: spot_whale_confirm,
+                spot_confirm,
+                score_base: score,
+                score: score_xmk,
+                payload: json!({
+                    "event_start_ts": start_ts.to_rfc3339(),
+                    "event_end_ts": end_ts.to_rfc3339(),
+                    "event_available_ts": confirm_ts.to_rfc3339(),
+                    "pivot_price": pivot_price,
+                    "price_low": l_g,
+                    "price_high": h_g,
+                    "trigger_side": trigger_side,
+                    "delta_sum": delta_sum,
+                    "rdelta_mean": rd_mean,
+                    "reject_ratio": reject_g,
+                    "key_distance_ticks": d_key,
+                    "stacked_buy_imbalance": stacked_buy_imbalance,
+                    "stacked_sell_imbalance": stacked_sell_imbalance,
+                    "spot_rdelta_1m_mean": spot_rd_mean,
+                    "spot_cvd_1m_change": spot_cvd_push,
+                    "spot_flow_confirm_score": spot_flow_confirm,
+                    "spot_whale_confirm_score": spot_whale_confirm,
+                    "spot_confirm": spot_confirm,
+                    "score_base": score,
+                    "strength_score_xmk": score_xmk,
+                    "sig_pass": true
+                }),
+            },
+        })
+    }
+
+    fn push_prev_session_value(&mut self, seq: usize, value: f64, is_high: bool) {
+        let deque = if is_high {
+            &mut self.rolling_highs
+        } else {
+            &mut self.rolling_lows
+        };
+        while deque
+            .back()
+            .map(|(_, existing)| {
+                if is_high {
+                    *existing <= value
+                } else {
+                    *existing >= value
+                }
+            })
+            .unwrap_or(false)
+        {
+            deque.pop_back();
+        }
+        deque.push_back((seq, value));
+        while deque
+            .front()
+            .map(|(front_seq, _)| *front_seq + 1_440 <= seq)
+            .unwrap_or(false)
+        {
+            deque.pop_front();
+        }
+    }
+
+    fn offset_of(&self, seq: usize) -> Option<usize> {
+        let first_seq = self.minutes.front()?.seq;
+        let idx = seq.checked_sub(first_seq)?;
+        (idx < self.minutes.len()).then_some(idx)
+    }
+}
+
+fn aligned_event_histories<'a>(
+    history_futures: &'a [MinuteHistory],
+    history_spot: &'a [MinuteHistory],
+) -> (&'a [MinuteHistory], &'a [MinuteHistory]) {
+    let n = history_futures.len().min(history_spot.len());
+    (
+        &history_futures[history_futures.len().saturating_sub(n)..],
+        &history_spot[history_spot.len().saturating_sub(n)..],
+    )
+}
+
+fn lower_bound_history_ts(history: &[MinuteHistory], target: DateTime<Utc>) -> usize {
+    let mut lo = 0usize;
+    let mut hi = history.len();
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if history[mid].ts_bucket < target {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
+}
+
+#[cfg(test)]
+pub(crate) fn compute_absorption_all_history_from_histories(
+    history_futures: &[MinuteHistory],
+    history_spot: &[MinuteHistory],
+) -> Vec<AbsorptionEventData> {
+    let series = crate::indicators::context::BasicEventHistorySeries::from_histories(
+        history_futures,
+        history_spot,
+    );
     let n = series.n;
     if n < CONFIRM_BARS + 5 {
         return Vec::new();
     }
 
-    let fut = &ctx.history_futures[ctx.history_futures.len() - n..];
+    let fut = &history_futures[history_futures.len().saturating_sub(n)..];
     let open = &series.open;
     let high = &series.high;
     let low = &series.low;
@@ -324,15 +850,9 @@ fn compute_absorption_all_history(ctx: &IndicatorContext) -> Vec<AbsorptionEvent
     out
 }
 
-pub(crate) fn detect_absorption_all_history(
-    ctx: &IndicatorContext,
-) -> std::sync::Arc<Vec<AbsorptionEventData>> {
-    ctx.absorption_all_events_or_init(compute_absorption_all_history)
-}
-
 pub(crate) fn detect_absorption_events(ctx: &IndicatorContext) -> Vec<AbsorptionEventData> {
     let current_available_ts = ctx.ts_bucket + Duration::minutes(1);
-    detect_absorption_all_history(ctx)
+    ctx.absorption_all_events()
         .iter()
         .filter(|event| event.confirm_ts == current_available_ts)
         .cloned()
@@ -432,7 +952,7 @@ impl Indicator for I06Absorption {
     }
 
     fn evaluate(&self, ctx: &IndicatorContext) -> IndicatorComputation {
-        let all_events = detect_absorption_all_history(ctx);
+        let all_events = ctx.absorption_all_events();
         let window_view = build_event_window_view(
             ctx.ts_bucket,
             all_events
@@ -472,8 +992,8 @@ impl Indicator for I06Absorption {
 #[cfg(test)]
 mod tests {
     use super::{
-        absorption_event_json, compute_absorption_all_history, detect_absorption_all_history,
-        detect_absorption_events, AbsorptionEventData,
+        absorption_event_json, compute_absorption_all_history_from_histories,
+        detect_absorption_events, AbsorptionEventData, AbsorptionEventStateMachine,
     };
     use crate::indicators::context::{
         DivergenceSigTestMode, IndicatorContext, IndicatorSharedCaches,
@@ -745,9 +1265,25 @@ mod tests {
             history_spot,
         );
 
-        let direct = compute_absorption_all_history(&ctx);
-        let cached = detect_absorption_all_history(&ctx);
+        let direct =
+            compute_absorption_all_history_from_histories(&ctx.history_futures, &ctx.history_spot);
+        ctx.shared_caches
+            .seed_absorption_all_events(Arc::new(direct.clone()));
+        let cached = ctx.absorption_all_events();
         assert_eq!(direct, *cached);
+
+        let history_futures = ctx.history_futures.as_ref().clone();
+        let history_spot = ctx.history_spot.as_ref().clone();
+
+        let mut rebuilt_machine = AbsorptionEventStateMachine::default();
+        rebuilt_machine.rebuild(&history_futures, &history_spot);
+        assert_eq!(direct, rebuilt_machine.events());
+
+        let mut streaming_machine = AbsorptionEventStateMachine::default();
+        for end in 0..history_futures.len() {
+            streaming_machine.sync(&history_futures[..=end], &history_spot[..=end]);
+        }
+        assert_eq!(direct, streaming_machine.events());
 
         let expected_current = direct
             .iter()

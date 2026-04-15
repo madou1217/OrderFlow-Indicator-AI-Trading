@@ -1,6 +1,6 @@
 use crate::indicators::context::{IndicatorComputation, IndicatorContext, IndicatorSnapshotRow};
 use crate::indicators::i12_buying_exhaustion::{
-    append_exhaustion_rows, detect_exhaustion_all_history, exhaustion_event_json,
+    append_exhaustion_rows, exhaustion_event_json,
 };
 use crate::indicators::indicator_trait::Indicator;
 use crate::indicators::shared::event_views::{build_event_window_view, build_recent_7d_payload};
@@ -15,7 +15,8 @@ impl Indicator for I13SellingExhaustion {
     }
 
     fn evaluate(&self, ctx: &IndicatorContext) -> IndicatorComputation {
-        let all_events = detect_exhaustion_all_history(ctx)
+        let all_events = ctx
+            .exhaustion_all_events()
             .iter()
             .filter(|e| e.event_type == "selling_exhaustion")
             .cloned()

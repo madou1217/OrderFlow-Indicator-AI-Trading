@@ -332,7 +332,9 @@ impl IndicatorContext {
             funding_points_recent,
             mark_points_recent,
             liquidation_recent_7d_payload,
+            absorption_all_events,
             divergence_all_events,
+            initiation_all_events,
             exhaustion_all_events,
             latest_common_oi_ratio_bucket,
             current_open_interest,
@@ -355,6 +357,9 @@ impl IndicatorContext {
             .or(kline_history_supplement.latest_options_surface_bucket);
         let shared_caches = Arc::new(IndicatorSharedCaches::default());
         let _ = shared_caches
+            .absorption_all_events
+            .set(absorption_all_events);
+        let _ = shared_caches
             .divergence_all_events
             .set(divergence_all_events);
         let _ = shared_caches
@@ -363,6 +368,9 @@ impl IndicatorContext {
         let _ = shared_caches
             .liquidation_recent_7d_payload
             .set(liquidation_recent_7d_payload);
+        let _ = shared_caches
+            .initiation_all_events
+            .set(initiation_all_events);
         let _ = shared_caches
             .exhaustion_all_events
             .set(exhaustion_all_events);
@@ -446,6 +454,7 @@ impl IndicatorContext {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn basic_event_history_series(&self) -> Arc<BasicEventHistorySeries> {
         self.shared_caches
             .basic_event_history_series
@@ -453,44 +462,36 @@ impl IndicatorContext {
             .clone()
     }
 
-    pub(crate) fn absorption_all_events_or_init<F>(&self, build: F) -> Arc<Vec<AbsorptionEventData>>
-    where
-        F: FnOnce(&IndicatorContext) -> Vec<AbsorptionEventData>,
-    {
+    pub(crate) fn absorption_all_events(&self) -> Arc<Vec<AbsorptionEventData>> {
         self.shared_caches
             .absorption_all_events
-            .get_or_init(|| Arc::new(build(self)))
-            .clone()
+            .get()
+            .cloned()
+            .expect("absorption event cache missing; precompute events before indicator evaluation")
     }
 
-    pub(crate) fn divergence_all_events_or_init<F>(&self, build: F) -> Arc<Vec<DivergenceEventData>>
-    where
-        F: FnOnce(&IndicatorContext) -> Vec<DivergenceEventData>,
-    {
+    pub(crate) fn divergence_all_events(&self) -> Arc<Vec<DivergenceEventData>> {
         self.shared_caches
             .divergence_all_events
-            .get_or_init(|| Arc::new(build(self)))
-            .clone()
+            .get()
+            .cloned()
+            .expect("divergence event cache missing; precompute events before indicator evaluation")
     }
 
-    pub(crate) fn initiation_all_events_or_init<F>(&self, build: F) -> Arc<Vec<InitiationEventData>>
-    where
-        F: FnOnce(&IndicatorContext) -> Vec<InitiationEventData>,
-    {
+    pub(crate) fn initiation_all_events(&self) -> Arc<Vec<InitiationEventData>> {
         self.shared_caches
             .initiation_all_events
-            .get_or_init(|| Arc::new(build(self)))
-            .clone()
+            .get()
+            .cloned()
+            .expect("initiation event cache missing; precompute events before indicator evaluation")
     }
 
-    pub(crate) fn exhaustion_all_events_or_init<F>(&self, build: F) -> Arc<Vec<ExhaustionEventData>>
-    where
-        F: FnOnce(&IndicatorContext) -> Vec<ExhaustionEventData>,
-    {
+    pub(crate) fn exhaustion_all_events(&self) -> Arc<Vec<ExhaustionEventData>> {
         self.shared_caches
             .exhaustion_all_events
-            .get_or_init(|| Arc::new(build(self)))
-            .clone()
+            .get()
+            .cloned()
+            .expect("exhaustion event cache missing; precompute events before indicator evaluation")
     }
 
     pub(crate) fn orderbook_depth_precomputed_or_init<F>(
@@ -730,6 +731,28 @@ impl IndicatorContext {
     }
 }
 
+impl IndicatorSharedCaches {
+    #[cfg(test)]
+    pub(crate) fn seed_absorption_all_events(&self, events: Arc<Vec<AbsorptionEventData>>) {
+        let _ = self.absorption_all_events.set(events);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn seed_divergence_all_events(&self, events: Arc<Vec<DivergenceEventData>>) {
+        let _ = self.divergence_all_events.set(events);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn seed_initiation_all_events(&self, events: Arc<Vec<InitiationEventData>>) {
+        let _ = self.initiation_all_events.set(events);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn seed_exhaustion_all_events(&self, events: Arc<Vec<ExhaustionEventData>>) {
+        let _ = self.exhaustion_all_events.set(events);
+    }
+}
+
 fn merge_options_surface_history(
     primary: &[OptionsSurfacePoint],
     fallback: &[OptionsSurfacePoint],
@@ -752,10 +775,12 @@ fn merge_options_surface_history(
 }
 
 impl BasicEventHistorySeries {
+    #[cfg(test)]
     fn from_context(ctx: &IndicatorContext) -> Self {
         Self::from_histories(&ctx.history_futures, &ctx.history_spot)
     }
 
+    #[cfg(test)]
     pub(crate) fn from_histories(fut: &[MinuteHistory], spot: &[MinuteHistory]) -> Self {
         let n = fut.len().min(spot.len());
         let fut = &fut[fut.len().saturating_sub(n)..];

@@ -2,7 +2,7 @@ use crate::indicators::context::{
     IndicatorComputation, IndicatorContext, IndicatorEventRow, IndicatorSnapshotRow,
 };
 use crate::indicators::i06_absorption::{
-    absorption_event_json, detect_absorption_all_history, detect_absorption_events,
+    absorption_event_json, detect_absorption_events,
 };
 use crate::indicators::indicator_trait::Indicator;
 use crate::indicators::shared::event_ids::build_indicator_event_id;
@@ -17,7 +17,8 @@ impl Indicator for I10BearishAbsorption {
     }
 
     fn evaluate(&self, ctx: &IndicatorContext) -> IndicatorComputation {
-        let all_events = detect_absorption_all_history(ctx)
+        let all_events = ctx
+            .absorption_all_events()
             .iter()
             .filter(|e| e.direction < 0)
             .cloned()

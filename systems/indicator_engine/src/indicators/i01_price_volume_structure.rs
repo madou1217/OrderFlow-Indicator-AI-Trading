@@ -2,14 +2,15 @@ use crate::indicators::context::{
     zscore, IndicatorComputation, IndicatorContext, IndicatorLevelRow, IndicatorSnapshotRow,
 };
 use crate::indicators::indicator_trait::Indicator;
+use crate::indicators::shared::incremental::compute_price_volume_structure_outputs_from_history;
 use crate::runtime::state_store::{tick_to_price, LevelAgg};
 use serde_json::json;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashSet};
 
 const VALUE_AREA_RATIO: f64 = 0.70;
-const DRYUP_LOOKBACK: usize = 30;
-const DRYUP_Z_THRESHOLD: f64 = 1.0;
+pub(crate) const DRYUP_LOOKBACK: usize = 30;
+pub(crate) const DRYUP_Z_THRESHOLD: f64 = 1.0;
 
 /// Prominence thresholds expressed as a fraction of the window's total volume.
 const HVN_PROMINENCE_FRACTION: f64 = 0.03;
@@ -20,7 +21,7 @@ const RAW_AUDIT_HVN_CAP: usize = 24;
 const RAW_AUDIT_LVN_CAP: usize = 24;
 
 /// Multi-window specs: (window_code, bar_count).
-const MULTI_WINDOWS: &[(&str, usize)] = &[
+pub(crate) const MULTI_WINDOWS: &[(&str, usize)] = &[
     ("15m", 15),
     ("4h", 240),
     ("1d", 1440),
@@ -84,17 +85,46 @@ impl Indicator for I01PriceVolumeStructure {
     }
 
     fn evaluate(&self, ctx: &IndicatorContext) -> IndicatorComputation {
-        let trade_history = if ctx.trade_history_futures.is_empty() {
+        if let Some(payload) = ctx.incremental_outputs.price_volume_structure_snapshot.clone() {
+            return IndicatorComputation {
+                snapshot: Some(IndicatorSnapshotRow {
+                    indicator_code: self.code(),
+                    window_code: "1m",
+                    payload_json: payload,
+                }),
+                level_rows: ctx
+                    .incremental_outputs
+                    .price_volume_structure_level_rows
+                    .clone(),
+                ..Default::default()
+            };
+        }
+
+        let effective_history = if ctx.trade_history_futures.is_empty() {
             &ctx.history_futures
         } else {
             &ctx.trade_history_futures
         };
 
+        if !effective_history.is_empty() {
+            let (snapshot, level_rows) =
+                compute_price_volume_structure_outputs_from_history(effective_history);
+            return IndicatorComputation {
+                snapshot: snapshot.map(|payload_json| IndicatorSnapshotRow {
+                    indicator_code: self.code(),
+                    window_code: "1m",
+                    payload_json,
+                }),
+                level_rows,
+                ..Default::default()
+            };
+        }
+
         // ── Current 1m bar (top-level snapshot, unchanged) ────────────────────
         let total_volume = ctx.futures.total_qty;
         let volume_z = zscore(
             total_volume,
-            trade_history
+            effective_history
                 .iter()
                 .rev()
                 .take(DRYUP_LOOKBACK)
@@ -113,7 +143,7 @@ impl Indicator for I01PriceVolumeStructure {
         // Snapshot payloads stay full-fidelity. Downstream filters decide how much
         // to trim for prompt-facing contexts; the indicator engine itself should
         // emit the full aggregated profile.
-        let avail = trade_history.len();
+        let avail = effective_history.len();
         let mut by_window = serde_json::Map::new();
 
         for &(wcode, window_bars) in MULTI_WINDOWS {
@@ -130,7 +160,7 @@ impl Indicator for I01PriceVolumeStructure {
                 e.buy_qty += l.buy_qty;
                 e.sell_qty += l.sell_qty;
             }
-            for hist in &trade_history[hist_start..hist_end] {
+            for hist in &effective_history[hist_start..hist_end] {
                 for (&t, l) in &hist.profile {
                     let e = agg.entry(t).or_default();
                     e.buy_qty += l.buy_qty;
@@ -149,7 +179,7 @@ impl Indicator for I01PriceVolumeStructure {
                     .map(|i| {
                         let end = hist_start - i * window_bars;
                         let start = end.saturating_sub(window_bars);
-                        trade_history[start..end]
+                        effective_history[start..end]
                             .iter()
                             .map(|h| h.total_qty)
                             .sum::<f64>()
@@ -188,7 +218,7 @@ impl Indicator for I01PriceVolumeStructure {
 
 /// Compute the full PVS payload (POC, VA, HVN/LVN, zscore, dryup, levels, value_area_levels)
 /// for a given aggregated price profile.
-fn build_pvs_payload(
+pub(crate) fn build_pvs_payload(
     profile: &BTreeMap<i64, LevelAgg>,
     total_volume: f64,
     volume_z: Option<f64>,
@@ -713,7 +743,7 @@ fn select_raw_audit_bins(
 }
 
 /// Build per-level DB rows for the 1m snapshot window.
-fn build_level_rows(
+pub(crate) fn build_level_rows(
     indicator_code: &'static str,
     window_code: &'static str,
     profile: &BTreeMap<i64, LevelAgg>,

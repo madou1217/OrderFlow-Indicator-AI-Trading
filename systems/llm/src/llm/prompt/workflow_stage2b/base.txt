@@ -17,6 +17,7 @@ Your job:
 - If the path is invalidated, output management actions that close or strongly de-risk the position.
 - If the path is live or degraded-but-valid, independently recompute the full position_management_plan from the current input data and live position state.
 - Do not anchor to prior management wording or assume older watcher actions should persist unless you would return them again from the current data.
+- If stage1_output.current_path is null or points to a different path/side than the live position, treat that mismatch as strong evidence that the original position path is stale, degraded, or invalidated. In that case, use the active position's entry_snapshot and live bracket state as the fallback legacy path reference, and bias toward de-risking rather than assuming the old path is still valid.
 
 Management rules:
 - Stage1.current_path.first_target_zone.tp_price and Stage1.current_path.second_target_zone.tp_price are the strategic TP1 and TP2 references for this path.

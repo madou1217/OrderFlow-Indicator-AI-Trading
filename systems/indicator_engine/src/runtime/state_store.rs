@@ -3,15 +3,21 @@ use crate::indicators::context::{
     OptionsSurfacePoint,
 };
 use crate::indicators::i03_divergence::{
-    compute_divergence_all_history, DivergenceEventData, DIVERGENCE_INCREMENTAL_LOOKBACK_MINUTES,
+    DivergenceEventData, DivergenceEventStateMachine,
+};
+use crate::indicators::i06_absorption::{
+    AbsorptionEventData, AbsorptionEventStateMachine,
+};
+use crate::indicators::i07_initiation::{
+    InitiationEventData, InitiationEventStateMachine,
 };
 use crate::indicators::i12_buying_exhaustion::{
-    compute_exhaustion_all_history_from_histories, ExhaustionEventData,
-    EXHAUSTION_INCREMENTAL_LOOKBACK_MINUTES,
+    ExhaustionEventData, ExhaustionEventStateMachine,
 };
 use crate::indicators::shared::funding::funding_change_json;
 use crate::indicators::shared::incremental::{
-    IncrementalIndicatorConfig, IncrementalIndicatorOutputs, IncrementalIndicatorState,
+    compute_price_volume_structure_outputs_from_history, IncrementalIndicatorConfig,
+    IncrementalIndicatorOutputs, IncrementalIndicatorState,
 };
 use crate::indicators::shared::liquidation::build_recent_7d_entry as build_liquidation_recent_7d_entry;
 use crate::ingest::decoder::{
@@ -301,7 +307,9 @@ pub struct WindowBundle {
     pub funding_points_recent: Arc<Vec<LatestFundingState>>,
     pub mark_points_recent: Arc<Vec<LatestMarkState>>,
     pub liquidation_recent_7d_payload: Arc<Vec<Value>>,
+    pub(crate) absorption_all_events: Arc<Vec<AbsorptionEventData>>,
     pub(crate) divergence_all_events: Arc<Vec<DivergenceEventData>>,
+    pub(crate) initiation_all_events: Arc<Vec<InitiationEventData>>,
     pub(crate) exhaustion_all_events: Arc<Vec<ExhaustionEventData>>,
     pub latest_common_oi_ratio_bucket: Option<DateTime<Utc>>,
     pub current_open_interest: Option<OpenInterestCurrentSidecar>,
@@ -1283,8 +1291,14 @@ pub struct StateStore {
     funding_points_recent_shared: Arc<Vec<LatestFundingState>>,
     mark_points_recent_shared: Arc<Vec<LatestMarkState>>,
     liquidation_recent_7d_payload_shared: Arc<Vec<Value>>,
+    absorption_all_events: Arc<Vec<AbsorptionEventData>>,
     divergence_all_events: Arc<Vec<DivergenceEventData>>,
+    initiation_all_events: Arc<Vec<InitiationEventData>>,
     exhaustion_all_events: Arc<Vec<ExhaustionEventData>>,
+    absorption_event_machine: AbsorptionEventStateMachine,
+    divergence_event_machine: DivergenceEventStateMachine,
+    initiation_event_machine: InitiationEventStateMachine,
+    exhaustion_event_machine: ExhaustionEventStateMachine,
     current_open_interest_timeline: VecDeque<OpenInterestCurrentSidecar>,
     open_interest_hist_5m: VecDeque<OpenInterestHistPoint>,
     global_account_ratio_5m: VecDeque<LongShortRatioPoint>,
@@ -1352,8 +1366,14 @@ impl StateStore {
             funding_points_recent_shared: Arc::new(Vec::new()),
             mark_points_recent_shared: Arc::new(Vec::new()),
             liquidation_recent_7d_payload_shared: Arc::new(Vec::new()),
+            absorption_all_events: Arc::new(Vec::new()),
             divergence_all_events: Arc::new(Vec::new()),
+            initiation_all_events: Arc::new(Vec::new()),
             exhaustion_all_events: Arc::new(Vec::new()),
+            absorption_event_machine: AbsorptionEventStateMachine::default(),
+            divergence_event_machine: DivergenceEventStateMachine::default(),
+            initiation_event_machine: InitiationEventStateMachine::default(),
+            exhaustion_event_machine: ExhaustionEventStateMachine::default(),
             current_open_interest_timeline: VecDeque::new(),
             open_interest_hist_5m: VecDeque::new(),
             global_account_ratio_5m: VecDeque::new(),
@@ -1430,8 +1450,14 @@ impl StateStore {
         self.funding_points_recent_shared = Arc::new(Vec::new());
         self.mark_points_recent_shared = Arc::new(Vec::new());
         self.liquidation_recent_7d_payload_shared = Arc::new(Vec::new());
+        self.absorption_all_events = Arc::new(Vec::new());
         self.divergence_all_events = Arc::new(Vec::new());
+        self.initiation_all_events = Arc::new(Vec::new());
         self.exhaustion_all_events = Arc::new(Vec::new());
+        self.absorption_event_machine = AbsorptionEventStateMachine::default();
+        self.divergence_event_machine = DivergenceEventStateMachine::default();
+        self.initiation_event_machine = InitiationEventStateMachine::default();
+        self.exhaustion_event_machine = ExhaustionEventStateMachine::default();
         self.current_open_interest_timeline.clear();
         self.open_interest_hist_5m.clear();
         self.global_account_ratio_5m.clear();
@@ -1920,8 +1946,14 @@ impl StateStore {
     }
 
     pub fn rebuild_deferred_derived_indicator_state(&mut self) {
+        self.absorption_all_events = Arc::new(Vec::new());
         self.divergence_all_events = Arc::new(Vec::new());
+        self.initiation_all_events = Arc::new(Vec::new());
         self.exhaustion_all_events = Arc::new(Vec::new());
+        self.absorption_event_machine = AbsorptionEventStateMachine::default();
+        self.divergence_event_machine = DivergenceEventStateMachine::default();
+        self.initiation_event_machine = InitiationEventStateMachine::default();
+        self.exhaustion_event_machine = ExhaustionEventStateMachine::default();
         if let Some(ts_bucket) = self.last_finalized_minute {
             self.refresh_incremental_indicator_event_caches(ts_bucket);
         }
@@ -2300,61 +2332,28 @@ impl StateStore {
     }
 
     fn refresh_incremental_indicator_event_caches(&mut self, ts_bucket: DateTime<Utc>) {
-        let divergence_tail_start =
-            ts_bucket - Duration::minutes(DIVERGENCE_INCREMENTAL_LOOKBACK_MINUTES);
-        let divergence_tail_futures = self
-            .history_futures
-            .iter()
-            .filter(|row| row.ts_bucket >= divergence_tail_start)
-            .cloned()
-            .collect::<Vec<_>>();
-        let divergence_tail_spot = self
-            .history_spot
-            .iter()
-            .filter(|row| row.ts_bucket >= divergence_tail_start)
-            .cloned()
-            .collect::<Vec<_>>();
-        let mut divergence_events = self
-            .divergence_all_events
-            .iter()
-            .filter(|event| event.event_available_ts < divergence_tail_start)
-            .cloned()
-            .collect::<Vec<_>>();
-        divergence_events.extend(compute_divergence_all_history(
-            &divergence_tail_futures,
-            &divergence_tail_spot,
+        let _ = ts_bucket;
+        self.absorption_event_machine
+            .sync(self.history_futures_shared.as_ref(), self.history_spot_shared.as_ref());
+        self.absorption_all_events = Arc::new(self.absorption_event_machine.events());
+
+        self.divergence_event_machine.sync(
+            self.history_futures_shared.as_ref(),
+            self.history_spot_shared.as_ref(),
             self.divergence_sig_test_mode,
             self.divergence_bootstrap_b,
             self.divergence_bootstrap_block_len,
             self.divergence_p_value_threshold,
-        ));
-        self.divergence_all_events = Arc::new(divergence_events);
+        );
+        self.divergence_all_events = Arc::new(self.divergence_event_machine.events());
 
-        let exhaustion_tail_start =
-            ts_bucket - Duration::minutes(EXHAUSTION_INCREMENTAL_LOOKBACK_MINUTES);
-        let exhaustion_tail_futures = self
-            .history_futures
-            .iter()
-            .filter(|row| row.ts_bucket >= exhaustion_tail_start)
-            .cloned()
-            .collect::<Vec<_>>();
-        let exhaustion_tail_spot = self
-            .history_spot
-            .iter()
-            .filter(|row| row.ts_bucket >= exhaustion_tail_start)
-            .cloned()
-            .collect::<Vec<_>>();
-        let mut exhaustion_events = self
-            .exhaustion_all_events
-            .iter()
-            .filter(|event| event.confirm_ts < exhaustion_tail_start)
-            .cloned()
-            .collect::<Vec<_>>();
-        exhaustion_events.extend(compute_exhaustion_all_history_from_histories(
-            &exhaustion_tail_futures,
-            &exhaustion_tail_spot,
-        ));
-        self.exhaustion_all_events = Arc::new(exhaustion_events);
+        self.initiation_event_machine
+            .sync(self.history_futures_shared.as_ref(), self.history_spot_shared.as_ref());
+        self.initiation_all_events = Arc::new(self.initiation_event_machine.events());
+
+        self.exhaustion_event_machine
+            .sync(self.history_futures_shared.as_ref(), self.history_spot_shared.as_ref());
+        self.exhaustion_all_events = Arc::new(self.exhaustion_event_machine.events());
     }
 
     fn bucket_mut(&mut self, market: MarketKind, ts_bucket: DateTime<Utc>) -> &mut MinuteBucket {
@@ -2912,6 +2911,11 @@ impl StateStore {
 
         let oi_ratio_view = self.build_oi_ratio_view_for_minute(ts_bucket);
         let options_surface_view = self.build_options_surface_view_for_minute(ts_bucket);
+        let trade_history_futures =
+            self.build_trade_history_with_canonical_backfill(MarketKind::Futures);
+        let trade_history_spot = self.build_trade_history_with_canonical_backfill(MarketKind::Spot);
+        let incremental_outputs = self
+            .incremental_outputs_with_canonical_pvs(&trade_history_futures);
 
         WindowBundle {
             ts_bucket,
@@ -2920,9 +2924,8 @@ impl StateStore {
             spot,
             history_futures: self.history_futures_shared.clone(),
             history_spot: self.history_spot_shared.clone(),
-            trade_history_futures: self
-                .build_trade_history_with_canonical_backfill(MarketKind::Futures),
-            trade_history_spot: self.build_trade_history_with_canonical_backfill(MarketKind::Spot),
+            trade_history_futures,
+            trade_history_spot,
             latest_mark: self.latest_mark.clone(),
             latest_funding: self.latest_funding.clone(),
             funding_changes_in_window,
@@ -2933,7 +2936,9 @@ impl StateStore {
             funding_points_recent: self.funding_points_recent_shared.clone(),
             mark_points_recent: self.mark_points_recent_shared.clone(),
             liquidation_recent_7d_payload: self.liquidation_recent_7d_payload_shared.clone(),
+            absorption_all_events: self.absorption_all_events.clone(),
             divergence_all_events: self.divergence_all_events.clone(),
+            initiation_all_events: self.initiation_all_events.clone(),
             exhaustion_all_events: self.exhaustion_all_events.clone(),
             latest_common_oi_ratio_bucket: oi_ratio_view.latest_common_bucket,
             current_open_interest: oi_ratio_view.current_open_interest,
@@ -2943,7 +2948,7 @@ impl StateStore {
             top_position_ratio_5m: oi_ratio_view.top_position_ratio_5m,
             latest_options_surface_bucket: options_surface_view.latest_bucket,
             options_surface_5m: options_surface_view.points,
-            incremental_outputs: self.incremental_indicator_state.outputs(),
+            incremental_outputs,
         }
     }
 
@@ -3002,7 +3007,9 @@ impl StateStore {
             funding_points_recent: self.funding_points_recent_shared.clone(),
             mark_points_recent: self.mark_points_recent_shared.clone(),
             liquidation_recent_7d_payload: self.liquidation_recent_7d_payload_shared.clone(),
+            absorption_all_events: self.absorption_all_events.clone(),
             divergence_all_events: self.divergence_all_events.clone(),
+            initiation_all_events: self.initiation_all_events.clone(),
             exhaustion_all_events: self.exhaustion_all_events.clone(),
             latest_common_oi_ratio_bucket: oi_ratio_view.latest_common_bucket,
             current_open_interest: oi_ratio_view.current_open_interest,
@@ -3020,6 +3027,12 @@ impl StateStore {
         let as_of_ts = ts_bucket + Duration::minutes(1);
         let oi_ratio_view = self.build_oi_ratio_view_for_minute(ts_bucket);
         let options_surface_view = self.build_options_surface_view_for_minute(ts_bucket);
+        let trade_history_futures =
+            self.build_trade_history_with_canonical_backfill_until(MarketKind::Futures, ts_bucket);
+        let trade_history_spot =
+            self.build_trade_history_with_canonical_backfill_until(MarketKind::Spot, ts_bucket);
+        let incremental_outputs = self
+            .incremental_outputs_with_canonical_pvs(&trade_history_futures);
         let futures = self
             .history_row(MarketKind::Futures, ts_bucket)
             .map(minute_window_from_history_row)
@@ -3035,10 +3048,8 @@ impl StateStore {
             spot,
             history_futures: Arc::new(self.history_prefix(MarketKind::Futures, ts_bucket)),
             history_spot: Arc::new(self.history_prefix(MarketKind::Spot, ts_bucket)),
-            trade_history_futures: self
-                .build_trade_history_with_canonical_backfill_until(MarketKind::Futures, ts_bucket),
-            trade_history_spot: self
-                .build_trade_history_with_canonical_backfill_until(MarketKind::Spot, ts_bucket),
+            trade_history_futures,
+            trade_history_spot,
             latest_mark: self.latest_mark_as_of(as_of_ts),
             latest_funding: self.latest_funding_as_of(as_of_ts),
             funding_changes_in_window: self.funding_changes_between(ts_bucket, as_of_ts),
@@ -3061,10 +3072,24 @@ impl StateStore {
                     .map(|row| row.payload_json.clone())
                     .collect(),
             ),
+            absorption_all_events: Arc::new(
+                self.absorption_all_events
+                    .iter()
+                    .filter(|event| event.confirm_ts <= as_of_ts)
+                    .cloned()
+                    .collect(),
+            ),
             divergence_all_events: Arc::new(
                 self.divergence_all_events
                     .iter()
                     .filter(|event| event.event_available_ts <= as_of_ts)
+                    .cloned()
+                    .collect(),
+            ),
+            initiation_all_events: Arc::new(
+                self.initiation_all_events
+                    .iter()
+                    .filter(|event| event.confirm_ts <= as_of_ts)
                     .cloned()
                     .collect(),
             ),
@@ -3083,8 +3108,25 @@ impl StateStore {
             top_position_ratio_5m: oi_ratio_view.top_position_ratio_5m,
             latest_options_surface_bucket: options_surface_view.latest_bucket,
             options_surface_5m: options_surface_view.points,
-            incremental_outputs: self.incremental_indicator_state.outputs(),
+            incremental_outputs,
         }
+    }
+
+    fn incremental_outputs_with_canonical_pvs(
+        &self,
+        trade_history_futures: &[MinuteHistory],
+    ) -> Arc<IncrementalIndicatorOutputs> {
+        let base = self.incremental_indicator_state.outputs();
+        if trade_history_futures.is_empty() {
+            return base;
+        }
+
+        let (snapshot, level_rows) =
+            compute_price_volume_structure_outputs_from_history(trade_history_futures);
+        let mut outputs = base.as_ref().clone();
+        outputs.price_volume_structure_snapshot = snapshot;
+        outputs.price_volume_structure_level_rows = level_rows;
+        Arc::new(outputs)
     }
 
     fn build_oi_ratio_view_for_minute(&self, ts_bucket: DateTime<Utc>) -> OiRatioWindowView {
@@ -6830,6 +6872,62 @@ mod tests {
                 .sum::<f64>(),
             4.0
         );
+    }
+
+    #[test]
+    fn build_window_bundle_overrides_pvs_snapshot_with_canonical_trade_history() {
+        let mut store = StateStore::new("TESTUSDT".to_string(), 1_000.0);
+        let ts_0 = Utc.with_ymd_and_hms(2026, 3, 7, 4, 16, 0).single().unwrap();
+        let ts_1 = ts_0 + ChronoDuration::minutes(1);
+        let ts_2 = ts_1 + ChronoDuration::minutes(1);
+
+        store.ingest(agg_trade_event_with_profile(ts_0, 1.0, 0.0, 2000.0, 0.10));
+        store.finalize_minute(ts_0);
+
+        // Canonical trade input exists for ts_1, but finalized history skips it.
+        store.ingest(agg_trade_event_with_profile(ts_1, 4.0, 0.0, 2001.0, 0.20));
+
+        store.ingest(agg_trade_event_with_profile(ts_2, 2.0, 0.0, 2002.0, 0.30));
+        let bundle = store.finalize_minute(ts_2);
+
+        let snapshot = bundle
+            .incremental_outputs
+            .price_volume_structure_snapshot
+            .as_ref()
+            .expect("pvs snapshot");
+        let w15 = snapshot["by_window"]["15m"].as_object().expect("15m payload");
+
+        assert_eq!(bundle.history_futures.len(), 2);
+        assert_eq!(bundle.trade_history_futures.len(), 3);
+        assert_eq!(w15.get("window_bars_used").and_then(|v| v.as_u64()), Some(3));
+        assert_eq!(w15.get("bar_volume").and_then(|v| v.as_f64()), Some(7.0));
+    }
+
+    #[test]
+    fn oi_ratio_patch_bundle_overrides_pvs_snapshot_with_canonical_trade_history() {
+        let mut store = StateStore::new("TESTUSDT".to_string(), 1_000.0);
+        let ts_0 = Utc.with_ymd_and_hms(2026, 3, 7, 4, 16, 0).single().unwrap();
+        let ts_1 = ts_0 + ChronoDuration::minutes(1);
+        let ts_2 = ts_1 + ChronoDuration::minutes(1);
+
+        store.ingest(agg_trade_event_with_profile(ts_0, 1.0, 0.0, 2000.0, 0.10));
+        store.finalize_minute(ts_0);
+        store.ingest(agg_trade_event_with_profile(ts_1, 4.0, 0.0, 2001.0, 0.20));
+        store.ingest(agg_trade_event_with_profile(ts_2, 2.0, 0.0, 2002.0, 0.30));
+        store.finalize_minute(ts_2);
+
+        let bundle = store.build_oi_ratio_patch_bundle_for_minute(ts_2);
+        let snapshot = bundle
+            .incremental_outputs
+            .price_volume_structure_snapshot
+            .as_ref()
+            .expect("pvs snapshot");
+        let w15 = snapshot["by_window"]["15m"].as_object().expect("15m payload");
+
+        assert_eq!(bundle.history_futures.len(), 2);
+        assert_eq!(bundle.trade_history_futures.len(), 3);
+        assert_eq!(w15.get("window_bars_used").and_then(|v| v.as_u64()), Some(3));
+        assert_eq!(w15.get("bar_volume").and_then(|v| v.as_f64()), Some(7.0));
     }
 
     #[test]

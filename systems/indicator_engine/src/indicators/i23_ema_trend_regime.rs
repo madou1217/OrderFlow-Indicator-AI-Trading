@@ -3,7 +3,8 @@ use crate::indicators::context::{
     KlineHistoryBar,
 };
 use crate::indicators::i19_kline_history::{
-    build_interval_bar_records, build_interval_bar_records_from_records,
+    build_interval_bar_records_from_records, in_memory_interval_bar_records,
+    merge_interval_bar_records, merged_daily_bar_records,
 };
 use crate::indicators::indicator_trait::Indicator;
 use crate::indicators::shared::output_mapper::snapshot_only;
@@ -179,15 +180,7 @@ fn build_htf_input_bars(
         let Some(tf_minutes) = window_to_minutes(tf_code) else {
             return Vec::new();
         };
-        let merged_daily = merge_htf_bars(
-            build_interval_bar_records(
-                &ctx.history_futures,
-                1440,
-                usize::MAX,
-                current_minute_close,
-            ),
-            &ctx.kline_history_futures_1d_db,
-        );
+        let merged_daily = merged_daily_bar_records(ctx, true, current_minute_close);
         return build_interval_bar_records_from_records(
             &merged_daily,
             tf_minutes,
@@ -196,18 +189,28 @@ fn build_htf_input_bars(
         );
     }
 
-    let Some(tf_minutes) = window_to_minutes(tf_code) else {
+    if window_to_minutes(tf_code).is_none() {
         return Vec::new();
-    };
-    merge_htf_bars(
-        build_interval_bar_records(
+    }
+    match tf_code {
+        "4h" | "1d" => merge_interval_bar_records(
+            htf_db_bars(ctx, tf_code),
+            &in_memory_interval_bar_records(
+                ctx,
+                &ctx.history_futures,
+                tf_code,
+                true,
+                current_minute_close,
+            ),
+        ),
+        _ => in_memory_interval_bar_records(
+            ctx,
             &ctx.history_futures,
-            tf_minutes,
-            usize::MAX,
+            tf_code,
+            true,
             current_minute_close,
         ),
-        htf_db_bars(ctx, tf_code),
-    )
+    }
 }
 
 fn collect_1m_closes(ctx: &IndicatorContext) -> Vec<(DateTime<Utc>, f64)> {
@@ -234,20 +237,6 @@ fn pick_or_compute_base_ema(
             let values = closes.iter().map(|(_, v)| *v).collect::<Vec<_>>();
             ema_last(&values, period)
         })
-}
-
-fn merge_htf_bars(
-    mut in_mem: Vec<KlineHistoryBar>,
-    db_rows: &[KlineHistoryBar],
-) -> Vec<KlineHistoryBar> {
-    let mut merged = BTreeMap::new();
-    for bar in db_rows {
-        merged.insert(bar.open_time, bar.clone());
-    }
-    for bar in in_mem.drain(..) {
-        merged.insert(bar.open_time, bar);
-    }
-    merged.into_values().collect()
 }
 
 fn htf_db_bars<'a>(ctx: &'a IndicatorContext, tf_code: &str) -> &'a [KlineHistoryBar] {

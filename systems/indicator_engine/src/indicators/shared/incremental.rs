@@ -1,3 +1,10 @@
+use crate::indicators::context::{zscore, IndicatorLevelRow, KlineHistoryBar};
+use crate::indicators::i01_price_volume_structure::{
+    build_level_rows, build_pvs_payload, DRYUP_LOOKBACK, DRYUP_Z_THRESHOLD, MULTI_WINDOWS,
+};
+use crate::indicators::i19_kline_history::{
+    apply_record_to_bar, bar_is_closed, minute_bar_to_record,
+};
 use crate::indicators::shared::avwap::{
     avwap_window_snapshot_json, AVWAP_LOOKBACK_DAYS, AVWAP_LOOKBACK_MINUTES,
 };
@@ -12,6 +19,7 @@ use std::sync::Arc;
 
 const EPS: f64 = 1e-12;
 const HISTORY_LIMIT_MINUTES_I64: i64 = crate::runtime::state_store::HISTORY_LIMIT_MINUTES as i64;
+const HISTORY_LIMIT_MINUTES_USIZE: usize = crate::runtime::state_store::HISTORY_LIMIT_MINUTES;
 const AVWAP_WINDOWS: [(&str, i64); 7] = [
     ("15m", 15),
     ("1h", 60),
@@ -32,6 +40,7 @@ const FUNDING_WINDOWS: [(&str, i64); 7] = [
     ("30d", 43_200),
 ];
 const FUNDING_ALL_WINDOWS: [i64; 8] = [1, 15, 60, 240, 1440, 4320, 10_080, 43_200];
+const HTF_CACHE_INTERVALS: [(&str, i64); 3] = [("15m", 15), ("4h", 240), ("1d", 1440)];
 
 #[derive(Debug, Clone, Default)]
 pub struct IncrementalIndicatorOutputs {
@@ -42,6 +51,9 @@ pub struct IncrementalIndicatorOutputs {
     pub tpo_snapshot: Option<Value>,
     pub rvwap_snapshot: Option<Value>,
     pub high_volume_pulse_snapshot: Option<Value>,
+    pub htf_bar_cache: HtfBarCacheOutput,
+    pub price_volume_structure_snapshot: Option<Value>,
+    pub price_volume_structure_level_rows: Vec<IndicatorLevelRow>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -72,6 +84,22 @@ pub struct FundingFeatureOutput {
 }
 
 #[derive(Debug, Clone, Default)]
+pub struct HtfBarCacheOutput {
+    pub futures: BTreeMap<String, Vec<KlineHistoryBar>>,
+    pub spot: BTreeMap<String, Vec<KlineHistoryBar>>,
+}
+
+impl HtfBarCacheOutput {
+    pub fn futures_records(&self, code: &str) -> Option<&[KlineHistoryBar]> {
+        self.futures.get(code).map(Vec::as_slice)
+    }
+
+    pub fn spot_records(&self, code: &str) -> Option<&[KlineHistoryBar]> {
+        self.spot.get(code).map(Vec::as_slice)
+    }
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct IncrementalIndicatorConfig {
     pub tpo_rows_nb: usize,
     pub tpo_value_area_pct: f64,
@@ -95,6 +123,8 @@ pub struct IncrementalIndicatorState {
     rvwap: RvwapState,
     high_volume: HighVolumePulseState,
     tpo: TpoState,
+    htf_bars: HtfBarCacheState,
+    price_volume_structure: PriceVolumeStructureState,
 }
 
 impl Default for IncrementalIndicatorState {
@@ -108,6 +138,8 @@ impl Default for IncrementalIndicatorState {
             rvwap: RvwapState::default(),
             high_volume: HighVolumePulseState::default(),
             tpo: TpoState::default(),
+            htf_bars: HtfBarCacheState::default(),
+            price_volume_structure: PriceVolumeStructureState::default(),
         }
     }
 }
@@ -140,6 +172,8 @@ impl IncrementalIndicatorState {
             self.config.tpo_ib_minutes,
             self.config.tpo_dev_output_windows.clone(),
         );
+        self.htf_bars = HtfBarCacheState::new();
+        self.price_volume_structure = PriceVolumeStructureState::new();
     }
 
     pub fn outputs(&self) -> Arc<IncrementalIndicatorOutputs> {
@@ -174,13 +208,18 @@ impl IncrementalIndicatorState {
         self.rvwap.rebuild(history_futures);
         self.high_volume.rebuild(history_futures);
         self.tpo.rebuild(history_futures, ts_bucket);
+        self.htf_bars.rebuild(history_futures, history_spot, ts_bucket);
+        self.price_volume_structure.rebuild(history_futures);
         self.outputs = Arc::new(build_incremental_outputs(
             &self.funding,
             &self.avwap,
             &self.rvwap,
             &self.high_volume,
             &self.tpo,
+            &self.htf_bars,
+            &self.price_volume_structure,
             ts_bucket,
+            history_futures,
             history_futures.last(),
             latest_mark,
         ));
@@ -211,6 +250,8 @@ impl IncrementalIndicatorState {
         self.rvwap.sync(history_futures);
         self.high_volume.sync(history_futures);
         self.tpo.sync(history_futures, ts_bucket);
+        self.htf_bars.sync(history_futures, history_spot, ts_bucket);
+        self.price_volume_structure.sync(history_futures);
 
         self.outputs = Arc::new(build_incremental_outputs(
             &self.funding,
@@ -218,7 +259,10 @@ impl IncrementalIndicatorState {
             &self.rvwap,
             &self.high_volume,
             &self.tpo,
+            &self.htf_bars,
+            &self.price_volume_structure,
             ts_bucket,
+            history_futures,
             history_futures.last(),
             latest_mark,
         ));
@@ -231,13 +275,18 @@ fn build_incremental_outputs(
     rvwap: &RvwapState,
     high_volume: &HighVolumePulseState,
     tpo: &TpoState,
+    htf_bars: &HtfBarCacheState,
+    price_volume_structure: &PriceVolumeStructureState,
     ts_bucket: DateTime<Utc>,
+    history_futures: &[MinuteHistory],
     latest_futures: Option<&MinuteHistory>,
     latest_mark: Option<&LatestMarkState>,
 ) -> IncrementalIndicatorOutputs {
     let (funding_snapshot, funding_feature_windows) = funding.outputs(ts_bucket);
     let (avwap_snapshot, avwap_feature) =
         avwap.build_outputs(ts_bucket, latest_futures, latest_mark);
+    let (price_volume_structure_snapshot, price_volume_structure_level_rows) =
+        price_volume_structure.outputs(history_futures);
 
     IncrementalIndicatorOutputs {
         funding_snapshot,
@@ -247,7 +296,450 @@ fn build_incremental_outputs(
         tpo_snapshot: tpo.snapshot(ts_bucket),
         rvwap_snapshot: rvwap.snapshot(ts_bucket),
         high_volume_pulse_snapshot: high_volume.snapshot(ts_bucket),
+        htf_bar_cache: htf_bars.outputs(),
+        price_volume_structure_snapshot,
+        price_volume_structure_level_rows,
     }
+}
+
+pub fn compute_price_volume_structure_outputs_from_history(
+    history_futures: &[MinuteHistory],
+) -> (Option<Value>, Vec<IndicatorLevelRow>) {
+    let mut state = PriceVolumeStructureState::new();
+    state.rebuild(history_futures);
+    state.outputs(history_futures)
+}
+
+#[derive(Debug, Clone)]
+struct HtfBarSeriesState {
+    interval_minutes: i64,
+    bars: BTreeMap<DateTime<Utc>, HtfBarBucketState>,
+    minute_assignments: VecDeque<(DateTime<Utc>, DateTime<Utc>)>,
+}
+
+#[derive(Debug, Clone)]
+struct HtfBarBucketState {
+    bar: KlineHistoryBar,
+    minutes: VecDeque<KlineHistoryBar>,
+}
+
+impl HtfBarBucketState {
+    fn new(open_time: DateTime<Utc>, interval_minutes: i64) -> Self {
+        Self {
+            bar: KlineHistoryBar {
+                open_time,
+                close_time: open_time + Duration::minutes(interval_minutes),
+                open: None,
+                high: None,
+                low: None,
+                close: None,
+                volume_base: 0.0,
+                volume_quote: 0.0,
+                is_closed: false,
+                minutes_covered: 0,
+                expected_minutes: interval_minutes,
+            },
+            minutes: VecDeque::new(),
+        }
+    }
+
+    fn recompute(&mut self, current_ts_bucket: DateTime<Utc>) {
+        let mut bar = KlineHistoryBar {
+            open_time: self.bar.open_time,
+            close_time: self.bar.close_time,
+            open: None,
+            high: None,
+            low: None,
+            close: None,
+            volume_base: 0.0,
+            volume_quote: 0.0,
+            is_closed: false,
+            minutes_covered: 0,
+            expected_minutes: self.bar.expected_minutes,
+        };
+        for minute in &self.minutes {
+            apply_record_to_bar(&mut bar, minute);
+        }
+        let current_minute_close = current_ts_bucket + Duration::minutes(1);
+        bar.is_closed = bar_is_closed(
+            bar.close_time,
+            current_minute_close,
+            bar.minutes_covered,
+            bar.expected_minutes,
+        );
+        self.bar = bar;
+    }
+}
+
+impl HtfBarSeriesState {
+    fn new(interval_minutes: i64) -> Self {
+        Self {
+            interval_minutes,
+            bars: BTreeMap::new(),
+            minute_assignments: VecDeque::new(),
+        }
+    }
+
+    fn append(
+        &mut self,
+        row: &MinuteHistory,
+        current_ts_bucket: DateTime<Utc>,
+        oldest_retained_ts: Option<DateTime<Utc>>,
+    ) {
+        let minute_record = minute_bar_to_record(row);
+        let open_time = floor_to_interval(minute_record.open_time, self.interval_minutes);
+        let entry = self
+            .bars
+            .entry(open_time)
+            .or_insert_with(|| HtfBarBucketState::new(open_time, self.interval_minutes));
+        entry.minutes.push_back(minute_record.clone());
+        entry.recompute(current_ts_bucket);
+        self.minute_assignments
+            .push_back((minute_record.open_time, open_time));
+        if let Some(oldest_ts) = oldest_retained_ts {
+            self.evict_expired_minutes(oldest_ts, current_ts_bucket);
+        }
+    }
+
+    fn outputs(&self) -> Vec<KlineHistoryBar> {
+        self.bars.values().map(|bucket| bucket.bar.clone()).collect()
+    }
+
+    fn evict_expired_minutes(
+        &mut self,
+        oldest_retained_ts: DateTime<Utc>,
+        current_ts_bucket: DateTime<Utc>,
+    ) {
+        while self
+            .minute_assignments
+            .front()
+            .map(|(minute_ts, _)| *minute_ts < oldest_retained_ts)
+            .unwrap_or(false)
+        {
+            let Some((minute_ts, open_time)) = self.minute_assignments.pop_front() else {
+                break;
+            };
+            let mut remove_bucket = false;
+            if let Some(bucket) = self.bars.get_mut(&open_time) {
+                if bucket
+                    .minutes
+                    .front()
+                    .map(|minute| minute.open_time == minute_ts)
+                    .unwrap_or(false)
+                {
+                    bucket.minutes.pop_front();
+                } else if let Some(position) =
+                    bucket.minutes.iter().position(|minute| minute.open_time == minute_ts)
+                {
+                    bucket.minutes.remove(position);
+                }
+                if bucket.minutes.is_empty() {
+                    remove_bucket = true;
+                } else {
+                    bucket.recompute(current_ts_bucket);
+                }
+            }
+            if remove_bucket {
+                self.bars.remove(&open_time);
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct HtfBarCacheState {
+    futures: BTreeMap<String, HtfBarSeriesState>,
+    spot: BTreeMap<String, HtfBarSeriesState>,
+    last_ts: Option<DateTime<Utc>>,
+}
+
+impl HtfBarCacheState {
+    fn new() -> Self {
+        let mut futures = BTreeMap::new();
+        let mut spot = BTreeMap::new();
+        for (code, interval_minutes) in HTF_CACHE_INTERVALS {
+            futures.insert(code.to_string(), HtfBarSeriesState::new(interval_minutes));
+            spot.insert(code.to_string(), HtfBarSeriesState::new(interval_minutes));
+        }
+        Self {
+            futures,
+            spot,
+            last_ts: None,
+        }
+    }
+
+    fn rebuild(
+        &mut self,
+        history_futures: &[MinuteHistory],
+        history_spot: &[MinuteHistory],
+        ts_bucket: DateTime<Utc>,
+    ) {
+        *self = Self::new();
+        let oldest_futures_ts = history_futures.first().map(|row| row.ts_bucket);
+        let oldest_spot_ts = history_spot.first().map(|row| row.ts_bucket);
+        for row in history_futures {
+            for series in self.futures.values_mut() {
+                series.append(row, row.ts_bucket, oldest_futures_ts);
+            }
+        }
+        for row in history_spot {
+            for series in self.spot.values_mut() {
+                series.append(row, row.ts_bucket, oldest_spot_ts);
+            }
+        }
+        if history_futures.is_empty() && history_spot.is_empty() {
+            self.last_ts = None;
+        } else {
+            self.last_ts = Some(ts_bucket);
+        }
+    }
+
+    fn sync(
+        &mut self,
+        history_futures: &[MinuteHistory],
+        history_spot: &[MinuteHistory],
+        ts_bucket: DateTime<Utc>,
+    ) {
+        match self.last_ts {
+            None => self.rebuild(history_futures, history_spot, ts_bucket),
+            Some(last_ts) => {
+                let oldest_futures_ts = history_futures.first().map(|row| row.ts_bucket);
+                let oldest_spot_ts = history_spot.first().map(|row| row.ts_bucket);
+                if let Some(oldest_ts) = oldest_futures_ts {
+                    for series in self.futures.values_mut() {
+                        series.evict_expired_minutes(oldest_ts, ts_bucket);
+                    }
+                }
+                if let Some(oldest_ts) = oldest_spot_ts {
+                    for series in self.spot.values_mut() {
+                        series.evict_expired_minutes(oldest_ts, ts_bucket);
+                    }
+                }
+                let futures_start_idx =
+                    lower_bound_history_ts(history_futures, last_ts + Duration::minutes(1));
+                let spot_start_idx =
+                    lower_bound_history_ts(history_spot, last_ts + Duration::minutes(1));
+                for row in &history_futures[futures_start_idx..] {
+                    for series in self.futures.values_mut() {
+                        series.append(row, row.ts_bucket, oldest_futures_ts);
+                    }
+                }
+                for row in &history_spot[spot_start_idx..] {
+                    for series in self.spot.values_mut() {
+                        series.append(row, row.ts_bucket, oldest_spot_ts);
+                    }
+                }
+                self.last_ts = Some(ts_bucket);
+            }
+        }
+    }
+
+    fn outputs(&self) -> HtfBarCacheOutput {
+        HtfBarCacheOutput {
+            futures: self
+                .futures
+                .iter()
+                .map(|(code, series)| (code.clone(), series.outputs()))
+                .collect(),
+            spot: self
+                .spot
+                .iter()
+                .map(|(code, series)| (code.clone(), series.outputs()))
+                .collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PvsMinuteContribution {
+    total_qty: f64,
+    profile: BTreeMap<i64, LevelAgg>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct PriceVolumeStructureWindowState {
+    max_bars: usize,
+    aggregate: BTreeMap<i64, LevelAgg>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct PriceVolumeStructureState {
+    minutes: VecDeque<PvsMinuteContribution>,
+    windows: BTreeMap<String, PriceVolumeStructureWindowState>,
+    last_ts: Option<DateTime<Utc>>,
+}
+
+impl PriceVolumeStructureState {
+    fn new() -> Self {
+        let windows = MULTI_WINDOWS
+            .iter()
+            .map(|(code, max_bars)| {
+                (
+                    (*code).to_string(),
+                    PriceVolumeStructureWindowState {
+                        max_bars: *max_bars,
+                        aggregate: BTreeMap::new(),
+                    },
+                )
+            })
+            .collect();
+        Self {
+            minutes: VecDeque::new(),
+            windows,
+            last_ts: None,
+        }
+    }
+
+    fn rebuild(&mut self, history_futures: &[MinuteHistory]) {
+        *self = Self::new();
+        for row in history_futures {
+            self.append_minute(row);
+        }
+    }
+
+    fn sync(&mut self, history_futures: &[MinuteHistory]) {
+        match self.last_ts {
+            None => self.rebuild(history_futures),
+            Some(last_ts) => {
+                if history_futures
+                    .last()
+                    .map(|row| row.ts_bucket <= last_ts)
+                    .unwrap_or(true)
+                {
+                    return;
+                }
+                let start_idx =
+                    lower_bound_history_ts(history_futures, last_ts + Duration::minutes(1));
+                for row in &history_futures[start_idx..] {
+                    self.append_minute(row);
+                }
+            }
+        }
+    }
+
+    fn append_minute(&mut self, row: &MinuteHistory) {
+        let contribution = PvsMinuteContribution {
+            total_qty: row.total_qty,
+            profile: row.profile.clone(),
+        };
+        let len_before = self.minutes.len();
+        for window_state in self.windows.values_mut() {
+            if len_before >= window_state.max_bars {
+                if let Some(expired) = self.minutes.get(len_before - window_state.max_bars) {
+                    subtract_profile(&mut window_state.aggregate, &expired.profile);
+                }
+            }
+            add_profile(&mut window_state.aggregate, &contribution.profile);
+        }
+        self.minutes.push_back(contribution);
+        while self.minutes.len() > HISTORY_LIMIT_MINUTES_USIZE {
+            self.minutes.pop_front();
+        }
+        self.last_ts = Some(row.ts_bucket);
+    }
+
+    fn outputs(
+        &self,
+        _history_futures: &[MinuteHistory],
+    ) -> (Option<Value>, Vec<IndicatorLevelRow>) {
+        let Some(current) = self.minutes.back() else {
+            return (None, Vec::new());
+        };
+
+        let total_volume = current.total_qty;
+        let volume_z = zscore(
+            total_volume,
+            self.minutes
+                .iter()
+                .rev()
+                .take(DRYUP_LOOKBACK)
+                .map(|row| row.total_qty)
+                .collect(),
+        );
+        let volume_dryup = volume_z
+            .map(|value| value <= -DRYUP_Z_THRESHOLD)
+            .unwrap_or(false);
+
+        let mut payload =
+            build_pvs_payload(&current.profile, total_volume, volume_z, volume_dryup);
+        let mut level_rows =
+            build_level_rows("price_volume_structure", "1m", &current.profile, total_volume);
+
+        let avail = self.minutes.len();
+        let mut by_window = Map::new();
+        for &(window_code, window_bars) in MULTI_WINDOWS {
+            let Some(window_state) = self.windows.get(window_code) else {
+                continue;
+            };
+            let window_total = window_state.aggregate.values().map(LevelAgg::total).sum::<f64>();
+            let window_bars_used = window_bars.min(avail);
+            let hist_start = avail.saturating_sub(window_bars_used);
+            let prior_vols = if hist_start >= window_bars {
+                let n_chunks = (hist_start / window_bars).min(DRYUP_LOOKBACK);
+                (0..n_chunks)
+                    .map(|idx| {
+                        let end = hist_start - idx * window_bars;
+                        let start = end.saturating_sub(window_bars);
+                        sum_pvs_range(&self.minutes, start, end)
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            let window_z = zscore(window_total, prior_vols);
+            let window_dryup = window_z
+                .map(|value| value <= -DRYUP_Z_THRESHOLD)
+                .unwrap_or(false);
+            let mut window_payload =
+                build_pvs_payload(&window_state.aggregate, window_total, window_z, window_dryup);
+            if let Some(obj) = window_payload.as_object_mut() {
+                obj.insert("window_bars_used".into(), json!(window_bars_used));
+            }
+            level_rows.extend(build_level_rows(
+                "price_volume_structure",
+                window_code,
+                &window_state.aggregate,
+                window_total,
+            ));
+            by_window.insert(window_code.to_string(), window_payload);
+        }
+
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("by_window".into(), Value::Object(by_window));
+        }
+
+        (Some(payload), level_rows)
+    }
+}
+
+fn add_profile(target: &mut BTreeMap<i64, LevelAgg>, profile: &BTreeMap<i64, LevelAgg>) {
+    for (&tick, level) in profile {
+        let entry = target.entry(tick).or_default();
+        entry.buy_qty += level.buy_qty;
+        entry.sell_qty += level.sell_qty;
+    }
+}
+
+fn subtract_profile(target: &mut BTreeMap<i64, LevelAgg>, profile: &BTreeMap<i64, LevelAgg>) {
+    for (&tick, level) in profile {
+        let remove = if let Some(entry) = target.get_mut(&tick) {
+            entry.buy_qty -= level.buy_qty;
+            entry.sell_qty -= level.sell_qty;
+            entry.buy_qty.abs() <= EPS && entry.sell_qty.abs() <= EPS
+        } else {
+            false
+        };
+        if remove {
+            target.remove(&tick);
+        }
+    }
+}
+
+fn sum_pvs_range(minutes: &VecDeque<PvsMinuteContribution>, start: usize, end: usize) -> f64 {
+    (start..end)
+        .filter_map(|idx| minutes.get(idx))
+        .map(|row| row.total_qty)
+        .sum()
 }
 
 #[derive(Debug, Clone, Default)]
@@ -2645,11 +3137,15 @@ mod tests {
         DivergenceSigTestMode, IndicatorContext, IndicatorRuntimeOptions, KlineHistorySupplement,
         OpenInterestCurrentSidecar,
     };
+    use crate::indicators::i01_price_volume_structure::I01PriceVolumeStructure;
     use crate::indicators::i16_funding_rate::I16FundingRate;
     use crate::indicators::i18_avwap::I18Avwap;
+    use crate::indicators::i19_kline_history::I19KlineHistory;
     use crate::indicators::i20_tpo_market_profile::I20TpoMarketProfile;
     use crate::indicators::i21_rvwap_sigma_bands::I21RvwapSigmaBands;
     use crate::indicators::i22_high_volume_pulse::I22HighVolumePulse;
+    use crate::indicators::i23_ema_trend_regime::I23EmaTrendRegime;
+    use crate::indicators::i24_fvg::I24Fvg;
     use crate::indicators::indicator_trait::Indicator;
     use crate::indicators::shared::funding::funding_change_json;
     use crate::ingest::decoder::MarketKind;
@@ -2742,8 +3238,8 @@ mod tests {
             spot,
             history_futures: Arc::new(futures_history.clone()),
             history_spot: Arc::new(spot_history.clone()),
-            trade_history_futures: futures_history.clone(),
-            trade_history_spot: spot_history.clone(),
+            trade_history_futures: Vec::new(),
+            trade_history_spot: Vec::new(),
             latest_mark: latest_mark.clone(),
             latest_funding: latest_funding.clone(),
             funding_changes_in_window: funding_changes
@@ -2784,7 +3280,9 @@ mod tests {
                     })
                     .collect(),
             ),
+            absorption_all_events: Arc::new(Vec::new()),
             divergence_all_events: Arc::new(Vec::new()),
+            initiation_all_events: Arc::new(Vec::new()),
             exhaustion_all_events: Arc::new(Vec::new()),
             latest_common_oi_ratio_bucket: None,
             current_open_interest: Some(OpenInterestCurrentSidecar {
@@ -2833,6 +3331,19 @@ mod tests {
 
         let pairs: Vec<(&str, Value, Value)> = vec![
             (
+                "price_volume_structure",
+                I01PriceVolumeStructure
+                    .evaluate(&legacy_ctx)
+                    .snapshot
+                    .expect("legacy pvs")
+                    .payload_json,
+                I01PriceVolumeStructure
+                    .evaluate(&incremental_ctx)
+                    .snapshot
+                    .expect("incremental pvs")
+                    .payload_json,
+            ),
+            (
                 "funding_rate",
                 I16FundingRate
                     .evaluate(&legacy_ctx)
@@ -2856,6 +3367,19 @@ mod tests {
                     .evaluate(&incremental_ctx)
                     .snapshot
                     .expect("incremental avwap")
+                    .payload_json,
+            ),
+            (
+                "kline_history",
+                I19KlineHistory
+                    .evaluate(&legacy_ctx)
+                    .snapshot
+                    .expect("legacy kline_history")
+                    .payload_json,
+                I19KlineHistory
+                    .evaluate(&incremental_ctx)
+                    .snapshot
+                    .expect("incremental kline_history")
                     .payload_json,
             ),
             (
@@ -2897,6 +3421,32 @@ mod tests {
                     .expect("incremental high_volume")
                     .payload_json,
             ),
+            (
+                "ema_trend_regime",
+                I23EmaTrendRegime
+                    .evaluate(&legacy_ctx)
+                    .snapshot
+                    .expect("legacy ema_trend_regime")
+                    .payload_json,
+                I23EmaTrendRegime
+                    .evaluate(&incremental_ctx)
+                    .snapshot
+                    .expect("incremental ema_trend_regime")
+                    .payload_json,
+            ),
+            (
+                "fvg",
+                I24Fvg
+                    .evaluate(&legacy_ctx)
+                    .snapshot
+                    .expect("legacy fvg")
+                    .payload_json,
+                I24Fvg
+                    .evaluate(&incremental_ctx)
+                    .snapshot
+                    .expect("incremental fvg")
+                    .payload_json,
+            ),
         ];
 
         for (code, legacy, incremental) in pairs {
@@ -2905,6 +3455,24 @@ mod tests {
                     "incremental payload diverged for {code} at {path}\nlegacy={legacy}\nincremental={incremental}"
                 );
             }
+        }
+
+        let pvs_legacy = I01PriceVolumeStructure.evaluate(&legacy_ctx);
+        let pvs_incremental = I01PriceVolumeStructure.evaluate(&incremental_ctx);
+        if let Some(path) = first_value_diff_path(
+            &level_rows_to_value(&pvs_legacy.level_rows),
+            &level_rows_to_value(&pvs_incremental.level_rows),
+        ) {
+            panic!("incremental level rows diverged for price_volume_structure at {path}");
+        }
+
+        let fvg_legacy = I24Fvg.evaluate(&legacy_ctx);
+        let fvg_incremental = I24Fvg.evaluate(&incremental_ctx);
+        if let Some(path) = first_value_diff_path(
+            &level_rows_to_value(&fvg_legacy.level_rows),
+            &level_rows_to_value(&fvg_incremental.level_rows),
+        ) {
+            panic!("incremental level rows diverged for fvg at {path}");
         }
     }
 
@@ -2934,6 +3502,46 @@ mod tests {
         rvwap.rebuild(&history);
 
         assert!(rvwap.compute_stats_at(2, 5).is_none());
+    }
+
+    #[test]
+    fn htf_cache_reclaims_expired_minutes_from_partial_bar() {
+        let ts_start = Utc
+            .with_ymd_and_hms(2026, 3, 20, 0, 0, 0)
+            .single()
+            .expect("valid ts");
+        let history = (0..16)
+            .map(|idx| history_row(
+                ts_start + Duration::minutes(idx as i64),
+                MarketKind::Futures,
+                100.0 + idx as f64,
+                1.0,
+            ))
+            .collect::<Vec<_>>();
+
+        let mut cache = super::HtfBarCacheState::new();
+        cache.rebuild(&history, &[], ts_start + Duration::minutes(15));
+
+        let initial = cache.outputs();
+        let initial_15m = initial
+            .futures
+            .get("15m")
+            .expect("15m futures bars");
+        assert_eq!(initial_15m.len(), 2);
+        assert_eq!(initial_15m[0].minutes_covered, 15);
+        assert_eq!(initial_15m[1].minutes_covered, 1);
+
+        cache.sync(&history[2..], &[], ts_start + Duration::minutes(15));
+        let trimmed = cache.outputs();
+        let trimmed_15m = trimmed
+            .futures
+            .get("15m")
+            .expect("trimmed 15m futures bars");
+        assert_eq!(trimmed_15m.len(), 2);
+        assert_eq!(trimmed_15m[0].open_time, ts_start);
+        assert_eq!(trimmed_15m[0].minutes_covered, 13);
+        assert_eq!(trimmed_15m[0].open, Some(101.8));
+        assert_eq!(trimmed_15m[1].minutes_covered, 1);
     }
 
     fn first_value_diff_path(left: &Value, right: &Value) -> Option<String> {
@@ -3124,6 +3732,22 @@ mod tests {
         window.profile = row.profile.clone();
         window.avwap = row.avwap_minute;
         window
+    }
+
+    fn level_rows_to_value(rows: &[crate::indicators::context::IndicatorLevelRow]) -> Value {
+        Value::Array(
+            rows.iter()
+                .map(|row| {
+                    json!({
+                        "indicator_code": row.indicator_code,
+                        "window_code": row.window_code,
+                        "price_level": row.price_level,
+                        "level_rank": row.level_rank,
+                        "metrics_json": row.metrics_json,
+                    })
+                })
+                .collect(),
+        )
     }
 
     fn history_row(

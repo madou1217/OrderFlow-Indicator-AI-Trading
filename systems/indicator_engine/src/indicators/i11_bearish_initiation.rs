@@ -2,7 +2,7 @@ use crate::indicators::context::{
     IndicatorComputation, IndicatorContext, IndicatorEventRow, IndicatorSnapshotRow,
 };
 use crate::indicators::i07_initiation::{
-    detect_initiation_all_history, detect_initiation_events, initiation_event_json,
+    detect_initiation_events, initiation_event_json,
 };
 use crate::indicators::indicator_trait::Indicator;
 use crate::indicators::shared::event_ids::build_indicator_event_id;
@@ -17,7 +17,8 @@ impl Indicator for I11BearishInitiation {
     }
 
     fn evaluate(&self, ctx: &IndicatorContext) -> IndicatorComputation {
-        let all_events = detect_initiation_all_history(ctx)
+        let all_events = ctx
+            .initiation_all_events()
             .iter()
             .filter(|e| e.direction < 0)
             .cloned()

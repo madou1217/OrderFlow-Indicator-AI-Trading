@@ -9,7 +9,7 @@ use crate::indicators::shared::event_views::{
 };
 use chrono::Duration;
 use serde_json::{json, Map, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 pub struct I03Divergence;
 
@@ -96,6 +96,625 @@ pub(crate) struct DivergenceEventData {
     pub likely_driver: String,
 }
 
+#[derive(Debug, Clone)]
+struct DivergenceDerivedMinute {
+    seq: usize,
+    ts_bucket: chrono::DateTime<chrono::Utc>,
+    close: f64,
+    high: f64,
+    low: f64,
+    cvd_fut: f64,
+    cvd_spot: f64,
+    detrended_price: Option<f64>,
+    z_cvd_fut: Option<f64>,
+    z_cvd_spot: Option<f64>,
+    atr: Option<f64>,
+}
+
+#[derive(Debug, Clone)]
+struct DivergencePivot {
+    seq: usize,
+}
+
+#[derive(Debug, Clone)]
+struct DivergenceCachedEvent {
+    required_start_ts: chrono::DateTime<chrono::Utc>,
+    event: DivergenceEventData,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct DivergenceEventStateMachine {
+    minutes: VecDeque<DivergenceDerivedMinute>,
+    close_tail: VecDeque<f64>,
+    cvd_fut_tail: VecDeque<f64>,
+    cvd_spot_tail: VecDeque<f64>,
+    detrended_cvd_fut_tail: VecDeque<f64>,
+    detrended_cvd_spot_tail: VecDeque<f64>,
+    tr_tail: VecDeque<f64>,
+    tr_sum: f64,
+    events: VecDeque<DivergenceCachedEvent>,
+    last_high_pivot: Option<DivergencePivot>,
+    last_low_pivot: Option<DivergencePivot>,
+    last_ts: Option<chrono::DateTime<chrono::Utc>>,
+    next_seq: usize,
+}
+
+impl DivergenceEventStateMachine {
+    pub(crate) fn rebuild(
+        &mut self,
+        history_futures: &[crate::runtime::state_store::MinuteHistory],
+        history_spot: &[crate::runtime::state_store::MinuteHistory],
+        sig_test_mode: DivergenceSigTestMode,
+        bootstrap_b: usize,
+        bootstrap_block_len: usize,
+        p_value_threshold: f64,
+    ) {
+        *self = Self::default();
+        let (history_futures, history_spot) = aligned_event_histories(history_futures, history_spot);
+        for (fut, spot) in history_futures.iter().zip(history_spot.iter()) {
+            self.append_pair(
+                fut,
+                spot,
+                sig_test_mode,
+                bootstrap_b,
+                bootstrap_block_len,
+                p_value_threshold,
+            );
+        }
+        self.last_ts = history_futures.last().map(|row| row.ts_bucket);
+    }
+
+    pub(crate) fn sync(
+        &mut self,
+        history_futures: &[crate::runtime::state_store::MinuteHistory],
+        history_spot: &[crate::runtime::state_store::MinuteHistory],
+        sig_test_mode: DivergenceSigTestMode,
+        bootstrap_b: usize,
+        bootstrap_block_len: usize,
+        p_value_threshold: f64,
+    ) {
+        let (history_futures, history_spot) = aligned_event_histories(history_futures, history_spot);
+        let Some(first_ts) = history_futures.first().map(|row| row.ts_bucket) else {
+            *self = Self::default();
+            return;
+        };
+        let last_ts = history_futures.last().map(|row| row.ts_bucket).unwrap_or(first_ts);
+        let front_pruned = self
+            .minutes
+            .front()
+            .map(|row| row.ts_bucket < first_ts)
+            .unwrap_or(false);
+        if front_pruned && sig_test_mode == DivergenceSigTestMode::BlockBootstrap {
+            self.rebuild(
+                history_futures,
+                history_spot,
+                sig_test_mode,
+                bootstrap_b,
+                bootstrap_block_len,
+                p_value_threshold,
+            );
+            return;
+        }
+        match self.last_ts {
+            None => {
+                self.rebuild(
+                    history_futures,
+                    history_spot,
+                    sig_test_mode,
+                    bootstrap_b,
+                    bootstrap_block_len,
+                    p_value_threshold,
+                );
+                return;
+            }
+            Some(prev_last_ts) if prev_last_ts >= last_ts => {
+                self.rebuild(
+                    history_futures,
+                    history_spot,
+                    sig_test_mode,
+                    bootstrap_b,
+                    bootstrap_block_len,
+                    p_value_threshold,
+                );
+                return;
+            }
+            Some(_) => {}
+        }
+        self.prune_before(first_ts);
+        let start_idx = lower_bound_history_ts(history_futures, self.last_ts.unwrap() + Duration::minutes(1));
+        if start_idx == 0 && self.minutes.is_empty() {
+            self.rebuild(
+                history_futures,
+                history_spot,
+                sig_test_mode,
+                bootstrap_b,
+                bootstrap_block_len,
+                p_value_threshold,
+            );
+            return;
+        }
+        for (fut, spot) in history_futures[start_idx..].iter().zip(history_spot[start_idx..].iter()) {
+            self.append_pair(
+                fut,
+                spot,
+                sig_test_mode,
+                bootstrap_b,
+                bootstrap_block_len,
+                p_value_threshold,
+            );
+        }
+        self.last_ts = Some(last_ts);
+    }
+
+    pub(crate) fn events(&self) -> Vec<DivergenceEventData> {
+        self.events.iter().map(|entry| entry.event.clone()).collect()
+    }
+
+    fn prune_before(&mut self, first_ts: chrono::DateTime<chrono::Utc>) {
+        while self
+            .minutes
+            .front()
+            .map(|row| row.ts_bucket < first_ts)
+            .unwrap_or(false)
+        {
+            self.minutes.pop_front();
+        }
+        while self
+            .events
+            .front()
+            .map(|entry| entry.required_start_ts < first_ts || entry.event.event_start_ts < first_ts)
+            .unwrap_or(false)
+        {
+            self.events.pop_front();
+        }
+        if self
+            .last_high_pivot
+            .as_ref()
+            .map(|pivot| self.offset_of(pivot.seq).is_none())
+            .unwrap_or(false)
+        {
+            self.last_high_pivot = None;
+        }
+        if self
+            .last_low_pivot
+            .as_ref()
+            .map(|pivot| self.offset_of(pivot.seq).is_none())
+            .unwrap_or(false)
+        {
+            self.last_low_pivot = None;
+        }
+    }
+
+    fn append_pair(
+        &mut self,
+        fut: &crate::runtime::state_store::MinuteHistory,
+        spot: &crate::runtime::state_store::MinuteHistory,
+        sig_test_mode: DivergenceSigTestMode,
+        bootstrap_b: usize,
+        bootstrap_block_len: usize,
+        p_value_threshold: f64,
+    ) {
+        let close = fut.close_price.or(fut.last_price).unwrap_or_default();
+        let high = fut.high_price.or(fut.last_price).unwrap_or_default();
+        let low = fut.low_price.or(fut.last_price).unwrap_or_default();
+        let cvd_fut = fut.cvd;
+        let cvd_spot = spot.cvd;
+
+        self.close_tail.push_back(close);
+        if self.close_tail.len() > DETREND_LEN_PRICE {
+            self.close_tail.pop_front();
+        }
+        self.cvd_fut_tail.push_back(cvd_fut);
+        if self.cvd_fut_tail.len() > DETREND_LEN_CVD {
+            self.cvd_fut_tail.pop_front();
+        }
+        self.cvd_spot_tail.push_back(cvd_spot);
+        if self.cvd_spot_tail.len() > DETREND_LEN_CVD {
+            self.cvd_spot_tail.pop_front();
+        }
+
+        let detrended_price = detrend_current(&self.close_tail, DETREND_LEN_PRICE);
+        let detrended_cvd_fut = detrend_current(&self.cvd_fut_tail, DETREND_LEN_CVD);
+        let detrended_cvd_spot = detrend_current(&self.cvd_spot_tail, DETREND_LEN_CVD);
+
+        self.detrended_cvd_fut_tail
+            .push_back(detrended_cvd_fut.unwrap_or(0.0));
+        if self.detrended_cvd_fut_tail.len() > ROBUST_Z_LOOKBACK {
+            self.detrended_cvd_fut_tail.pop_front();
+        }
+        self.detrended_cvd_spot_tail
+            .push_back(detrended_cvd_spot.unwrap_or(0.0));
+        if self.detrended_cvd_spot_tail.len() > ROBUST_Z_LOOKBACK {
+            self.detrended_cvd_spot_tail.pop_front();
+        }
+
+        let z_cvd_fut = robust_z_current(&self.detrended_cvd_fut_tail, ROBUST_Z_LOOKBACK);
+        let z_cvd_spot = robust_z_current(&self.detrended_cvd_spot_tail, ROBUST_Z_LOOKBACK);
+
+        let prev_close = self
+            .minutes
+            .back()
+            .map(|row| row.close)
+            .unwrap_or(close);
+        let tr = (high - low)
+            .max((high - prev_close).abs())
+            .max((low - prev_close).abs());
+        self.tr_tail.push_back(tr);
+        self.tr_sum += tr;
+        if self.tr_tail.len() > ATR_LOOKBACK {
+            if let Some(removed) = self.tr_tail.pop_front() {
+                self.tr_sum -= removed;
+            }
+        }
+        let atr = (self.tr_tail.len() == ATR_LOOKBACK).then(|| self.tr_sum / ATR_LOOKBACK as f64);
+
+        let seq = self.next_seq;
+        self.minutes.push_back(DivergenceDerivedMinute {
+            seq,
+            ts_bucket: fut.ts_bucket,
+            close,
+            high,
+            low,
+            cvd_fut,
+            cvd_spot,
+            detrended_price,
+            z_cvd_fut,
+            z_cvd_spot,
+            atr,
+        });
+        self.maybe_confirm_pivot(
+            seq,
+            true,
+            sig_test_mode,
+            bootstrap_b,
+            bootstrap_block_len,
+            p_value_threshold,
+        );
+        self.maybe_confirm_pivot(
+            seq,
+            false,
+            sig_test_mode,
+            bootstrap_b,
+            bootstrap_block_len,
+            p_value_threshold,
+        );
+        self.next_seq += 1;
+    }
+
+    fn maybe_confirm_pivot(
+        &mut self,
+        current_seq: usize,
+        is_high: bool,
+        sig_test_mode: DivergenceSigTestMode,
+        bootstrap_b: usize,
+        bootstrap_block_len: usize,
+        p_value_threshold: f64,
+    ) {
+        if current_seq < PIVOT_K {
+            return;
+        }
+        let pivot_seq = current_seq - PIVOT_K;
+        let Some(pivot_idx) = self.offset_of(pivot_seq) else {
+            return;
+        };
+        if pivot_idx < PIVOT_K || pivot_idx + PIVOT_K >= self.minutes.len() {
+            return;
+        }
+        let is_pivot = if is_high {
+            let pivot_high = self.minutes[pivot_idx].high;
+            let left_max = self
+                .minutes
+                .iter()
+                .skip(pivot_idx - PIVOT_K)
+                .take(PIVOT_K)
+                .map(|row| row.high)
+                .fold(f64::NEG_INFINITY, f64::max);
+            let right_max = self
+                .minutes
+                .iter()
+                .skip(pivot_idx + 1)
+                .take(PIVOT_K)
+                .map(|row| row.high)
+                .fold(f64::NEG_INFINITY, f64::max);
+            pivot_high > left_max && pivot_high >= right_max
+        } else {
+            let pivot_low = self.minutes[pivot_idx].low;
+            let left_min = self
+                .minutes
+                .iter()
+                .skip(pivot_idx - PIVOT_K)
+                .take(PIVOT_K)
+                .map(|row| row.low)
+                .fold(f64::INFINITY, f64::min);
+            let right_min = self
+                .minutes
+                .iter()
+                .skip(pivot_idx + 1)
+                .take(PIVOT_K)
+                .map(|row| row.low)
+                .fold(f64::INFINITY, f64::min);
+            pivot_low < left_min && pivot_low <= right_min
+        };
+        if !is_pivot {
+            return;
+        }
+        let current_pivot = DivergencePivot { seq: pivot_seq };
+        if is_high {
+            if let Some(prev) = self.last_high_pivot.clone() {
+                if let Some(event) = self.build_candidate_event(
+                    &prev,
+                    &current_pivot,
+                    true,
+                    sig_test_mode,
+                    bootstrap_b,
+                    bootstrap_block_len,
+                    p_value_threshold,
+                ) {
+                    self.events.push_back(event);
+                }
+            }
+            self.last_high_pivot = Some(current_pivot);
+        } else {
+            if let Some(prev) = self.last_low_pivot.clone() {
+                if let Some(event) = self.build_candidate_event(
+                    &prev,
+                    &current_pivot,
+                    false,
+                    sig_test_mode,
+                    bootstrap_b,
+                    bootstrap_block_len,
+                    p_value_threshold,
+                ) {
+                    self.events.push_back(event);
+                }
+            }
+            self.last_low_pivot = Some(current_pivot);
+        }
+    }
+
+    fn build_candidate_event(
+        &self,
+        pivot_1: &DivergencePivot,
+        pivot_2: &DivergencePivot,
+        is_high_side: bool,
+        sig_test_mode: DivergenceSigTestMode,
+        bootstrap_b: usize,
+        bootstrap_block_len: usize,
+        p_value_threshold: f64,
+    ) -> Option<DivergenceCachedEvent> {
+        let idx_1 = self.offset_of(pivot_1.seq)?;
+        let idx_2 = self.offset_of(pivot_2.seq)?;
+        let first = self.minutes.get(idx_1)?;
+        let second = self.minutes.get(idx_2)?;
+        let leg = (second.ts_bucket - first.ts_bucket).num_minutes();
+        if !(MIN_LEG_GAP_MINUTES..=MAX_LEG_GAP_MINUTES).contains(&leg) {
+            return None;
+        }
+        let atr_v = second.atr.unwrap_or(0.0);
+        if atr_v <= 1e-12 {
+            return None;
+        }
+        let leg_eff = (second.close - first.close).abs() / (atr_v + 1e-12);
+        if leg_eff < ETA_LEG {
+            return None;
+        }
+        let (Some(zc1), Some(zc2), Some(zs1), Some(zs2)) =
+            (first.z_cvd_fut, second.z_cvd_fut, first.z_cvd_spot, second.z_cvd_spot)
+        else {
+            return None;
+        };
+        let (price_start, price_end, price_diff) = if is_high_side {
+            (first.high, second.high, second.high - first.high)
+        } else {
+            (first.low, second.low, second.low - first.low)
+        };
+        let cvd_diff_fut = zc2 - zc1;
+        let cvd_diff_spot = zs2 - zs1;
+        let eps_price = 0.5 * atr_v;
+        let price_effect_z = price_diff / (atr_v + 1e-12);
+        let cvd_effect_z = cvd_diff_fut;
+        let divergence_type = if is_high_side {
+            if price_diff >= eps_price && cvd_diff_fut <= -EPS_CVD_Z {
+                Some("bearish")
+            } else if price_diff <= -eps_price && cvd_diff_fut >= EPS_CVD_Z {
+                Some("hidden_bearish")
+            } else {
+                None
+            }
+        } else if price_diff <= -eps_price && cvd_diff_fut >= EPS_CVD_Z {
+            Some("bullish")
+        } else if price_diff >= eps_price && cvd_diff_fut <= -EPS_CVD_Z {
+            Some("hidden_bullish")
+        } else {
+            None
+        }?;
+
+        let mut p_value_price = if price_effect_z.abs() >= ZP_MIN { 0.0 } else { 1.0 };
+        let mut p_value_cvd = if cvd_effect_z.abs() >= ZC_MIN { 0.0 } else { 1.0 };
+        let mut sig_pass = price_effect_z.abs() >= ZP_MIN && cvd_effect_z.abs() >= ZC_MIN;
+
+        if sig_test_mode == DivergenceSigTestMode::BlockBootstrap {
+            let leg_len = (idx_2 - idx_1 + 1).max(2);
+            let price_returns = build_returns_from_option_series(
+                &self
+                    .minutes
+                    .iter()
+                    .take(idx_2 + 1)
+                    .map(|row| row.detrended_price)
+                    .collect::<Vec<_>>(),
+                idx_2,
+            );
+            let cvd_returns = build_returns_from_option_series(
+                &self
+                    .minutes
+                    .iter()
+                    .take(idx_2 + 1)
+                    .map(|row| row.z_cvd_fut)
+                    .collect::<Vec<_>>(),
+                idx_2,
+            );
+
+            if price_returns.len() >= BOOTSTRAP_MIN_RET_SAMPLES {
+                if let Some(p) = block_bootstrap_pvalue(
+                    &price_returns,
+                    leg_len,
+                    price_effect_z.abs(),
+                    bootstrap_b,
+                    bootstrap_block_len,
+                    ((idx_1 as u64) << 32) ^ (idx_2 as u64) ^ 0xA5A5_5A5A_u64,
+                ) {
+                    p_value_price = p;
+                }
+            }
+            if cvd_returns.len() >= BOOTSTRAP_MIN_RET_SAMPLES {
+                if let Some(p) = block_bootstrap_pvalue(
+                    &cvd_returns,
+                    leg_len,
+                    cvd_effect_z.abs(),
+                    bootstrap_b,
+                    bootstrap_block_len,
+                    ((idx_1 as u64) << 32) ^ (idx_2 as u64) ^ 0x5AA5_A55A_u64,
+                ) {
+                    p_value_cvd = p;
+                }
+            }
+            sig_pass = p_value_price <= p_value_threshold && p_value_cvd <= p_value_threshold;
+        }
+        if !sig_pass {
+            return None;
+        }
+
+        let delta_p_sign = price_diff.signum() as i16;
+        let spot_flow_confirm = delta_p_sign == (cvd_diff_spot.signum() as i16);
+        let fut_div_sign = (price_diff.signum() * cvd_diff_fut.signum()) as i16;
+        let spot_lead_score = if (cvd_diff_spot.abs() + cvd_diff_fut.abs()) > 1e-12
+            && (price_diff.signum() == cvd_diff_spot.signum())
+            && (price_diff.signum() != cvd_diff_fut.signum())
+        {
+            cvd_diff_spot.abs() / (cvd_diff_spot.abs() + cvd_diff_fut.abs() + 1e-12)
+        } else {
+            0.0
+        };
+        let likely_driver = if spot_lead_score >= 0.6 {
+            "spot_led"
+        } else if spot_lead_score < 0.3 && fut_div_sign != -1 {
+            "futures_led"
+        } else {
+            "mixed"
+        };
+        let score =
+            clip01(0.5 * (price_effect_z.abs() / 3.0) + 0.5 * (cvd_effect_z.abs() / 3.0));
+        let event = DivergenceEventData {
+            divergence_type: divergence_type.to_string(),
+            pivot_side: if is_high_side {
+                "high".to_string()
+            } else {
+                "low".to_string()
+            },
+            event_start_ts: first.ts_bucket,
+            event_end_ts: second.ts_bucket + Duration::minutes(1),
+            event_available_ts: second.ts_bucket + Duration::minutes(PIVOT_K as i64 + 1),
+            pivot_ts_1: first.ts_bucket,
+            pivot_ts_2: second.ts_bucket,
+            pivot_confirm_ts_1: first.ts_bucket + Duration::minutes(PIVOT_K as i64),
+            pivot_confirm_ts_2: second.ts_bucket + Duration::minutes(PIVOT_K as i64),
+            leg_minutes: leg,
+            price_start,
+            price_end,
+            cvd_start_fut: first.cvd_fut,
+            cvd_end_fut: second.cvd_fut,
+            cvd_start_spot: first.cvd_spot,
+            cvd_end_spot: second.cvd_spot,
+            price_diff,
+            cvd_diff_fut,
+            cvd_diff_spot,
+            price_effect_z,
+            cvd_effect_z,
+            sig_pass,
+            p_value_price,
+            p_value_cvd,
+            score,
+            spot_price_flow_confirm: spot_flow_confirm,
+            fut_divergence_sign: fut_div_sign,
+            spot_lead_score,
+            likely_driver: likely_driver.to_string(),
+        };
+        let earliest_required_minutes =
+            (DETREND_LEN_CVD + ROBUST_Z_LOOKBACK).saturating_sub(2) as i64;
+        Some(DivergenceCachedEvent {
+            required_start_ts: (second.ts_bucket - Duration::minutes(earliest_required_minutes))
+                .min(first.ts_bucket - Duration::minutes(PIVOT_K as i64)),
+            event,
+        })
+    }
+
+    fn offset_of(&self, seq: usize) -> Option<usize> {
+        let first_seq = self.minutes.front()?.seq;
+        let idx = seq.checked_sub(first_seq)?;
+        (idx < self.minutes.len()).then_some(idx)
+    }
+}
+
+fn aligned_event_histories<'a>(
+    history_futures: &'a [crate::runtime::state_store::MinuteHistory],
+    history_spot: &'a [crate::runtime::state_store::MinuteHistory],
+) -> (
+    &'a [crate::runtime::state_store::MinuteHistory],
+    &'a [crate::runtime::state_store::MinuteHistory],
+) {
+    let n = history_futures.len().min(history_spot.len());
+    (
+        &history_futures[history_futures.len().saturating_sub(n)..],
+        &history_spot[history_spot.len().saturating_sub(n)..],
+    )
+}
+
+fn lower_bound_history_ts(
+    history: &[crate::runtime::state_store::MinuteHistory],
+    target: chrono::DateTime<chrono::Utc>,
+) -> usize {
+    let mut lo = 0usize;
+    let mut hi = history.len();
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if history[mid].ts_bucket < target {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
+}
+
+fn detrend_current(values: &VecDeque<f64>, window: usize) -> Option<f64> {
+    if values.len() < window {
+        return None;
+    }
+    let slice = values.iter().skip(values.len() - window).copied().collect::<Vec<_>>();
+    let n = slice.len() as f64;
+    let x_mean = (n - 1.0) / 2.0;
+    let y_mean = slice.iter().sum::<f64>() / n;
+    let mut num = 0.0;
+    let mut den = 0.0;
+    for (idx, y) in slice.iter().enumerate() {
+        let x = idx as f64;
+        num += (x - x_mean) * (y - y_mean);
+        den += (x - x_mean) * (x - x_mean);
+    }
+    let slope = if den > 1e-12 { num / den } else { 0.0 };
+    let intercept = y_mean - slope * x_mean;
+    let pred = intercept + slope * (window as f64 - 1.0);
+    Some(slice[window - 1] - pred)
+}
+
+fn robust_z_current(values: &VecDeque<f64>, lookback: usize) -> Option<f64> {
+    if values.len() < lookback {
+        return None;
+    }
+    let raw = values.iter().skip(values.len() - lookback).copied().collect::<Vec<_>>();
+    robust_z_at(&raw, raw.len() - 1, lookback)
+}
+
 fn candidate_to_event_data(
     candidate: &DivergenceCandidate,
     fut: &[crate::runtime::state_store::MinuteHistory],
@@ -139,16 +758,7 @@ impl Indicator for I03Divergence {
     }
 
     fn evaluate(&self, ctx: &IndicatorContext) -> IndicatorComputation {
-        let all_events = ctx.divergence_all_events_or_init(|ctx| {
-            compute_divergence_all_history(
-                &ctx.history_futures,
-                &ctx.history_spot,
-                ctx.divergence_sig_test_mode,
-                ctx.divergence_bootstrap_b,
-                ctx.divergence_bootstrap_block_len,
-                ctx.divergence_p_value_threshold,
-            )
-        });
+        let all_events = ctx.divergence_all_events();
         let n = ctx.history_futures.len().min(ctx.history_spot.len());
         if n < (PIVOT_K * 4).max(ROBUST_Z_LOOKBACK + 5) {
             return IndicatorComputation {
@@ -381,6 +991,7 @@ fn divergence_label(kind: &str) -> &'static str {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn compute_divergence_all_history(
     history_futures: &[crate::runtime::state_store::MinuteHistory],
     history_spot: &[crate::runtime::state_store::MinuteHistory],
@@ -1014,6 +1625,139 @@ impl XorShift64 {
             0
         } else {
             (self.next_u64() as usize) % bound
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        compute_divergence_all_history, DivergenceEventStateMachine, DivergenceSigTestMode,
+    };
+    use crate::ingest::decoder::MarketKind;
+    use crate::runtime::state_store::{LevelAgg, MinuteHistory};
+    use chrono::{Duration, TimeZone, Utc};
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn streaming_divergence_matches_direct_compute() {
+        let base = Utc.with_ymd_and_hms(2026, 3, 10, 0, 0, 0).unwrap();
+        let mut history_futures = Vec::new();
+        let mut history_spot = Vec::new();
+        for idx in 0..80 {
+            let ts = base + Duration::minutes(idx as i64);
+            let angle = idx as f64 / 4.0;
+            let price = 100.0 + angle.sin() * 2.0 + idx as f64 * 0.03;
+            let spot_price = 99.8 + angle.sin() * 1.7 + idx as f64 * 0.025;
+            history_futures.push(sample_minute(
+                ts,
+                MarketKind::Futures,
+                price,
+                10.0 + angle.cos(),
+                30.0 + angle.sin() * -5.0 + idx as f64 * 0.2,
+            ));
+            history_spot.push(sample_minute(
+                ts,
+                MarketKind::Spot,
+                spot_price,
+                9.0 + angle.sin(),
+                25.0 + angle.sin() * 4.0 + idx as f64 * 0.15,
+            ));
+        }
+
+        let direct = compute_divergence_all_history(
+            &history_futures,
+            &history_spot,
+            DivergenceSigTestMode::Threshold,
+            200,
+            5,
+            0.05,
+        );
+
+        let mut rebuilt_machine = DivergenceEventStateMachine::default();
+        rebuilt_machine.rebuild(
+            &history_futures,
+            &history_spot,
+            DivergenceSigTestMode::Threshold,
+            200,
+            5,
+            0.05,
+        );
+        assert_eq!(direct, rebuilt_machine.events());
+
+        let mut streaming_machine = DivergenceEventStateMachine::default();
+        for end in 0..history_futures.len() {
+            streaming_machine.sync(
+                &history_futures[..=end],
+                &history_spot[..=end],
+                DivergenceSigTestMode::Threshold,
+                200,
+                5,
+                0.05,
+            );
+        }
+        assert_eq!(direct, streaming_machine.events());
+    }
+
+    fn sample_minute(
+        ts_bucket: chrono::DateTime<chrono::Utc>,
+        market: MarketKind,
+        price: f64,
+        delta: f64,
+        cvd: f64,
+    ) -> MinuteHistory {
+        let mut profile = BTreeMap::new();
+        profile.insert(
+            (price * 100.0).round() as i64,
+            LevelAgg {
+                buy_qty: delta.max(0.0),
+                sell_qty: (-delta).max(0.0),
+            },
+        );
+        MinuteHistory {
+            ts_bucket,
+            market,
+            open_price: Some(price - 0.2),
+            high_price: Some(price + 0.5),
+            low_price: Some(price - 0.5),
+            close_price: Some(price + 0.1),
+            last_price: Some(price + 0.1),
+            buy_qty: delta.max(0.0) + 1.0,
+            sell_qty: (-delta).max(0.0) + 1.0,
+            total_qty: delta.abs() + 2.0,
+            total_notional: price * (delta.abs() + 2.0),
+            delta,
+            relative_delta: delta / 10.0,
+            force_liq: BTreeMap::new(),
+            ofi: delta / 2.0,
+            spread_twa: Some(0.02),
+            topk_depth_twa: Some(1000.0),
+            obi_twa: Some(0.1),
+            obi_l1_twa: Some(0.1),
+            obi_k_twa: Some(0.1),
+            obi_k_dw_twa: Some(0.1),
+            obi_k_dw_close: Some(0.1),
+            obi_k_dw_change: Some(0.01),
+            obi_k_dw_adj_twa: Some(0.1),
+            bbo_updates: 1,
+            microprice_twa: Some(price),
+            microprice_classic_twa: Some(price),
+            microprice_kappa_twa: Some(price),
+            microprice_adj_twa: Some(price),
+            cvd,
+            vpin: 0.2,
+            avwap_minute: Some(price),
+            whale_trade_count: 0,
+            whale_buy_count: 0,
+            whale_sell_count: 0,
+            whale_notional_total: 0.0,
+            whale_notional_buy: 0.0,
+            whale_notional_sell: 0.0,
+            whale_qty_eth_total: 0.0,
+            whale_qty_eth_buy: 0.0,
+            whale_qty_eth_sell: 0.0,
+            whale_max_single_notional: 0.0,
+            profile,
         }
     }
 }

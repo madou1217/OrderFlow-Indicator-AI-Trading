@@ -5932,9 +5932,9 @@ async fn invoke_workflow_bundle_models(
                     .as_ref()
                     .map(|path| path.side.clone())
                     .unwrap_or_default();
-                let active_position_count =
+                let same_side_active_position_count =
                     active_position_count_for_side(&trading_state, &path_side);
-                let live_entry_order_count =
+                let same_side_live_entry_order_count =
                     live_entry_order_count_for_side(&trading_state, &path_side);
                 let quality_allows_new_entry = stage1_quality_allows_new_entry(
                     &stage1_output,
@@ -5945,8 +5945,8 @@ async fn invoke_workflow_bundle_models(
                         .min_overall_quality_for_new_entry_dispatch,
                 );
                 let dispatch_flags = workflow_stage2_dispatch_flags(
-                    active_position_count,
-                    live_entry_order_count,
+                    same_side_active_position_count,
+                    same_side_live_entry_order_count,
                     quality_allows_new_entry,
                     &config.llm.workflow.limits,
                 );
@@ -5962,22 +5962,23 @@ async fn invoke_workflow_bundle_models(
                         &trading_state,
                         &entry_snapshots,
                     );
+                let stage2b_live_position_count = trading_state.active_positions.len();
                 let should_run_stage2a =
                     startup_immediate_stage2a_due || dispatch_flags.should_run_stage2a;
-                let stage2b_dispatch_enabled = dispatch_flags.should_run_stage2b;
+                let stage2b_dispatch_enabled = stage2b_live_position_count > 0;
                 let stage2b_context_count = stage2b_contexts.len();
                 let should_run_stage2b = stage2b_dispatch_enabled && stage2b_context_count > 0;
                 let should_run_stage2c =
                     dispatch_flags.should_run_stage2c && !stage2c_contexts.is_empty();
                 let stage2c_exposure_state = stage2c_exposure_state_for_counts(
-                    active_position_count,
-                    live_entry_order_count,
+                    same_side_active_position_count,
+                    same_side_live_entry_order_count,
                 );
                 if !should_run_stage2b {
                     let stage2b_skip_reason =
                         match (stage2b_dispatch_enabled, stage2b_context_count > 0) {
-                            (false, false) => "no_same_side_live_position_and_no_stage2b_context",
-                            (false, true) => "no_same_side_live_position",
+                            (false, false) => "no_live_position_and_no_stage2b_context",
+                            (false, true) => "no_live_position",
                             (true, false) => "no_stage2b_context",
                             (true, true) => "not_skipped",
                         };
@@ -5987,8 +5988,9 @@ async fn invoke_workflow_bundle_models(
                         trigger = &*trigger,
                         path_id = %current_path_id,
                         path_side = %path_side,
-                        active_position_count,
-                        live_entry_order_count,
+                        live_position_count = stage2b_live_position_count,
+                        same_side_active_position_count,
+                        same_side_live_entry_order_count,
                         stage2b_dispatch_enabled,
                         stage2b_context_count,
                         stage2b_context_keys = ?stage2b_contexts
@@ -6006,8 +6008,9 @@ async fn invoke_workflow_bundle_models(
                             "trigger": &*trigger,
                             "path_id": current_path_id,
                             "path_side": path_side,
-                            "active_position_count": active_position_count,
-                            "live_entry_order_count": live_entry_order_count,
+                            "live_position_count": stage2b_live_position_count,
+                            "same_side_active_position_count": same_side_active_position_count,
+                            "same_side_live_entry_order_count": same_side_live_entry_order_count,
                             "dispatch_flag_should_run_stage2b": stage2b_dispatch_enabled,
                             "stage2b_context_count": stage2b_context_count,
                             "stage2b_context_keys": stage2b_contexts
@@ -6295,7 +6298,9 @@ async fn invoke_workflow_bundle_models(
                             other => return Err(anyhow!("unsupported stage2a decision {}", other)),
                         }
                     }
-                } else if active_position_count == 0 && live_entry_order_count == 0 {
+                } else if same_side_active_position_count == 0
+                    && same_side_live_entry_order_count == 0
+                {
                     clear_approved_tactical_plan(&mut workflow_state);
                     crate::workflow::persistence::save_workflow_state(&state_dir, &workflow_state)?;
                     append_workflow_journal_event(
@@ -6308,8 +6313,8 @@ async fn invoke_workflow_bundle_models(
                                 &stage1_output,
                                 &config.llm.workflow.stage1.min_overall_quality_for_new_entry_dispatch,
                             ),
-                            "active_position_count": active_position_count,
-                            "live_entry_order_count": live_entry_order_count,
+                            "active_position_count": same_side_active_position_count,
+                            "live_entry_order_count": same_side_live_entry_order_count,
                         }),
                     );
                 }
@@ -6463,8 +6468,9 @@ async fn invoke_workflow_bundle_models(
                             trigger = &*trigger,
                             path_id = %current_path_id,
                             path_side = %path_side,
-                            active_position_count,
-                            live_entry_order_count,
+                            live_position_count = stage2b_live_position_count,
+                            same_side_active_position_count,
+                            same_side_live_entry_order_count,
                             stage2b_dispatch_enabled,
                             stage2b_context_count,
                             cleared_context_keys = ?workflow_state
@@ -6482,8 +6488,9 @@ async fn invoke_workflow_bundle_models(
                                 "trigger": &*trigger,
                                 "path_id": current_path_id,
                                 "path_side": path_side,
-                                "active_position_count": active_position_count,
-                                "live_entry_order_count": live_entry_order_count,
+                                "live_position_count": stage2b_live_position_count,
+                                "same_side_active_position_count": same_side_active_position_count,
+                                "same_side_live_entry_order_count": same_side_live_entry_order_count,
                                 "dispatch_flag_should_run_stage2b": stage2b_dispatch_enabled,
                                 "stage2b_context_count": stage2b_context_count,
                                 "cleared_context_keys": workflow_state
