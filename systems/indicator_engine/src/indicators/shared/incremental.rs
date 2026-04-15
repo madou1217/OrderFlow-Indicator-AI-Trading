@@ -180,6 +180,36 @@ impl IncrementalIndicatorState {
         self.outputs.clone()
     }
 
+    pub fn rebuild_outputs_for_minute(
+        &self,
+        ts_bucket: DateTime<Utc>,
+        history_futures: &[MinuteHistory],
+        history_spot: &[MinuteHistory],
+        latest_mark: Option<&LatestMarkState>,
+        funding_changes_recent: &[FundingChange],
+        funding_recent_7d_payload: Arc<Vec<Value>>,
+        funding_points_recent: &[LatestFundingState],
+        mark_points_recent: &[LatestMarkState],
+    ) -> Arc<IncrementalIndicatorOutputs> {
+        if !self.configured {
+            return Arc::new(IncrementalIndicatorOutputs::default());
+        }
+
+        let mut replay = IncrementalIndicatorState::default();
+        replay.configure(self.config.clone());
+        replay.rebuild(
+            Some(ts_bucket),
+            history_futures,
+            history_spot,
+            latest_mark,
+            funding_changes_recent,
+            funding_recent_7d_payload,
+            funding_points_recent,
+            mark_points_recent,
+        );
+        replay.outputs()
+    }
+
     pub fn rebuild(
         &mut self,
         ts_bucket: Option<DateTime<Utc>>,
@@ -208,7 +238,8 @@ impl IncrementalIndicatorState {
         self.rvwap.rebuild(history_futures);
         self.high_volume.rebuild(history_futures);
         self.tpo.rebuild(history_futures, ts_bucket);
-        self.htf_bars.rebuild(history_futures, history_spot, ts_bucket);
+        self.htf_bars
+            .rebuild(history_futures, history_spot, ts_bucket);
         self.price_volume_structure.rebuild(history_futures);
         self.outputs = Arc::new(build_incremental_outputs(
             &self.funding,
@@ -402,7 +433,10 @@ impl HtfBarSeriesState {
     }
 
     fn outputs(&self) -> Vec<KlineHistoryBar> {
-        self.bars.values().map(|bucket| bucket.bar.clone()).collect()
+        self.bars
+            .values()
+            .map(|bucket| bucket.bar.clone())
+            .collect()
     }
 
     fn evict_expired_minutes(
@@ -428,8 +462,10 @@ impl HtfBarSeriesState {
                     .unwrap_or(false)
                 {
                     bucket.minutes.pop_front();
-                } else if let Some(position) =
-                    bucket.minutes.iter().position(|minute| minute.open_time == minute_ts)
+                } else if let Some(position) = bucket
+                    .minutes
+                    .iter()
+                    .position(|minute| minute.open_time == minute_ts)
                 {
                     bucket.minutes.remove(position);
                 }
@@ -660,10 +696,13 @@ impl PriceVolumeStructureState {
             .map(|value| value <= -DRYUP_Z_THRESHOLD)
             .unwrap_or(false);
 
-        let mut payload =
-            build_pvs_payload(&current.profile, total_volume, volume_z, volume_dryup);
-        let mut level_rows =
-            build_level_rows("price_volume_structure", "1m", &current.profile, total_volume);
+        let mut payload = build_pvs_payload(&current.profile, total_volume, volume_z, volume_dryup);
+        let mut level_rows = build_level_rows(
+            "price_volume_structure",
+            "1m",
+            &current.profile,
+            total_volume,
+        );
 
         let avail = self.minutes.len();
         let mut by_window = Map::new();
@@ -671,7 +710,11 @@ impl PriceVolumeStructureState {
             let Some(window_state) = self.windows.get(window_code) else {
                 continue;
             };
-            let window_total = window_state.aggregate.values().map(LevelAgg::total).sum::<f64>();
+            let window_total = window_state
+                .aggregate
+                .values()
+                .map(LevelAgg::total)
+                .sum::<f64>();
             let window_bars_used = window_bars.min(avail);
             let hist_start = avail.saturating_sub(window_bars_used);
             let prior_vols = if hist_start >= window_bars {
@@ -690,8 +733,12 @@ impl PriceVolumeStructureState {
             let window_dryup = window_z
                 .map(|value| value <= -DRYUP_Z_THRESHOLD)
                 .unwrap_or(false);
-            let mut window_payload =
-                build_pvs_payload(&window_state.aggregate, window_total, window_z, window_dryup);
+            let mut window_payload = build_pvs_payload(
+                &window_state.aggregate,
+                window_total,
+                window_z,
+                window_dryup,
+            );
             if let Some(obj) = window_payload.as_object_mut() {
                 obj.insert("window_bars_used".into(), json!(window_bars_used));
             }
@@ -3511,22 +3558,21 @@ mod tests {
             .single()
             .expect("valid ts");
         let history = (0..16)
-            .map(|idx| history_row(
-                ts_start + Duration::minutes(idx as i64),
-                MarketKind::Futures,
-                100.0 + idx as f64,
-                1.0,
-            ))
+            .map(|idx| {
+                history_row(
+                    ts_start + Duration::minutes(idx as i64),
+                    MarketKind::Futures,
+                    100.0 + idx as f64,
+                    1.0,
+                )
+            })
             .collect::<Vec<_>>();
 
         let mut cache = super::HtfBarCacheState::new();
         cache.rebuild(&history, &[], ts_start + Duration::minutes(15));
 
         let initial = cache.outputs();
-        let initial_15m = initial
-            .futures
-            .get("15m")
-            .expect("15m futures bars");
+        let initial_15m = initial.futures.get("15m").expect("15m futures bars");
         assert_eq!(initial_15m.len(), 2);
         assert_eq!(initial_15m[0].minutes_covered, 15);
         assert_eq!(initial_15m[1].minutes_covered, 1);

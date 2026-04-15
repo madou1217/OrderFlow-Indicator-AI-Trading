@@ -2,18 +2,10 @@ use crate::indicators::context::{
     LongShortRatioPoint, OpenInterestCurrentSidecar, OpenInterestHistPoint, OptionMarkGreeksPoint,
     OptionsSurfacePoint,
 };
-use crate::indicators::i03_divergence::{
-    DivergenceEventData, DivergenceEventStateMachine,
-};
-use crate::indicators::i06_absorption::{
-    AbsorptionEventData, AbsorptionEventStateMachine,
-};
-use crate::indicators::i07_initiation::{
-    InitiationEventData, InitiationEventStateMachine,
-};
-use crate::indicators::i12_buying_exhaustion::{
-    ExhaustionEventData, ExhaustionEventStateMachine,
-};
+use crate::indicators::i03_divergence::{DivergenceEventData, DivergenceEventStateMachine};
+use crate::indicators::i06_absorption::{AbsorptionEventData, AbsorptionEventStateMachine};
+use crate::indicators::i07_initiation::{InitiationEventData, InitiationEventStateMachine};
+use crate::indicators::i12_buying_exhaustion::{ExhaustionEventData, ExhaustionEventStateMachine};
 use crate::indicators::shared::funding::funding_change_json;
 use crate::indicators::shared::incremental::{
     compute_price_volume_structure_outputs_from_history, IncrementalIndicatorConfig,
@@ -1920,29 +1912,47 @@ impl StateStore {
     }
 
     pub fn finalize_minute(&mut self, ts_bucket: DateTime<Utc>) -> WindowBundle {
-        let futures = self.finalize_market(MarketKind::Futures, ts_bucket);
-        let spot = self.finalize_market(MarketKind::Spot, ts_bucket);
-        self.finish_finalize_minute_state(ts_bucket, true);
+        let (futures, spot) = self.advance_finalized_state(ts_bucket, true);
+        self.build_finalized_window_bundle(ts_bucket, futures, spot)
+    }
+
+    pub fn finalize_minute_for_live_job(&self, ts_bucket: DateTime<Utc>) -> WindowBundle {
+        let futures = self
+            .history_row(MarketKind::Futures, ts_bucket)
+            .map(minute_window_from_history_row)
+            .unwrap_or_else(|| MinuteWindowData::empty(MarketKind::Futures, ts_bucket));
+        let spot = self
+            .history_row(MarketKind::Spot, ts_bucket)
+            .map(minute_window_from_history_row)
+            .unwrap_or_else(|| MinuteWindowData::empty(MarketKind::Spot, ts_bucket));
+
+        if self.last_finalized_minute == Some(ts_bucket) {
+            // Fast path for the current finalized frontier: the shared history and
+            // incremental outputs already reflect this exact minute.
+            self.build_live_window_bundle(ts_bucket, futures, spot)
+        } else {
+            // Historical or replayed live minutes must not advance the shared state
+            // again. Reconstruct the bundle from the finalized prefix as-of ts_bucket.
+            self.build_historical_live_window_bundle(ts_bucket, futures, spot)
+        }
+    }
+
+    pub fn advance_finalized_state(
+        &mut self,
+        ts_bucket: DateTime<Utc>,
+        refresh_derived_indicator_state: bool,
+    ) -> (MinuteWindowData, MinuteWindowData) {
+        self.advance_finalized_state_inner(ts_bucket, refresh_derived_indicator_state)
+    }
+
+    pub fn build_finalized_window_bundle(
+        &self,
+        ts_bucket: DateTime<Utc>,
+        futures: MinuteWindowData,
+        spot: MinuteWindowData,
+    ) -> WindowBundle {
+        debug_assert_eq!(self.last_finalized_minute, Some(ts_bucket));
         self.build_window_bundle(ts_bucket, futures, spot)
-    }
-
-    pub fn finalize_minute_for_live_job(&mut self, ts_bucket: DateTime<Utc>) -> WindowBundle {
-        let futures = self.finalize_market(MarketKind::Futures, ts_bucket);
-        let spot = self.finalize_market(MarketKind::Spot, ts_bucket);
-        self.finish_finalize_minute_state(ts_bucket, true);
-        self.build_live_window_bundle(ts_bucket, futures, spot)
-    }
-
-    pub fn advance_finalized_state(&mut self, ts_bucket: DateTime<Utc>) {
-        let _ = self.finalize_market(MarketKind::Futures, ts_bucket);
-        let _ = self.finalize_market(MarketKind::Spot, ts_bucket);
-        self.finish_finalize_minute_state(ts_bucket, true);
-    }
-
-    pub fn advance_finalized_state_without_derived_refresh(&mut self, ts_bucket: DateTime<Utc>) {
-        let _ = self.finalize_market(MarketKind::Futures, ts_bucket);
-        let _ = self.finalize_market(MarketKind::Spot, ts_bucket);
-        self.finish_finalize_minute_state(ts_bucket, false);
     }
 
     pub fn rebuild_deferred_derived_indicator_state(&mut self) {
@@ -1973,7 +1983,7 @@ impl StateStore {
         let mut rebuilt = 0usize;
         let mut minute = from_ts;
         while minute <= to_ts_inclusive {
-            self.advance_finalized_state(minute);
+            self.advance_finalized_state(minute, true);
             rebuilt += 1;
             minute += Duration::minutes(1);
         }
@@ -2065,7 +2075,8 @@ impl StateStore {
         let mut out = Vec::new();
         let mut minute = start;
         while minute <= batch_end {
-            out.push(self.finalize_minute(minute));
+            let (futures, spot) = self.advance_finalized_state(minute, true);
+            out.push(self.build_finalized_window_bundle(minute, futures, spot));
             minute += Duration::minutes(1);
         }
         out
@@ -2079,7 +2090,7 @@ impl StateStore {
         let mut rebuilt = 0usize;
         let mut minute = start;
         while minute <= batch_end {
-            self.advance_finalized_state(minute);
+            self.advance_finalized_state(minute, true);
             rebuilt += 1;
             minute += Duration::minutes(1);
         }
@@ -2333,8 +2344,10 @@ impl StateStore {
 
     fn refresh_incremental_indicator_event_caches(&mut self, ts_bucket: DateTime<Utc>) {
         let _ = ts_bucket;
-        self.absorption_event_machine
-            .sync(self.history_futures_shared.as_ref(), self.history_spot_shared.as_ref());
+        self.absorption_event_machine.sync(
+            self.history_futures_shared.as_ref(),
+            self.history_spot_shared.as_ref(),
+        );
         self.absorption_all_events = Arc::new(self.absorption_event_machine.events());
 
         self.divergence_event_machine.sync(
@@ -2347,12 +2360,16 @@ impl StateStore {
         );
         self.divergence_all_events = Arc::new(self.divergence_event_machine.events());
 
-        self.initiation_event_machine
-            .sync(self.history_futures_shared.as_ref(), self.history_spot_shared.as_ref());
+        self.initiation_event_machine.sync(
+            self.history_futures_shared.as_ref(),
+            self.history_spot_shared.as_ref(),
+        );
         self.initiation_all_events = Arc::new(self.initiation_event_machine.events());
 
-        self.exhaustion_event_machine
-            .sync(self.history_futures_shared.as_ref(), self.history_spot_shared.as_ref());
+        self.exhaustion_event_machine.sync(
+            self.history_futures_shared.as_ref(),
+            self.history_spot_shared.as_ref(),
+        );
         self.exhaustion_all_events = Arc::new(self.exhaustion_event_machine.events());
     }
 
@@ -2881,7 +2898,7 @@ impl StateStore {
     }
 
     fn build_window_bundle(
-        &mut self,
+        &self,
         ts_bucket: DateTime<Utc>,
         futures: MinuteWindowData,
         spot: MinuteWindowData,
@@ -2914,8 +2931,8 @@ impl StateStore {
         let trade_history_futures =
             self.build_trade_history_with_canonical_backfill(MarketKind::Futures);
         let trade_history_spot = self.build_trade_history_with_canonical_backfill(MarketKind::Spot);
-        let incremental_outputs = self
-            .incremental_outputs_with_canonical_pvs(&trade_history_futures);
+        let incremental_outputs =
+            self.incremental_outputs_with_canonical_pvs(&trade_history_futures);
 
         WindowBundle {
             ts_bucket,
@@ -3023,6 +3040,105 @@ impl StateStore {
         }
     }
 
+    fn build_historical_live_window_bundle(
+        &self,
+        ts_bucket: DateTime<Utc>,
+        futures: MinuteWindowData,
+        spot: MinuteWindowData,
+    ) -> WindowBundle {
+        let as_of_ts = ts_bucket + Duration::minutes(1);
+        let history_futures = self.history_prefix(MarketKind::Futures, ts_bucket);
+        let history_spot = self.history_prefix(MarketKind::Spot, ts_bucket);
+        let funding_changes_recent = self.funding_changes_until(as_of_ts);
+        let funding_recent_7d_payload: Arc<Vec<Value>> = Arc::new(
+            self.funding_recent_7d_payload
+                .iter()
+                .filter(|row| row.ts < as_of_ts)
+                .map(|row| row.payload_json.clone())
+                .collect(),
+        );
+        let funding_points_recent = self.funding_points_until(as_of_ts);
+        let mark_points_recent = self.mark_points_until(as_of_ts);
+        let latest_mark = self.latest_mark_as_of(as_of_ts);
+        let latest_funding = self.latest_funding_as_of(as_of_ts);
+        let oi_ratio_view = self.build_oi_ratio_view_for_minute(ts_bucket);
+        let options_surface_view = self.build_options_surface_view_for_minute(ts_bucket);
+        let incremental_outputs = self.incremental_indicator_state.rebuild_outputs_for_minute(
+            ts_bucket,
+            history_futures.as_slice(),
+            history_spot.as_slice(),
+            latest_mark.as_ref(),
+            funding_changes_recent.as_slice(),
+            funding_recent_7d_payload.clone(),
+            funding_points_recent.as_slice(),
+            mark_points_recent.as_slice(),
+        );
+
+        WindowBundle {
+            ts_bucket,
+            symbol: self.symbol.clone(),
+            futures,
+            spot,
+            history_futures: Arc::new(history_futures),
+            history_spot: Arc::new(history_spot),
+            trade_history_futures: Vec::new(),
+            trade_history_spot: Vec::new(),
+            latest_mark,
+            latest_funding,
+            funding_changes_in_window: self.funding_changes_between(ts_bucket, as_of_ts),
+            funding_points_in_window: self.funding_points_between(ts_bucket, as_of_ts),
+            mark_points_in_window: self.mark_points_between(ts_bucket, as_of_ts),
+            funding_changes_recent: Arc::new(funding_changes_recent),
+            funding_recent_7d_payload,
+            funding_points_recent: Arc::new(funding_points_recent),
+            mark_points_recent: Arc::new(mark_points_recent),
+            liquidation_recent_7d_payload: Arc::new(
+                self.liquidation_recent_7d_payload
+                    .iter()
+                    .filter(|row| row.ts <= ts_bucket)
+                    .map(|row| row.payload_json.clone())
+                    .collect(),
+            ),
+            absorption_all_events: Arc::new(
+                self.absorption_all_events
+                    .iter()
+                    .filter(|event| event.confirm_ts <= as_of_ts)
+                    .cloned()
+                    .collect(),
+            ),
+            divergence_all_events: Arc::new(
+                self.divergence_all_events
+                    .iter()
+                    .filter(|event| event.event_available_ts <= as_of_ts)
+                    .cloned()
+                    .collect(),
+            ),
+            initiation_all_events: Arc::new(
+                self.initiation_all_events
+                    .iter()
+                    .filter(|event| event.confirm_ts <= as_of_ts)
+                    .cloned()
+                    .collect(),
+            ),
+            exhaustion_all_events: Arc::new(
+                self.exhaustion_all_events
+                    .iter()
+                    .filter(|event| event.confirm_ts <= as_of_ts)
+                    .cloned()
+                    .collect(),
+            ),
+            latest_common_oi_ratio_bucket: oi_ratio_view.latest_common_bucket,
+            current_open_interest: oi_ratio_view.current_open_interest,
+            open_interest_hist_5m: oi_ratio_view.open_interest_hist_5m,
+            global_account_ratio_5m: oi_ratio_view.global_account_ratio_5m,
+            top_account_ratio_5m: oi_ratio_view.top_account_ratio_5m,
+            top_position_ratio_5m: oi_ratio_view.top_position_ratio_5m,
+            latest_options_surface_bucket: options_surface_view.latest_bucket,
+            options_surface_5m: options_surface_view.points,
+            incremental_outputs,
+        }
+    }
+
     pub fn build_oi_ratio_patch_bundle_for_minute(&self, ts_bucket: DateTime<Utc>) -> WindowBundle {
         let as_of_ts = ts_bucket + Duration::minutes(1);
         let oi_ratio_view = self.build_oi_ratio_view_for_minute(ts_bucket);
@@ -3031,8 +3147,8 @@ impl StateStore {
             self.build_trade_history_with_canonical_backfill_until(MarketKind::Futures, ts_bucket);
         let trade_history_spot =
             self.build_trade_history_with_canonical_backfill_until(MarketKind::Spot, ts_bucket);
-        let incremental_outputs = self
-            .incremental_outputs_with_canonical_pvs(&trade_history_futures);
+        let incremental_outputs =
+            self.incremental_outputs_with_canonical_pvs(&trade_history_futures);
         let futures = self
             .history_row(MarketKind::Futures, ts_bucket)
             .map(minute_window_from_history_row)
@@ -3127,6 +3243,17 @@ impl StateStore {
         outputs.price_volume_structure_snapshot = snapshot;
         outputs.price_volume_structure_level_rows = level_rows;
         Arc::new(outputs)
+    }
+
+    fn advance_finalized_state_inner(
+        &mut self,
+        ts_bucket: DateTime<Utc>,
+        refresh_derived_indicator_state: bool,
+    ) -> (MinuteWindowData, MinuteWindowData) {
+        let futures = self.finalize_market(MarketKind::Futures, ts_bucket);
+        let spot = self.finalize_market(MarketKind::Spot, ts_bucket);
+        self.finish_finalize_minute_state(ts_bucket, refresh_derived_indicator_state);
+        (futures, spot)
     }
 
     fn build_oi_ratio_view_for_minute(&self, ts_bucket: DateTime<Utc>) -> OiRatioWindowView {
@@ -5162,7 +5289,7 @@ mod tests {
         }
 
         let _ = full_store.finalize_minute(ts);
-        state_only_store.advance_finalized_state(ts);
+        state_only_store.advance_finalized_state(ts, true);
 
         assert_eq!(
             state_only_store.last_finalized_minute,
@@ -5303,6 +5430,75 @@ mod tests {
                 .funding_timeline
                 .back()
                 .map(|f| (f.ts, f.funding_rate, f.mark_price))
+        );
+    }
+
+    #[test]
+    fn build_finalized_window_bundle_matches_finalize_minute_output() {
+        let ts = Utc.with_ymd_and_hms(2026, 3, 6, 5, 0, 0).single().unwrap();
+        let mut full_store = StateStore::new("TESTUSDT".to_string(), 1_000.0);
+        let mut state_only_store = StateStore::new("TESTUSDT".to_string(), 1_000.0);
+
+        for store in [&mut full_store, &mut state_only_store] {
+            store.set_incremental_runtime_options(IncrementalIndicatorConfig::default());
+            store.ingest(agg_trade_event(ts, 1.0, 0.5, 0.2));
+            store.ingest(agg_trade_event_spot(ts, 1.0, 0.5, 0.2));
+            store.ingest(agg_orderbook_event(ts, 4, 4, 0.1));
+            store.ingest(agg_orderbook_event_spot(ts, 4, 4, 0.1));
+            store.ingest(agg_liq_event(ts, 10.0));
+            store.ingest(agg_funding_mark_event(ts, 45, 2000.0, 0.01));
+        }
+
+        let full_bundle = full_store.finalize_minute(ts);
+        let (futures, spot) = state_only_store.advance_finalized_state(ts, true);
+        let rebuilt_bundle = state_only_store.build_finalized_window_bundle(ts, futures, spot);
+
+        assert_eq!(rebuilt_bundle.ts_bucket, full_bundle.ts_bucket);
+        assert_eq!(
+            rebuilt_bundle.futures.trade_count,
+            full_bundle.futures.trade_count
+        );
+        assert_eq!(
+            rebuilt_bundle.futures.buy_notional,
+            full_bundle.futures.buy_notional
+        );
+        assert_eq!(
+            rebuilt_bundle.futures.total_notional,
+            full_bundle.futures.total_notional
+        );
+        assert_eq!(
+            rebuilt_bundle.futures.heatmap.len(),
+            full_bundle.futures.heatmap.len()
+        );
+        assert_eq!(
+            rebuilt_bundle.spot.trade_count,
+            full_bundle.spot.trade_count
+        );
+        assert_eq!(
+            rebuilt_bundle.history_futures.len(),
+            full_bundle.history_futures.len()
+        );
+        assert_eq!(
+            rebuilt_bundle.trade_history_futures.len(),
+            full_bundle.trade_history_futures.len()
+        );
+        assert_eq!(
+            rebuilt_bundle
+                .incremental_outputs
+                .price_volume_structure_snapshot,
+            full_bundle
+                .incremental_outputs
+                .price_volume_structure_snapshot
+        );
+        assert_eq!(
+            rebuilt_bundle
+                .incremental_outputs
+                .price_volume_structure_level_rows
+                .len(),
+            full_bundle
+                .incremental_outputs
+                .price_volume_structure_level_rows
+                .len()
         );
     }
 
@@ -5465,7 +5661,7 @@ mod tests {
         for minute_offset in 0..12 {
             let ts = ts_1 + ChronoDuration::minutes(minute_offset);
             let _ = full_store.finalize_minute(ts);
-            deferred_store.advance_finalized_state_without_derived_refresh(ts);
+            deferred_store.advance_finalized_state(ts, false);
         }
         full_store.rebuild_deferred_derived_indicator_state();
         deferred_store.rebuild_deferred_derived_indicator_state();
@@ -5575,7 +5771,7 @@ mod tests {
         store.ingest(agg_liq_event(ts, 10.0));
         store.ingest(agg_funding_mark_event(ts, 45, 2000.0, 0.01));
 
-        store.advance_finalized_state_without_derived_refresh(ts);
+        store.advance_finalized_state(ts, false);
         assert!(store.has_pending_deferred_derived_indicator_refresh());
 
         store.rebuild_deferred_derived_indicator_state();
@@ -6895,11 +7091,16 @@ mod tests {
             .price_volume_structure_snapshot
             .as_ref()
             .expect("pvs snapshot");
-        let w15 = snapshot["by_window"]["15m"].as_object().expect("15m payload");
+        let w15 = snapshot["by_window"]["15m"]
+            .as_object()
+            .expect("15m payload");
 
         assert_eq!(bundle.history_futures.len(), 2);
         assert_eq!(bundle.trade_history_futures.len(), 3);
-        assert_eq!(w15.get("window_bars_used").and_then(|v| v.as_u64()), Some(3));
+        assert_eq!(
+            w15.get("window_bars_used").and_then(|v| v.as_u64()),
+            Some(3)
+        );
         assert_eq!(w15.get("bar_volume").and_then(|v| v.as_f64()), Some(7.0));
     }
 
@@ -6922,16 +7123,21 @@ mod tests {
             .price_volume_structure_snapshot
             .as_ref()
             .expect("pvs snapshot");
-        let w15 = snapshot["by_window"]["15m"].as_object().expect("15m payload");
+        let w15 = snapshot["by_window"]["15m"]
+            .as_object()
+            .expect("15m payload");
 
         assert_eq!(bundle.history_futures.len(), 2);
         assert_eq!(bundle.trade_history_futures.len(), 3);
-        assert_eq!(w15.get("window_bars_used").and_then(|v| v.as_u64()), Some(3));
+        assert_eq!(
+            w15.get("window_bars_used").and_then(|v| v.as_u64()),
+            Some(3)
+        );
         assert_eq!(w15.get("bar_volume").and_then(|v| v.as_f64()), Some(7.0));
     }
 
     #[test]
-    fn finalize_minute_for_live_job_skips_trade_history_shadow() {
+    fn finalize_minute_for_live_job_skips_trade_history_shadow_on_current_frontier() {
         let mut store = StateStore::new("TESTUSDT".to_string(), 1_000.0);
         let ts_0 = Utc.with_ymd_and_hms(2026, 3, 7, 4, 16, 0).single().unwrap();
         let ts_1 = ts_0 + ChronoDuration::minutes(1);
@@ -6940,6 +7146,7 @@ mod tests {
         let _ = store.finalize_minute(ts_0);
 
         store.ingest(agg_trade_event_with_profile(ts_1, 2.0, 1.0, 2001.0, 0.20));
+        store.advance_finalized_state(ts_1, true);
         let bundle = store.finalize_minute_for_live_job(ts_1);
 
         assert!(bundle.trade_history_futures.is_empty());
@@ -6959,6 +7166,48 @@ mod tests {
                 .sum::<f64>(),
             3.0
         );
+    }
+
+    #[test]
+    fn finalize_minute_for_live_job_rebuilds_prior_minute_without_mutating_state() {
+        let mut store = StateStore::new("TESTUSDT".to_string(), 1_000.0);
+        store.set_incremental_runtime_options(IncrementalIndicatorConfig::default());
+
+        let ts_0 = Utc.with_ymd_and_hms(2026, 3, 7, 4, 16, 0).single().unwrap();
+        let ts_1 = ts_0 + ChronoDuration::minutes(1);
+
+        store.ingest(agg_trade_event_with_profile(ts_0, 1.0, 0.0, 2000.0, 0.10));
+        let _ = store.finalize_minute(ts_0);
+        store.ingest(agg_trade_event_with_profile(ts_1, 2.0, 1.0, 2001.0, 0.20));
+        let _ = store.finalize_minute(ts_1);
+
+        let futures_len_before = store.history_futures.len();
+        let spot_len_before = store.history_spot.len();
+
+        let bundle = store.finalize_minute_for_live_job(ts_0);
+        let snapshot = bundle
+            .incremental_outputs
+            .price_volume_structure_snapshot
+            .as_ref()
+            .expect("pvs snapshot");
+        let w15 = snapshot["by_window"]["15m"]
+            .as_object()
+            .expect("15m payload");
+
+        assert_eq!(store.history_futures.len(), futures_len_before);
+        assert_eq!(store.history_spot.len(), spot_len_before);
+        assert_eq!(bundle.history_futures.len(), 1);
+        assert_eq!(
+            bundle.history_futures.last().map(|row| row.ts_bucket),
+            Some(ts_0)
+        );
+        assert_eq!(bundle.futures.ts_bucket, ts_0);
+        assert_eq!(
+            w15.get("window_bars_used").and_then(|v| v.as_u64()),
+            Some(1)
+        );
+        assert!(bundle.trade_history_futures.is_empty());
+        assert!(bundle.trade_history_spot.is_empty());
     }
 
     #[test]

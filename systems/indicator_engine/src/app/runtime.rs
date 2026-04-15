@@ -1737,6 +1737,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                         dispatcher.as_ref(),
                         &state_store,
                         &mut scheduler,
+                        live_commit_frontier_override_ts_ms.as_ref(),
                         &runtime_options,
                         &snapshot_path,
                         startup_checkpoint_path.as_deref(),
@@ -1748,10 +1749,6 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                         &mut oi_ratio_patch_task,
                     )
                     .await?;
-                    if let Some(repair_ready_through_ts) = repaired {
-                        live_commit_frontier_override_ts_ms
-                            .store(repair_ready_through_ts.timestamp_millis(), Ordering::Release);
-                    }
                     if repaired.is_some() || confirmed_repair_controller.pending_from_ts().is_some() {
                         continue;
                     }
@@ -1867,6 +1864,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                         supplement_cache.as_ref(),
                         &state_store,
                         &mut scheduler,
+                        live_commit_frontier_override_ts_ms.as_ref(),
                         &runtime_options,
                         &snapshot_path,
                         startup_checkpoint_path.as_deref(),
@@ -1880,8 +1878,6 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                     )
                     .await?
                     .map(|repair_ready_through_ts| {
-                        live_commit_frontier_override_ts_ms
-                            .store(repair_ready_through_ts.timestamp_millis(), Ordering::Release);
                         live_repair_controller
                             .clear_deferred_gaps_through(repair_ready_through_ts);
                         repair_ready_through_ts
@@ -4808,7 +4804,7 @@ async fn maybe_recover_from_leading_canonical_gap(
     let warm_end_ts = if history_floor_ts <= warm_end_candidate {
         let mut minute = history_floor_ts;
         while minute <= warm_end_candidate {
-            state_store.advance_finalized_state(minute);
+            state_store.advance_finalized_state(minute, true);
             warmed_minutes += 1;
             if warmed_minutes % STARTUP_BACKFILL_YIELD_EVERY_MINUTES == 0 {
                 tokio::task::yield_now().await;
@@ -4820,7 +4816,7 @@ async fn maybe_recover_from_leading_canonical_gap(
         None
     };
 
-    scheduler.mark_emitted_through(warm_end_candidate);
+    sync_frontiers_after_state_only_rebuild(scheduler, None, warm_end_candidate);
 
     Some(LeadingGapRecoveryPlan {
         blocked_minute: next_minute,
@@ -4974,7 +4970,8 @@ async fn materialize_repair_range(
             );
         }
         while minute <= batch_end_ts {
-            let window = state_store.finalize_minute(minute);
+            let (futures, spot) = state_store.advance_finalized_state(minute, true);
+            let window = state_store.build_finalized_window_bundle(minute, futures, spot);
             let snapshots = process_window_bundle(
                 ctx,
                 dispatcher,
@@ -5060,6 +5057,7 @@ async fn maybe_execute_live_catchup_cutover(
     supplement_cache: &RuntimeHistorySupplementCache,
     state_store: &Arc<Mutex<StateStore>>,
     scheduler: &mut WindowScheduler,
+    live_commit_frontier_override_ts_ms: &AtomicI64,
     _runtime_options: &IndicatorRuntimeOptions,
     snapshot_path: &str,
     startup_checkpoint_path: Option<&str>,
@@ -5195,6 +5193,12 @@ async fn maybe_execute_live_catchup_cutover(
     )
     .await?;
 
+    sync_frontiers_after_state_only_rebuild(
+        scheduler,
+        Some(live_commit_frontier_override_ts_ms),
+        repair_ready_through_ts,
+    );
+
     info!(
         repair_start_ts = %repair_start_ts,
         repair_ready_through_ts = %repair_ready_through_ts,
@@ -5217,7 +5221,8 @@ async fn maybe_execute_confirmed_repair_replay(
     _metrics: Arc<AppMetrics>,
     dispatcher: &Dispatcher,
     state_store: &Arc<Mutex<StateStore>>,
-    _scheduler: &mut WindowScheduler,
+    scheduler: &mut WindowScheduler,
+    live_commit_frontier_override_ts_ms: &AtomicI64,
     _runtime_options: &IndicatorRuntimeOptions,
     snapshot_path: &str,
     startup_checkpoint_path: Option<&str>,
@@ -5316,6 +5321,11 @@ async fn maybe_execute_confirmed_repair_replay(
     )
     .await?;
 
+    sync_frontiers_after_state_only_rebuild(
+        scheduler,
+        Some(live_commit_frontier_override_ts_ms),
+        repair_ready_through_ts,
+    );
     repair_controller.clear();
     info!(
         repair_start_ts = %repair_start_ts,
@@ -5333,7 +5343,7 @@ async fn maybe_execute_shutdown_confirmed_repair_replay(
     _metrics: Arc<AppMetrics>,
     dispatcher: &Dispatcher,
     state_store: &mut StateStore,
-    _scheduler: &mut WindowScheduler,
+    scheduler: &mut WindowScheduler,
     _runtime_options: &IndicatorRuntimeOptions,
     snapshot_path: &str,
     startup_checkpoint_path: Option<&str>,
@@ -5384,6 +5394,8 @@ async fn maybe_execute_shutdown_confirmed_repair_replay(
     )
     .await?;
 
+    sync_frontiers_after_state_only_rebuild(scheduler, None, repair_ready_through_ts);
+
     info!(
         repair_start_ts = %repair_start_ts,
         repair_ready_through_ts = %repair_ready_through_ts,
@@ -5401,6 +5413,30 @@ fn shutdown_ready_through_candidate(
     next_minute
         .filter(|minute| *minute <= shutdown_closed_minute)
         .map(|_| shutdown_closed_minute)
+}
+
+fn advance_scheduler_after_state_only_repair(
+    scheduler: &mut WindowScheduler,
+    repair_ready_through_ts: DateTime<Utc>,
+) {
+    let should_advance = scheduler
+        .next_minute_to_emit()
+        .map(|next| next <= repair_ready_through_ts)
+        .unwrap_or(true);
+    if should_advance {
+        scheduler.mark_emitted_through(repair_ready_through_ts);
+    }
+}
+
+fn sync_frontiers_after_state_only_rebuild(
+    scheduler: &mut WindowScheduler,
+    live_commit_frontier_override_ts_ms: Option<&AtomicI64>,
+    rebuilt_through_ts: DateTime<Utc>,
+) {
+    advance_scheduler_after_state_only_repair(scheduler, rebuilt_through_ts);
+    if let Some(override_ts_ms) = live_commit_frontier_override_ts_ms {
+        override_ts_ms.store(rebuilt_through_ts.timestamp_millis(), Ordering::Release);
+    }
 }
 
 async fn process_ready_minutes(
@@ -5490,7 +5526,8 @@ async fn process_ready_minutes(
     }
 
     for minute in scheduler.ready_minutes_through(ready_through_ts) {
-        let window = state_store.finalize_minute(minute);
+        let (futures, spot) = state_store.advance_finalized_state(minute, true);
+        let window = state_store.build_finalized_window_bundle(minute, futures, spot);
         match process_window_bundle(
             ctx,
             dispatcher,
@@ -6157,6 +6194,13 @@ async fn run_live_prepare_loop(
             }
 
             for minute in &task.minutes {
+                let needs_finalize = state_store
+                    .last_finalized_minute()
+                    .map(|last| *minute > last)
+                    .unwrap_or(true);
+                if needs_finalize {
+                    state_store.advance_finalized_state(*minute, true);
+                }
                 let bundle = state_store.finalize_minute_for_live_job(*minute);
                 prepared_jobs.push(ReadyMinuteJob {
                     ts_bucket: *minute,
@@ -6588,7 +6632,7 @@ async fn enqueue_live_ready_jobs(
             let first_ready = ready_minutes.first().copied();
             let last_ready = ready_minutes.last().copied();
             for (idx, minute) in ready_minutes.into_iter().enumerate() {
-                state_store.advance_finalized_state_without_derived_refresh(minute);
+                state_store.advance_finalized_state(minute, false);
                 scheduler.mark_emitted_through(minute);
                 live_windows_enqueued += 1;
                 if first_bucket.is_none() {
@@ -7175,7 +7219,7 @@ async fn run_startup_backfill(
     }
     if from_ts >= to_ts {
         if let Some(last_finalized_ts) = state_store.last_finalized_minute() {
-            scheduler.mark_emitted_through(last_finalized_ts);
+            sync_frontiers_after_state_only_rebuild(scheduler, None, last_finalized_ts);
             let replay_cutoff_bucket = last_finalized_ts + ChronoDuration::minutes(1);
             info!(
                 last_finalized_ts = %last_finalized_ts,
@@ -7379,7 +7423,7 @@ async fn run_startup_backfill(
 
     if total_rows == 0 && state_store.latest_continuous_canonical_segment().is_none() {
         if let Some(last_finalized_ts) = state_store.last_finalized_minute() {
-            scheduler.mark_emitted_through(last_finalized_ts);
+            sync_frontiers_after_state_only_rebuild(scheduler, None, last_finalized_ts);
             return Ok(Some(last_finalized_ts + ChronoDuration::minutes(1)));
         }
         info!("startup historical backfill found no canonical rows in requested range");
@@ -7395,7 +7439,7 @@ async fn run_startup_backfill(
             "startup historical backfill found no continuous canonical segment"
         );
         if let Some(last_finalized_ts) = state_store.last_finalized_minute() {
-            scheduler.mark_emitted_through(last_finalized_ts);
+            sync_frontiers_after_state_only_rebuild(scheduler, None, last_finalized_ts);
             return Ok(Some(last_finalized_ts + ChronoDuration::minutes(1)));
         }
         return Ok(None);
@@ -7415,7 +7459,7 @@ async fn run_startup_backfill(
             "startup historical backfill continuity window does not overlap requested range"
         );
         if let Some(last_finalized_ts) = state_store.last_finalized_minute() {
-            scheduler.mark_emitted_through(last_finalized_ts);
+            sync_frontiers_after_state_only_rebuild(scheduler, None, last_finalized_ts);
             return Ok(Some(last_finalized_ts + ChronoDuration::minutes(1)));
         }
         return Ok(None);
@@ -7534,7 +7578,7 @@ async fn run_startup_backfill(
         let mut minute = warm_start_ts;
         let mut warmed_minutes = 0usize;
         while minute <= warm_end_ts {
-            state_store.advance_finalized_state_without_derived_refresh(minute);
+            state_store.advance_finalized_state(minute, false);
             warmed_minutes += 1;
             if warmed_minutes % STARTUP_BACKFILL_YIELD_EVERY_MINUTES == 0 {
                 tokio::task::yield_now().await;
@@ -7595,7 +7639,7 @@ async fn run_startup_backfill(
         if repair_start_ts <= replay_end_ts {
             let mut minute = repair_start_ts;
             while minute <= replay_end_ts {
-                state_store.advance_finalized_state_without_derived_refresh(minute);
+                state_store.advance_finalized_state(minute, false);
                 rebuilt_minutes += 1;
                 if rebuilt_minutes % STARTUP_BACKFILL_YIELD_EVERY_MINUTES == 0 {
                     tokio::task::yield_now().await;
@@ -7615,7 +7659,7 @@ async fn run_startup_backfill(
             0,
             0,
         );
-        scheduler.mark_emitted_through(replay_end_ts);
+        sync_frontiers_after_state_only_rebuild(scheduler, None, replay_end_ts);
         refresh_startup_backfill_checkpoint_with_finalized_history(
             &startup_backfill_progress,
             startup_checkpoint_path,
@@ -7683,7 +7727,8 @@ async fn run_startup_backfill(
             0,
         );
         while minute <= batch_end_ts {
-            let window = state_store.finalize_minute(minute);
+            let (futures, spot) = state_store.advance_finalized_state(minute, true);
+            let window = state_store.build_finalized_window_bundle(minute, futures, spot);
             let snapshots = process_window_bundle(
                 ctx,
                 dispatcher,
@@ -7751,7 +7796,7 @@ async fn run_startup_backfill(
         }
     }
 
-    scheduler.mark_emitted_through(replay_end_ts);
+    sync_frontiers_after_state_only_rebuild(scheduler, None, replay_end_ts);
     refresh_startup_backfill_checkpoint_with_finalized_history(
         &startup_backfill_progress,
         startup_checkpoint_path,
@@ -9608,13 +9653,14 @@ async fn export_snapshots(
 #[cfg(test)]
 mod tests {
     use super::{
-        allow_live_tail_reconcile, allow_oi_ratio_patch_processing, build_backfill_sql,
-        build_paged_backfill_sql, build_paged_backfill_sql_internal,
-        configured_live_catchup_enter_lag_minutes, configured_live_catchup_resume_lag_minutes,
-        confirmed_repair_pipeline_idle, effective_live_commit_frontier_ts,
-        expand_startup_backfill_to_minimum_recovery_window, find_long_null_price_run,
-        handle_ingest_event, hydrate_futures_orderbook_heatmaps_for_range_with_fetch,
-        live_catchup_cutover_ready, live_catchup_requested, live_tail_reconcile_start_ts,
+        advance_scheduler_after_state_only_repair, allow_live_tail_reconcile,
+        allow_oi_ratio_patch_processing, build_backfill_sql, build_paged_backfill_sql,
+        build_paged_backfill_sql_internal, configured_live_catchup_enter_lag_minutes,
+        configured_live_catchup_resume_lag_minutes, confirmed_repair_pipeline_idle,
+        effective_live_commit_frontier_ts, expand_startup_backfill_to_minimum_recovery_window,
+        find_long_null_price_run, handle_ingest_event,
+        hydrate_futures_orderbook_heatmaps_for_range_with_fetch, live_catchup_cutover_ready,
+        live_catchup_requested, live_tail_reconcile_start_ts,
         minimum_live_catchup_cutover_tail_minutes, minimum_startup_recovery_history_floor,
         minute_exclusive_upper_bound, minute_history_is_strictly_contiguous,
         replay_heatmap_hydration_batch_end, replay_row_after_cursor,
@@ -9625,14 +9671,15 @@ mod tests {
         snapshot_is_reusable_recovery_seed, snapshot_null_price_run_reaches_recent_tail,
         stale_live_pending_minutes, startup_backfill_checkpoint_path,
         startup_checkpoint_canonical_replay_start_ts,
-        startup_state_only_recovery_can_skip_warm_history, try_load_startup_backfill_checkpoint,
-        try_load_state_snapshot, BackfillCursor, ConfirmedLateRepairController,
-        KlineSupplementCacheEntry, LiveCanonicalRepairController, ReplayRow, SnapshotLoadOutcome,
-        StartupBackfillCheckpoint, StartupBackfillProgress, FUNDING_BACKFILL_WINDOW_SQL,
-        LIQ_BACKFILL_WINDOW_SQL, LIVE_CANONICAL_TAIL_RECONCILE_LOOKBACK_MINUTES,
-        MIN_RESTART_RECOVERY_HISTORY_MINUTES, MIN_REUSABLE_FINALIZED_HISTORY_MINUTES,
-        ORDERBOOK_BACKFILL_WINDOW_SQL_SCALAR, ORDERBOOK_BACKFILL_WINDOW_SQL_WITH_HEATMAP,
-        STARTUP_BACKFILL_CHECKPOINT_VERSION, TRADE_BACKFILL_WINDOW_SQL,
+        startup_state_only_recovery_can_skip_warm_history, sync_frontiers_after_state_only_rebuild,
+        try_load_startup_backfill_checkpoint, try_load_state_snapshot, BackfillCursor,
+        ConfirmedLateRepairController, KlineSupplementCacheEntry, LiveCanonicalRepairController,
+        ReplayRow, SnapshotLoadOutcome, StartupBackfillCheckpoint, StartupBackfillProgress,
+        FUNDING_BACKFILL_WINDOW_SQL, LIQ_BACKFILL_WINDOW_SQL,
+        LIVE_CANONICAL_TAIL_RECONCILE_LOOKBACK_MINUTES, MIN_RESTART_RECOVERY_HISTORY_MINUTES,
+        MIN_REUSABLE_FINALIZED_HISTORY_MINUTES, ORDERBOOK_BACKFILL_WINDOW_SQL_SCALAR,
+        ORDERBOOK_BACKFILL_WINDOW_SQL_WITH_HEATMAP, STARTUP_BACKFILL_CHECKPOINT_VERSION,
+        TRADE_BACKFILL_WINDOW_SQL,
     };
     use crate::app::bootstrap::{
         AppSection, DatabaseConfig, IndicatorConfig, MqConfig, MqExchangeConfig, MqExchanges,
@@ -9654,7 +9701,7 @@ mod tests {
     use chrono::{Duration as ChronoDuration, TimeZone, Utc};
     use serde_json::json;
     use std::collections::{BTreeMap, HashMap};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
     use std::sync::Arc;
     use uuid::Uuid;
 
@@ -10089,7 +10136,7 @@ mod tests {
 
         let mut minute = warm_start_ts;
         while minute <= warm_end_ts {
-            state_store.advance_finalized_state_without_derived_refresh(minute);
+            state_store.advance_finalized_state(minute, false);
             minute += ChronoDuration::minutes(1);
         }
 
@@ -10105,7 +10152,7 @@ mod tests {
 
         let mut minute = repair_start_ts;
         while minute <= replay_end_ts {
-            state_store.advance_finalized_state_without_derived_refresh(minute);
+            state_store.advance_finalized_state(minute, false);
             minute += ChronoDuration::minutes(1);
         }
 
@@ -10653,6 +10700,78 @@ mod tests {
         assert!(stale_live_pending_minutes(Some(minute_21), &pending).is_empty());
         assert!(stale_live_pending_minutes(None, &pending).is_empty());
         assert!(!stale_live_pending_minutes(Some(minute_22), &pending).is_empty());
+    }
+
+    #[test]
+    fn advance_scheduler_after_state_only_repair_skips_repaired_tail() {
+        let prior_bucket_ts = Utc
+            .with_ymd_and_hms(2026, 4, 13, 8, 42, 0)
+            .single()
+            .unwrap();
+        let repair_ready_through_ts = Utc
+            .with_ymd_and_hms(2026, 4, 13, 8, 54, 0)
+            .single()
+            .unwrap();
+
+        let mut scheduler = WindowScheduler::new(0);
+        scheduler.mark_emitted_through(prior_bucket_ts);
+
+        advance_scheduler_after_state_only_repair(&mut scheduler, repair_ready_through_ts);
+
+        assert_eq!(
+            scheduler.next_minute_to_emit(),
+            Some(repair_ready_through_ts + ChronoDuration::minutes(1))
+        );
+    }
+
+    #[test]
+    fn advance_scheduler_after_state_only_repair_never_moves_backward() {
+        let repair_ready_through_ts = Utc
+            .with_ymd_and_hms(2026, 4, 13, 8, 54, 0)
+            .single()
+            .unwrap();
+        let already_emitted_through = repair_ready_through_ts + ChronoDuration::minutes(2);
+
+        let mut scheduler = WindowScheduler::new(0);
+        scheduler.mark_emitted_through(already_emitted_through);
+
+        advance_scheduler_after_state_only_repair(&mut scheduler, repair_ready_through_ts);
+
+        assert_eq!(
+            scheduler.next_minute_to_emit(),
+            Some(already_emitted_through + ChronoDuration::minutes(1))
+        );
+    }
+
+    #[test]
+    fn sync_frontiers_after_state_only_rebuild_updates_commit_frontier() {
+        let prior_bucket_ts = Utc
+            .with_ymd_and_hms(2026, 4, 13, 8, 42, 0)
+            .single()
+            .unwrap();
+        let rebuilt_through_ts = Utc
+            .with_ymd_and_hms(2026, 4, 13, 8, 54, 0)
+            .single()
+            .unwrap();
+        let commit_frontier_override_ts_ms = AtomicI64::new(0);
+
+        let mut scheduler = WindowScheduler::new(0);
+        scheduler.mark_emitted_through(prior_bucket_ts);
+
+        sync_frontiers_after_state_only_rebuild(
+            &mut scheduler,
+            Some(&commit_frontier_override_ts_ms),
+            rebuilt_through_ts,
+        );
+
+        assert_eq!(
+            scheduler.next_minute_to_emit(),
+            Some(rebuilt_through_ts + ChronoDuration::minutes(1))
+        );
+        assert_eq!(
+            commit_frontier_override_ts_ms.load(Ordering::Acquire),
+            rebuilt_through_ts.timestamp_millis()
+        );
     }
 
     #[test]
