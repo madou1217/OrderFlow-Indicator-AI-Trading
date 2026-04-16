@@ -112,7 +112,8 @@ impl InitiationEventStateMachine {
         history_spot: &[MinuteHistory],
     ) {
         *self = Self::default();
-        let (history_futures, history_spot) = aligned_event_histories(history_futures, history_spot);
+        let (history_futures, history_spot) =
+            aligned_event_histories(history_futures, history_spot);
         for (fut, spot) in history_futures.iter().zip(history_spot.iter()) {
             self.append_pair(fut, spot);
         }
@@ -124,12 +125,16 @@ impl InitiationEventStateMachine {
         history_futures: &[MinuteHistory],
         history_spot: &[MinuteHistory],
     ) {
-        let (history_futures, history_spot) = aligned_event_histories(history_futures, history_spot);
+        let (history_futures, history_spot) =
+            aligned_event_histories(history_futures, history_spot);
         let Some(first_ts) = history_futures.first().map(|row| row.ts_bucket) else {
             *self = Self::default();
             return;
         };
-        let last_ts = history_futures.last().map(|row| row.ts_bucket).unwrap_or(first_ts);
+        let last_ts = history_futures
+            .last()
+            .map(|row| row.ts_bucket)
+            .unwrap_or(first_ts);
         match self.last_ts {
             None => {
                 self.rebuild(history_futures, history_spot);
@@ -142,19 +147,28 @@ impl InitiationEventStateMachine {
             Some(_) => {}
         }
         self.prune_before(first_ts);
-        let start_idx = lower_bound_history_ts(history_futures, self.last_ts.unwrap() + Duration::minutes(1));
+        let start_idx = lower_bound_history_ts(
+            history_futures,
+            self.last_ts.unwrap() + Duration::minutes(1),
+        );
         if start_idx == 0 && self.minutes.is_empty() {
             self.rebuild(history_futures, history_spot);
             return;
         }
-        for (fut, spot) in history_futures[start_idx..].iter().zip(history_spot[start_idx..].iter()) {
+        for (fut, spot) in history_futures[start_idx..]
+            .iter()
+            .zip(history_spot[start_idx..].iter())
+        {
             self.append_pair(fut, spot);
         }
         self.last_ts = Some(last_ts);
     }
 
     pub(crate) fn events(&self) -> Vec<InitiationEventData> {
-        self.events.iter().map(|entry| entry.event.clone()).collect()
+        self.events
+            .iter()
+            .map(|entry| entry.event.clone())
+            .collect()
     }
 
     fn prune_before(&mut self, first_ts: DateTime<Utc>) {
@@ -225,8 +239,7 @@ impl InitiationEventStateMachine {
         }
         let zdelta = if self.delta_window.len() == ZDELTA_LOOKBACK {
             let mean = self.delta_window_sum / ZDELTA_LOOKBACK as f64;
-            let var =
-                (self.delta_window_sumsq / ZDELTA_LOOKBACK as f64 - mean * mean).max(0.0);
+            let var = (self.delta_window_sumsq / ZDELTA_LOOKBACK as f64 - mean * mean).max(0.0);
             (fut.delta - mean) / (var.sqrt() + 1e-12)
         } else {
             0.0
@@ -341,7 +354,11 @@ impl InitiationEventStateMachine {
         self.pending.push_back(InitiationPendingCandidate {
             direction,
             start_seq: seq,
-            pivot_price: if direction > 0 { current.vah } else { current.val },
+            pivot_price: if direction > 0 {
+                current.vah
+            } else {
+                current.val
+            },
             z_delta: current.zdelta,
             follow_through_delta_sum: current.delta,
             min_close_post_break: f64::INFINITY,
@@ -397,13 +414,9 @@ impl InitiationEventStateMachine {
         };
         let spot_rd_mean = group.iter().map(|row| row.spot_rdelta).sum::<f64>() / n_g;
         let spot_cvd_change = confirm.spot_cvd - start.spot_cvd;
-        let spot_break_confirm =
-            (candidate.direction as f64 * spot_rd_mean) >= 0.05
-                && (candidate.direction as f64 * spot_cvd_change) >= 0.0;
-        let spot_whale_confirm = group
-            .iter()
-            .map(|row| row.spot_whale_notional)
-            .sum::<f64>()
+        let spot_break_confirm = (candidate.direction as f64 * spot_rd_mean) >= 0.05
+            && (candidate.direction as f64 * spot_cvd_change) >= 0.0;
+        let spot_whale_confirm = group.iter().map(|row| row.spot_whale_notional).sum::<f64>()
             * candidate.direction as f64
             > 0.0;
         let score = 0.30 * clip01(candidate.z_delta.abs() / 3.0)

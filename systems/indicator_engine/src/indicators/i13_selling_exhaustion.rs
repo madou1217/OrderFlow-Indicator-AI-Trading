@@ -1,7 +1,5 @@
 use crate::indicators::context::{IndicatorComputation, IndicatorContext, IndicatorSnapshotRow};
-use crate::indicators::i12_buying_exhaustion::{
-    append_exhaustion_rows, exhaustion_event_json,
-};
+use crate::indicators::i12_buying_exhaustion::{append_exhaustion_rows, exhaustion_event_json};
 use crate::indicators::indicator_trait::Indicator;
 use crate::indicators::shared::event_views::{build_event_window_view, build_recent_7d_payload};
 use chrono::Duration;

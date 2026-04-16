@@ -1,9 +1,7 @@
 use crate::indicators::context::{
     IndicatorComputation, IndicatorContext, IndicatorEventRow, IndicatorSnapshotRow,
 };
-use crate::indicators::i06_absorption::{
-    absorption_event_json, detect_absorption_events,
-};
+use crate::indicators::i06_absorption::{absorption_event_json, detect_absorption_events};
 use crate::indicators::indicator_trait::Indicator;
 use crate::indicators::shared::event_ids::build_indicator_event_id;
 use crate::indicators::shared::event_views::{build_event_window_view, build_recent_7d_payload};

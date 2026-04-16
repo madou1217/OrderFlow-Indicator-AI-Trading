@@ -2232,12 +2232,7 @@ impl StateStore {
             self.push_finalized_vpin_snapshot(market, ts_bucket);
         } else {
             self.cvd_spot = cvd_new;
-            self.history_spot.push_back(history.clone());
-            Self::push_shared_with_limit(
-                &mut self.history_spot_shared,
-                history,
-                HISTORY_LIMIT_MINUTES,
-            );
+            self.push_spot_history(history);
             while self.history_spot.len() > HISTORY_LIMIT_MINUTES {
                 self.history_spot.pop_front();
                 let shared = Arc::make_mut(&mut self.history_spot_shared);
@@ -2253,6 +2248,15 @@ impl StateStore {
 
     fn push_futures_history(&mut self, history: MinuteHistory) {
         let ts_bucket = history.ts_bucket;
+        if self
+            .history_futures
+            .iter()
+            .rposition(|row| row.ts_bucket == ts_bucket)
+            .is_some()
+        {
+            self.replace_futures_history(history);
+            return;
+        }
         let payload_json = build_liquidation_recent_7d_entry(&history);
         self.history_futures.push_back(history.clone());
         Self::push_shared_with_limit(
@@ -2268,6 +2272,52 @@ impl StateStore {
         Self::push_shared_with_limit(
             &mut self.liquidation_recent_7d_payload_shared,
             payload_json,
+            HISTORY_LIMIT_MINUTES,
+        );
+    }
+
+    fn replace_futures_history(&mut self, history: MinuteHistory) {
+        let ts_bucket = history.ts_bucket;
+        if let Some(position) = self
+            .history_futures
+            .iter()
+            .rposition(|row| row.ts_bucket == ts_bucket)
+        {
+            self.history_futures[position] = history;
+            self.history_futures_shared = Arc::new(self.history_futures.iter().cloned().collect());
+            self.liquidation_recent_7d_payload = self
+                .history_futures
+                .iter()
+                .map(|row| TimedJsonPayload {
+                    ts: row.ts_bucket,
+                    payload_json: build_liquidation_recent_7d_entry(row),
+                })
+                .collect();
+            self.liquidation_recent_7d_payload_shared = Arc::new(
+                self.liquidation_recent_7d_payload
+                    .iter()
+                    .map(|row| row.payload_json.clone())
+                    .collect(),
+            );
+        }
+    }
+
+    fn push_spot_history(&mut self, history: MinuteHistory) {
+        let ts_bucket = history.ts_bucket;
+        if let Some(position) = self
+            .history_spot
+            .iter()
+            .rposition(|row| row.ts_bucket == ts_bucket)
+        {
+            self.history_spot[position] = history;
+            self.history_spot_shared = Arc::new(self.history_spot.iter().cloned().collect());
+            return;
+        }
+
+        self.history_spot.push_back(history.clone());
+        Self::push_shared_with_limit(
+            &mut self.history_spot_shared,
+            history,
             HISTORY_LIMIT_MINUTES,
         );
     }
@@ -3250,6 +3300,21 @@ impl StateStore {
         ts_bucket: DateTime<Utc>,
         refresh_derived_indicator_state: bool,
     ) -> (MinuteWindowData, MinuteWindowData) {
+        if self.last_finalized_minute == Some(ts_bucket) {
+            if refresh_derived_indicator_state && self.deferred_derived_indicator_refresh_pending {
+                self.rebuild_deferred_derived_indicator_state();
+            }
+            let futures = self
+                .history_row(MarketKind::Futures, ts_bucket)
+                .map(minute_window_from_history_row)
+                .unwrap_or_else(|| MinuteWindowData::empty(MarketKind::Futures, ts_bucket));
+            let spot = self
+                .history_row(MarketKind::Spot, ts_bucket)
+                .map(minute_window_from_history_row)
+                .unwrap_or_else(|| MinuteWindowData::empty(MarketKind::Spot, ts_bucket));
+            return (futures, spot);
+        }
+
         let futures = self.finalize_market(MarketKind::Futures, ts_bucket);
         let spot = self.finalize_market(MarketKind::Spot, ts_bucket);
         self.finish_finalize_minute_state(ts_bucket, refresh_derived_indicator_state);
@@ -3601,6 +3666,12 @@ impl StateStore {
             MarketKind::Futures => &mut self.finalized_vpin_futures,
             MarketKind::Spot => &mut self.finalized_vpin_spot,
         };
+        if let Some(existing) = target.back_mut() {
+            if existing.ts_bucket == ts_bucket {
+                existing.snapshot = snapshot;
+                return;
+            }
+        }
         target.push_back(FinalizedVpinState {
             ts_bucket,
             snapshot,
@@ -4816,8 +4887,8 @@ fn collect_heatmap_levels(
 #[cfg(test)]
 mod tests {
     use super::{
-        aggregate_options_surface_bucket, choose_nearest_strike,
-        OPTIONS_SURFACE_HISTORY_KEEP_5M_BUCKETS,
+        aggregate_options_surface_bucket, build_liquidation_recent_7d_entry, choose_nearest_strike,
+        TimedJsonPayload, OPTIONS_SURFACE_HISTORY_KEEP_5M_BUCKETS,
     };
     use super::{minute_window_from_history_row, MinuteWindowData, StateSnapshot, StateStore};
     use crate::indicators::context::{OptionMarkGreeksPoint, OptionsSurfacePoint};
@@ -5776,6 +5847,97 @@ mod tests {
 
         store.rebuild_deferred_derived_indicator_state();
         assert!(!store.has_pending_deferred_derived_indicator_refresh());
+    }
+
+    #[test]
+    fn repair_rebuild_keeps_avwap_observed_minutes_within_lookback() {
+        let ts_start = Utc.with_ymd_and_hms(2026, 3, 6, 5, 0, 0).single().unwrap();
+        let mut store = StateStore::new("TESTUSDT".to_string(), 1_000.0);
+        store.set_incremental_runtime_options(IncrementalIndicatorConfig::default());
+
+        for minute_offset in 0..15 {
+            let ts = ts_start + ChronoDuration::minutes(minute_offset);
+            let buy_qty = 1.0 + minute_offset as f64 * 0.2;
+            let sell_qty = 0.4 + minute_offset as f64 * 0.1;
+            let vpin = 0.10 + minute_offset as f64 * 0.01;
+            store.ingest(agg_trade_event(ts, buy_qty, sell_qty, vpin));
+            store.ingest(agg_trade_event_spot(
+                ts,
+                buy_qty * 0.9,
+                sell_qty * 0.95,
+                vpin * 0.8,
+            ));
+            store.ingest(agg_orderbook_event(
+                ts,
+                4 + minute_offset,
+                4 + minute_offset,
+                0.1,
+            ));
+            store.ingest(agg_orderbook_event_spot(
+                ts,
+                4 + minute_offset,
+                4 + minute_offset,
+                0.1,
+            ));
+            store.ingest(agg_liq_event(ts, 10.0 + minute_offset as f64));
+            store.ingest(agg_funding_mark_event(
+                ts,
+                30 + minute_offset,
+                2000.0 + minute_offset as f64,
+                -0.0010 + minute_offset as f64 * 0.00001,
+            ));
+            let _ = store.finalize_minute(ts);
+        }
+
+        let last_futures = store
+            .history_futures
+            .back()
+            .cloned()
+            .expect("futures history");
+        let last_spot = store.history_spot.back().cloned().expect("spot history");
+        for _ in 0..5 {
+            store.history_futures.push_back(last_futures.clone());
+            store.history_spot.push_back(last_spot.clone());
+        }
+        store.history_futures_shared =
+            std::sync::Arc::new(store.history_futures.iter().cloned().collect());
+        store.history_spot_shared =
+            std::sync::Arc::new(store.history_spot.iter().cloned().collect());
+        store.liquidation_recent_7d_payload = store
+            .history_futures
+            .iter()
+            .map(|row| TimedJsonPayload {
+                ts: row.ts_bucket,
+                payload_json: build_liquidation_recent_7d_entry(row),
+            })
+            .collect();
+        store.liquidation_recent_7d_payload_shared = std::sync::Arc::new(
+            store
+                .liquidation_recent_7d_payload
+                .iter()
+                .map(|row| row.payload_json.clone())
+                .collect(),
+        );
+
+        store.rebuild_deferred_derived_indicator_state();
+
+        let outputs = store.incremental_indicator_state.outputs();
+        let snapshot = outputs
+            .avwap_snapshot
+            .as_ref()
+            .expect("avwap snapshot after repair rebuild");
+        assert_eq!(
+            snapshot["by_window"]["15m"]["observed_minutes"].as_u64(),
+            Some(15)
+        );
+        assert_eq!(
+            snapshot["by_window"]["15m"]["missing_minutes"].as_i64(),
+            Some(0)
+        );
+        assert_eq!(
+            snapshot["by_window"]["15m"]["is_ready"].as_bool(),
+            Some(true)
+        );
     }
 
     #[test]
@@ -7208,6 +7370,51 @@ mod tests {
         );
         assert!(bundle.trade_history_futures.is_empty());
         assert!(bundle.trade_history_spot.is_empty());
+    }
+
+    #[test]
+    fn advance_finalized_state_same_minute_is_idempotent() {
+        let ts_0 = Utc.with_ymd_and_hms(2026, 3, 7, 4, 16, 0).single().unwrap();
+        let ts_1 = ts_0 + ChronoDuration::minutes(1);
+        let mut store = StateStore::new("TESTUSDT".to_string(), 1_000.0);
+        store.set_incremental_runtime_options(IncrementalIndicatorConfig::default());
+
+        for ts in [ts_0, ts_1] {
+            store.ingest(agg_trade_event(ts, 2.0, 1.0, 0.20));
+            store.ingest(agg_trade_event_spot(ts, 1.8, 0.9, 0.18));
+            store.ingest(agg_orderbook_event(ts, 4, 4, 0.10));
+            store.ingest(agg_orderbook_event_spot(ts, 4, 4, 0.10));
+            store.ingest(agg_liq_event(ts, 10.0));
+            store.ingest(agg_funding_mark_event(ts, 45, 2000.0, 0.01));
+        }
+
+        let _ = store.advance_finalized_state(ts_0, true);
+        let _ = store.advance_finalized_state(ts_1, true);
+
+        let futures_len_before = store.history_futures.len();
+        let spot_len_before = store.history_spot.len();
+        let vpin_futures_len_before = store.finalized_vpin_futures.len();
+        let vpin_spot_len_before = store.finalized_vpin_spot.len();
+        let outputs_before = store.incremental_indicator_state.outputs();
+
+        let _ = store.advance_finalized_state(ts_1, true);
+
+        let outputs_after = store.incremental_indicator_state.outputs();
+        assert_eq!(store.history_futures.len(), futures_len_before);
+        assert_eq!(store.history_spot.len(), spot_len_before);
+        assert_eq!(store.finalized_vpin_futures.len(), vpin_futures_len_before);
+        assert_eq!(store.finalized_vpin_spot.len(), vpin_spot_len_before);
+        assert_eq!(outputs_after.avwap_snapshot, outputs_before.avwap_snapshot);
+        assert_eq!(outputs_after.tpo_snapshot, outputs_before.tpo_snapshot);
+        assert_eq!(store.last_finalized_minute, Some(ts_1));
+        assert_eq!(
+            store.history_futures.back().map(|row| row.ts_bucket),
+            Some(ts_1)
+        );
+        assert_eq!(
+            store.history_spot.back().map(|row| row.ts_bucket),
+            Some(ts_1)
+        );
     }
 
     #[test]

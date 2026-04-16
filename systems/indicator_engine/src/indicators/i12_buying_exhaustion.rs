@@ -104,7 +104,8 @@ impl ExhaustionEventStateMachine {
         history_spot: &[MinuteHistory],
     ) {
         *self = Self::default();
-        let (history_futures, history_spot) = aligned_event_histories(history_futures, history_spot);
+        let (history_futures, history_spot) =
+            aligned_event_histories(history_futures, history_spot);
         for (fut, spot) in history_futures.iter().zip(history_spot.iter()) {
             self.append_pair(fut, spot);
         }
@@ -116,12 +117,16 @@ impl ExhaustionEventStateMachine {
         history_futures: &[MinuteHistory],
         history_spot: &[MinuteHistory],
     ) {
-        let (history_futures, history_spot) = aligned_event_histories(history_futures, history_spot);
+        let (history_futures, history_spot) =
+            aligned_event_histories(history_futures, history_spot);
         let Some(first_ts) = history_futures.first().map(|row| row.ts_bucket) else {
             *self = Self::default();
             return;
         };
-        let last_ts = history_futures.last().map(|row| row.ts_bucket).unwrap_or(first_ts);
+        let last_ts = history_futures
+            .last()
+            .map(|row| row.ts_bucket)
+            .unwrap_or(first_ts);
         match self.last_ts {
             None => {
                 self.rebuild(history_futures, history_spot);
@@ -134,19 +139,28 @@ impl ExhaustionEventStateMachine {
             Some(_) => {}
         }
         self.prune_before(first_ts);
-        let start_idx = lower_bound_history_ts(history_futures, self.last_ts.unwrap() + Duration::minutes(1));
+        let start_idx = lower_bound_history_ts(
+            history_futures,
+            self.last_ts.unwrap() + Duration::minutes(1),
+        );
         if start_idx == 0 && self.minutes.is_empty() {
             self.rebuild(history_futures, history_spot);
             return;
         }
-        for (fut, spot) in history_futures[start_idx..].iter().zip(history_spot[start_idx..].iter()) {
+        for (fut, spot) in history_futures[start_idx..]
+            .iter()
+            .zip(history_spot[start_idx..].iter())
+        {
             self.append_pair(fut, spot);
         }
         self.last_ts = Some(last_ts);
     }
 
     pub(crate) fn events(&self) -> Vec<ExhaustionEventData> {
-        self.events.iter().map(|entry| entry.event.clone()).collect()
+        self.events
+            .iter()
+            .map(|entry| entry.event.clone())
+            .collect()
     }
 
     fn prune_before(&mut self, first_ts: DateTime<Utc>) {
@@ -161,9 +175,7 @@ impl ExhaustionEventStateMachine {
         while self
             .events
             .front()
-            .map(|entry| {
-                entry.required_start_ts < first_ts || entry.event.start_ts < first_ts
-            })
+            .map(|entry| entry.required_start_ts < first_ts || entry.event.start_ts < first_ts)
             .unwrap_or(false)
         {
             self.events.pop_front();
@@ -386,44 +398,51 @@ impl ExhaustionEventStateMachine {
         let confirm = self.minutes.get(confirm_idx)?;
         let range = (second.high - second.low).max(TICK_SIZE);
         let confirm_speed = 1.0 / ((confirm_seq - candidate.pivot_seq_2) as f64).max(1.0);
-        let (event_type, pivot_price, price_push, delta_change, rdelta_change, reject_ratio, base_score) =
-            if candidate.direction < 0 {
-                let reject_top = (second.high - second.close) / (range + 1e-12);
-                let price_push = (second.high - first.high) / TICK_SIZE;
-                let delta_drop = first.delta - second.delta;
-                let rdelta_drop = first.rdelta - second.rdelta;
-                (
-                    "buying_exhaustion",
-                    second.high,
-                    price_push,
-                    second.delta - first.delta,
-                    second.rdelta - first.rdelta,
-                    reject_top,
-                    0.30 * clip01(price_push / 10.0)
-                        + 0.25 * clip01(delta_drop / (3.0 * EPSILON_DELTA))
-                        + 0.20 * clip01(rdelta_drop / (3.0 * EPSILON_RDELTA))
-                        + 0.15 * clip01((reject_top - ETA_REJECT) / (1.0 - ETA_REJECT))
-                        + 0.10 * clip01(confirm_speed * CONFIRM_BARS as f64),
-                )
-            } else {
-                let reject_bottom = (second.close - second.low) / (range + 1e-12);
-                let price_push = (first.low - second.low) / TICK_SIZE;
-                let delta_lift = second.delta - first.delta;
-                let rdelta_lift = second.rdelta - first.rdelta;
-                (
-                    "selling_exhaustion",
-                    second.low,
-                    price_push,
-                    second.delta - first.delta,
-                    second.rdelta - first.rdelta,
-                    reject_bottom,
-                    0.30 * clip01(price_push / 10.0)
-                        + 0.25 * clip01(delta_lift / (3.0 * EPSILON_DELTA))
-                        + 0.20 * clip01(rdelta_lift / (3.0 * EPSILON_RDELTA))
-                        + 0.15 * clip01((reject_bottom - ETA_REJECT) / (1.0 - ETA_REJECT))
-                        + 0.10 * clip01(confirm_speed * CONFIRM_BARS as f64),
-                )
-            };
+        let (
+            event_type,
+            pivot_price,
+            price_push,
+            delta_change,
+            rdelta_change,
+            reject_ratio,
+            base_score,
+        ) = if candidate.direction < 0 {
+            let reject_top = (second.high - second.close) / (range + 1e-12);
+            let price_push = (second.high - first.high) / TICK_SIZE;
+            let delta_drop = first.delta - second.delta;
+            let rdelta_drop = first.rdelta - second.rdelta;
+            (
+                "buying_exhaustion",
+                second.high,
+                price_push,
+                second.delta - first.delta,
+                second.rdelta - first.rdelta,
+                reject_top,
+                0.30 * clip01(price_push / 10.0)
+                    + 0.25 * clip01(delta_drop / (3.0 * EPSILON_DELTA))
+                    + 0.20 * clip01(rdelta_drop / (3.0 * EPSILON_RDELTA))
+                    + 0.15 * clip01((reject_top - ETA_REJECT) / (1.0 - ETA_REJECT))
+                    + 0.10 * clip01(confirm_speed * CONFIRM_BARS as f64),
+            )
+        } else {
+            let reject_bottom = (second.close - second.low) / (range + 1e-12);
+            let price_push = (first.low - second.low) / TICK_SIZE;
+            let delta_lift = second.delta - first.delta;
+            let rdelta_lift = second.rdelta - first.rdelta;
+            (
+                "selling_exhaustion",
+                second.low,
+                price_push,
+                second.delta - first.delta,
+                second.rdelta - first.rdelta,
+                reject_bottom,
+                0.30 * clip01(price_push / 10.0)
+                    + 0.25 * clip01(delta_lift / (3.0 * EPSILON_DELTA))
+                    + 0.20 * clip01(rdelta_lift / (3.0 * EPSILON_RDELTA))
+                    + 0.15 * clip01((reject_bottom - ETA_REJECT) / (1.0 - ETA_REJECT))
+                    + 0.10 * clip01(confirm_speed * CONFIRM_BARS as f64),
+            )
+        };
         let spot_cvd_push = confirm.spot_cvd - second.spot_cvd;
         let spot_whale_push = self
             .minutes
@@ -1019,8 +1038,7 @@ impl Indicator for I12BuyingExhaustion {
 mod tests {
     use super::{
         compute_exhaustion_all_history_from_histories, detect_buying_events, detect_selling_events,
-        exhaustion_event_json, ExhaustionEventData,
-        ExhaustionEventStateMachine,
+        exhaustion_event_json, ExhaustionEventData, ExhaustionEventStateMachine,
     };
     use crate::indicators::context::{
         DivergenceSigTestMode, IndicatorContext, IndicatorSharedCaches,

@@ -1205,14 +1205,23 @@ impl AvwapState {
 
     fn append_minute(&mut self, fut: &MinuteHistory, spot: &MinuteHistory) {
         let ts_bucket = fut.ts_bucket;
-        self.contributions.push_back(AvwapMinuteContribution {
+        let contribution = AvwapMinuteContribution {
             ts_bucket,
             fut_notional: fut.total_notional,
             fut_qty: fut.total_qty,
             spot_notional: spot.total_notional,
             spot_qty: spot.total_qty,
             gap_minute: minute_gap(fut, spot),
-        });
+        };
+        if let Some(position) = self
+            .contributions
+            .iter()
+            .rposition(|row| row.ts_bucket == ts_bucket)
+        {
+            self.contributions[position] = contribution;
+        } else {
+            self.contributions.push_back(contribution);
+        }
 
         let cutoff = ts_bucket - Duration::minutes(AVWAP_MAX_LOOKBACK_MINUTES);
         while self
@@ -1229,19 +1238,31 @@ impl AvwapState {
                 continue;
             }
             let metrics = self.window_metrics(ts_bucket, interval_mins);
-            self.series_by_window
+            let ts_bucket_str = ts_bucket.to_rfc3339();
+            let series = self.series_by_window.entry(code.to_string()).or_default();
+            if let Some(position) = series.iter().rposition(|row| row.ts_bucket == ts_bucket) {
+                series[position] = AvwapSeriesRow { ts_bucket };
+            } else {
+                series.push_back(AvwapSeriesRow { ts_bucket });
+            }
+
+            let series_json = self
+                .series_json_by_window
                 .entry(code.to_string())
-                .or_default()
-                .push_back(AvwapSeriesRow { ts_bucket });
-            self.series_json_by_window
-                .entry(code.to_string())
-                .or_default()
-                .push_back(json!({
-                    "ts": ts_bucket.to_rfc3339(),
-                    "avwap_fut": metrics.avwap_fut,
-                    "avwap_spot": metrics.avwap_spot,
-                    "xmk_avwap_gap_f_minus_s": metrics.gap,
-                }));
+                .or_default();
+            let payload = json!({
+                "ts": ts_bucket_str,
+                "avwap_fut": metrics.avwap_fut,
+                "avwap_spot": metrics.avwap_spot,
+                "xmk_avwap_gap_f_minus_s": metrics.gap,
+            });
+            if let Some(position) = series_json.iter().rposition(|row| {
+                row.get("ts").and_then(Value::as_str) == payload.get("ts").and_then(Value::as_str)
+            }) {
+                series_json[position] = payload;
+            } else {
+                series_json.push_back(payload);
+            }
             if let Some(series) = self.series_by_window.get_mut(code) {
                 while series
                     .front()
@@ -1397,18 +1418,22 @@ impl AvwapState {
 
     fn window_metrics(&self, end_ts: DateTime<Utc>, lookback_minutes: i64) -> AvwapWindowMetrics {
         let start_exclusive = end_ts - Duration::minutes(lookback_minutes.max(1));
+        let mut contributions_by_ts = BTreeMap::new();
+        for row in self.contributions.iter() {
+            if row.ts_bucket <= start_exclusive || row.ts_bucket > end_ts {
+                continue;
+            }
+            contributions_by_ts.insert(row.ts_bucket, row.clone());
+        }
+
         let mut fut_notional = 0.0;
         let mut fut_qty = 0.0;
         let mut spot_notional = 0.0;
         let mut spot_qty = 0.0;
         let mut minute_gaps = Vec::new();
-        let mut observed_minutes = 0usize;
+        let observed_minutes = contributions_by_ts.len();
 
-        for row in self.contributions.iter() {
-            if row.ts_bucket <= start_exclusive || row.ts_bucket > end_ts {
-                continue;
-            }
-            observed_minutes += 1;
+        for row in contributions_by_ts.values() {
             fut_notional += row.fut_notional;
             fut_qty += row.fut_qty;
             spot_notional += row.spot_notional;
@@ -3179,7 +3204,10 @@ fn lower_bound_history_ts(history: &[MinuteHistory], target: DateTime<Utc>) -> u
 
 #[cfg(test)]
 mod tests {
-    use super::{IncrementalIndicatorConfig, IncrementalIndicatorState, RvwapState};
+    use super::{
+        AvwapMinuteContribution, AvwapState, IncrementalIndicatorConfig, IncrementalIndicatorState,
+        RvwapState,
+    };
     use crate::indicators::context::{
         DivergenceSigTestMode, IndicatorContext, IndicatorRuntimeOptions, KlineHistorySupplement,
         OpenInterestCurrentSidecar,
@@ -3521,6 +3549,36 @@ mod tests {
         ) {
             panic!("incremental level rows diverged for fvg at {path}");
         }
+    }
+
+    #[test]
+    fn avwap_window_metrics_dedup_duplicate_ts_buckets() {
+        let ts_start = Utc
+            .with_ymd_and_hms(2026, 3, 20, 0, 0, 0)
+            .single()
+            .expect("valid ts");
+        let mut state = AvwapState::new();
+
+        for minute_offset in 0..3 {
+            let ts = ts_start + Duration::minutes(minute_offset);
+            let fut = history_row(ts, MarketKind::Futures, 100.0 + minute_offset as f64, 1.0);
+            let spot = history_row(ts, MarketKind::Spot, 99.0 + minute_offset as f64, 1.0);
+            state.append_minute(&fut, &spot);
+        }
+
+        state.contributions.push_back(AvwapMinuteContribution {
+            ts_bucket: ts_start + Duration::minutes(1),
+            fut_notional: 201.0,
+            fut_qty: 1.0,
+            spot_notional: 198.0,
+            spot_qty: 1.0,
+            gap_minute: Some(3.0),
+        });
+
+        let metrics = state.window_metrics(ts_start + Duration::minutes(2), 15);
+        assert_eq!(metrics.observed_minutes, 3);
+        assert!((metrics.avwap_fut.expect("fut avwap") - (403.0 / 3.0)).abs() < 1e-9);
+        assert!((metrics.avwap_spot.expect("spot avwap") - (398.0 / 3.0)).abs() < 1e-9);
     }
 
     #[test]

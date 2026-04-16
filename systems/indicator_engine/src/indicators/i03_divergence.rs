@@ -150,7 +150,8 @@ impl DivergenceEventStateMachine {
         p_value_threshold: f64,
     ) {
         *self = Self::default();
-        let (history_futures, history_spot) = aligned_event_histories(history_futures, history_spot);
+        let (history_futures, history_spot) =
+            aligned_event_histories(history_futures, history_spot);
         for (fut, spot) in history_futures.iter().zip(history_spot.iter()) {
             self.append_pair(
                 fut,
@@ -173,12 +174,16 @@ impl DivergenceEventStateMachine {
         bootstrap_block_len: usize,
         p_value_threshold: f64,
     ) {
-        let (history_futures, history_spot) = aligned_event_histories(history_futures, history_spot);
+        let (history_futures, history_spot) =
+            aligned_event_histories(history_futures, history_spot);
         let Some(first_ts) = history_futures.first().map(|row| row.ts_bucket) else {
             *self = Self::default();
             return;
         };
-        let last_ts = history_futures.last().map(|row| row.ts_bucket).unwrap_or(first_ts);
+        let last_ts = history_futures
+            .last()
+            .map(|row| row.ts_bucket)
+            .unwrap_or(first_ts);
         let front_pruned = self
             .minutes
             .front()
@@ -221,7 +226,10 @@ impl DivergenceEventStateMachine {
             Some(_) => {}
         }
         self.prune_before(first_ts);
-        let start_idx = lower_bound_history_ts(history_futures, self.last_ts.unwrap() + Duration::minutes(1));
+        let start_idx = lower_bound_history_ts(
+            history_futures,
+            self.last_ts.unwrap() + Duration::minutes(1),
+        );
         if start_idx == 0 && self.minutes.is_empty() {
             self.rebuild(
                 history_futures,
@@ -233,7 +241,10 @@ impl DivergenceEventStateMachine {
             );
             return;
         }
-        for (fut, spot) in history_futures[start_idx..].iter().zip(history_spot[start_idx..].iter()) {
+        for (fut, spot) in history_futures[start_idx..]
+            .iter()
+            .zip(history_spot[start_idx..].iter())
+        {
             self.append_pair(
                 fut,
                 spot,
@@ -247,7 +258,10 @@ impl DivergenceEventStateMachine {
     }
 
     pub(crate) fn events(&self) -> Vec<DivergenceEventData> {
-        self.events.iter().map(|entry| entry.event.clone()).collect()
+        self.events
+            .iter()
+            .map(|entry| entry.event.clone())
+            .collect()
     }
 
     fn prune_before(&mut self, first_ts: chrono::DateTime<chrono::Utc>) {
@@ -262,7 +276,9 @@ impl DivergenceEventStateMachine {
         while self
             .events
             .front()
-            .map(|entry| entry.required_start_ts < first_ts || entry.event.event_start_ts < first_ts)
+            .map(|entry| {
+                entry.required_start_ts < first_ts || entry.event.event_start_ts < first_ts
+            })
             .unwrap_or(false)
         {
             self.events.pop_front();
@@ -331,11 +347,7 @@ impl DivergenceEventStateMachine {
         let z_cvd_fut = robust_z_current(&self.detrended_cvd_fut_tail, ROBUST_Z_LOOKBACK);
         let z_cvd_spot = robust_z_current(&self.detrended_cvd_spot_tail, ROBUST_Z_LOOKBACK);
 
-        let prev_close = self
-            .minutes
-            .back()
-            .map(|row| row.close)
-            .unwrap_or(close);
+        let prev_close = self.minutes.back().map(|row| row.close).unwrap_or(close);
         let tr = (high - low)
             .max((high - prev_close).abs())
             .max((low - prev_close).abs());
@@ -498,9 +510,12 @@ impl DivergenceEventStateMachine {
         if leg_eff < ETA_LEG {
             return None;
         }
-        let (Some(zc1), Some(zc2), Some(zs1), Some(zs2)) =
-            (first.z_cvd_fut, second.z_cvd_fut, first.z_cvd_spot, second.z_cvd_spot)
-        else {
+        let (Some(zc1), Some(zc2), Some(zs1), Some(zs2)) = (
+            first.z_cvd_fut,
+            second.z_cvd_fut,
+            first.z_cvd_spot,
+            second.z_cvd_spot,
+        ) else {
             return None;
         };
         let (price_start, price_end, price_diff) = if is_high_side {
@@ -529,8 +544,16 @@ impl DivergenceEventStateMachine {
             None
         }?;
 
-        let mut p_value_price = if price_effect_z.abs() >= ZP_MIN { 0.0 } else { 1.0 };
-        let mut p_value_cvd = if cvd_effect_z.abs() >= ZC_MIN { 0.0 } else { 1.0 };
+        let mut p_value_price = if price_effect_z.abs() >= ZP_MIN {
+            0.0
+        } else {
+            1.0
+        };
+        let mut p_value_cvd = if cvd_effect_z.abs() >= ZC_MIN {
+            0.0
+        } else {
+            1.0
+        };
         let mut sig_pass = price_effect_z.abs() >= ZP_MIN && cvd_effect_z.abs() >= ZC_MIN;
 
         if sig_test_mode == DivergenceSigTestMode::BlockBootstrap {
@@ -602,8 +625,7 @@ impl DivergenceEventStateMachine {
         } else {
             "mixed"
         };
-        let score =
-            clip01(0.5 * (price_effect_z.abs() / 3.0) + 0.5 * (cvd_effect_z.abs() / 3.0));
+        let score = clip01(0.5 * (price_effect_z.abs() / 3.0) + 0.5 * (cvd_effect_z.abs() / 3.0));
         let event = DivergenceEventData {
             divergence_type: divergence_type.to_string(),
             pivot_side: if is_high_side {
@@ -690,7 +712,11 @@ fn detrend_current(values: &VecDeque<f64>, window: usize) -> Option<f64> {
     if values.len() < window {
         return None;
     }
-    let slice = values.iter().skip(values.len() - window).copied().collect::<Vec<_>>();
+    let slice = values
+        .iter()
+        .skip(values.len() - window)
+        .copied()
+        .collect::<Vec<_>>();
     let n = slice.len() as f64;
     let x_mean = (n - 1.0) / 2.0;
     let y_mean = slice.iter().sum::<f64>() / n;
@@ -711,7 +737,11 @@ fn robust_z_current(values: &VecDeque<f64>, lookback: usize) -> Option<f64> {
     if values.len() < lookback {
         return None;
     }
-    let raw = values.iter().skip(values.len() - lookback).copied().collect::<Vec<_>>();
+    let raw = values
+        .iter()
+        .skip(values.len() - lookback)
+        .copied()
+        .collect::<Vec<_>>();
     robust_z_at(&raw, raw.len() - 1, lookback)
 }
 

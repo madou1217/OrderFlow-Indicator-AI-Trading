@@ -1,9 +1,7 @@
 use crate::indicators::context::{
     IndicatorComputation, IndicatorContext, IndicatorEventRow, IndicatorSnapshotRow,
 };
-use crate::indicators::i07_initiation::{
-    detect_initiation_events, initiation_event_json,
-};
+use crate::indicators::i07_initiation::{detect_initiation_events, initiation_event_json};
 use crate::indicators::indicator_trait::Indicator;
 use crate::indicators::shared::event_ids::build_indicator_event_id;
 use crate::indicators::shared::event_views::{build_event_window_view, build_recent_7d_payload};

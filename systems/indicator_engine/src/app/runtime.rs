@@ -5169,9 +5169,7 @@ async fn maybe_execute_live_catchup_cutover(
             "live catchup state cutover",
         )
         .await?;
-        if state_store.has_pending_deferred_derived_indicator_refresh() {
-            state_store.rebuild_deferred_derived_indicator_state();
-        }
+        state_store.rebuild_deferred_derived_indicator_state();
         state_store.clear_dirty_recompute_state();
         state_store.clear_oi_ratio_patch_state();
         state_store
@@ -5300,6 +5298,7 @@ async fn maybe_execute_confirmed_repair_replay(
             "confirmed live repair state rebuild",
         )
         .await?;
+        state_store.rebuild_deferred_derived_indicator_state();
         state_store.clear_dirty_recompute_state();
         state_store.clear_oi_ratio_patch_state();
         state_store
@@ -5380,6 +5379,7 @@ async fn maybe_execute_shutdown_confirmed_repair_replay(
         "shutdown confirmed repair state rebuild",
     )
     .await?;
+    state_store.rebuild_deferred_derived_indicator_state();
     state_store.clear_dirty_recompute_state();
     state_store.clear_oi_ratio_patch_state();
     let repair_snapshot = state_store.extract_snapshot();

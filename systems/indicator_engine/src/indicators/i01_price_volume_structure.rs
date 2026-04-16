@@ -85,7 +85,11 @@ impl Indicator for I01PriceVolumeStructure {
     }
 
     fn evaluate(&self, ctx: &IndicatorContext) -> IndicatorComputation {
-        if let Some(payload) = ctx.incremental_outputs.price_volume_structure_snapshot.clone() {
+        if let Some(payload) = ctx
+            .incremental_outputs
+            .price_volume_structure_snapshot
+            .clone()
+        {
             return IndicatorComputation {
                 snapshot: Some(IndicatorSnapshotRow {
                     indicator_code: self.code(),

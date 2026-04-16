@@ -113,7 +113,8 @@ impl AbsorptionEventStateMachine {
         history_spot: &[MinuteHistory],
     ) {
         *self = Self::default();
-        let (history_futures, history_spot) = aligned_event_histories(history_futures, history_spot);
+        let (history_futures, history_spot) =
+            aligned_event_histories(history_futures, history_spot);
         for (fut, spot) in history_futures.iter().zip(history_spot.iter()) {
             self.append_pair(fut, spot);
         }
@@ -125,12 +126,16 @@ impl AbsorptionEventStateMachine {
         history_futures: &[MinuteHistory],
         history_spot: &[MinuteHistory],
     ) {
-        let (history_futures, history_spot) = aligned_event_histories(history_futures, history_spot);
+        let (history_futures, history_spot) =
+            aligned_event_histories(history_futures, history_spot);
         let Some(first_ts) = history_futures.first().map(|row| row.ts_bucket) else {
             *self = Self::default();
             return;
         };
-        let last_ts = history_futures.last().map(|row| row.ts_bucket).unwrap_or(first_ts);
+        let last_ts = history_futures
+            .last()
+            .map(|row| row.ts_bucket)
+            .unwrap_or(first_ts);
         match self.last_ts {
             None => {
                 self.rebuild(history_futures, history_spot);
@@ -143,19 +148,28 @@ impl AbsorptionEventStateMachine {
             Some(_) => {}
         }
         self.prune_before(first_ts);
-        let start_idx = lower_bound_history_ts(history_futures, self.last_ts.unwrap() + Duration::minutes(1));
+        let start_idx = lower_bound_history_ts(
+            history_futures,
+            self.last_ts.unwrap() + Duration::minutes(1),
+        );
         if start_idx == 0 && self.minutes.is_empty() {
             self.rebuild(history_futures, history_spot);
             return;
         }
-        for (fut, spot) in history_futures[start_idx..].iter().zip(history_spot[start_idx..].iter()) {
+        for (fut, spot) in history_futures[start_idx..]
+            .iter()
+            .zip(history_spot[start_idx..].iter())
+        {
             self.append_pair(fut, spot);
         }
         self.last_ts = Some(last_ts);
     }
 
     pub(crate) fn events(&self) -> Vec<AbsorptionEventData> {
-        self.events.iter().map(|entry| entry.event.clone()).collect()
+        self.events
+            .iter()
+            .map(|entry| entry.event.clone())
+            .collect()
     }
 
     fn prune_before(&mut self, first_ts: DateTime<Utc>) {
@@ -187,9 +201,7 @@ impl AbsorptionEventStateMachine {
         while self
             .events
             .front()
-            .map(|entry| {
-                entry.required_start_ts < first_ts || entry.event.start_ts < first_ts
-            })
+            .map(|entry| entry.required_start_ts < first_ts || entry.event.start_ts < first_ts)
             .unwrap_or(false)
         {
             self.events.pop_front();
@@ -439,7 +451,8 @@ impl AbsorptionEventStateMachine {
             .take(confirm_idx - start_idx + 1)
             .map(|row| row.spot_whale_notional)
             .sum::<f64>();
-        let spot_flow_confirm = clip01((group.direction as f64 * spot_rd_mean) / (THETA_RD_SPOT + 1e-12));
+        let spot_flow_confirm =
+            clip01((group.direction as f64 * spot_rd_mean) / (THETA_RD_SPOT + 1e-12));
         let spot_whale_confirm =
             clip01((group.direction as f64 * spot_whale_push) / (THETA_WHALE_SPOT + 1e-12));
         let score_xmk = 0.85 * score + 0.10 * spot_flow_confirm + 0.05 * spot_whale_confirm;
