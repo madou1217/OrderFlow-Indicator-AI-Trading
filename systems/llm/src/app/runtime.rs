@@ -308,12 +308,12 @@ pub async fn run(ctx: AppContext) -> Result<()> {
     ensure_temp_model_input_dir().await?;
     ensure_llm_journal_dir().await?;
     ensure_account_trading_ws_started(
-        &ctx.http_client,
+        &ctx.binance_http_client,
         &ctx.config.api.binance,
         &ctx.config.llm.execution,
     );
     match cleanup_orphan_exit_orders_for_symbol(
-        &ctx.http_client,
+        &ctx.binance_http_client,
         &ctx.config.api.binance,
         &ctx.config.llm.execution,
         &ctx.config.llm.symbol,
@@ -336,7 +336,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
         ),
     }
     match cleanup_stale_position_management_state_on_startup(
-        &ctx.http_client,
+        &ctx.binance_http_client,
         &ctx.config.api.binance,
         &ctx.config.llm.execution,
         &ctx.config.llm.symbol,
@@ -2430,7 +2430,7 @@ async fn process_fast_market_event_for_plan(
 
     match adapt_execution_intent(&intent) {
         Ok(adapted_intent) => match execute_workflow_execution_intent(
-            &ctx.http_client,
+            &ctx.binance_http_client,
             &ctx.config.api.binance,
             &ctx.config.llm.execution,
             symbol,
@@ -2639,7 +2639,7 @@ async fn process_fast_position_management_actions(
                 }),
             );
             if reconcile_missing_position_management_snapshot(
-                &ctx.http_client,
+                &ctx.binance_http_client,
                 &ctx.config.api.binance,
                 &ctx.config.llm.execution,
                 symbol,
@@ -2677,7 +2677,7 @@ async fn process_fast_position_management_actions(
                 }),
             );
             if reconcile_flat_position_management_context(
-                &ctx.http_client,
+                &ctx.binance_http_client,
                 &ctx.config.api.binance,
                 &ctx.config.llm.execution,
                 symbol,
@@ -2770,7 +2770,7 @@ async fn process_fast_position_management_actions(
                         match adapt_execution_intent(&intent) {
                             Ok(adapted_intent) => {
                                 match execute_workflow_execution_intent(
-                                    &ctx.http_client,
+                                    &ctx.binance_http_client,
                                     &ctx.config.api.binance,
                                     &ctx.config.llm.execution,
                                     symbol,
@@ -2934,7 +2934,7 @@ async fn process_fast_position_management_actions(
                 ) {
                     Ok((management_action, adapted_action)) => {
                         match execute_workflow_management_action(
-                            &ctx.http_client,
+                            &ctx.binance_http_client,
                             &ctx.config.api.binance,
                             &ctx.config.llm.execution,
                             symbol,
@@ -3278,7 +3278,7 @@ async fn process_fast_pending_order_management_actions(
         match action.action_type.as_str() {
             "cancel_pending_order" => {
                 match cancel_workflow_pending_entry_orders(
-                    &ctx.http_client,
+                    &ctx.binance_http_client,
                     &ctx.config.api.binance,
                     &ctx.config.llm.execution,
                     symbol,
@@ -3393,7 +3393,7 @@ async fn process_fast_pending_order_management_actions(
                         match adapt_execution_intent(&intent) {
                             Ok(adapted_intent) => {
                                 match cancel_workflow_pending_entry_orders(
-                                    &ctx.http_client,
+                                    &ctx.binance_http_client,
                                     &ctx.config.api.binance,
                                     &ctx.config.llm.execution,
                                     symbol,
@@ -3417,7 +3417,7 @@ async fn process_fast_pending_order_management_actions(
                                             }),
                                         );
                                         match execute_workflow_execution_intent(
-                                            &ctx.http_client,
+                                            &ctx.binance_http_client,
                                             &ctx.config.api.binance,
                                             &ctx.config.llm.execution,
                                             symbol,
@@ -4499,7 +4499,7 @@ async fn handle_fast_market_event(
             .collect::<HashMap<_, _>>();
 
     let trading_state = fetch_symbol_trading_state_for_fast_path(
-        &ctx.http_client,
+        &ctx.binance_http_client,
         &ctx.config.api.binance,
         &ctx.config.llm.execution,
         &symbol,
@@ -5785,6 +5785,7 @@ async fn invoke_workflow_bundle_models(
     let config = Arc::clone(&ctx.config);
     let db_pool = ctx.db_pool.clone();
     let http_client = ctx.http_client.clone();
+    let binance_http_client = ctx.binance_http_client.clone();
     let loopback_http_client = ctx.loopback_http_client.clone();
     let symbol = bundle.raw.symbol.to_ascii_uppercase();
     let state_dir = config.llm.workflow.state_dir.clone();
@@ -5858,7 +5859,7 @@ async fn invoke_workflow_bundle_models(
         stage1_output.ok_or_else(|| anyhow!("workflow stage1 output missing after refresh"))?;
 
     let trading_state = fetch_symbol_trading_state(
-        &http_client,
+        &binance_http_client,
         &config.api.binance,
         &config.llm.execution,
         &symbol,
