@@ -1517,7 +1517,8 @@ async fn invoke_bundle_models(
         return;
     }
     if let Err(err) = invoke_workflow_bundle_models(ctx, print_response, bundle, trigger).await {
-        error!(error = %err, "workflow invoke failed");
+        let error_chain = format!("{err:#}");
+        error!(error = %err, error_chain = %error_chain, "workflow invoke failed");
     }
 }
 
