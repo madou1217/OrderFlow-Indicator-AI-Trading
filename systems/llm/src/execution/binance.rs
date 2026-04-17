@@ -1319,7 +1319,8 @@ pub async fn execute_workflow_execution_intent(
     let symbol_filters = fetch_symbol_filters(http_client, api_config, symbol).await?;
     let account_balance = fetch_account_balance(http_client, api_config, exec_config).await?;
     let leverage = scaled_workflow_leverage(intent, exec_config);
-    let (margin_budget_usdt, _) = select_margin_budget(exec_config, &account_balance)?;
+    let (margin_budget_usdt, margin_budget_source) =
+        select_margin_budget(exec_config, &account_balance)?;
     let position_side = resolve_position_side(exec_config, decision);
     let entry_plan = workflow_entry_plan_from_intent(intent)?;
     let entry_price = entry_plan.requested_entry_price;
@@ -1388,6 +1389,12 @@ pub async fn execute_workflow_execution_intent(
         best_bid_price = best_bid_price,
         best_ask_price = best_ask_price,
         maker_entry_price = maker_entry_price,
+        leverage = leverage,
+        margin_budget_usdt = margin_budget_usdt,
+        margin_budget_source = margin_budget_source,
+        account_total_wallet_balance = account_balance.total_wallet_balance,
+        account_available_balance = account_balance.available_balance,
+        quantity = %quantity_str,
         final_take_profit = tp_price,
         final_stop_loss = sl_price,
         final_risk_reward_ratio = final_rr,
@@ -1416,7 +1423,7 @@ pub async fn execute_workflow_execution_intent(
     let tp_trigger_price = format_decimal(tp_price, symbol_filters.price_precision);
     let sl_trigger_price = format_decimal(sl_price, symbol_filters.price_precision);
     set_futures_leverage(http_client, api_config, exec_config, symbol, leverage).await?;
-    let entry_order_id = place_entry_market_order(
+    let entry_order_id = match place_entry_market_order(
         http_client,
         api_config,
         exec_config,
@@ -1429,7 +1436,78 @@ pub async fn execute_workflow_execution_intent(
         symbol_filters.price_precision,
         entry_plan.allow_taker_fallback && !exec_config.place_exit_orders,
     )
-    .await?;
+    .await
+    {
+        Ok(order_id) => order_id,
+        Err(err) if is_margin_insufficient_error(&err) => {
+            let original_error = format!("{err:#}");
+            warn!(
+                symbol = %symbol,
+                decision = decision.as_str(),
+                position_side = %position_side,
+                cached_total_wallet_balance = account_balance.total_wallet_balance,
+                cached_available_balance = account_balance.available_balance,
+                cached_margin_budget_usdt = margin_budget_usdt,
+                cached_margin_budget_source = margin_budget_source,
+                leverage = leverage,
+                cached_quantity = %quantity_str,
+                "entry order rejected by Binance for insufficient margin; refreshing account balance from REST"
+            );
+
+            let refreshed_account_balance =
+                refresh_account_balance_from_rest(http_client, api_config, exec_config)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "entry order rejected for insufficient margin; failed to refresh account balance from REST after original_error={}",
+                            original_error
+                        )
+                    })?;
+            let (refreshed_margin_budget_usdt, refreshed_margin_budget_source) =
+                select_margin_budget(exec_config, &refreshed_account_balance)?;
+
+            warn!(
+                symbol = %symbol,
+                decision = decision.as_str(),
+                position_side = %position_side,
+                refreshed_total_wallet_balance = refreshed_account_balance.total_wallet_balance,
+                refreshed_available_balance = refreshed_account_balance.available_balance,
+                refreshed_margin_budget_usdt = refreshed_margin_budget_usdt,
+                refreshed_margin_budget_source = refreshed_margin_budget_source,
+                leverage = leverage,
+                retried_quantity = %quantity_str,
+                "retrying entry order once with original quantity after account balance refresh"
+            );
+
+            let order_id = place_entry_market_order(
+                http_client,
+                api_config,
+                exec_config,
+                symbol,
+                decision,
+                position_side,
+                &quantity_str,
+                &maker_entry_price_str,
+                symbol_filters.tick_size,
+                symbol_filters.price_precision,
+                entry_plan.allow_taker_fallback && !exec_config.place_exit_orders,
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "entry order retry after account balance refresh failed; original_error={}; refreshed_total_wallet_balance={} refreshed_available_balance={} refreshed_margin_budget_usdt={} refreshed_margin_budget_source={} retried_quantity={}",
+                    original_error,
+                    refreshed_account_balance.total_wallet_balance,
+                    refreshed_account_balance.available_balance,
+                    refreshed_margin_budget_usdt,
+                    refreshed_margin_budget_source,
+                    quantity_str
+                )
+            })?;
+            order_id
+        }
+        Err(err) => return Err(err),
+    };
 
     if exec_config.place_exit_orders {
         let (take_profit_order_id, tp_is_algo_order, stop_loss_order_id) =
@@ -2253,6 +2331,14 @@ async fn fetch_account_balance(
         }
     }
 
+    refresh_account_balance_from_rest(http_client, api_config, exec_config).await
+}
+
+async fn refresh_account_balance_from_rest(
+    http_client: &Client,
+    api_config: &BinanceApiConfig,
+    exec_config: &LlmExecutionConfig,
+) -> Result<FuturesAccountBalance> {
     let account: FuturesAccountResponse = signed_get_json(
         http_client,
         api_config,
@@ -2273,6 +2359,11 @@ async fn fetch_account_balance(
         guard.total_wallet_balance = Some(total_wallet_balance);
         guard.available_balance = Some(available_balance);
     }
+    info!(
+        total_wallet_balance = total_wallet_balance,
+        available_balance = available_balance,
+        "refreshed futures account balance from REST"
+    );
     Ok(FuturesAccountBalance {
         total_wallet_balance,
         available_balance,
@@ -3037,6 +3128,11 @@ fn is_post_only_reject_error(err: &anyhow::Error) -> bool {
     text.contains("\"code\":-5022")
         || text.contains("Post Only order will be rejected")
         || text.contains("could not be executed as maker")
+}
+
+fn is_margin_insufficient_error(err: &anyhow::Error) -> bool {
+    let text = format!("{err:#}");
+    text.contains("\"code\":-2019") || text.contains("Margin is insufficient")
 }
 
 async fn cancel_order_by_id(
@@ -4078,6 +4174,7 @@ struct FuturesUserTradeRow {
     realized_pnl: String,
 }
 
+#[derive(Debug, Clone, Copy)]
 struct FuturesAccountBalance {
     total_wallet_balance: f64,
     available_balance: f64,
@@ -5366,6 +5463,26 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(formatted, vec!["0.15", "0.10", "0.10", "0.10"]);
+    }
+
+    #[test]
+    fn detects_margin_insufficient_binance_error() {
+        let err = anyhow!(
+            "{}",
+            "binance /fapi/v1/order failed status=400 Bad Request body={\"code\":-2019,\"msg\":\"Margin is insufficient.\"}"
+        );
+
+        assert!(is_margin_insufficient_error(&err));
+    }
+
+    #[test]
+    fn margin_insufficient_detection_ignores_unrelated_errors() {
+        let err = anyhow!(
+            "{}",
+            "binance /fapi/v1/order failed status=400 Bad Request body={\"code\":-5022,\"msg\":\"Post Only order will be rejected.\"}"
+        );
+
+        assert!(!is_margin_insufficient_error(&err));
     }
 
     #[test]
