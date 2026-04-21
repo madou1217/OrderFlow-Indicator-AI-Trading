@@ -65,6 +65,9 @@ static WORKFLOW_STAGE_FLIGHTS: OnceLock<StdMutex<HashMap<String, WorkflowStageFl
 static STARTUP_STAGE1_REFRESHED_SYMBOLS: OnceLock<StdMutex<HashSet<String>>> = OnceLock::new();
 static FAST_PRICE_EVENT_BUFFER: OnceLock<StdMutex<HashMap<String, VecDeque<FastPriceEvent>>>> =
     OnceLock::new();
+static FAST_WATCHER_PLAN_DIAGNOSTICS: OnceLock<
+    StdMutex<HashMap<String, FastWatcherPlanDiagnostic>>,
+> = OnceLock::new();
 
 fn workflow_stage_flights() -> &'static StdMutex<HashMap<String, WorkflowStageFlights>> {
     WORKFLOW_STAGE_FLIGHTS.get_or_init(|| StdMutex::new(HashMap::new()))
@@ -76,6 +79,11 @@ fn startup_stage1_refreshed_symbols() -> &'static StdMutex<HashSet<String>> {
 
 fn fast_price_event_buffer() -> &'static StdMutex<HashMap<String, VecDeque<FastPriceEvent>>> {
     FAST_PRICE_EVENT_BUFFER.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+fn fast_watcher_plan_diagnostics() -> &'static StdMutex<HashMap<String, FastWatcherPlanDiagnostic>>
+{
+    FAST_WATCHER_PLAN_DIAGNOSTICS.get_or_init(|| StdMutex::new(HashMap::new()))
 }
 
 fn startup_stage1_refresh_due(symbol: &str) -> bool {
@@ -225,6 +233,27 @@ struct FastWatcherPlanState {
     plan_version: String,
     context_key: String,
     last_event_ts: Option<DateTime<Utc>>,
+    activation_seen_at: Option<DateTime<Utc>>,
+    advanced_beyond_entry_after_activation: bool,
+    pullback_touch_seen_at: Option<DateTime<Utc>>,
+    pullback_reclaim_started_at: Option<DateTime<Utc>>,
+    breakout_started_at: Option<DateTime<Utc>>,
+    breakout_extreme_price: Option<f64>,
+    invalidation_probe_seen_at: Option<DateTime<Utc>>,
+    recovery_started_at: Option<DateTime<Utc>>,
+    ready_logged: bool,
+    last_dispatch_block_reason: Option<String>,
+    fired: bool,
+}
+
+#[derive(Debug, Clone)]
+struct FastWatcherPlanDiagnostic {
+    plan_version: String,
+    context_key: String,
+    last_event_ts: Option<DateTime<Utc>>,
+    last_price: Option<f64>,
+    last_price_source: Option<String>,
+    last_routing_key: Option<String>,
     activation_seen_at: Option<DateTime<Utc>>,
     advanced_beyond_entry_after_activation: bool,
     pullback_touch_seen_at: Option<DateTime<Utc>>,
@@ -1955,6 +1984,116 @@ fn sync_fast_watcher_plan_state(
     should_reset
 }
 
+fn record_fast_watcher_plan_diagnostic(state: &FastWatcherPlanState, event: &FastPriceEvent) {
+    let diagnostic = FastWatcherPlanDiagnostic {
+        plan_version: state.plan_version.clone(),
+        context_key: state.context_key.clone(),
+        last_event_ts: Some(event.event_ts),
+        last_price: Some(event.price),
+        last_price_source: Some(event.source.as_str().to_string()),
+        last_routing_key: Some(event.routing_key.clone()),
+        activation_seen_at: state.activation_seen_at,
+        advanced_beyond_entry_after_activation: state.advanced_beyond_entry_after_activation,
+        pullback_touch_seen_at: state.pullback_touch_seen_at,
+        pullback_reclaim_started_at: state.pullback_reclaim_started_at,
+        breakout_started_at: state.breakout_started_at,
+        breakout_extreme_price: state.breakout_extreme_price,
+        invalidation_probe_seen_at: state.invalidation_probe_seen_at,
+        recovery_started_at: state.recovery_started_at,
+        ready_logged: state.ready_logged,
+        last_dispatch_block_reason: state.last_dispatch_block_reason.clone(),
+        fired: state.fired,
+    };
+    if let Ok(mut diagnostics) = fast_watcher_plan_diagnostics().lock() {
+        diagnostics.insert(diagnostic.context_key.clone(), diagnostic);
+        if diagnostics.len() > 128 {
+            diagnostics.retain(|_, item| item.last_event_ts.is_some());
+        }
+    }
+}
+
+fn take_fast_watcher_plan_diagnostic(context_key: &str) -> Option<FastWatcherPlanDiagnostic> {
+    fast_watcher_plan_diagnostics()
+        .lock()
+        .ok()
+        .and_then(|mut diagnostics| diagnostics.remove(context_key))
+}
+
+fn fast_watcher_plan_stall_reason(
+    plan: &crate::workflow::schema::EntryPlan,
+    diagnostic: Option<&FastWatcherPlanDiagnostic>,
+) -> &'static str {
+    let Some(diagnostic) = diagnostic else {
+        return "watcher_state_missing";
+    };
+    if diagnostic.fired {
+        return "already_fired";
+    }
+    if diagnostic.last_dispatch_block_reason.is_some() {
+        return "dispatch_blocked";
+    }
+    if plan.entry_profile == "failed_auction_reentry" {
+        if diagnostic.invalidation_probe_seen_at.is_none() {
+            return "invalidation_probe_not_seen";
+        }
+        if diagnostic.recovery_started_at.is_none() {
+            return "recovery_not_seen_after_probe";
+        }
+        return "recovery_confirmation_not_completed";
+    }
+    match plan.intent_mode.as_str() {
+        "immediate" => "price_never_inside_entry_zone",
+        "pullback" => {
+            if diagnostic.activation_seen_at.is_none() {
+                return "activation_not_seen";
+            }
+            if !diagnostic.advanced_beyond_entry_after_activation {
+                return "activation_seen_but_no_favorable_move_beyond_entry";
+            }
+            if diagnostic.pullback_touch_seen_at.is_none() {
+                return "waiting_for_pullback_touch";
+            }
+            if diagnostic.pullback_reclaim_started_at.is_none() {
+                return "waiting_for_reclaim_after_pullback";
+            }
+            "reclaim_confirmation_not_completed_or_dispatch_price_invalid"
+        }
+        "breakout" => {
+            if diagnostic.breakout_started_at.is_none() {
+                return "breakout_not_seen";
+            }
+            "breakout_confirmation_not_completed"
+        }
+        _ => "unsupported_intent_mode",
+    }
+}
+
+fn fast_watcher_plan_diagnostic_payload(diagnostic: Option<&FastWatcherPlanDiagnostic>) -> Value {
+    diagnostic
+        .map(|item| {
+            json!({
+                "plan_version": &item.plan_version,
+                "context_key": &item.context_key,
+                "last_event_ts": item.last_event_ts,
+                "last_price": item.last_price,
+                "last_price_source": &item.last_price_source,
+                "last_routing_key": &item.last_routing_key,
+                "activation_seen_at": item.activation_seen_at,
+                "advanced_beyond_entry_after_activation": item.advanced_beyond_entry_after_activation,
+                "pullback_touch_seen_at": item.pullback_touch_seen_at,
+                "pullback_reclaim_started_at": item.pullback_reclaim_started_at,
+                "breakout_started_at": item.breakout_started_at,
+                "breakout_extreme_price": item.breakout_extreme_price,
+                "invalidation_probe_seen_at": item.invalidation_probe_seen_at,
+                "recovery_started_at": item.recovery_started_at,
+                "ready_logged": item.ready_logged,
+                "last_dispatch_block_reason": &item.last_dispatch_block_reason,
+                "fired": item.fired,
+            })
+        })
+        .unwrap_or(Value::Null)
+}
+
 fn fast_entry_selection_block_reason(
     symbol: &str,
     tactical_plan: &crate::workflow::schema::TacticalEntryPlan,
@@ -2269,6 +2408,7 @@ async fn process_fast_market_event_for_plan(
 ) -> Result<()> {
     if entry_snapshots.contains_key(context_key) {
         fast_plan_state.fired = true;
+        record_fast_watcher_plan_diagnostic(fast_plan_state, event);
         return Ok(());
     }
 
@@ -2281,6 +2421,7 @@ async fn process_fast_market_event_for_plan(
     if !entry_ready {
         fast_plan_state.ready_logged = false;
         fast_plan_state.last_dispatch_block_reason = None;
+        record_fast_watcher_plan_diagnostic(fast_plan_state, event);
         return Ok(());
     }
     if !fast_plan_state.ready_logged {
@@ -2358,9 +2499,11 @@ async fn process_fast_market_event_for_plan(
             );
         }
         fast_plan_state.last_dispatch_block_reason = Some(reason.to_string());
+        record_fast_watcher_plan_diagnostic(fast_plan_state, event);
         return Ok(());
     }
     fast_plan_state.last_dispatch_block_reason = None;
+    record_fast_watcher_plan_diagnostic(fast_plan_state, event);
     let Some(selected_entry_plan) = select_fast_entry_plan(
         symbol,
         tactical_plan,
@@ -2464,6 +2607,7 @@ async fn process_fast_market_event_for_plan(
                     }),
                 );
                 fast_plan_state.fired = true;
+                record_fast_watcher_plan_diagnostic(fast_plan_state, event);
                 if !report.dry_run {
                     let snapshot = crate::workflow::management::snapshot_from_execution_intent(
                         symbol,
@@ -5900,15 +6044,98 @@ async fn invoke_workflow_bundle_models(
         .as_ref()
         .filter(|_| workflow_state.approved_tactical_plan.is_none())
     {
+        let expired_context_key = workflow_entry_context_key(
+            &symbol,
+            &expired_tactical_plan.entry_plan.side,
+            &expired_tactical_plan.path_id,
+        );
+        let watcher_diagnostic = take_fast_watcher_plan_diagnostic(&expired_context_key);
+        let watcher_stall_reason = fast_watcher_plan_stall_reason(
+            &expired_tactical_plan.entry_plan,
+            watcher_diagnostic.as_ref(),
+        );
+        let last_event_ts = watcher_diagnostic
+            .as_ref()
+            .and_then(|item| item.last_event_ts);
+        let last_price = watcher_diagnostic.as_ref().and_then(|item| item.last_price);
+        let last_price_source = watcher_diagnostic
+            .as_ref()
+            .and_then(|item| item.last_price_source.as_deref());
+        let activation_low = expired_tactical_plan
+            .entry_plan
+            .entry_activation_level
+            .as_ref()
+            .map(|zone| zone.low);
+        let activation_high = expired_tactical_plan
+            .entry_plan
+            .entry_activation_level
+            .as_ref()
+            .map(|zone| zone.high);
+        let activation_seen_at = watcher_diagnostic
+            .as_ref()
+            .and_then(|item| item.activation_seen_at);
+        let advanced_beyond_entry_after_activation = watcher_diagnostic
+            .as_ref()
+            .map(|item| item.advanced_beyond_entry_after_activation);
+        let pullback_touch_seen_at = watcher_diagnostic
+            .as_ref()
+            .and_then(|item| item.pullback_touch_seen_at);
+        let pullback_reclaim_started_at = watcher_diagnostic
+            .as_ref()
+            .and_then(|item| item.pullback_reclaim_started_at);
+        let breakout_started_at = watcher_diagnostic
+            .as_ref()
+            .and_then(|item| item.breakout_started_at);
+        let invalidation_probe_seen_at = watcher_diagnostic
+            .as_ref()
+            .and_then(|item| item.invalidation_probe_seen_at);
+        let recovery_started_at = watcher_diagnostic
+            .as_ref()
+            .and_then(|item| item.recovery_started_at);
         crate::workflow::persistence::save_workflow_state(&state_dir, &workflow_state)?;
+        info!(
+            symbol = %symbol,
+            trigger = &*trigger,
+            path_id = %expired_tactical_plan.path_id,
+            context_key = %expired_context_key,
+            side = %expired_tactical_plan.entry_plan.side,
+            entry_profile = %expired_tactical_plan.entry_plan.entry_profile,
+            intent_mode = %expired_tactical_plan.entry_plan.intent_mode,
+            activation_low = ?activation_low,
+            activation_high = ?activation_high,
+            entry_zone_low = expired_tactical_plan.entry_plan.entry_zone.low,
+            entry_zone_high = expired_tactical_plan.entry_plan.entry_zone.high,
+            last_event_ts = ?last_event_ts,
+            last_price = ?last_price,
+            last_price_source = ?last_price_source,
+            activation_seen_at = ?activation_seen_at,
+            advanced_beyond_entry_after_activation = ?advanced_beyond_entry_after_activation,
+            pullback_touch_seen_at = ?pullback_touch_seen_at,
+            pullback_reclaim_started_at = ?pullback_reclaim_started_at,
+            breakout_started_at = ?breakout_started_at,
+            invalidation_probe_seen_at = ?invalidation_probe_seen_at,
+            recovery_started_at = ?recovery_started_at,
+            stall_reason = watcher_stall_reason,
+            "workflow tactical plan cleared after watcher entry window expired"
+        );
         append_workflow_journal_event(
             "workflow_tactical_plan_cleared",
             &symbol,
             bundle.raw.ts_bucket,
             json!({
                 "trigger": &*trigger,
-                "path_id": expired_tactical_plan.path_id,
+                "path_id": &expired_tactical_plan.path_id,
+                "context_key": &expired_context_key,
                 "reason": "same_15m_window_expired",
+                "stall_reason": watcher_stall_reason,
+                "entry_plan": entry_plan_log_payload(
+                    &expired_tactical_plan.path_id,
+                    &expired_context_key,
+                    &expired_tactical_plan.entry_plan,
+                ),
+                "watcher_diagnostic": fast_watcher_plan_diagnostic_payload(
+                    watcher_diagnostic.as_ref(),
+                ),
             }),
         );
     }

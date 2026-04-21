@@ -70,8 +70,6 @@ impl OutboxDispatcher {
             .await
             .context("listen indicator bundle outbox ready")?;
 
-        self.ensure_schema().await?;
-
         let mut next_housekeeping_at =
             Instant::now() + Duration::from_secs(OUTBOX_HOUSEKEEPING_INTERVAL_SECS);
 

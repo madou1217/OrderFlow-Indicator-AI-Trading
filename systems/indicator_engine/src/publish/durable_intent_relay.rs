@@ -7,7 +7,6 @@ use serde_json::Value;
 use sqlx::postgres::PgListener;
 use sqlx::{FromRow, PgPool, QueryBuilder};
 use std::collections::HashSet;
-use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::Instant;
 use tracing::{info, warn};
@@ -56,8 +55,6 @@ impl DurableIntentRelay {
             .listen(INTENT_NOTIFY_CHANNEL)
             .await
             .context("listen indicator bundle intent ready")?;
-
-        self.ensure_schema().await?;
 
         let mut next_resync_at = Instant::now() + Duration::from_secs(RELAY_RESYNC_INTERVAL_SECS);
 

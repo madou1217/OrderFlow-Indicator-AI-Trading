@@ -1360,8 +1360,8 @@ pub async fn run(ctx: AppContext) -> Result<()> {
     > = None;
 
     let mut startup_cutover_completed = startup_replay_cutoff_bucket.is_none();
-    let relay_handle = tokio::spawn(async move { durable_intent_relay.run_loop().await });
-    let outbox_handle = tokio::spawn(async move { outbox_dispatcher.run_loop().await });
+    let mut relay_handle = tokio::spawn(async move { durable_intent_relay.run_loop().await });
+    let mut outbox_handle = tokio::spawn(async move { outbox_dispatcher.run_loop().await });
     let mut snapshot_fanout_handle: Option<JoinHandle<Result<()>>> = None;
     let mut snapshot_fanout_started = false;
     info!(
@@ -1412,6 +1412,18 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                 shutdown_requested = true;
                 shutdown_closed_minute = Some(cutoff);
                 break;
+            }
+            result = &mut relay_handle => {
+                return handle_critical_background_task_exit(
+                    "indicator durable intent relay",
+                    result,
+                );
+            }
+            result = &mut outbox_handle => {
+                return handle_critical_background_task_exit(
+                    "indicator bundle outbox dispatcher",
+                    result,
+                );
             }
             maybe_event = prepare_ingest_rx.recv(), if !ingest_channel_closed => {
                 if let Some(queued) = maybe_event {
@@ -6463,6 +6475,38 @@ async fn run_live_prepare_loop(
     }
 
     Ok(())
+}
+
+fn handle_critical_background_task_exit(
+    task_name: &'static str,
+    result: std::result::Result<Result<()>, tokio::task::JoinError>,
+) -> Result<()> {
+    match result {
+        Ok(Ok(())) => {
+            error!(
+                task = task_name,
+                "critical indicator background task exited unexpectedly"
+            );
+            anyhow::bail!("{task_name} exited unexpectedly");
+        }
+        Ok(Err(err)) => {
+            error!(
+                error = %err,
+                debug_error = ?err,
+                task = task_name,
+                "critical indicator background task failed"
+            );
+            Err(err).with_context(|| format!("{task_name} failed"))
+        }
+        Err(err) => {
+            error!(
+                error = %err,
+                task = task_name,
+                "critical indicator background task join failed"
+            );
+            Err(err).with_context(|| format!("{task_name} join failed"))
+        }
+    }
 }
 
 async fn poll_prepare_handle(handle_slot: &mut Option<JoinHandle<Result<()>>>) -> Result<()> {
