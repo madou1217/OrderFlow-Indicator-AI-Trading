@@ -34,10 +34,10 @@ use sqlx::{postgres::PgRow, PgPool, Row};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::path::Path;
-use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
-use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::sync::{mpsc, Mutex, Notify, RwLock};
 use tokio::task::JoinHandle;
 use tokio::time::{interval, Instant, MissedTickBehavior};
 use tracing::{debug, error, info, warn};
@@ -62,6 +62,7 @@ const ASYNC_HISTORICAL_MATERIALIZE_BATCH_SIZE: usize = 60;
 const OI_RATIO_PATCH_BATCH_SIZE: usize = 6;
 const OI_RATIO_PATCH_WINDOW_BUDGET_PER_TICK: usize = 24;
 const PROCESS_READY_MINUTES_WARN_MS: u128 = 2_000;
+const INITIAL_LIVE_EPOCH: u64 = 1;
 const LIVE_READY_JOB_QUEUE_CAPACITY: usize = 8;
 const LIVE_PREPARE_TASK_QUEUE_CAPACITY: usize = 8;
 const LIVE_COMPUTED_JOB_QUEUE_CAPACITY: usize = LIVE_READY_JOB_QUEUE_CAPACITY * 3;
@@ -264,7 +265,10 @@ enum ReadyJobSource {
     DirtyRecompute,
 }
 
+type LiveEpoch = u64;
+
 struct ReadyMinuteJob {
+    live_epoch: LiveEpoch,
     ts_bucket: DateTime<Utc>,
     mode: DispatchMode,
     source: ReadyJobSource,
@@ -273,6 +277,7 @@ struct ReadyMinuteJob {
 }
 
 struct ComputedMinuteJob {
+    live_epoch: LiveEpoch,
     ts_bucket: DateTime<Utc>,
     source: ReadyJobSource,
     enqueued_at: Instant,
@@ -280,6 +285,7 @@ struct ComputedMinuteJob {
 }
 
 struct PrepareMinuteTask {
+    live_epoch: LiveEpoch,
     minutes: Vec<DateTime<Utc>>,
     mode: DispatchMode,
     enqueued_at: Instant,
@@ -757,6 +763,89 @@ fn confirmed_repair_pipeline_idle(
         && dirty_ready_job_pending.load(Ordering::Acquire) == 0
 }
 
+fn state_only_rebuild_start_ready(
+    live_prepare_minute_pending: &Arc<AtomicUsize>,
+    dirty_ready_job_pending: &Arc<AtomicUsize>,
+) -> bool {
+    live_prepare_minute_pending.load(Ordering::Acquire) == 0
+        && dirty_ready_job_pending.load(Ordering::Acquire) == 0
+}
+
+fn stale_live_epoch(job_epoch: LiveEpoch, current_live_epoch: LiveEpoch) -> bool {
+    job_epoch != current_live_epoch
+}
+
+fn advance_live_epoch(
+    current_live_epoch: &AtomicU64,
+    live_epoch_advance_notify: &Notify,
+) -> LiveEpoch {
+    let next_epoch = current_live_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+    live_epoch_advance_notify.notify_waiters();
+    next_epoch
+}
+
+fn drop_stale_live_ready_job(
+    ready_job_pending: &Arc<AtomicUsize>,
+    ts_bucket: DateTime<Utc>,
+    job_epoch: LiveEpoch,
+    current_live_epoch: LiveEpoch,
+    stage: &'static str,
+) {
+    ready_job_pending.fetch_sub(1, Ordering::AcqRel);
+    info!(
+        ts_bucket = %ts_bucket,
+        job_live_epoch = job_epoch,
+        current_live_epoch = current_live_epoch,
+        stage = stage,
+        "dropping stale live minute after live epoch advanced"
+    );
+}
+
+fn drop_stale_live_pending_jobs<T, F>(
+    current_live_epoch: LiveEpoch,
+    pending: &mut BTreeMap<DateTime<Utc>, T>,
+    live_ready_job_pending: &Arc<AtomicUsize>,
+    mut live_epoch_of: F,
+) -> Vec<DateTime<Utc>>
+where
+    F: FnMut(&T) -> LiveEpoch,
+{
+    let stale_minutes = pending
+        .iter()
+        .filter_map(|(ts_bucket, job)| {
+            stale_live_epoch(live_epoch_of(job), current_live_epoch).then_some(*ts_bucket)
+        })
+        .collect::<Vec<_>>();
+    for ts_bucket in &stale_minutes {
+        let _stale_job = pending
+            .remove(ts_bucket)
+            .expect("stale live pending minute must exist");
+        live_ready_job_pending.fetch_sub(1, Ordering::AcqRel);
+    }
+    stale_minutes
+}
+
+fn log_stale_live_pending_batch(
+    stale_minutes: &[DateTime<Utc>],
+    current_live_epoch: LiveEpoch,
+    stage: &'static str,
+) {
+    if stale_minutes.is_empty() {
+        return;
+    }
+
+    let first_ts = stale_minutes.first().copied();
+    let last_ts = stale_minutes.last().copied();
+    info!(
+        stage = stage,
+        current_live_epoch = current_live_epoch,
+        dropped_minutes = stale_minutes.len(),
+        first_ts = ?first_ts,
+        last_ts = ?last_ts,
+        "dropping stale queued live minutes after live epoch advanced"
+    );
+}
+
 fn live_gap_repair_scan_end_ts(
     next_minute: DateTime<Utc>,
     latest_confirmed_closed: DateTime<Utc>,
@@ -1196,6 +1285,9 @@ pub async fn run(ctx: AppContext) -> Result<()> {
         mpsc::channel(LIVE_READY_JOB_QUEUE_CAPACITY);
     let mut live_ready_job_tx = Some(live_ready_job_tx_raw);
     let live_ready_job_pending = Arc::new(AtomicUsize::new(0));
+    let live_epoch = Arc::new(AtomicU64::new(INITIAL_LIVE_EPOCH));
+    let live_epoch_advance_notify = Arc::new(Notify::new());
+    let live_commit_gate = Arc::new(Mutex::new(()));
     let live_ready_job_rx = Arc::new(Mutex::new(live_ready_job_rx_raw));
     let (live_computed_job_tx, live_computed_job_rx) =
         mpsc::channel(LIVE_COMPUTED_JOB_QUEUE_CAPACITY);
@@ -1215,6 +1307,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
             .expect("live ready job sender must exist before prepare worker spawn")
             .clone(),
         live_ready_job_pending.clone(),
+        live_epoch.clone(),
     )));
     let mut live_materialize_handles = (0..LIVE_MATERIALIZE_WORKER_COUNT)
         .map(|_| {
@@ -1225,6 +1318,8 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                 runtime_options.clone(),
                 live_ready_job_rx.clone(),
                 live_computed_job_tx.clone(),
+                live_ready_job_pending.clone(),
+                live_epoch.clone(),
             ))
         })
         .collect::<Vec<_>>();
@@ -1242,6 +1337,9 @@ pub async fn run(ctx: AppContext) -> Result<()> {
         live_ready_job_pending.clone(),
         live_commit_initial_persisted_ts,
         live_commit_frontier_override_ts_ms.clone(),
+        live_epoch.clone(),
+        live_epoch_advance_notify.clone(),
+        live_commit_gate.clone(),
     )));
     let (dirty_ready_job_tx_raw, dirty_ready_job_rx) =
         mpsc::channel(DIRTY_READY_JOB_QUEUE_CAPACITY);
@@ -1738,6 +1836,9 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                         &state_store,
                         &mut scheduler,
                         live_commit_frontier_override_ts_ms.as_ref(),
+                        live_epoch.as_ref(),
+                        live_epoch_advance_notify.as_ref(),
+                        live_commit_gate.as_ref(),
                         &runtime_options,
                         &snapshot_path,
                         startup_checkpoint_path.as_deref(),
@@ -1819,9 +1920,8 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                     matches!(live_publish_state, LivePublishState::MutedCatchup),
                 );
 
-                let repair_pipeline_idle = confirmed_repair_pipeline_idle(
+                let state_only_rebuild_ready = state_only_rebuild_start_ready(
                     &live_prepare_minute_pending,
-                    &live_ready_job_pending,
                     &dirty_ready_job_pending,
                 );
                 let cutover_ready = live_catchup_cutover_ready(
@@ -1855,7 +1955,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
 
                 if matches!(live_publish_state, LivePublishState::MutedCatchup)
                     && cutover_ready
-                    && repair_pipeline_idle
+                    && state_only_rebuild_ready
                 {
                     if maybe_execute_live_catchup_cutover(
                         &ctx,
@@ -1865,6 +1965,9 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                         &state_store,
                         &mut scheduler,
                         live_commit_frontier_override_ts_ms.as_ref(),
+                        live_epoch.as_ref(),
+                        live_epoch_advance_notify.as_ref(),
+                        live_commit_gate.as_ref(),
                         &runtime_options,
                         &snapshot_path,
                         startup_checkpoint_path.as_deref(),
@@ -1974,6 +2077,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                         .expect("live prepare task sender must exist while runtime loop is active"),
                     &live_prepare_minute_pending,
                     &live_ready_job_pending,
+                    live_epoch.as_ref(),
                     dirty_ready_job_tx
                         .as_ref()
                         .expect("dirty ready job sender must exist while runtime loop is active"),
@@ -5058,6 +5162,9 @@ async fn maybe_execute_live_catchup_cutover(
     state_store: &Arc<Mutex<StateStore>>,
     scheduler: &mut WindowScheduler,
     live_commit_frontier_override_ts_ms: &AtomicI64,
+    current_live_epoch: &AtomicU64,
+    live_epoch_advance_notify: &Notify,
+    live_commit_gate: &Mutex<()>,
     _runtime_options: &IndicatorRuntimeOptions,
     snapshot_path: &str,
     startup_checkpoint_path: Option<&str>,
@@ -5079,11 +5186,7 @@ async fn maybe_execute_live_catchup_cutover(
         );
         return Ok(None);
     }
-    if !confirmed_repair_pipeline_idle(
-        live_prepare_minute_pending,
-        live_ready_job_pending,
-        dirty_ready_job_pending,
-    ) {
+    if !state_only_rebuild_start_ready(live_prepare_minute_pending, dirty_ready_job_pending) {
         return Ok(None);
     }
 
@@ -5148,6 +5251,17 @@ async fn maybe_execute_live_catchup_cutover(
         );
         return Ok(None);
     };
+
+    let _live_commit_gate = live_commit_gate.lock().await;
+    let next_live_epoch = advance_live_epoch(current_live_epoch, live_epoch_advance_notify);
+    info!(
+        repair_start_ts = %repair_start_ts,
+        repair_ready_through_ts = %repair_ready_through_ts,
+        latest_confirmed_closed = %latest_confirmed_closed,
+        live_ready_pending = live_ready_job_pending.load(Ordering::Acquire),
+        live_epoch = next_live_epoch,
+        "advanced live job epoch for live catch-up cutover; stale live jobs will be dropped"
+    );
 
     supplement_cache.clear().await;
     let (rebuilt_minutes, pending_historical_range, repair_snapshot) = {
@@ -5221,6 +5335,9 @@ async fn maybe_execute_confirmed_repair_replay(
     state_store: &Arc<Mutex<StateStore>>,
     scheduler: &mut WindowScheduler,
     live_commit_frontier_override_ts_ms: &AtomicI64,
+    current_live_epoch: &AtomicU64,
+    live_epoch_advance_notify: &Notify,
+    live_commit_gate: &Mutex<()>,
     _runtime_options: &IndicatorRuntimeOptions,
     snapshot_path: &str,
     startup_checkpoint_path: Option<&str>,
@@ -5238,11 +5355,7 @@ async fn maybe_execute_confirmed_repair_replay(
     let live_prepare_pending = live_prepare_minute_pending.load(Ordering::Acquire);
     let live_ready_pending = live_ready_job_pending.load(Ordering::Acquire);
     let dirty_ready_pending = dirty_ready_job_pending.load(Ordering::Acquire);
-    if !confirmed_repair_pipeline_idle(
-        live_prepare_minute_pending,
-        live_ready_job_pending,
-        dirty_ready_job_pending,
-    ) {
+    if !state_only_rebuild_start_ready(live_prepare_minute_pending, dirty_ready_job_pending) {
         if repair_controller.should_log_deferred() {
             info!(
                 repair_start_ts = %repair_start_ts,
@@ -5250,7 +5363,7 @@ async fn maybe_execute_confirmed_repair_replay(
                 live_prepare_pending,
                 live_ready_pending,
                 dirty_ready_pending,
-                "confirmed late canonical correction is waiting for the live pipeline to drain before state rebuild"
+                "confirmed late canonical correction is waiting for live prepare/dirty work to drain before state rebuild"
             );
         }
         return Ok(None);
@@ -5273,6 +5386,17 @@ async fn maybe_execute_confirmed_repair_replay(
         }
         return Ok(None);
     };
+
+    let _live_commit_gate = live_commit_gate.lock().await;
+    let next_live_epoch = advance_live_epoch(current_live_epoch, live_epoch_advance_notify);
+    info!(
+        repair_start_ts = %repair_start_ts,
+        repair_ready_through_ts = %repair_ready_through_ts,
+        latest_confirmed_closed = %latest_confirmed_closed,
+        live_ready_pending = live_ready_pending,
+        live_epoch = next_live_epoch,
+        "advanced live job epoch for confirmed repair; stale live jobs will be dropped"
+    );
 
     abort_oi_ratio_patch_task_shared(oi_ratio_patch_task, state_store, "confirmed_repair_replay")
         .await;
@@ -6004,6 +6128,8 @@ async fn run_live_materialize_compute_loop(
     runtime_options: IndicatorRuntimeOptions,
     ready_job_rx: Arc<Mutex<mpsc::Receiver<ReadyMinuteJob>>>,
     computed_job_tx: mpsc::Sender<ComputedMinuteJob>,
+    ready_job_pending: Arc<AtomicUsize>,
+    current_live_epoch: Arc<AtomicU64>,
 ) -> Result<()> {
     loop {
         let job = {
@@ -6013,6 +6139,17 @@ async fn run_live_materialize_compute_loop(
         let Some(job) = job else {
             break;
         };
+        let observed_live_epoch = current_live_epoch.load(Ordering::Acquire);
+        if stale_live_epoch(job.live_epoch, observed_live_epoch) {
+            drop_stale_live_ready_job(
+                &ready_job_pending,
+                job.ts_bucket,
+                job.live_epoch,
+                observed_live_epoch,
+                "compute_dequeue",
+            );
+            continue;
+        }
         let artifacts = compute_window_bundle_artifacts(
             &ctx,
             dispatcher.as_ref(),
@@ -6022,8 +6159,20 @@ async fn run_live_materialize_compute_loop(
             job.mode,
         )
         .await?;
+        let observed_live_epoch = current_live_epoch.load(Ordering::Acquire);
+        if stale_live_epoch(job.live_epoch, observed_live_epoch) {
+            drop_stale_live_ready_job(
+                &ready_job_pending,
+                job.ts_bucket,
+                job.live_epoch,
+                observed_live_epoch,
+                "compute_complete",
+            );
+            continue;
+        }
         computed_job_tx
             .send(ComputedMinuteJob {
+                live_epoch: job.live_epoch,
                 ts_bucket: job.ts_bucket,
                 source: job.source,
                 enqueued_at: job.enqueued_at,
@@ -6043,12 +6192,40 @@ async fn run_live_ordered_commit_loop(
     live_ready_job_pending: Arc<AtomicUsize>,
     initial_last_persisted_ts: Option<DateTime<Utc>>,
     live_commit_frontier_override_ts_ms: Arc<AtomicI64>,
+    current_live_epoch: Arc<AtomicU64>,
+    live_epoch_advance_notify: Arc<Notify>,
+    live_commit_gate: Arc<Mutex<()>>,
 ) -> Result<()> {
     let mut next_commit_ts = initial_last_persisted_ts.map(|ts| ts + ChronoDuration::minutes(1));
     let mut pending = BTreeMap::<DateTime<Utc>, ComputedMinuteJob>::new();
+    let mut computed_channel_open = true;
 
-    while let Some(job) = computed_job_rx.recv().await {
-        pending.insert(job.ts_bucket, job);
+    while computed_channel_open {
+        tokio::select! {
+            maybe_job = computed_job_rx.recv(), if computed_channel_open => {
+                match maybe_job {
+                    Some(job) => {
+                        let observed_live_epoch = current_live_epoch.load(Ordering::Acquire);
+                        if stale_live_epoch(job.live_epoch, observed_live_epoch) {
+                            drop_stale_live_ready_job(
+                                &live_ready_job_pending,
+                                job.ts_bucket,
+                                job.live_epoch,
+                                observed_live_epoch,
+                                "commit_receive",
+                            );
+                        } else {
+                            pending.insert(job.ts_bucket, job);
+                        }
+                    }
+                    None => {
+                        computed_channel_open = false;
+                    }
+                }
+            }
+            _ = live_epoch_advance_notify.notified() => {}
+        }
+
         commit_live_jobs_in_order(
             &metrics,
             dispatcher.as_ref(),
@@ -6056,6 +6233,8 @@ async fn run_live_ordered_commit_loop(
             &mut next_commit_ts,
             &mut pending,
             live_commit_frontier_override_ts_ms.as_ref(),
+            current_live_epoch.as_ref(),
+            live_commit_gate.as_ref(),
         )
         .await?;
     }
@@ -6067,6 +6246,8 @@ async fn run_live_ordered_commit_loop(
         &mut next_commit_ts,
         &mut pending,
         live_commit_frontier_override_ts_ms.as_ref(),
+        current_live_epoch.as_ref(),
+        live_commit_gate.as_ref(),
     )
     .await?;
     if !pending.is_empty() {
@@ -6086,7 +6267,22 @@ async fn commit_live_jobs_in_order(
     next_commit_ts: &mut Option<DateTime<Utc>>,
     pending: &mut BTreeMap<DateTime<Utc>, ComputedMinuteJob>,
     live_commit_frontier_override_ts_ms: &AtomicI64,
+    current_live_epoch: &AtomicU64,
+    live_commit_gate: &Mutex<()>,
 ) -> Result<()> {
+    let observed_live_epoch = current_live_epoch.load(Ordering::Acquire);
+    let dropped_stale_minutes = drop_stale_live_pending_jobs(
+        observed_live_epoch,
+        pending,
+        live_ready_job_pending,
+        |job| job.live_epoch,
+    );
+    log_stale_live_pending_batch(
+        &dropped_stale_minutes,
+        observed_live_epoch,
+        "commit_pending",
+    );
+
     *next_commit_ts = resolved_live_commit_next_ts(
         *next_commit_ts,
         pending.keys().next().copied(),
@@ -6107,6 +6303,18 @@ async fn commit_live_jobs_in_order(
         let Some(job) = pending.remove(&expected_ts) else {
             break;
         };
+        let _live_commit_gate = live_commit_gate.lock().await;
+        let observed_live_epoch = current_live_epoch.load(Ordering::Acquire);
+        if stale_live_epoch(job.live_epoch, observed_live_epoch) {
+            drop_stale_live_ready_job(
+                live_ready_job_pending,
+                expected_ts,
+                job.live_epoch,
+                observed_live_epoch,
+                "commit_gate",
+            );
+            continue;
+        }
         let mode = job.artifacts.mode;
         let snapshots = dispatcher.persist_window_artifacts(job.artifacts).await?;
         live_ready_job_pending.fetch_sub(1, Ordering::AcqRel);
@@ -6130,8 +6338,25 @@ async fn run_live_prepare_loop(
     prepare_minute_pending: Arc<AtomicUsize>,
     ready_job_tx: mpsc::Sender<ReadyMinuteJob>,
     ready_job_pending: Arc<AtomicUsize>,
+    current_live_epoch: Arc<AtomicU64>,
 ) -> Result<()> {
     while let Some(task) = prepare_task_rx.recv().await {
+        let observed_live_epoch = current_live_epoch.load(Ordering::Acquire);
+        if stale_live_epoch(task.live_epoch, observed_live_epoch) {
+            prepare_minute_pending.fetch_sub(task.minutes.len(), Ordering::AcqRel);
+            let first_minute = task.minutes.first().copied();
+            let last_minute = task.minutes.last().copied();
+            info!(
+                task_live_epoch = task.live_epoch,
+                current_live_epoch = observed_live_epoch,
+                first_minute = ?first_minute,
+                last_minute = ?last_minute,
+                dropped_minutes = task.minutes.len(),
+                "dropping stale live prepare task after live epoch advanced"
+            );
+            continue;
+        }
+
         let first_minute = task.minutes.first().copied();
         let last_minute = task.minutes.last().copied();
         let fetched_rows = if let (Some(first_minute), Some(last_minute)) =
@@ -6203,6 +6428,7 @@ async fn run_live_prepare_loop(
                 }
                 let bundle = state_store.finalize_minute_for_live_job(*minute);
                 prepared_jobs.push(ReadyMinuteJob {
+                    live_epoch: task.live_epoch,
                     ts_bucket: *minute,
                     mode: task.mode,
                     source: ReadyJobSource::Live,
@@ -6589,6 +6815,7 @@ async fn enqueue_live_ready_jobs(
     live_prepare_task_tx: &mpsc::Sender<PrepareMinuteTask>,
     live_prepare_minute_pending: &Arc<AtomicUsize>,
     live_ready_job_pending: &Arc<AtomicUsize>,
+    current_live_epoch: &AtomicU64,
     _dirty_ready_job_tx: &mpsc::Sender<ReadyMinuteJob>,
     dirty_ready_job_pending: &Arc<AtomicUsize>,
     ready_through_ts: DateTime<Utc>,
@@ -6647,10 +6874,12 @@ async fn enqueue_live_ready_jobs(
                 state_store.mark_historical_materialization_pending(first_ready, last_ready);
             }
         } else {
+            let live_epoch = current_live_epoch.load(Ordering::Acquire);
             let enqueued = try_enqueue_prepare_minute_task(
                 live_prepare_task_tx,
                 live_prepare_minute_pending,
                 PrepareMinuteTask {
+                    live_epoch,
                     minutes: ready_minutes.clone(),
                     mode: dispatch_mode,
                     enqueued_at: Instant::now(),
@@ -9657,10 +9886,10 @@ mod tests {
         allow_oi_ratio_patch_processing, build_backfill_sql, build_paged_backfill_sql,
         build_paged_backfill_sql_internal, configured_live_catchup_enter_lag_minutes,
         configured_live_catchup_resume_lag_minutes, confirmed_repair_pipeline_idle,
-        effective_live_commit_frontier_ts, expand_startup_backfill_to_minimum_recovery_window,
-        find_long_null_price_run, handle_ingest_event,
-        hydrate_futures_orderbook_heatmaps_for_range_with_fetch, live_catchup_cutover_ready,
-        live_catchup_requested, live_tail_reconcile_start_ts,
+        drop_stale_live_pending_jobs, effective_live_commit_frontier_ts,
+        expand_startup_backfill_to_minimum_recovery_window, find_long_null_price_run,
+        handle_ingest_event, hydrate_futures_orderbook_heatmaps_for_range_with_fetch,
+        live_catchup_cutover_ready, live_catchup_requested, live_tail_reconcile_start_ts,
         minimum_live_catchup_cutover_tail_minutes, minimum_startup_recovery_history_floor,
         minute_exclusive_upper_bound, minute_history_is_strictly_contiguous,
         replay_heatmap_hydration_batch_end, replay_row_after_cursor,
@@ -9671,15 +9900,15 @@ mod tests {
         snapshot_is_reusable_recovery_seed, snapshot_null_price_run_reaches_recent_tail,
         stale_live_pending_minutes, startup_backfill_checkpoint_path,
         startup_checkpoint_canonical_replay_start_ts,
-        startup_state_only_recovery_can_skip_warm_history, sync_frontiers_after_state_only_rebuild,
-        try_load_startup_backfill_checkpoint, try_load_state_snapshot, BackfillCursor,
-        ConfirmedLateRepairController, KlineSupplementCacheEntry, LiveCanonicalRepairController,
-        ReplayRow, SnapshotLoadOutcome, StartupBackfillCheckpoint, StartupBackfillProgress,
-        FUNDING_BACKFILL_WINDOW_SQL, LIQ_BACKFILL_WINDOW_SQL,
-        LIVE_CANONICAL_TAIL_RECONCILE_LOOKBACK_MINUTES, MIN_RESTART_RECOVERY_HISTORY_MINUTES,
-        MIN_REUSABLE_FINALIZED_HISTORY_MINUTES, ORDERBOOK_BACKFILL_WINDOW_SQL_SCALAR,
-        ORDERBOOK_BACKFILL_WINDOW_SQL_WITH_HEATMAP, STARTUP_BACKFILL_CHECKPOINT_VERSION,
-        TRADE_BACKFILL_WINDOW_SQL,
+        startup_state_only_recovery_can_skip_warm_history, state_only_rebuild_start_ready,
+        sync_frontiers_after_state_only_rebuild, try_load_startup_backfill_checkpoint,
+        try_load_state_snapshot, BackfillCursor, ConfirmedLateRepairController,
+        KlineSupplementCacheEntry, LiveCanonicalRepairController, ReplayRow, SnapshotLoadOutcome,
+        StartupBackfillCheckpoint, StartupBackfillProgress, FUNDING_BACKFILL_WINDOW_SQL,
+        LIQ_BACKFILL_WINDOW_SQL, LIVE_CANONICAL_TAIL_RECONCILE_LOOKBACK_MINUTES,
+        MIN_RESTART_RECOVERY_HISTORY_MINUTES, MIN_REUSABLE_FINALIZED_HISTORY_MINUTES,
+        ORDERBOOK_BACKFILL_WINDOW_SQL_SCALAR, ORDERBOOK_BACKFILL_WINDOW_SQL_WITH_HEATMAP,
+        STARTUP_BACKFILL_CHECKPOINT_VERSION, TRADE_BACKFILL_WINDOW_SQL,
     };
     use crate::app::bootstrap::{
         AppSection, DatabaseConfig, IndicatorConfig, MqConfig, MqExchangeConfig, MqExchanges,
@@ -10847,6 +11076,50 @@ mod tests {
             &live_ready,
             &dirty_ready
         ));
+    }
+
+    #[test]
+    fn state_only_rebuild_start_ready_ignores_live_ready_backlog() {
+        let live_prepare = Arc::new(AtomicUsize::new(0));
+        let dirty_ready = Arc::new(AtomicUsize::new(0));
+
+        assert!(state_only_rebuild_start_ready(&live_prepare, &dirty_ready));
+
+        live_prepare.store(1, Ordering::Release);
+        assert!(!state_only_rebuild_start_ready(&live_prepare, &dirty_ready));
+        live_prepare.store(0, Ordering::Release);
+        dirty_ready.store(1, Ordering::Release);
+        assert!(!state_only_rebuild_start_ready(&live_prepare, &dirty_ready));
+    }
+
+    #[test]
+    fn drop_stale_live_pending_jobs_removes_only_old_epochs() {
+        let minute_10 = Utc
+            .with_ymd_and_hms(2026, 4, 13, 8, 10, 0)
+            .single()
+            .unwrap();
+        let minute_11 = Utc
+            .with_ymd_and_hms(2026, 4, 13, 8, 11, 0)
+            .single()
+            .unwrap();
+        let minute_12 = Utc
+            .with_ymd_and_hms(2026, 4, 13, 8, 12, 0)
+            .single()
+            .unwrap();
+        let mut pending = BTreeMap::new();
+        pending.insert(minute_10, 1u64);
+        pending.insert(minute_11, 2u64);
+        pending.insert(minute_12, 1u64);
+        let live_ready_job_pending = Arc::new(AtomicUsize::new(pending.len()));
+
+        let dropped =
+            drop_stale_live_pending_jobs(2, &mut pending, &live_ready_job_pending, |job_epoch| {
+                *job_epoch
+            });
+
+        assert_eq!(dropped, vec![minute_10, minute_12]);
+        assert_eq!(pending, BTreeMap::from([(minute_11, 2u64)]));
+        assert_eq!(live_ready_job_pending.load(Ordering::Acquire), 1);
     }
 
     #[test]
