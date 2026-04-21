@@ -671,7 +671,7 @@ fn resolved_live_commit_next_ts(
 
     let candidate_next_ts = frontier_override_ts + ChronoDuration::minutes(1);
     let can_advance = pending_first_ts
-        .map(|pending_first_ts| pending_first_ts >= candidate_next_ts)
+        .map(|pending_first_ts| pending_first_ts >= frontier_override_ts)
         .unwrap_or(true);
     if can_advance {
         next_commit_ts = Some(
@@ -10647,6 +10647,31 @@ mod tests {
                 Some(repair_ready_through),
             ),
             Some(first_pending_live)
+        );
+    }
+
+    #[test]
+    fn resolved_live_commit_next_ts_skips_stale_frontier_pending_after_state_only_repair() {
+        let current_next = Utc
+            .with_ymd_and_hms(2026, 4, 13, 8, 43, 0)
+            .single()
+            .unwrap();
+        let repair_ready_through = Utc
+            .with_ymd_and_hms(2026, 4, 13, 8, 54, 0)
+            .single()
+            .unwrap();
+        let stale_pending_frontier_minute = Utc
+            .with_ymd_and_hms(2026, 4, 13, 8, 54, 0)
+            .single()
+            .unwrap();
+
+        assert_eq!(
+            resolved_live_commit_next_ts(
+                Some(current_next),
+                Some(stale_pending_frontier_minute),
+                Some(repair_ready_through),
+            ),
+            Some(repair_ready_through + ChronoDuration::minutes(1))
         );
     }
 
