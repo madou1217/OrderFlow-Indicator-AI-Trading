@@ -44,13 +44,3 @@ sudo service orderflow-llm restart
 sudo journalctl -u orderflow-llm -f
 ```
 
-运行 API：
-
-```bash
-cd /home/tools/codex-proxy
-npm run build
-sudo service orderflow-api start
-sudo service orderflow-api stop
-sudo service orderflow-api restart
-sudo journalctl -u orderflow-api -f
-```
