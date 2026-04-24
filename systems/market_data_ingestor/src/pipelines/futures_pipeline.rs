@@ -37,7 +37,8 @@ use tokio::time::{Duration, Instant, MissedTickBehavior};
 use tokio_tungstenite::tungstenite::protocol::Message;
 use tracing::{debug, error, info, warn};
 
-const FUTURES_WS_BASE: &str = "wss://fstream.binance.com";
+const FUTURES_PUBLIC_WS_BASE: &str = "wss://fstream.binance.com/public";
+const FUTURES_MARKET_WS_BASE: &str = "wss://fstream.binance.com/market";
 const REST_PAGE_LIMIT: u16 = 1000;
 const KLINE_INTERVALS: [&str; 5] = ["1m", "15m", "1h", "4h", "1d"];
 const WS_KEEPALIVE_PING_SECS: u64 = 20;
@@ -61,6 +62,32 @@ const BACKFILL_KLINE_THROTTLE: BackfillThrottleConfig = BackfillThrottleConfig {
     queue_low_watermark: 4_000,
 };
 const KLINE_STARTUP_BOOTSTRAP_BARS: i64 = 32;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FuturesWsGroup {
+    Public,
+    Market,
+}
+
+impl FuturesWsGroup {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Public => "public",
+            Self::Market => "market",
+        }
+    }
+
+    fn base_url(self) -> &'static str {
+        match self {
+            Self::Public => FUTURES_PUBLIC_WS_BASE,
+            Self::Market => FUTURES_MARKET_WS_BASE,
+        }
+    }
+
+    fn needs_reconnect_reconcile(self) -> bool {
+        matches!(self, Self::Market)
+    }
+}
 
 #[derive(Debug, Clone)]
 struct KlineGapReplayJob {
@@ -310,11 +337,11 @@ pub async fn run(
     metrics: Arc<AppMetrics>,
 ) -> Result<()> {
     let symbol = ctx.config.market_data.symbol.clone();
-    let streams = futures_streams::required_streams(&symbol);
+    let public_streams = futures_streams::public_streams(&symbol);
+    let market_streams = futures_streams::market_streams(&symbol);
     let mut gap_detector = GapDetector::default();
     let kline_3d_aggregator = Arc::new(Mutex::new(Kline3dAggregator::default()));
     let mut last_closed_kline_open_ms: HashMap<String, i64> = HashMap::new();
-    let mut reconnect_attempt: u32 = 0;
     let trade_gapfill_inflight = Arc::new(AtomicBool::new(false));
     let reconnect_reconcile_inflight = Arc::new(AtomicBool::new(false));
     let (kline_gap_tx, mut kline_gap_rx) =
@@ -399,11 +426,81 @@ pub async fn run(
         Arc::clone(&metrics),
     );
 
+    let gap_detector = Arc::new(Mutex::new(gap_detector));
+    let public_loop = run_ws_group(
+        FuturesWsGroup::Public,
+        public_streams,
+        ctx.clone(),
+        rest_client.clone(),
+        publisher.clone(),
+        outbox_writer.clone(),
+        db_writer.clone(),
+        ops_writer.clone(),
+        metrics.clone(),
+        persist_queue.clone(),
+        gap_detector.clone(),
+        trade_gapfill_inflight.clone(),
+        reconnect_reconcile_inflight.clone(),
+        kline_3d_aggregator.clone(),
+        kline_gap_tx.clone(),
+        None,
+    );
+    let market_loop = run_ws_group(
+        FuturesWsGroup::Market,
+        market_streams,
+        ctx,
+        rest_client,
+        publisher,
+        outbox_writer,
+        db_writer,
+        ops_writer,
+        metrics,
+        persist_queue,
+        gap_detector,
+        trade_gapfill_inflight,
+        reconnect_reconcile_inflight,
+        kline_3d_aggregator,
+        kline_gap_tx,
+        Some(last_closed_kline_open_ms),
+    );
+
+    let (_public, _market) = tokio::try_join!(public_loop, market_loop)?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_ws_group(
+    group: FuturesWsGroup,
+    streams: Vec<String>,
+    ctx: Arc<AppContext>,
+    rest_client: Arc<BinanceRestClient>,
+    publisher: Arc<MqPublisher>,
+    outbox_writer: Arc<OutboxWriter>,
+    db_writer: Arc<MdDbWriter>,
+    ops_writer: Arc<OpsDbWriter>,
+    metrics: Arc<AppMetrics>,
+    persist_queue: AsyncPersistQueue,
+    gap_detector: Arc<Mutex<GapDetector>>,
+    trade_gapfill_inflight: Arc<AtomicBool>,
+    reconnect_reconcile_inflight: Arc<AtomicBool>,
+    kline_3d_aggregator: Arc<Mutex<Kline3dAggregator>>,
+    kline_gap_tx: mpsc::Sender<KlineGapReplayJob>,
+    mut last_closed_kline_open_ms: Option<HashMap<String, i64>>,
+) -> Result<()> {
+    let symbol = ctx.config.market_data.symbol.clone();
+    let mut reconnect_attempt: u32 = 0;
+
     loop {
-        info!(market = "futures", ?streams, "connecting futures websocket");
+        info!(
+            market = "futures",
+            ws_group = group.label(),
+            ?streams,
+            base_url = group.base_url(),
+            "connecting futures websocket"
+        );
         let was_reconnect = reconnect_attempt > 0;
         let mut ws =
-            match connect_combined_stream(FUTURES_WS_BASE, &streams, ctx.ws_proxy_url.as_deref())
+            match connect_combined_stream(group.base_url(), &streams, ctx.ws_proxy_url.as_deref())
                 .await
             {
                 Ok(ws) => {
@@ -411,7 +508,12 @@ pub async fn run(
                     ws
                 }
                 Err(err) => {
-                    error!(error = %err, "futures websocket connect failed, retrying");
+                    error!(
+                        error = %err,
+                        market = "futures",
+                        ws_group = group.label(),
+                        "futures websocket connect failed, retrying"
+                    );
                     let sleep_for = reconnect::next_backoff(reconnect_attempt);
                     reconnect_attempt = reconnect_attempt.saturating_add(1);
                     tokio::time::sleep(sleep_for).await;
@@ -419,11 +521,21 @@ pub async fn run(
                 }
             };
 
-        info!(market = "futures", "futures websocket connected");
+        info!(
+            market = "futures",
+            ws_group = group.label(),
+            "futures websocket connected"
+        );
 
-        if was_reconnect {
-            let last_trade_agg_id = gap_detector.last_trade_agg_id("futures", &symbol);
-            let kline_state_snapshot = last_closed_kline_open_ms.clone();
+        if was_reconnect && group.needs_reconnect_reconcile() {
+            let last_trade_agg_id = {
+                let detector = gap_detector.lock().await;
+                detector.last_trade_agg_id("futures", &symbol)
+            };
+            let kline_state_snapshot = last_closed_kline_open_ms
+                .as_ref()
+                .cloned()
+                .unwrap_or_default();
             let kline_state_count = kline_state_snapshot.len();
             let kline_3d_snapshot = {
                 let aggregator = kline_3d_aggregator.lock().await;
@@ -446,6 +558,7 @@ pub async fn run(
                     let started_at = Instant::now();
                     info!(
                         market = "futures",
+                        ws_group = FuturesWsGroup::Market.label(),
                         last_trade_agg_id = last_trade_agg_id,
                         kline_state_count = kline_state_count,
                         "starting background reconnect reconcile"
@@ -467,6 +580,7 @@ pub async fn run(
                         Ok(()) => {
                             info!(
                                 market = "futures",
+                                ws_group = FuturesWsGroup::Market.label(),
                                 elapsed_ms = started_at.elapsed().as_millis(),
                                 "background reconnect reconcile completed"
                             );
@@ -475,6 +589,7 @@ pub async fn run(
                             warn!(
                                 error = %err,
                                 market = "futures",
+                                ws_group = FuturesWsGroup::Market.label(),
                                 elapsed_ms = started_at.elapsed().as_millis(),
                                 "background reconnect reconcile failed"
                             );
@@ -485,6 +600,7 @@ pub async fn run(
             } else {
                 warn!(
                     market = "futures",
+                    ws_group = group.label(),
                     "background reconnect reconcile already running, skip new schedule"
                 );
             }
@@ -526,6 +642,7 @@ pub async fn run(
                     {
                         warn!(
                             market = "futures",
+                            ws_group = group.label(),
                             ws_read_per_sec = ws_read_per_sec,
                             ws_drop_per_sec = ws_drop_per_sec,
                             ws_source_lag_per_sec = ws_source_lag_per_sec,
@@ -548,16 +665,26 @@ pub async fn run(
                 _ = ping_interval.tick() => {
                     if let Err(err) = ws.send(Message::Ping(Vec::new().into())).await {
                         reconnect_reason = "keepalive_ping_failed";
-                        warn!(error = %err, market = "futures", "futures websocket keepalive ping failed");
+                        warn!(
+                            error = %err,
+                            market = "futures",
+                            ws_group = group.label(),
+                            "futures websocket keepalive ping failed"
+                        );
                         break;
                     }
-                    debug!(market = "futures", "futures websocket keepalive ping sent");
+                    debug!(
+                        market = "futures",
+                        ws_group = group.label(),
+                        "futures websocket keepalive ping sent"
+                    );
 
                     let idle = last_recv_at.elapsed();
                     if idle >= Duration::from_secs(WS_IDLE_TIMEOUT_SECS) {
                         reconnect_reason = "idle_timeout";
                         warn!(
                             market = "futures",
+                            ws_group = group.label(),
                             idle_secs = idle.as_secs(),
                             timeout_secs = WS_IDLE_TIMEOUT_SECS,
                             "futures websocket idle timeout reached, reconnecting"
@@ -568,7 +695,11 @@ pub async fn run(
                 frame = ws.next() => {
                     let Some(frame) = frame else {
                         reconnect_reason = "stream_ended";
-                        warn!(market = "futures", "futures websocket stream ended");
+                        warn!(
+                            market = "futures",
+                            ws_group = group.label(),
+                            "futures websocket stream ended"
+                        );
                         break;
                     };
 
@@ -584,138 +715,174 @@ pub async fn run(
                                     ws_drop_total = ws_drop_total.saturating_add(1);
                                     ws_drop_per_sec = ws_drop_per_sec.saturating_add(1);
                                     ws_drop_decode_per_sec = ws_drop_decode_per_sec.saturating_add(1);
-                                    warn!(error = %err, "futures decode message failed");
-                            continue;
-                        }
-                    };
+                                    warn!(
+                                        error = %err,
+                                        market = "futures",
+                                        ws_group = group.label(),
+                                        "futures decode message failed"
+                                    );
+                                    continue;
+                                }
+                            };
 
-                    let event = match normalize::normalize_ws_event(
-                        Market::Futures,
-                        &combined.stream,
-                        &combined.data,
-                    ) {
-                        Ok(Some(event)) => event,
-                        Ok(None) => continue,
-                        Err(err) => {
-                            metrics.inc_normalize_error();
-                            ws_drop_total = ws_drop_total.saturating_add(1);
-                            ws_drop_per_sec = ws_drop_per_sec.saturating_add(1);
-                            ws_drop_normalize_per_sec =
-                                ws_drop_normalize_per_sec.saturating_add(1);
-                            warn!(error = %err, stream = %combined.stream, "futures normalize failed");
-                            continue;
-                        }
-                    };
+                            let event = match normalize::normalize_ws_event(
+                                Market::Futures,
+                                &combined.stream,
+                                &combined.data,
+                            ) {
+                                Ok(Some(event)) => event,
+                                Ok(None) => continue,
+                                Err(err) => {
+                                    metrics.inc_normalize_error();
+                                    ws_drop_total = ws_drop_total.saturating_add(1);
+                                    ws_drop_per_sec = ws_drop_per_sec.saturating_add(1);
+                                    ws_drop_normalize_per_sec =
+                                        ws_drop_normalize_per_sec.saturating_add(1);
+                                    warn!(
+                                        error = %err,
+                                        stream = %combined.stream,
+                                        market = "futures",
+                                        ws_group = group.label(),
+                                        "futures normalize failed"
+                                    );
+                                    continue;
+                                }
+                            };
 
-                    let source_lag_secs = (Utc::now() - event.event_ts).num_seconds();
-                    let observation =
-                        source_lag_tracker.observe(source_lag_secs, event.backfill_in_progress);
-                    let force_reconnect_after_event = observation.force_reconnect;
-                    if observation.source_lag_secs > SOURCE_LAG_WARN_SECS {
-                        ws_source_lag_per_sec = ws_source_lag_per_sec.saturating_add(1);
-                    }
-                    if observation.log_stale {
-                        warn!(
-                            market = %event.market,
-                            symbol = %event.symbol,
-                            msg_type = %event.msg_type,
-                            stream_name = %event.stream_name,
-                            source_kind = %event.source_kind,
-                            source_lag_secs = observation.source_lag_secs,
-                            stale_source_streak = observation.stale_source_streak,
-                            stale_source_seen = observation.stale_source_seen,
-                            stale_for_ms = observation.stale_duration_ms,
-                            event_ts = %event.event_ts,
-                            now_ts = %Utc::now(),
-                            "source lag before persist"
-                        );
-                    }
-                    if observation.force_reconnect {
-                        warn!(
-                            market = %event.market,
-                            symbol = %event.symbol,
-                            source_lag_secs = observation.source_lag_secs,
-                            stale_source_streak = observation.stale_source_streak,
-                            stale_source_seen = observation.stale_source_seen,
-                            stale_for_ms = observation.stale_duration_ms,
-                            force_reconnect_after_secs = SOURCE_LAG_FORCE_RECONNECT_SECS,
-                            force_reconnect_after_dwell_secs = SOURCE_LAG_FORCE_RECONNECT_DWELL_SECS,
-                            "stale ws source detected, schedule reconnect after current event persistence"
-                        );
-                    } else if observation.log_recovered {
-                        info!(
-                            market = %event.market,
-                            symbol = %event.symbol,
-                            recovered_source_lag_secs = observation.source_lag_secs,
-                            stale_source_streak = observation.stale_source_streak,
-                            stale_source_seen = observation.stale_source_seen,
-                            stale_for_ms = observation.stale_duration_ms,
-                            "ws source lag recovered"
-                        );
-                    }
+                            let source_lag_secs = (Utc::now() - event.event_ts).num_seconds();
+                            let observation =
+                                source_lag_tracker.observe(source_lag_secs, event.backfill_in_progress);
+                            let force_reconnect_after_event = observation.force_reconnect;
+                            if observation.source_lag_secs > SOURCE_LAG_WARN_SECS {
+                                ws_source_lag_per_sec = ws_source_lag_per_sec.saturating_add(1);
+                            }
+                            if observation.log_stale {
+                                warn!(
+                                    market = %event.market,
+                                    ws_group = group.label(),
+                                    symbol = %event.symbol,
+                                    msg_type = %event.msg_type,
+                                    stream_name = %event.stream_name,
+                                    source_kind = %event.source_kind,
+                                    source_lag_secs = observation.source_lag_secs,
+                                    stale_source_streak = observation.stale_source_streak,
+                                    stale_source_seen = observation.stale_source_seen,
+                                    stale_for_ms = observation.stale_duration_ms,
+                                    event_ts = %event.event_ts,
+                                    now_ts = %Utc::now(),
+                                    "source lag before persist"
+                                );
+                            }
+                            if observation.force_reconnect {
+                                warn!(
+                                    market = %event.market,
+                                    ws_group = group.label(),
+                                    symbol = %event.symbol,
+                                    source_lag_secs = observation.source_lag_secs,
+                                    stale_source_streak = observation.stale_source_streak,
+                                    stale_source_seen = observation.stale_source_seen,
+                                    stale_for_ms = observation.stale_duration_ms,
+                                    force_reconnect_after_secs = SOURCE_LAG_FORCE_RECONNECT_SECS,
+                                    force_reconnect_after_dwell_secs = SOURCE_LAG_FORCE_RECONNECT_DWELL_SECS,
+                                    "stale ws source detected, schedule reconnect after current event persistence"
+                                );
+                            } else if observation.log_recovered {
+                                info!(
+                                    market = %event.market,
+                                    ws_group = group.label(),
+                                    symbol = %event.symbol,
+                                    recovered_source_lag_secs = observation.source_lag_secs,
+                                    stale_source_streak = observation.stale_source_streak,
+                                    stale_source_seen = observation.stale_source_seen,
+                                    stale_for_ms = observation.stale_duration_ms,
+                                    "ws source lag recovered"
+                                );
+                            }
 
-                    handle_trade_gap(
-                        &event,
-                        &mut gap_detector,
-                        &rest_client,
-                        &db_writer,
-                        &publisher,
-                        &outbox_writer,
-                        &ops_writer,
-                        &metrics,
-                        &trade_gapfill_inflight,
-                    )
-                    .await;
+                            {
+                                let mut detector = gap_detector.lock().await;
+                                handle_trade_gap(
+                                    &event,
+                                    &mut detector,
+                                    &rest_client,
+                                    &db_writer,
+                                    &publisher,
+                                    &outbox_writer,
+                                    &ops_writer,
+                                    &metrics,
+                                    &trade_gapfill_inflight,
+                                );
+                                handle_depth_gap(&event, &mut detector, &ops_writer);
+                            }
 
-                    handle_depth_gap(&event, &mut gap_detector, &ops_writer).await;
+                            if let Some(last_closed_kline_open_ms) =
+                                last_closed_kline_open_ms.as_mut()
+                            {
+                                handle_kline_gap(
+                                    &event,
+                                    last_closed_kline_open_ms,
+                                    &kline_3d_aggregator,
+                                    &kline_gap_tx,
+                                    &db_writer,
+                                    &publisher,
+                                    &outbox_writer,
+                                    &ops_writer,
+                                    &metrics,
+                                )
+                                .await;
+                            }
 
-                    handle_kline_gap(
-                        &event,
-                        &mut last_closed_kline_open_ms,
-                        &kline_3d_aggregator,
-                        &kline_gap_tx,
-                        &db_writer,
-                        &publisher,
-                        &outbox_writer,
-                        &ops_writer,
-                        &metrics,
-                    )
-                    .await;
+                            maybe_mirror_raw_orderbook_to_outbox(
+                                &event,
+                                &publisher,
+                                &outbox_writer,
+                                &metrics,
+                                "futures",
+                            )
+                            .await;
 
-                    maybe_mirror_raw_orderbook_to_outbox(
-                        &event,
-                        &publisher,
-                        &outbox_writer,
-                        &metrics,
-                        "futures",
-                    )
-                    .await;
-
-                    mirror_raw_event_to_cold_store(&event);
-                    for queued in ws_preagg.ingest_raw_event(event) {
-                        enqueue_persist_event(&persist_queue, "futures", queued).await;
-                    }
-                    if force_reconnect_after_event {
-                        reconnect_reason = "stale_source_force_reconnect";
-                        break;
-                    }
+                            mirror_raw_event_to_cold_store(&event);
+                            for queued in ws_preagg.ingest_raw_event(event) {
+                                enqueue_persist_event(&persist_queue, "futures", queued).await;
+                            }
+                            if force_reconnect_after_event {
+                                reconnect_reason = "stale_source_force_reconnect";
+                                break;
+                            }
                         }
                         Ok(Message::Ping(payload)) => {
                             last_recv_at = Instant::now();
                             if let Err(err) = ws.send(Message::Pong(payload)).await {
-                                warn!(error = %err, "futures pong failed");
+                                warn!(
+                                    error = %err,
+                                    market = "futures",
+                                    ws_group = group.label(),
+                                    "futures pong failed"
+                                );
                                 break;
                             }
-                            debug!(market = "futures", "futures websocket pong sent");
+                            debug!(
+                                market = "futures",
+                                ws_group = group.label(),
+                                "futures websocket pong sent"
+                            );
                         }
                         Ok(Message::Pong(_)) => {
                             last_recv_at = Instant::now();
-                            debug!(market = "futures", "futures websocket pong received");
+                            debug!(
+                                market = "futures",
+                                ws_group = group.label(),
+                                "futures websocket pong received"
+                            );
                         }
                         Ok(msg) if is_terminal_message(&msg) => {
                             last_recv_at = Instant::now();
                             reconnect_reason = "server_close_frame";
-                            warn!(market = "futures", "futures websocket closed by server");
+                            warn!(
+                                market = "futures",
+                                ws_group = group.label(),
+                                "futures websocket closed by server"
+                            );
                             break;
                         }
                         Ok(_) => {
@@ -731,6 +898,7 @@ pub async fn run(
                                 || err_text.contains("close_notify");
                             warn!(
                                 market = "futures",
+                                ws_group = group.label(),
                                 proxy_enabled = ctx.ws_proxy_url.is_some(),
                                 reconnect_attempt = reconnect_attempt,
                                 idle_secs = last_recv_at.elapsed().as_secs(),
@@ -755,6 +923,7 @@ pub async fn run(
         let sleep_for = reconnect::next_backoff(reconnect_attempt);
         info!(
             market = "futures",
+            ws_group = group.label(),
             reconnect_reason = reconnect_reason,
             ws_read_total = ws_read_total,
             ws_drop_total = ws_drop_total,
@@ -768,7 +937,7 @@ pub async fn run(
     }
 }
 
-async fn handle_trade_gap(
+fn handle_trade_gap(
     event: &NormalizedMdEvent,
     gap_detector: &mut GapDetector,
     rest_client: &Arc<BinanceRestClient>,
@@ -947,7 +1116,7 @@ async fn replay_trade_gap(
     Ok(())
 }
 
-async fn handle_depth_gap(
+fn handle_depth_gap(
     event: &NormalizedMdEvent,
     gap_detector: &mut GapDetector,
     ops_writer: &Arc<OpsDbWriter>,
