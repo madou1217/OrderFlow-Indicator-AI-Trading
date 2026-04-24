@@ -4,7 +4,7 @@ use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use futures_util::StreamExt;
 use hmac::{Hmac, Mac};
-use reqwest::Client;
+use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::Sha256;
@@ -23,6 +23,9 @@ const ACCOUNT_WS_RECONNECT_DELAY_SECS: u64 = 3;
 const ACCOUNT_WS_LOG_VALUE_PREVIEW_CHARS: usize = 240;
 const ACCOUNT_WS_BALANCE_SUMMARY_LIMIT: usize = 4;
 const ACCOUNT_WS_POSITION_SUMMARY_LIMIT: usize = 4;
+const BINANCE_SIGNED_GET_MAX_ATTEMPTS: usize = 3;
+const BINANCE_SIGNED_GET_RETRY_INITIAL_DELAY_MS: u64 = 250;
+const BINANCE_SIGNED_GET_RETRY_MAX_DELAY_MS: u64 = 1_000;
 const POST_ONLY_MAKER_REPRICE_RETRY_COUNT: usize = 3;
 static ACCOUNT_WS_LISTENER_STARTED: AtomicBool = AtomicBool::new(false);
 static ACCOUNT_WS_STATE: OnceLock<Arc<Mutex<AccountWsState>>> = OnceLock::new();
@@ -3907,27 +3910,93 @@ async fn signed_get_json<T: for<'de> Deserialize<'de>>(
     path: &str,
     params: Vec<(String, String)>,
 ) -> Result<T> {
-    let url = signed_url(api_config, exec_config, path, params)?;
-    let response = http_client
-        .get(&url)
-        .header("X-MBX-APIKEY", api_config.resolved_api_key())
-        .send()
-        .await
-        .with_context(|| format!("binance signed GET {} failed", path))?;
-    let status = response.status();
-    if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        return Err(anyhow!(
-            "binance {} failed status={} body={}",
-            path,
-            status,
-            body
-        ));
+    let api_key = api_config.resolved_api_key();
+    let mut attempt = 1;
+    let mut retry_delay = Duration::from_millis(BINANCE_SIGNED_GET_RETRY_INITIAL_DELAY_MS);
+    loop {
+        let url = signed_url(api_config, exec_config, path, params.clone())?;
+        let response = match http_client
+            .get(&url)
+            .header("X-MBX-APIKEY", api_key.as_str())
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(err) => {
+                if attempt < BINANCE_SIGNED_GET_MAX_ATTEMPTS
+                    && is_retryable_binance_get_transport_error(&err)
+                {
+                    warn!(
+                        path = %path,
+                        attempt = attempt,
+                        max_attempts = BINANCE_SIGNED_GET_MAX_ATTEMPTS,
+                        retry_delay_ms = retry_delay.as_millis(),
+                        error = %err,
+                        "binance signed GET failed with retryable transport error; retrying"
+                    );
+                    sleep(retry_delay).await;
+                    attempt += 1;
+                    retry_delay = next_binance_signed_get_retry_delay(retry_delay);
+                    continue;
+                }
+                return Err(err).with_context(|| format!("binance signed GET {} failed", path));
+            }
+        };
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            if attempt < BINANCE_SIGNED_GET_MAX_ATTEMPTS && is_retryable_binance_get_status(status)
+            {
+                warn!(
+                    path = %path,
+                    status = %status,
+                    attempt = attempt,
+                    max_attempts = BINANCE_SIGNED_GET_MAX_ATTEMPTS,
+                    retry_delay_ms = retry_delay.as_millis(),
+                    body_preview = %preview_for_log(&body, ACCOUNT_WS_LOG_VALUE_PREVIEW_CHARS),
+                    "binance signed GET returned retryable status; retrying"
+                );
+                sleep(retry_delay).await;
+                attempt += 1;
+                retry_delay = next_binance_signed_get_retry_delay(retry_delay);
+                continue;
+            }
+            return Err(anyhow!(
+                "binance {} failed status={} body={}",
+                path,
+                status,
+                body
+            ));
+        }
+        return response
+            .json()
+            .await
+            .with_context(|| format!("decode binance {} response", path));
     }
-    response
-        .json()
-        .await
-        .with_context(|| format!("decode binance {} response", path))
+}
+
+fn is_retryable_binance_get_transport_error(err: &reqwest::Error) -> bool {
+    err.is_timeout() || err.is_connect() || err.is_request() || err.is_body()
+}
+
+fn is_retryable_binance_get_status(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::REQUEST_TIMEOUT
+            | StatusCode::BAD_GATEWAY
+            | StatusCode::SERVICE_UNAVAILABLE
+            | StatusCode::GATEWAY_TIMEOUT
+    ) || status.is_server_error()
+}
+
+fn next_binance_signed_get_retry_delay(current: Duration) -> Duration {
+    let doubled_ms = current.as_millis().saturating_mul(2);
+    let capped_ms = doubled_ms.min(u128::from(BINANCE_SIGNED_GET_RETRY_MAX_DELAY_MS));
+    Duration::from_millis(capped_ms as u64)
+}
+
+fn preview_for_log(value: &str, max_chars: usize) -> String {
+    value.chars().take(max_chars).collect()
 }
 
 async fn signed_delete_json<T: for<'de> Deserialize<'de>>(
@@ -5463,6 +5532,38 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(formatted, vec!["0.15", "0.10", "0.10", "0.10"]);
+    }
+
+    #[test]
+    fn binance_signed_get_retry_status_policy_only_retries_transient_failures() {
+        assert!(is_retryable_binance_get_status(StatusCode::REQUEST_TIMEOUT));
+        assert!(is_retryable_binance_get_status(StatusCode::BAD_GATEWAY));
+        assert!(is_retryable_binance_get_status(
+            StatusCode::INTERNAL_SERVER_ERROR
+        ));
+        assert!(!is_retryable_binance_get_status(StatusCode::BAD_REQUEST));
+        assert!(!is_retryable_binance_get_status(StatusCode::UNAUTHORIZED));
+        assert!(!is_retryable_binance_get_status(
+            StatusCode::TOO_MANY_REQUESTS
+        ));
+    }
+
+    #[test]
+    fn binance_signed_get_retry_delay_doubles_until_cap() {
+        let first = Duration::from_millis(BINANCE_SIGNED_GET_RETRY_INITIAL_DELAY_MS);
+
+        assert_eq!(
+            next_binance_signed_get_retry_delay(first),
+            Duration::from_millis(500)
+        );
+        assert_eq!(
+            next_binance_signed_get_retry_delay(Duration::from_millis(800)),
+            Duration::from_millis(BINANCE_SIGNED_GET_RETRY_MAX_DELAY_MS)
+        );
+        assert_eq!(
+            next_binance_signed_get_retry_delay(Duration::from_millis(1_000)),
+            Duration::from_millis(BINANCE_SIGNED_GET_RETRY_MAX_DELAY_MS)
+        );
     }
 
     #[test]
