@@ -1608,6 +1608,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                                 && live_repair_controller.has_deferred_gap(blocked_minute)
                             {
                                 scheduler.mark_emitted_through(blocked_minute);
+                                live_publish_state = LivePublishState::MutedCatchup;
                                 warn!(
                                     reason = "live_gap_repair",
                                     blocked_minute = %blocked_minute,
@@ -1693,6 +1694,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                                                 next_minute_before_repairs,
                                                 blocked_minute,
                                             );
+                                            live_publish_state = LivePublishState::MutedCatchup;
                                             warn!(
                                                 reason = "live_gap_repair",
                                                 blocked_minute = %blocked_minute,
@@ -1719,6 +1721,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                                             next_minute_before_repairs,
                                             blocked_minute,
                                         );
+                                        live_publish_state = LivePublishState::MutedCatchup;
                                         warn!(
                                             error = %err,
                                             reason = "live_gap_repair",
