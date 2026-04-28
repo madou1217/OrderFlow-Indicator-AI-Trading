@@ -1,7 +1,7 @@
 use crate::app::config::{BinanceApiConfig, LlmExecutionConfig};
 use crate::execution::intent_adapter::{AdaptedExecutionIntent, AdaptedManagementAction};
 use anyhow::{anyhow, Context, Result};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
 use hmac::{Hmac, Mac};
 use reqwest::{Client, StatusCode};
@@ -26,6 +26,8 @@ const ACCOUNT_WS_POSITION_SUMMARY_LIMIT: usize = 4;
 const BINANCE_SIGNED_GET_MAX_ATTEMPTS: usize = 3;
 const BINANCE_SIGNED_GET_RETRY_INITIAL_DELAY_MS: u64 = 250;
 const BINANCE_SIGNED_GET_RETRY_MAX_DELAY_MS: u64 = 1_000;
+const BINANCE_ORDER_REALIZED_PNL_MAX_ATTEMPTS: usize = 5;
+const BINANCE_ORDER_REALIZED_PNL_RETRY_DELAY_MS: u64 = 300;
 const POST_ONLY_MAKER_REPRICE_RETRY_COUNT: usize = 3;
 static ACCOUNT_WS_LISTENER_STARTED: AtomicBool = AtomicBool::new(false);
 static ACCOUNT_WS_STATE: OnceLock<Arc<Mutex<AccountWsState>>> = OnceLock::new();
@@ -168,6 +170,13 @@ pub struct ManagementExecutionReport {
     pub modify_take_profit_order_ids: Vec<i64>,
     pub modify_stop_loss_order_ids: Vec<i64>,
     pub realized_pnl_usdt: f64,
+    pub realized_pnl_fetch_errors: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RealizedPnlLookup {
+    pub realized_pnl_usdt: f64,
+    pub trade_count: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1629,6 +1638,7 @@ pub async fn execute_workflow_management_action(
         modify_take_profit_order_ids: Vec::new(),
         modify_stop_loss_order_ids: Vec::new(),
         realized_pnl_usdt: 0.0,
+        realized_pnl_fetch_errors: Vec::new(),
     };
 
     match action.action_type.as_str() {
@@ -1653,22 +1663,6 @@ pub async fn execute_workflow_management_action(
                 &cancel_candidates,
             )
             .await?;
-            if let Some(execution_price) = action.execution_price {
-                for position in matching_positions {
-                    let close_order_id = place_workflow_exit_for_position(
-                        http_client,
-                        api_config,
-                        exec_config,
-                        symbol,
-                        position,
-                        ExitKind::StopLoss,
-                        execution_price,
-                    )
-                    .await?;
-                    report.close_order_ids.push(close_order_id);
-                }
-                return Ok(report);
-            }
             let symbol_filters = fetch_symbol_filters(http_client, api_config, symbol).await?;
             for position in matching_positions {
                 let close_qty =
@@ -1694,7 +1688,7 @@ pub async fn execute_workflow_management_action(
                 )
                 .await?;
                 report.close_order_ids.push(close_order_id);
-                if let Ok(pnl) = fetch_order_realized_pnl(
+                match fetch_order_realized_pnl(
                     http_client,
                     api_config,
                     exec_config,
@@ -1703,7 +1697,10 @@ pub async fn execute_workflow_management_action(
                 )
                 .await
                 {
-                    report.realized_pnl_usdt += pnl;
+                    Ok(pnl) => report.realized_pnl_usdt += pnl,
+                    Err(err) => report
+                        .realized_pnl_fetch_errors
+                        .push(format!("order_id={close_order_id}: {err:#}")),
                 }
             }
             Ok(report)
@@ -1766,7 +1763,7 @@ pub async fn execute_workflow_management_action(
                 )
                 .await?;
                 report.reduce_order_ids.push(reduce_order_id);
-                if let Ok(pnl) = fetch_order_realized_pnl(
+                match fetch_order_realized_pnl(
                     http_client,
                     api_config,
                     exec_config,
@@ -1775,7 +1772,10 @@ pub async fn execute_workflow_management_action(
                 )
                 .await
                 {
-                    report.realized_pnl_usdt += pnl;
+                    Ok(pnl) => report.realized_pnl_usdt += pnl,
+                    Err(err) => report
+                        .realized_pnl_fetch_errors
+                        .push(format!("order_id={reduce_order_id}: {err:#}")),
                 }
             }
 
@@ -3815,21 +3815,80 @@ async fn fetch_order_realized_pnl(
     symbol: &str,
     order_id: i64,
 ) -> Result<f64> {
+    for attempt in 1..=BINANCE_ORDER_REALIZED_PNL_MAX_ATTEMPTS {
+        let rows: Vec<FuturesUserTradeRow> = signed_get_json(
+            http_client,
+            api_config,
+            exec_config,
+            "/fapi/v1/userTrades",
+            vec![
+                ("symbol".to_string(), symbol.to_string()),
+                ("orderId".to_string(), order_id.to_string()),
+            ],
+        )
+        .await?;
+        if !rows.is_empty() {
+            return Ok(rows.iter().map(FuturesUserTradeRow::realized_pnl).sum());
+        }
+        if attempt < BINANCE_ORDER_REALIZED_PNL_MAX_ATTEMPTS {
+            sleep(Duration::from_millis(
+                BINANCE_ORDER_REALIZED_PNL_RETRY_DELAY_MS,
+            ))
+            .await;
+        }
+    }
+    Err(anyhow!(
+        "no userTrades rows returned for {} order_id={} after {} attempts",
+        symbol,
+        order_id,
+        BINANCE_ORDER_REALIZED_PNL_MAX_ATTEMPTS
+    ))
+}
+
+pub async fn fetch_symbol_realized_pnl_since(
+    http_client: &Client,
+    api_config: &BinanceApiConfig,
+    exec_config: &LlmExecutionConfig,
+    symbol: &str,
+    start_time: DateTime<Utc>,
+    end_time: DateTime<Utc>,
+    position_side: Option<&str>,
+) -> Result<RealizedPnlLookup> {
+    let mut params = vec![
+        ("symbol".to_string(), symbol.to_string()),
+        (
+            "startTime".to_string(),
+            start_time.timestamp_millis().to_string(),
+        ),
+        (
+            "endTime".to_string(),
+            end_time.timestamp_millis().to_string(),
+        ),
+        ("limit".to_string(), "1000".to_string()),
+    ];
+    params.retain(|(_, value)| !value.trim().is_empty());
     let rows: Vec<FuturesUserTradeRow> = signed_get_json(
         http_client,
         api_config,
         exec_config,
         "/fapi/v1/userTrades",
-        vec![
-            ("symbol".to_string(), symbol.to_string()),
-            ("orderId".to_string(), order_id.to_string()),
-        ],
+        params,
     )
     .await?;
-    Ok(rows
-        .iter()
-        .map(|row| row.realized_pnl.parse::<f64>().unwrap_or(0.0))
-        .sum())
+    let rows = rows
+        .into_iter()
+        .filter(|row| {
+            position_side.map_or(true, |side| {
+                row.position_side.trim().is_empty()
+                    || row.position_side.eq_ignore_ascii_case("BOTH")
+                    || row.position_side.eq_ignore_ascii_case(side)
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(RealizedPnlLookup {
+        realized_pnl_usdt: rows.iter().map(FuturesUserTradeRow::realized_pnl).sum(),
+        trade_count: rows.len(),
+    })
 }
 
 async fn fetch_open_algo_orders(
@@ -4240,7 +4299,15 @@ struct FuturesOpenOrderRow {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct FuturesUserTradeRow {
+    #[serde(default)]
+    position_side: String,
     realized_pnl: String,
+}
+
+impl FuturesUserTradeRow {
+    fn realized_pnl(&self) -> f64 {
+        self.realized_pnl.parse::<f64>().unwrap_or(0.0)
+    }
 }
 
 #[derive(Debug, Clone, Copy)]

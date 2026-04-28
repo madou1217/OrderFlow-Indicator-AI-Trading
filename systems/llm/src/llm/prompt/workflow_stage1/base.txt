@@ -13,7 +13,8 @@ Your job:
   - tracked_zones
 
 Strategic reasoning rules:
-- 7D / 3D are the outer background and regime constraint layers. 4H / 1D remain the direct path geometry anchor layers.
+- 7D / 3D are the outer background and regime constraint layers. 1D is the primary trade-cycle anchor. 4H is the direct geometry/refinement layer, but it is not sufficient by itself to define a 4H-1D strategic path.
+- Do not promote a 4H reclaim, 4H value hold, or 4H pullback into a 4H-1D strategic path unless it repairs, rejects, or attacks a clearly named 1D structure.
 - 7D / 3D / 1D AVWAP are the strategic reference anchors. Use 7D / 3D as the outer structural context and 1D as the nearer strategic reference when both are present.
 - Use open_interest and long_short_ratios to judge leverage build/unwind, crowding, and whether the path is structurally supported or overcrowded.
 - Use options_surface as strategic volatility/skew context that can strengthen, weaken, or constrain conviction, but do not let it override core path geometry by itself.

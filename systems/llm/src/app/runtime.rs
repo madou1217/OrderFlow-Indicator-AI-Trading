@@ -5,9 +5,9 @@ use crate::app::x::XOperator;
 use crate::execution::binance::{
     cancel_workflow_pending_entry_orders, cleanup_orphan_exit_orders_for_symbol,
     ensure_account_trading_ws_started, execute_workflow_execution_intent,
-    execute_workflow_management_action, fetch_symbol_trading_state,
-    fetch_symbol_trading_state_for_fast_path, ActivePositionSnapshot, ExecutionReport,
-    ManagementExecutionReport, OpenOrderSnapshot,
+    execute_workflow_management_action, fetch_symbol_realized_pnl_since,
+    fetch_symbol_trading_state, fetch_symbol_trading_state_for_fast_path, ActivePositionSnapshot,
+    ExecutionReport, ManagementExecutionReport, OpenOrderSnapshot,
     TradeExecutionBlockedByCurrentPriceBeyondStopLoss, TradingStateSnapshot,
 };
 use crate::execution::intent_adapter::{adapt_execution_intent, adapt_management_action};
@@ -1844,6 +1844,41 @@ fn workflow_entry_context_key(symbol: &str, side: &str, path_id: &str) -> String
     )
 }
 
+fn workflow_entry_attempt_context_key(
+    symbol: &str,
+    side: &str,
+    path_id: &str,
+    event_ts: DateTime<Utc>,
+    attempt_ts: DateTime<Utc>,
+) -> String {
+    let event_ns = timestamp_nanos_for_context(event_ts);
+    let attempt_ns = timestamp_nanos_for_context(attempt_ts);
+    format!(
+        "{}:entry_{}_{}",
+        workflow_entry_context_key(symbol, side, path_id),
+        event_ns,
+        attempt_ns
+    )
+}
+
+fn timestamp_nanos_for_context(ts: DateTime<Utc>) -> i64 {
+    ts.timestamp_nanos_opt()
+        .unwrap_or_else(|| ts.timestamp_micros().saturating_mul(1_000))
+}
+
+fn entry_snapshot_exists_for_path(
+    entry_snapshots: &HashMap<String, crate::workflow::schema::EntrySnapshot>,
+    symbol: &str,
+    side: &str,
+    path_id: &str,
+) -> bool {
+    entry_snapshots.values().any(|snapshot| {
+        snapshot.symbol.eq_ignore_ascii_case(symbol)
+            && snapshot.side.eq_ignore_ascii_case(side)
+            && snapshot.path_id == path_id
+    })
+}
+
 fn activation_or_entry_zone<'a>(
     plan: &'a crate::workflow::schema::EntryPlan,
 ) -> &'a crate::workflow::schema::PriceZone {
@@ -2112,8 +2147,7 @@ fn fast_entry_selection_block_reason(
     if workflow_state.filled_stopout_attempts >= max_filled_stopout_attempts {
         return Some("max_filled_stopout_attempts_reached");
     }
-    let context_key = workflow_entry_context_key(symbol, side, &tactical_plan.path_id);
-    if entry_snapshots.contains_key(&context_key) {
+    if entry_snapshot_exists_for_path(entry_snapshots, symbol, side, &tactical_plan.path_id) {
         return Some("entry_snapshot_exists");
     }
     None
@@ -2383,8 +2417,12 @@ fn select_fast_entry_plan<'a>(
         return None;
     }
     let candidate = &tactical_plan.entry_plan;
-    let context_key = workflow_entry_context_key(symbol, &candidate.side, &tactical_plan.path_id);
-    if entry_snapshots.contains_key(&context_key) {
+    if entry_snapshot_exists_for_path(
+        entry_snapshots,
+        symbol,
+        &candidate.side,
+        &tactical_plan.path_id,
+    ) {
         return None;
     }
     Some(SelectedEntryPlan {
@@ -2406,7 +2444,12 @@ async fn process_fast_market_event_for_plan(
     trading_state: &TradingStateSnapshot,
     event: &FastPriceEvent,
 ) -> Result<()> {
-    if entry_snapshots.contains_key(context_key) {
+    if entry_snapshot_exists_for_path(
+        entry_snapshots,
+        symbol,
+        &tactical_plan.entry_plan.side,
+        &tactical_plan.path_id,
+    ) {
         fast_plan_state.fired = true;
         record_fast_watcher_plan_diagnostic(fast_plan_state, event);
         return Ok(());
@@ -2517,6 +2560,13 @@ async fn process_fast_market_event_for_plan(
         return Ok(());
     };
 
+    let attempt_context_key = workflow_entry_attempt_context_key(
+        symbol,
+        &selected_entry_plan.plan.side,
+        &tactical_plan.path_id,
+        event.event_ts,
+        Utc::now(),
+    );
     let intent = execution_intent_from_entry_plan(
         symbol,
         &tactical_plan.path_id,
@@ -2527,6 +2577,7 @@ async fn process_fast_market_event_for_plan(
             .as_ref(),
         selected_entry_plan.trigger_price,
         ctx.config.llm.workflow.watcher.entry_ttl_minutes,
+        &attempt_context_key,
         None,
     );
     info!(
@@ -2557,9 +2608,10 @@ async fn process_fast_market_event_for_plan(
             "routing_key": &event.routing_key,
             "entry_plan": entry_plan_log_payload(
                 &tactical_plan.path_id,
-                context_key,
+                &intent.entry_snapshot.context_key,
                 selected_entry_plan.plan,
             ),
+            "plan_context_key": context_key,
             "execution_intent": {
                 "side": &intent.side,
                 "intent_mode": &intent.intent_mode,
@@ -2731,6 +2783,32 @@ async fn process_fast_position_management_actions(
     event: &FastPriceEvent,
 ) -> Result<bool> {
     let mut state_dirty = false;
+    let stale_context_keys = stale_position_management_context_keys(workflow_state, trading_state);
+    for context_key in stale_context_keys {
+        let path_id = workflow_state
+            .approved_position_management_plans
+            .get(&context_key)
+            .map(|plan| plan.path_id.clone())
+            .unwrap_or_else(|| "unknown".to_string());
+        if reconcile_flat_position_management_context(
+            &ctx.binance_http_client,
+            &ctx.config.api.binance,
+            &ctx.config.llm.execution,
+            symbol,
+            state_dir,
+            workflow_state,
+            entry_snapshots,
+            &context_key,
+            &path_id,
+            "watcher_fast_consumer",
+            event.event_ts,
+        )
+        .await?
+        {
+            state_dirty = true;
+        }
+    }
+
     let plan_context_keys = workflow_state
         .approved_position_management_plans
         .keys()
@@ -2906,6 +2984,7 @@ async fn process_fast_position_management_actions(
                             Some(&bracket_template),
                             watch_facts.current_price,
                             ctx.config.llm.workflow.watcher.entry_ttl_minutes,
+                            &snapshot.context_key,
                             action
                                 .add_ratio
                                 .map(|ratio| active_position.position_amt.abs() * ratio),
@@ -3109,6 +3188,7 @@ async fn process_fast_position_management_actions(
                                             "modify_take_profit_order_ids": report.modify_take_profit_order_ids,
                                             "modify_stop_loss_order_ids": report.modify_stop_loss_order_ids,
                                             "realized_pnl_usdt": report.realized_pnl_usdt,
+                                            "realized_pnl_fetch_errors": report.realized_pnl_fetch_errors,
                                         },
                                     }),
                                 );
@@ -3814,13 +3894,14 @@ async fn process_fast_pending_order_management_actions(
 }
 
 fn execution_intent_from_entry_plan(
-    symbol: &str,
+    _symbol: &str,
     path_id: &str,
     plan: &crate::workflow::schema::EntryPlan,
     current_path: &crate::workflow::schema::CurrentPath,
     bracket_override: Option<&crate::workflow::schema::PostFillBracketTemplate>,
     trigger_price: f64,
     ttl_minutes: u64,
+    context_key: &str,
     quantity_override: Option<f64>,
 ) -> crate::workflow::schema::ExecutionIntent {
     let take_profit_1 = bracket_override
@@ -3854,7 +3935,7 @@ fn execution_intent_from_entry_plan(
         max_drift_pct: plan.max_drift_pct,
         path_id: path_id.to_string(),
         entry_snapshot: crate::workflow::schema::EntrySnapshotRef {
-            context_key: workflow_entry_context_key(symbol, &plan.side, path_id),
+            context_key: context_key.to_string(),
             path_id: path_id.to_string(),
         },
         reason: Some(entry_plan_reason(plan)),
@@ -4087,6 +4168,7 @@ fn build_stage2c_replace_execution_intent(
         Some(&bracket_template),
         watch_price,
         ttl_minutes,
+        &snapshot.context_key,
         None,
     );
     intent.reason = Some(action.reason.clone());
@@ -4269,6 +4351,74 @@ fn workflow_side_from_context_key(context_key: &str) -> Option<&'static str> {
     }
 }
 
+async fn reconcile_realized_pnl_for_entry_snapshot(
+    http_client: &Client,
+    api_config: &crate::app::config::BinanceApiConfig,
+    exec_config: &crate::app::config::LlmExecutionConfig,
+    symbol: &str,
+    snapshot: Option<&crate::workflow::schema::EntrySnapshot>,
+    context_key: &str,
+    path_id: &str,
+    trigger: &str,
+    ts_bucket: DateTime<Utc>,
+) -> Value {
+    let Some(snapshot) = snapshot else {
+        return Value::Null;
+    };
+
+    match fetch_symbol_realized_pnl_since(
+        http_client,
+        api_config,
+        exec_config,
+        symbol,
+        snapshot.created_at,
+        Utc::now(),
+        Some(&snapshot.side),
+    )
+    .await
+    {
+        Ok(lookup) => {
+            append_workflow_journal_event(
+                "workflow_realized_pnl_reconciled",
+                symbol,
+                ts_bucket,
+                json!({
+                    "trigger": trigger,
+                    "context_key": context_key,
+                    "path_id": path_id,
+                    "side": &snapshot.side,
+                    "snapshot_created_at": snapshot.created_at,
+                    "realized_pnl_usdt": lookup.realized_pnl_usdt,
+                    "trade_count": lookup.trade_count,
+                }),
+            );
+            json!({
+                "realized_pnl_usdt": lookup.realized_pnl_usdt,
+                "trade_count": lookup.trade_count,
+            })
+        }
+        Err(err) => {
+            let error = format!("{err:#}");
+            append_workflow_journal_event(
+                "workflow_realized_pnl_reconcile_error",
+                symbol,
+                ts_bucket,
+                json!({
+                    "trigger": trigger,
+                    "context_key": context_key,
+                    "path_id": path_id,
+                    "side": &snapshot.side,
+                    "snapshot_created_at": snapshot.created_at,
+                    "error": &error,
+                }),
+            );
+            json!({
+                "error": error,
+            })
+        }
+    }
+}
+
 async fn reconcile_missing_position_management_snapshot(
     http_client: &Client,
     api_config: &crate::app::config::BinanceApiConfig,
@@ -4364,6 +4514,20 @@ async fn reconcile_flat_position_management_context(
         return Ok(false);
     }
 
+    let snapshot_for_pnl = entry_snapshots.get(context_key).cloned();
+    let realized_pnl_reconciliation = reconcile_realized_pnl_for_entry_snapshot(
+        http_client,
+        api_config,
+        exec_config,
+        symbol,
+        snapshot_for_pnl.as_ref(),
+        context_key,
+        path_id,
+        trigger,
+        ts_bucket,
+    )
+    .await;
+
     remove_position_management_plan(workflow_state, context_key);
     if entry_snapshots.remove(context_key).is_some() {
         crate::workflow::persistence::delete_entry_snapshot(state_dir, symbol, context_key)?;
@@ -4394,6 +4558,7 @@ async fn reconcile_flat_position_management_context(
             "side": side,
             "refreshed_active_position_count": refreshed_state.active_positions.len(),
             "refreshed_open_order_count": refreshed_state.open_orders.len(),
+            "realized_pnl_reconciliation": realized_pnl_reconciliation,
         }),
     );
     Ok(true)
@@ -4458,6 +4623,30 @@ async fn cleanup_stale_position_management_state_on_startup(
     }
 
     for context_key in stale_context_keys {
+        let cleanup_ts = Utc::now();
+        let snapshot_for_pnl = entry_snapshots.get(&context_key).cloned();
+        let path_id = workflow_state
+            .approved_position_management_plans
+            .get(&context_key)
+            .map(|plan| plan.path_id.clone())
+            .or_else(|| {
+                snapshot_for_pnl
+                    .as_ref()
+                    .map(|snapshot| snapshot.path_id.clone())
+            })
+            .unwrap_or_else(|| "unknown".to_string());
+        let realized_pnl_reconciliation = reconcile_realized_pnl_for_entry_snapshot(
+            http_client,
+            api_config,
+            exec_config,
+            symbol,
+            snapshot_for_pnl.as_ref(),
+            &context_key,
+            &path_id,
+            "startup_stale_position_cleanup",
+            cleanup_ts,
+        )
+        .await;
         remove_position_management_plan(&mut workflow_state, &context_key);
         if entry_snapshots.remove(&context_key).is_some() {
             crate::workflow::persistence::delete_entry_snapshot(state_dir, symbol, &context_key)?;
@@ -4466,6 +4655,20 @@ async fn cleanup_stale_position_management_state_on_startup(
         if workflow_state.last_filled_context_key.as_deref() == Some(context_key.as_str()) {
             workflow_state.last_filled_context_key = None;
         }
+        append_workflow_journal_event(
+            "workflow_stage2b_management_plan_removed",
+            symbol,
+            cleanup_ts,
+            json!({
+                "trigger": "startup_stale_position_cleanup",
+                "context_key": &context_key,
+                "path_id": path_id,
+                "reason": "startup_refresh_confirmed_flat",
+                "refreshed_active_position_count": trading_state.active_positions.len(),
+                "refreshed_open_order_count": trading_state.open_orders.len(),
+                "realized_pnl_reconciliation": realized_pnl_reconciliation,
+            }),
+        );
         result.removed_context_keys.push(context_key);
     }
 
@@ -4668,7 +4871,7 @@ async fn handle_fast_market_event(
         }
     });
     let approved_plan_before_fast_review = workflow_state.approved_tactical_plan.clone();
-    if maybe_record_stopout_and_cleanup(
+    if let Some(stopout_snapshot) = maybe_record_stopout_and_cleanup(
         &mut workflow_state,
         approved_plan_before_fast_review.as_ref(),
         &symbol,
@@ -4678,6 +4881,18 @@ async fn handle_fast_market_event(
         &state_dir,
     )? {
         crate::workflow::persistence::save_workflow_state(&state_dir, &workflow_state)?;
+        let _ = reconcile_realized_pnl_for_entry_snapshot(
+            &ctx.binance_http_client,
+            &ctx.config.api.binance,
+            &ctx.config.llm.execution,
+            &symbol,
+            Some(&stopout_snapshot),
+            &stopout_snapshot.context_key,
+            &stopout_snapshot.path_id,
+            "watcher_fast_consumer_stopout_cleanup",
+            event.event_ts,
+        )
+        .await;
     }
     let watch_facts = fast_watcher_price_facts(event.price);
     let stage1_replay_attempt = maybe_replay_stage1_path_boundary_window(
@@ -4839,7 +5054,12 @@ async fn handle_fast_market_event(
         return Ok(());
     }
 
-    if entry_snapshots.contains_key(&context_key) {
+    if entry_snapshot_exists_for_path(
+        &entry_snapshots,
+        &symbol,
+        &tactical_plan.entry_plan.side,
+        &tactical_plan.path_id,
+    ) {
         fast_plan_state.fired = true;
         return Ok(());
     }
@@ -5503,26 +5723,31 @@ fn maybe_record_stopout_and_cleanup(
     latest_price: f64,
     entry_snapshots: &mut HashMap<String, crate::workflow::schema::EntrySnapshot>,
     state_dir: &str,
-) -> Result<bool> {
+) -> Result<Option<crate::workflow::schema::EntrySnapshot>> {
     let Some(tactical_plan) = approved_tactical_plan else {
-        return Ok(false);
+        return Ok(None);
     };
     let Some(last_context_key) = workflow_state.last_filled_context_key.clone() else {
-        return Ok(false);
+        return Ok(None);
     };
     let watched_plan = &tactical_plan.entry_plan;
-    let expected_context_key =
-        workflow_entry_context_key(symbol, &watched_plan.side, &tactical_plan.path_id);
-    if expected_context_key != last_context_key {
-        return Ok(false);
+    let Some(last_snapshot) = entry_snapshots.get(&last_context_key) else {
+        return Ok(None);
+    };
+    if !last_snapshot.symbol.eq_ignore_ascii_case(symbol)
+        || !last_snapshot.side.eq_ignore_ascii_case(&watched_plan.side)
+        || last_snapshot.path_id != tactical_plan.path_id
+    {
+        return Ok(None);
     }
     if has_active_position_for_side(trading_state, &watched_plan.side) {
-        return Ok(false);
+        return Ok(None);
     }
     if !stop_loss_hit(watched_plan, latest_price) {
-        return Ok(false);
+        return Ok(None);
     }
 
+    let stopout_snapshot = last_snapshot.clone();
     workflow_state.filled_stopout_attempts = workflow_state
         .filled_stopout_attempts
         .saturating_add(1)
@@ -5531,7 +5756,7 @@ fn maybe_record_stopout_and_cleanup(
     if entry_snapshots.remove(&last_context_key).is_some() {
         crate::workflow::persistence::delete_entry_snapshot(state_dir, symbol, &last_context_key)?;
     }
-    Ok(true)
+    Ok(Some(stopout_snapshot))
 }
 
 async fn persist_workflow_prompt_input_to_disk(
@@ -8150,6 +8375,39 @@ mod tests {
     }
 
     #[test]
+    fn workflow_entry_attempt_context_key_is_unique_per_attempt() {
+        let event_ts = DateTime::parse_from_rfc3339("2026-04-25T12:24:15.959Z")
+            .expect("event ts")
+            .with_timezone(&Utc);
+        let first_attempt = DateTime::parse_from_rfc3339("2026-04-25T12:24:19.032000001Z")
+            .expect("attempt ts")
+            .with_timezone(&Utc);
+        let second_attempt = DateTime::parse_from_rfc3339("2026-04-25T12:24:19.032000002Z")
+            .expect("attempt ts")
+            .with_timezone(&Utc);
+
+        let first = workflow_entry_attempt_context_key(
+            "btcusdt",
+            "long",
+            "BTCUSDT_STAGE1_VALUE_RETURN_LONG_2026-04-25",
+            event_ts,
+            first_attempt,
+        );
+        let second = workflow_entry_attempt_context_key(
+            "btcusdt",
+            "long",
+            "BTCUSDT_STAGE1_VALUE_RETURN_LONG_2026-04-25",
+            event_ts,
+            second_attempt,
+        );
+
+        assert_ne!(first, second);
+        assert!(
+            first.starts_with("BTCUSDT:LONG:BTCUSDT_STAGE1_VALUE_RETURN_LONG_2026-04-25:entry_")
+        );
+    }
+
+    #[test]
     fn execution_intent_from_entry_plan_uses_configured_ttl() {
         let stage1_output = sample_stage1_output();
         let current_path = stage1_output.current_path.as_ref().expect("path");
@@ -8162,6 +8420,7 @@ mod tests {
             None,
             101.5,
             22,
+            "ETHUSDT:LONG:path_a",
             None,
         );
 
@@ -8217,7 +8476,15 @@ mod tests {
         };
 
         let long_intent = execution_intent_from_entry_plan(
-            "ETHUSDT", "path_a", &long_plan, &long_path, None, 101.2, 15, None,
+            "ETHUSDT",
+            "path_a",
+            &long_plan,
+            &long_path,
+            None,
+            101.2,
+            15,
+            "ETHUSDT:LONG:path_a",
+            None,
         );
         let short_intent = execution_intent_from_entry_plan(
             "ETHUSDT",
@@ -8227,6 +8494,7 @@ mod tests {
             None,
             100.8,
             15,
+            "ETHUSDT:SHORT:path_a",
             None,
         );
 
@@ -10907,6 +11175,7 @@ mod tests {
             modify_take_profit_order_ids: Vec::new(),
             modify_stop_loss_order_ids: vec![12345],
             realized_pnl_usdt: 0.0,
+            realized_pnl_fetch_errors: Vec::new(),
         };
 
         let signal = build_management_trade_signal(
