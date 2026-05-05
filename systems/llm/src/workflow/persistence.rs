@@ -994,7 +994,7 @@ mod tests {
                 "activation_level": {
                     "low": 100.0,
                     "high": 101.0,
-                    "timeframe": "4h",
+                    "timeframe": "1d",
                     "label": "activation",
                     "reason": "legacy"
                 },
@@ -1002,7 +1002,7 @@ mod tests {
                 "first_path_target": {
                     "low": 103.0,
                     "high": 104.0,
-                    "timeframe": "4h",
+                    "timeframe": "1d",
                     "label": "tp1",
                     "reason": "legacy"
                 },
@@ -1018,7 +1018,7 @@ mod tests {
                 "failure_level": {
                     "low": 98.0,
                     "high": 99.0,
-                    "timeframe": "4h",
+                    "timeframe": "1d",
                     "label": "failure",
                     "reason": "legacy"
                 },

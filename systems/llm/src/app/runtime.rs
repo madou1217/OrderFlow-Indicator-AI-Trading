@@ -6605,7 +6605,13 @@ async fn invoke_workflow_bundle_models(
                         let Some(value) = payload.get("parsed_value").cloned() else {
                             continue;
                         };
-                        match crate::workflow::parser::parse_stage2a_output(value, &stage1_output) {
+                        match crate::workflow::parser::parse_stage2a_output(value, &stage1_output)
+                            .and_then(|draft| {
+                                crate::workflow::stage2::finalize_stage2a_output_with_stage1_risk(
+                                    draft,
+                                    &stage1_output,
+                                )
+                            }) {
                             Ok(parsed) => {
                                 selected_stage2a_model_name = Some(out.model_name.clone());
                                 stage2a_output = Some(parsed);

@@ -593,6 +593,39 @@ pub struct EntryPlan {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
+pub struct Stage2AEntryPlanDraft {
+    pub entry_profile: String,
+    pub intent_mode: String,
+    #[serde(default)]
+    pub entry_activation_level: Option<PriceZone>,
+    pub entry_zone: PriceZone,
+    #[serde(default = "default_stage2a_leverage")]
+    pub leverage: u32,
+    pub entry_reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct TacticalEntryPlanDraft {
+    pub path_id: String,
+    pub entry_plan: Stage2AEntryPlanDraft,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Stage2AOutputDraft {
+    pub stage2_decision: String,
+    pub path_audit_note: String,
+    #[serde(default)]
+    pub tactical_entry_plan: Option<TacticalEntryPlanDraft>,
+    #[serde(default)]
+    pub reevaluation_reason: Option<String>,
+    #[serde(default)]
+    pub wait_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct TacticalEntryPlan {
     pub path_id: String,
     pub entry_plan: EntryPlan,

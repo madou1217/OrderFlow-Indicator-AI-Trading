@@ -126,7 +126,7 @@ fn zone_reevaluation_trigger_schema() -> Value {
                 ]
             },
             "zone_id": {"type": ["string", "null"]},
-            "timeframe": {"type": ["string", "null"], "enum": ["4h", "1d", "4h-1d", null]},
+            "timeframe": {"type": ["string", "null"], "enum": ["1d", "3d", "1d-3d", null]},
             "min_confirmed_bars": {"type": ["integer", "null"], "minimum": 1},
             "summary": {"type": "string"},
             "evidence": {"type": "array", "items": {"type": "string"}}
@@ -294,9 +294,9 @@ fn driver_attribution_schema() -> Value {
 
 fn target_zone_schema() -> Value {
     let timeframes = vec![
-        Value::String("4h".to_string()),
         Value::String("1d".to_string()),
-        Value::String("4h-1d".to_string()),
+        Value::String("3d".to_string()),
+        Value::String("1d-3d".to_string()),
         Value::Null,
     ];
     json!({
@@ -339,10 +339,10 @@ fn current_path_schema() -> Value {
             "id": {"type": "string"},
             "side": {"type": "string", "enum": ["LONG", "SHORT"]},
             "thesis": {"type": "string"},
-            "strategic_activation_level": price_zone_schema(&["4h", "1d", "4h-1d"]),
+            "strategic_activation_level": price_zone_schema(&["1d", "3d", "1d-3d"]),
             "first_target_zone": target_zone_schema(),
             "second_target_zone": target_zone_schema(),
-            "failure_level": price_zone_schema(&["4h", "1d", "4h-1d"]),
+            "failure_level": price_zone_schema(&["1d", "3d", "1d-3d"]),
             "tracked_zones": {"type": "array", "items": tracked_zone_schema()},
         }
     })
@@ -396,12 +396,8 @@ fn entry_plan_schema() -> Value {
             "intent_mode",
             "entry_activation_level",
             "entry_zone",
-            "entry_invalidation_level",
-            "stop_loss",
             "leverage",
-            "entry_reason",
-            "invalidation_reason",
-            "stop_loss_reason"
+            "entry_reason"
         ],
         "properties": {
             "entry_profile": {
@@ -415,12 +411,8 @@ fn entry_plan_schema() -> Value {
             "intent_mode": {"type": "string", "enum": ["immediate", "pullback", "breakout"]},
             "entry_activation_level": nullable(freeform_price_zone_schema()),
             "entry_zone": freeform_price_zone_schema(),
-            "entry_invalidation_level": freeform_price_zone_schema(),
-            "stop_loss": {"type": "number"},
             "leverage": {"type": "integer", "minimum": 1, "maximum": 20},
-            "entry_reason": {"type": "string"},
-            "invalidation_reason": {"type": "string"},
-            "stop_loss_reason": {"type": "string"}
+            "entry_reason": {"type": "string"}
         }
     })
 }
@@ -595,8 +587,8 @@ fn pending_order_management_action_schema() -> Value {
             "path_id": {"type": "string"},
             "trigger_condition": nullable(price_trigger_condition_schema()),
             "execution_price": {"type": ["number", "null"]},
-            "replacement_entry_zone": nullable(price_zone_schema(&["15m", "15m-4h"])),
-            "replacement_entry_invalidation_level": nullable(price_zone_schema(&["15m", "15m-4h"])),
+            "replacement_entry_zone": nullable(price_zone_schema(&["15m", "15m-1d"])),
+            "replacement_entry_invalidation_level": nullable(price_zone_schema(&["15m", "15m-1d"])),
             "replacement_stop_loss": {"type": ["number", "null"]},
             "reuse_current_entry_template": {"type": ["boolean", "null"]},
             "post_fill_bracket_template": nullable(post_fill_bracket_template_schema()),
@@ -1176,12 +1168,23 @@ mod tests {
         let entry_plan =
             &schema["properties"]["tactical_entry_plan"]["anyOf"][0]["properties"]["entry_plan"];
         assert!(entry_plan["properties"].get("max_drift_pct").is_none());
+        assert!(entry_plan["properties"]
+            .get("entry_invalidation_level")
+            .is_none());
+        assert!(entry_plan["properties"].get("stop_loss").is_none());
+        assert!(entry_plan["properties"]
+            .get("invalidation_reason")
+            .is_none());
+        assert!(entry_plan["properties"].get("stop_loss_reason").is_none());
         let required = entry_plan["required"]
             .as_array()
             .expect("entry_plan required array");
         assert!(!required
             .iter()
             .any(|value| value.as_str() == Some("max_drift_pct")));
+        assert!(!required
+            .iter()
+            .any(|value| value.as_str() == Some("stop_loss")));
     }
 
     #[test]

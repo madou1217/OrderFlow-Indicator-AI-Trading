@@ -15,7 +15,7 @@ pub fn build_stage1_prompt_input(
             .refresh_cause = refresh_reason.clone();
     }
     Stage1PromptInput {
-        task: "Build the 3D/4H/1D market map, choose the primary script, and construct the strategic path"
+        task: "Build the 3D/1D market map, choose the primary script, and construct the strategic 1D-3D path"
             .to_string(),
         strategic_indicator_summary,
         refresh_reason,

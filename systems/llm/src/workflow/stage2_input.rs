@@ -1442,7 +1442,7 @@ pub fn build_stage2a_prompt_input(
     stage1_output: &Stage1Output,
 ) -> Stage2APromptInput {
     Stage2APromptInput {
-        task: "Review the current strategic path and either arm a tactical entry, explicitly wait without trading, or request a Stage1 reevaluation from the dedicated Stage2 context"
+        task: "Review the current 1D-3D strategic path and either arm an entry point, explicitly wait without trading, or request a Stage1 reevaluation from the dedicated Stage2 context"
             .to_string(),
         strategic_context_frozen: build_strategic_context_frozen(summary, stage1_output),
         entry_location_context_15m: build_entry_location_context_15m(input, summary, stage1_output),
@@ -1603,7 +1603,7 @@ mod tests {
                 strategic_activation_level: PriceZone {
                     low: 100.0,
                     high: 102.0,
-                    timeframe: Some("4h".to_string()),
+                    timeframe: Some("1d".to_string()),
                     label: None,
                     reason: None,
                 },
@@ -1629,7 +1629,7 @@ mod tests {
                 failure_level: PriceZone {
                     low: 96.0,
                     high: 97.0,
-                    timeframe: Some("4h".to_string()),
+                    timeframe: Some("1d".to_string()),
                     label: None,
                     reason: None,
                 },
@@ -1640,7 +1640,7 @@ mod tests {
                 tracked_zones: vec![
                     TrackedZone {
                         zone_id: "zone_activation".to_string(),
-                        timeframe: "4h".to_string(),
+                        timeframe: "1d".to_string(),
                         role: "activation".to_string(),
                         low: 100.0,
                         high: 102.0,
@@ -1664,7 +1664,7 @@ mod tests {
                     },
                     TrackedZone {
                         zone_id: "zone_failure".to_string(),
-                        timeframe: "4h".to_string(),
+                        timeframe: "1d".to_string(),
                         role: "failure".to_string(),
                         low: 96.0,
                         high: 97.0,
@@ -2957,7 +2957,7 @@ mod tests {
         assert_eq!(
             stage2c_encoded["entry_location_context_15m"]["avwap_anchor_distances"]
                 ["selected_anchor_distances"][0]["mapped_reference_window"],
-            json!("4h")
+            json!("1d")
         );
         assert_eq!(
             stage2c_encoded["continuity_confirmation_context_5m"]["cvd_pack_5m"]["point"]
